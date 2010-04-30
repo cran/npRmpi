@@ -1,0 +1,74 @@
+
+R version 2.11.0 (2010-04-22)
+Copyright (C) 2010 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npsigtest_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+> options(np.messages=FALSE)
+> 
+> set.seed(42)
+> 
+> ## Significance testing with z irrelevant
+> 
+> n <- 500
+> z <- factor(rbinom(n,1,.5))
+> x1 <- rnorm(n)
+> x2 <- runif(n,-2,2)
+> y <- x1 + x2 + rnorm(n)
+> 
+> t <- system.time(model <- npreg(y~z+x1+x2,
++                                     regtype="ll",
++                                     bwmethod="cv.aic"))
+> 
+> 
+> ## An example of the consistent nonparametric significance test
+> 
+> t <- t + system.time(output <- npsigtest(model))
+> 
+> output
+
+Kernel Regression Significance Test
+Type I Test with IID Bootstrap (399 replications)
+Explanatory variables tested for significance:
+z (1), x1 (2), x2 (3)
+
+                      z       x1        x2
+Bandwidth(s): 0.2116178 6.166078 0.9550357
+
+Significance Tests
+P Value: 
+z  0.11529  
+x1 < 2e-16 *** 
+x2 < 2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 143.673 
+> 
+> proc.time()
+   user  system elapsed 
+143.604   0.140 144.199 

@@ -1,0 +1,88 @@
+
+R version 2.11.0 (2010-04-22)
+Copyright (C) 2010 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npindexich_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+> options(np.messages=FALSE)
+> 
+> ## Generate some data
+> 
+> n <- 2500
+> 
+> set.seed(42)
+> 
+> x1 <- runif(n, min=-1, max=1)
+> x2 <- runif(n, min=-1, max=1)
+> y <- x1 - x2 + rnorm(n)
+> 
+> ## A single index model example (Ichimura, continuous y)
+> 
+> t <- system.time(bw <- npindexbw(formula=y~x1+x2))
+> 
+> summary(bw)
+
+Single Index Model
+Regression data (2500 observations, 2 variable(s)):
+
+      x1         x2
+Beta:  1 -0.9819115
+Bandwidth:  0.1805395
+Optimisation Method:  Nelder-Mead
+Regression Type: Local-Constant
+Bandwidth Selection Method: Ichimura
+Formula: y ~ x1 + x2
+Objective Function Value: 1.036736 (achieved on multistart 2)
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+
+> 
+> t <- t + system.time(model <- npindex(bws=bw, gradients=TRUE))
+> 
+> summary(model)
+
+Single Index Model
+Regression Data: 2500 training points, in 2 variable(s)
+
+      x1         x2
+Beta:  1 -0.9819115
+Bandwidth: 0.1805395
+Kernel Regression Estimator: Local-Constant
+
+Residual standard error: 1.029777
+R-squared: 0.4058975
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 36.834 
+> 
+> 
+> proc.time()
+   user  system elapsed 
+ 37.153   0.080  37.362 

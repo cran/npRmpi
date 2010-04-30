@@ -1,0 +1,67 @@
+
+R version 2.11.0 (2010-04-22)
+Copyright (C) 2010 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npqreg_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+> options(np.messages=FALSE)
+> 
+> data("Italy")
+> 
+> ## A quantile regression example
+> 
+> t <- system.time(bw <- npcdensbw(gdp~ordered(year),data=Italy))
+> 
+> summary(bw)
+
+Conditional density data (1008 observations, 2 variable(s))
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+Bandwidth Selection Method: Maximum Likelihood Cross-Validation
+Formula: gdp ~ ordered(year)
+Bandwidth Type: Fixed
+Objective Function Value: 2.656451 (achieved on multistart 1)
+
+Exp. Var. Name: ordered(year) Bandwidth: 0.6713491   Lambda Max: 1 
+
+Dep. Var. Name: gdp           Bandwidth: 0.7132911 Scale Factor: 0.4011295
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Dependent Vars.: 1
+
+Ordered Categorical Kernel Type: Wang and Van Ryzin
+No. Ordered Categorical Explanatory Vars.: 1
+
+> 
+> t <- t + system.time(model.q0.25 <- npqreg(bws=bw, tau=0.25))
+> t <- t + system.time(model.q0.50 <- npqreg(bws=bw, tau=0.50))
+> t <- t + system.time(model.q0.75 <- npqreg(bws=bw, tau=0.75))
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 96.105 
+> 
+> proc.time()
+   user  system elapsed 
+ 96.356   0.102  96.735 

@@ -1,0 +1,94 @@
+
+R version 2.11.0 (2010-04-22)
+Copyright (C) 2010 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npcdensls_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+> options(np.messages=FALSE)
+> 
+> library(MASS)
+> 
+> set.seed(42)
+> 
+> n <- 500
+> 
+> rho <- 0.25
+> mu <- c(0,0)
+> Sigma <- matrix(c(1,rho,rho,1),2,2)
+> data <- mvrnorm(n=n, mu, Sigma)
+> mydat <- data.frame(x=data[,2],y=data[,1])
+> 
+> ## A simple example with least-squares cross-validation
+> 
+> t <- system.time(bw <- npcdensbw(y~x,
++                                  bwmethod="cv.ls",
++                                  data=mydat))
+> 
+> summary(bw)
+
+Conditional density data (500 observations, 2 variable(s))
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+Bandwidth Selection Method: Least Squares Cross-Validation
+Formula: y ~ x
+Bandwidth Type: Fixed
+Objective Function Value: -0.2863016 (achieved on multistart 2)
+
+Exp. Var. Name: x Bandwidth: 0.7376342 Scale Factor: 2.079154 
+
+Dep. Var. Name: y Bandwidth: 0.3752106 Scale Factor: 1.099904
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> t <- t + system.time(model <- npcdens(bws=bw))
+> 
+> summary(model)
+
+Conditional Density Data: 500 training points, in 2 variable(s)
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+                                y
+Dep. Var. Bandwidth(s): 0.3752106
+                                x
+Exp. Var. Bandwidth(s): 0.7376342
+
+Bandwidth Type: Fixed
+Log Likelihood: -690.7773
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 125.994 
+> 
+> 
+> proc.time()
+   user  system elapsed 
+125.700   0.204 126.811 

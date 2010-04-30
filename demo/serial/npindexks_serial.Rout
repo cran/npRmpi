@@ -1,0 +1,101 @@
+
+R version 2.11.0 (2010-04-22)
+Copyright (C) 2010 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npindexks_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+> options(np.messages=FALSE)
+> 
+> ## Generate some data
+> 
+> n <- 2500
+> 
+> set.seed(42)
+> 
+> x <- rchisq(n, df=3)
+> x1 <- (ifelse(x < 6, x, 6) - 2.348)/1.511
+> x <- rnorm(n)
+> x2 <- ifelse(abs(x) < 2 , x, 2) / 0.8796
+> y <- ifelse(x1 + x2 + rnorm(n) > 0, 1, 0)
+>      
+> ## A single index model example (Klein & Spady, binary y)
+> 
+> t <- system.time(bw <- npindexbw(formula=y~x1+x2,
++                                  method="kleinspady"))
+> 
+> summary(bw)
+
+Single Index Model
+Regression data (2500 observations, 2 variable(s)):
+
+      x1       x2
+Beta:  1 1.013558
+Bandwidth:  0.2024523
+Optimisation Method:  Nelder-Mead
+Regression Type: Local-Constant
+Bandwidth Selection Method: Klein and Spady
+Formula: y ~ x1 + x2
+Objective Function Value: 0.3415126 (achieved on multistart 2)
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+
+> 
+> t <- t + system.time(model <- npindex(bws=bw, gradients=TRUE))
+> 
+> summary(model)
+
+Single Index Model
+Regression Data: 2500 training points, in 2 variable(s)
+
+      x1       x2
+Beta:  1 1.013558
+Bandwidth: 0.2024523
+Kernel Regression Estimator: Local-Constant
+
+Confusion Matrix
+      Predicted
+Actual    0    1
+     0  922  174
+     1  214 1190
+
+Overall Correct Classification Ratio:  0.8448
+Correct Classification Ratio By Outcome:
+        0         1 
+0.8412409 0.8475783 
+
+McFadden-Puig-Kerschner performance measure:  0.8326285
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 50.361 
+> 
+> 
+> proc.time()
+   user  system elapsed 
+ 50.683   0.087  50.901 
