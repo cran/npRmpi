@@ -2,25 +2,25 @@
 mpi.finalize <- function(){
     if(mpi.is.master())
         print("Exiting Rmpi. Rmpi cannot be used unless relaunching R.")
-    .Call("mpi_finalize",PACKAGE="npRmpi")
+    .Call("mpi_finalize",PACKAGE = "npRmpi")
 }
 
 mpi.exit <- function(){
     if (mpi.is.master())
     	print("Detaching Rmpi. Rmpi cannot be used unless relaunching R.")
-    .Call("mpi_finalize",PACKAGE="npRmpi")
+    .Call("mpi_finalize",PACKAGE = "npRmpi")
     detach(package:Rmpi)
 }
 
 mpi.quit <- function(save="no"){
-    .Call("mpi_finalize",PACKAGE="npRmpi")
+    .Call("mpi_finalize",PACKAGE = "npRmpi")
     q(save=save,runLast=FALSE)
 }
 
 mpi.is.master <- function () 
 {
     if (is.loaded("mpi_comm_get_parent"))
-	as.logical(.Call("mpi_is_master",PACKAGE="npRmpi"))
+	as.logical(.Call("mpi_is_master",PACKAGE = "npRmpi"))
     else {
 	if (mpi.comm.size(1)>0)
 	    as.logical(mpi.comm.rank(1)==0)
@@ -30,60 +30,52 @@ mpi.is.master <- function ()
 }
 
 mpi.any.source <- function(){
-    .Call("mpi_any_source",PACKAGE="npRmpi")
+    .Call("mpi_any_source",PACKAGE = "npRmpi")
 }
 
 mpi.any.tag <- function(){
-    .Call("mpi_any_tag",PACKAGE="npRmpi")
+    .Call("mpi_any_tag",PACKAGE = "npRmpi")
 }
 
 mpi.proc.null <- function(){
-    .Call("mpi_proc_null",PACKAGE="npRmpi")
+    .Call("mpi_proc_null",PACKAGE = "npRmpi")
 }
 
 string <- function(length){
     if (as.integer(length) < 1)
 	stop("need positive length")
 
-    .Call("mkstr",as.integer(length),PACKAGE="npRmpi")
+    .Call("mkstr",as.integer(length),PACKAGE = "npRmpi")
 }
 
 mpi.info.create <- function(info=0){
-	.Call("mpi_info_create", as.integer(info),PACKAGE="npRmpi")
+	.Call("mpi_info_create", as.integer(info),PACKAGE = "npRmpi")
 }
 
 mpi.info.set <- function(info=0, key, value){
     .Call("mpi_info_set", as.integer(info), as.character(key), 
-	as.character(value),PACKAGE="npRmpi")
+	as.character(value),PACKAGE = "npRmpi")
 }
 
 mpi.info.get <- function(info=0, key, valuelen){
     .Call("mpi_info_get",as.integer(info), as.character(key), 
-	as.integer(valulen), .as.integer(valuelen),PACKAGE="npRmpi")
+	as.integer(valulen), .as.integer(valuelen),PACKAGE = "npRmpi")
 }
 
 mpi.info.free <- function(info=0){
-	.Call("mpi_info_free", as.integer(info),PACKAGE="npRmpi")
+	.Call("mpi_info_free", as.integer(info),PACKAGE = "npRmpi")
 }
 
 mpi.universe.size <- function(){
 	if (!is.loaded("mpi_universe_size")) 
         stop("This function is not supported under MPI 1.2")
-	out <-.Call("mpi_universe_size",PACKAGE="npRmpi")
+	out <-.Call("mpi_universe_size",PACKAGE = "npRmpi")
 	if (out==0){
 	    if (exists(".mpi.universe.size"))
 		out<-.mpi.universe.size
 	    else {
 			if (.Platform$OS=="windows") {
 		    	out <- length(mpichhosts())-1
-				if  (out==0)
-					repeat {
-						out <- out+1
-						cpus=length(.Call("RegQuery", as.integer(3), 
-						paste("HARDWARE\\DESCRIPTION\\System\\CentralProcessor", out,sep="\\"), PACKAGE="npRmpi") )
-						if (cpus==0)
-							break
-					}
 			}
 	    }		
 	}
@@ -93,7 +85,7 @@ mpi.universe.size <- function(){
 }
 
 mpi.get.processor.name <- function(short=TRUE){
-    name <- .Call("mpi_get_processor_name",PACKAGE="npRmpi")
+    name <- .Call("mpi_get_processor_name",PACKAGE = "npRmpi")
     if (short)
 	name <- unlist(strsplit(name, "\\."))[1]
     name

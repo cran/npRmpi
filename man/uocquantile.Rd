@@ -31,15 +31,8 @@ uocquantile(x, prob)
 }
 
 \examples{
-## For the npRmpi package kindly see the examples in the demos directory
-## (npRmpi/demos) and study them carefully. The examples below run only
-## in the np package version (serial) and running parallel programs
-## requires additional care (see the npRmpi vignette for details via
-## vignette("npRmpi",package="npRmpi")).
-\dontrun{
 x <- rbinom(n = 100, size = 10, prob = 0.5)
 uocquantile(x, 0.5)
-}
 }
 
 \keyword{univar}

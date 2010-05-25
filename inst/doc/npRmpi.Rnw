@@ -46,7 +46,7 @@
   McMaster University\\
   Hamilton, Ontario, Canada, L8S 4L8\\
   E-mail: \email{racinej@mcmaster.ca}\\
-  URL: \url{http://www.mcmaster.ca/economics/racine/}\\
+  URL: \url{http://www.economics.mcmaster.ca/faculty/racinej}\\
 }
 
 \begin{document}
@@ -141,13 +141,16 @@ parallel computing you are strongly advised to seek local advice.
 
 That being said, if you have current versions of \proglang{R} and Open
 \proglang{MPI} properly installed on your system, installation of the
-\pkg{npRmpi} package could be as simple as downloading the
-\pkg{npRmpi} tarball and, from a command shell, running
-
+\pkg{npRmpi} package can be done in the standard manner from within
+\proglang{R} via
+\begin{verbatim}
+> install.packages("npRmpi")
+\end{verbatim}
+or, alternatively, you can download the \pkg{npRmpi} tarball from CRAN
+and, from a command shell, run
 \begin{verbatim}
 R CMD INSTALL npRmpi_foo.tar.gz 
 \end{verbatim}
-
 where foo is the version number. 
 
 For clusters you may additionally need to provide locations of
@@ -156,13 +159,10 @@ variations for me to assist). On a local Linux cluster I use the
 following by way of illustration (for this illustration we use the
 Intel compiler suite and need to set \proglang{MPI} library paths and
 \proglang{MPI} root directories):
-
 \begin{verbatim}
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/sharcnet/openmpi/1.4.2/intel/lib
-export MPI_ROOT=/opt/sharcnet/openmpi/1.4.2/intel 
-R CMD INSTALL npRmpi_foo.tar.gz
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/sharcnet/openmpi/current/intel/lib
+export MPI_ROOT=/opt/sharcnet/openmpi/current/intel 
 \end{verbatim}
-
 where again foo is the version number. 
 
 Please seek local help for further assistance on installing and
@@ -201,6 +201,53 @@ sqsub -q mpi -n 2 R CMD BATCH npudensml_npRmpi.R
 Again, kindly consult local tech support personnel for issues
 concerning the use of batch queueing systems and using compute
 clusters.
+
+\subsection{Parallel Execution in an Interactive R Session}
+
+You might instead wish to run your code interactively in an
+\proglang{R} terminal/console rather than in batch mode. Doing so
+requires the essential elements in Section \ref{sec example} below
+with two minor differences. For this we do not require that the
+initialization file \code{.Rprofile} reside in the root or current
+directory (if it does it will be benign). To start a session, (i) you
+will load the \pkg{npRmpi} package in the normal manner via
+\code{library("npRmpi")}, then (ii) generate the slave nodes using the
+command \code{mpi.spawn.Rslaves(nslaves=foo)}. For example, on a dual
+core desktop set \code{foo=1} so that
+\code{mpi.spawn.Rslaves(nslaves=1)} will spawn one slave node in
+addition to the master node on which \proglang{R} is running for a
+total of two compute nodes. See the file \code{interactive_Rterm.R} in
+the demo directory for an illustration, but here is some sample code
+illustrating the additional elements required for an interactive
+session.
+
+Note also that in an interactive session the messages displayed during
+execution might be informative so there is no need for the option
+\code{option(np.messages=FALSE)} and you likely would want to comment
+this statement out in the demo files if you are running them
+interactively.
+
+\begin{verbatim}
+## This code can be run interactively inside the R terminal/console
+## It does not require that you have the .Rprofile file from
+## npRmpi/inst/ in your current directory or home directory as we can
+## load the npRmpi package in the standard manner.
+
+library(npRmpi)
+
+## Now we can spawn our slaves from within the R terminal/console manually. 
+## On a two core desktop we need an additional slave on top of the master
+## node to allow both cores to run simultaneously.
+
+mpi.spawn.Rslaves(nslaves=1)
+
+## Then the rest of your program would follow along the lines of that 
+## in, say, Section \ref{sec example}...
+\end{verbatim}
+
+A number of illustrative examples are readily available in the
+interactive session via \code{example()} e.g.~\code{example(npreg)}
+and so forth.
 
 \subsection{Essential Program Elements}\label{sec example}
 
@@ -356,33 +403,32 @@ encouraged and much appreciated.
 
 \section{Illustrative Timed Runs}\label{sec run time}
 
-The times reported in Table \ref{run table} were generated using R
-2.11-0 and Open MPI 1.2.8 on a 2008 vintage MacBook running Snow
-Leopard 10.6.3 on a 2.4 GHz Intel Core 2 Duo (a completely stock
-installation). Code was first run in serial mode using the np package
-version 0.30-9 then in parallel mode with 2 processors using the
-npRmpi package version 0.30-9. Elapsed time for the np functions is
-provided (seconds) as is the ratio of the elapsed time for the
+The run times reported in Table \ref{run table} were generated using R
+2.11-0 and Open MPI 1.2.8 on a MacBook laptop running Snow Leopard
+10.6.3 on a 2.4 GHz Intel Core 2 Duo (a completely stock
+installation). The ratios reported in Table \ref{run saw table} were
+run on the SHARCNET cluster `saw' (\url{www.sharcnet.ca}) using R
+2.11-0 and Open MPI 1.4.2.\footnote{`saw' is an HP cluster with 2,704
+  cores running Red Hat Enterprise Linux version 5.1 with InfiniBand
+  interconnects, 16 GB RAM/node, 2 sockets x 4 cores per socket
+  outfitted with 2.83 GHz Xeon processors.}  Each example was first
+run in serial mode using the np package version 0.40-0 then in
+parallel mode with 2 processors (on the MacBook) through 8 processors
+(on the Infiniband Cluster) using the npRmpi package version
+0.40-0. Elapsed time for the np functions is provided in Table
+\ref{run table} (seconds) as is the ratio of the elapsed time for each
 parallel run to the serial run.
 
-Note that many of these illustrative examples use smallish sample
-sizes hence the run time with 2 processors will not be 1/2 that with 1
-processor due to overhead. But for larger samples (i.e. the ones you
-actually need parallel computing for, not these toy illustrations) you
-ought to see an improvement that is inversely related to the number of
-processors.
-
-\begin{table}
+\begin{table}[!ht]
 \begin{center}
   \caption{\label{run table}Illustrative timed runs (seconds) with 1
     processor (serial, np package) and 2 processors (parallel, npRmpi
-    package).}
+    package) on a 2.4 GHz Intel Core 2 Duo running Mac OS X 10.6.3.}
 \begin{tabular}{lrrr}
 Function & Secs(1) & Secs(2) & Ratio\cr
 \hline
 npcdens (ls) & 126.3 & 112.3 & 0.89\cr
 npcdens (ml) & 50.1 & 25.5 & 0.51\cr
-npcdistccdf & 68.0 & 35.7 & 0.53\cr
 npcmstest & 73.9 & 51.9 & 0.70\cr
 npconmode & 90.8 & 37.2 & 0.41\cr
 npdeneqtest & 43.2 & 23.9 & 0.55\cr
@@ -406,6 +452,46 @@ npunitest & 41.6 & 28.1 & 0.67\cr
 \end{center}
 \end{table}
 
+\begin{table}[!ht]
+\begin{center}
+  \caption{\label{run saw table}Illustrative timed runs (ratio of
+    execution time for the serial np package versus the npRmpi package
+    with cpu=processors) on an HP cluster equipped with 2.83 GHz Xeon
+    processors running Red Hat Enterprise Linux 5.1.}
+\begin{tabular}{lrrrrrrr}
+Function  & cpu=2 & cpu=3 & cpu=4 & cpu=5 & cpu=6 & cpu=7 & cpu=8\cr
+\hline
+npcdens (ls) & 0.51 & 0.35 & 0.29 & 0.28 & 0.24 & 0.22 & 0.24\cr
+npcdens (ml) & 0.49 & 0.31 & 0.24 & 0.20 & 0.16 & 0.14 & 0.13\cr
+npcmstest & 0.55 & 0.42 & 0.35 & 0.34 & 0.33 & 0.33 & 0.33\cr
+npconmode & 0.54 & 0.28 & 0.25 & 0.21 & 0.17 & 0.14 & 0.12\cr
+npdeneqtest & 0.53 & 0.37 & 0.29 & 0.25 & 0.22 & 0.20 & 0.18\cr
+npdeptest & 0.53 & 0.36 & 0.28 & 0.24 & 0.21 & 0.19 & 0.16\cr
+npindex (Ichimura) & 0.51 & 0.35 & 0.27 & 0.23 & 0.20 & 0.18 & 0.17\cr
+npindex (Klein/Spady) & 0.53 & 0.35 & 0.28 & 0.23 & 0.21 & 0.19 & 0.17\cr
+npqreg & 0.52 & 0.31 & 0.23 & 0.19 & 0.20 & 0.19 & 0.12\cr
+npreg (lc, aic) & 0.52 & 0.35 & 0.30 & 0.24 & 0.19 & 0.18 & 0.15\cr
+npreg (lc, ls) & 0.53 & 0.35 & 0.27 & 0.21 & 0.18 & 0.16 & 0.14\cr
+npreg (ll, aic) & 0.68 & 0.48 & 0.38 & 0.40 & 0.24 & 0.28 & 0.20\cr
+npreg (ll, ls) & 0.55 & 0.37 & 0.29 & 0.23 & 0.19 & 0.16 & 0.14\cr
+npscoef & 0.65 & 0.58 & 0.56 & 0.57 & 0.58 & 0.59 & 0.60\cr
+npsdeptest & 0.55 & 0.42 & 0.37 & 0.35 & 0.33 & 0.33 & 0.33\cr
+npsigtest & 0.63 & 0.42 & 0.33 & 0.28 & 0.25 & 0.23 & 0.24\cr
+npsymtest & 0.58 & 0.44 & 0.38 & 0.35 & 0.34 & 0.33 & 0.33\cr
+npudens (ls) & 0.48 & 0.32 & 0.24 & 0.21 & 0.16 & 0.10 & 0.13\cr
+npudens (ml) & 0.48 & 0.31 & 0.25 & 0.20 & 0.16 & 0.14 & 0.12\cr
+npunitest & 0.52 & 0.40 & 0.33 & 0.30 & 0.28 & 0.28 & 0.28\cr
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+Note that many of these illustrative examples use smallish sample
+sizes hence the run time with 2 processors will not be 1/2 that with 1
+processor due to overhead. But for larger samples (i.e. the ones you
+actually need parallel computing for, not these toy illustrations) you
+ought to see an improvement in run time that is inversely related to
+the number of processors.
 
 \section{Known Issues}
 
@@ -446,3 +532,4 @@ npunitest & 41.6 & 28.1 & 0.67\cr
 \end{enumerate}
 
 \end{document}
+

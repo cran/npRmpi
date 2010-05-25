@@ -51,16 +51,30 @@ npseed(seed)
   This method currently only supports objects from the \code{\link{np}} library.
 }
 \examples{
-## For the npRmpi package kindly see the examples in the demos directory
-## (npRmpi/demos) and study them carefully. The examples below run only
-## in the np package version (serial) and running parallel programs
-## requires additional care (see the npRmpi vignette for details via
-## vignette("npRmpi",package="npRmpi")).
-\dontrun{
-npseed(712)
-x <- runif(10)
-y <- x + rnorm(10, sd = 0.1)
-bw <- npregbw(y~x)
-}
+## The following example is adapted for interactive parallel execution
+## in R. Here we spawn 1 slave so that there will be two compute nodes
+## (master and slave).  Kindly see the batch examples in the demos
+## directory (npRmpi/demos) and study them carefully. Also kindly see
+## the more extensive examples in the np package itself. See the npRmpi
+## vignette for further details on running parallel np programs via
+## vignette("npRmpi",package="npRmpi").
+
+mpi.spawn.Rslaves(nslaves=1)
+mpi.bcast.cmd(np.mpi.initialize(),
+              caller.execute=TRUE)
+
+mpi.bcast.cmd(npseed(42),
+              caller.execute=TRUE)
+
+## For the interactive run only we close the slaves perhaps to proceed
+## with other examples and so forth. This is redundant in batch mode.
+
+mpi.close.Rslaves()
+
+## Note that in order to exit npRmpi properly avoid quit(), and instead
+## use mpi.quit() as follows.
+
+## mpi.bcast.cmd(mpi.quit(),
+##               caller.execute=TRUE)
 }
 \keyword{nonparametric}

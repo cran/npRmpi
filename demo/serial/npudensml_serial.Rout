@@ -30,9 +30,9 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
 > 
 > ## Generate some data
 > 
-> n <- 2500
-> 
 > set.seed(42)
+> 
+> n <- 2500
 > 
 > mydat <- data.frame(x=rnorm(n))
 > 
@@ -58,8 +58,8 @@ No. Continuous Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 25.345 
+Elapsed time = 25.558 
 > 
 > proc.time()
    user  system elapsed 
- 25.760   0.055  25.844 
+ 24.546   0.085  26.144 

@@ -19,9 +19,9 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9) + Rmpi 0.5-8
-master (rank 0, comm 1) of size 2 is running on: pc-racine2 
-slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-10) + Rmpi 0.5-9
+master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
+slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -47,20 +47,23 @@ slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2
 > ## Significance testing with z irrelevant
 > 
 > n <- 500
+> 
 > z <- factor(rbinom(n,1,.5))
 > x1 <- rnorm(n)
 > x2 <- runif(n,-2,2)
 > y <- x1 + x2 + rnorm(n)
+> mydat <- data.frame(z,x1,x2,y)
+> rm(z.x1,x2,y)
+Warning message:
+In rm(z.x1, x2, y) : object 'z.x1' not found
 > 
-> mpi.bcast.Robj2slave(z)
-> mpi.bcast.Robj2slave(x1)
-> mpi.bcast.Robj2slave(x2)
-> mpi.bcast.Robj2slave(y)
+> mpi.bcast.Robj2slave(mydat)
 > 
 > t <- system.time(mpi.bcast.cmd(model <- npreg(y~z+x1+x2,
-+                                                   regtype="ll",
-+                                                   bwmethod="cv.aic"),
-+                                    caller.execute=TRUE))
++                                               regtype="ll",
++                                               bwmethod="cv.aic",
++                                               data=mydat),
++                                caller.execute=TRUE))
 > 
 > ## An example of the consistent nonparametric significance test
 > 
@@ -87,7 +90,7 @@ Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 88.047 
+Elapsed time = 83.044 
 > 
 > ## Clean up properly then quit()
 > 

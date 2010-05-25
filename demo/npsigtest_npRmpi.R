@@ -23,20 +23,21 @@ mpi.bcast.cmd(set.seed(42),
 ## Significance testing with z irrelevant
 
 n <- 500
+
 z <- factor(rbinom(n,1,.5))
 x1 <- rnorm(n)
 x2 <- runif(n,-2,2)
 y <- x1 + x2 + rnorm(n)
+mydat <- data.frame(z,x1,x2,y)
+rm(z,x1,x2,y)
 
-mpi.bcast.Robj2slave(z)
-mpi.bcast.Robj2slave(x1)
-mpi.bcast.Robj2slave(x2)
-mpi.bcast.Robj2slave(y)
+mpi.bcast.Robj2slave(mydat)
 
 t <- system.time(mpi.bcast.cmd(model <- npreg(y~z+x1+x2,
-                                                  regtype="ll",
-                                                  bwmethod="cv.aic"),
-                                   caller.execute=TRUE))
+                                              regtype="ll",
+                                              bwmethod="cv.aic",
+                                              data=mydat),
+                               caller.execute=TRUE))
 
 ## An example of the consistent nonparametric significance test
 

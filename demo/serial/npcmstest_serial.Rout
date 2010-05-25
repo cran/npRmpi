@@ -31,8 +31,11 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
 > data("oecdpanel")
 > attach(oecdpanel)
 > 
+> oecd <- factor(oecd)
+> year <- factor(year)
+> 
 > model <- lm(growth ~ oecd +
-+             factor(year) +
++             year +
 +             initgdp +
 +             I(initgdp^2) +
 +             I(initgdp^3) +
@@ -45,7 +48,7 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
 +             x=TRUE, 
 +             y=TRUE)
 > 
-> X <- data.frame(factor(oecd), factor(year), initgdp, popgro, inv, humancap)
+> X <- data.frame(oecd, year, initgdp, popgro, inv, humancap)
 > 
 > ## Consistent model specification test (we override defaults for
 > ## demonstration purposes - don't do this for real problems).
@@ -60,7 +63,7 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
 > output
 
 Consistent Model Specification Test
-Parametric null model: lm(formula = growth ~ oecd + factor(year) + initgdp + I(initgdp^2) +     I(initgdp^3) + I(initgdp^4) + popgro + inv + humancap + I(humancap^2) +     I(humancap^3) - 1, x = TRUE, y = TRUE)
+Parametric null model: lm(formula = growth ~ oecd + year + initgdp + I(initgdp^2) +     I(initgdp^3) + I(initgdp^4) + popgro + inv + humancap + I(humancap^2) +     I(humancap^3) - 1, x = TRUE, y = TRUE)
 Number of regressors: 6
 IID Bootstrap (399 replications)
 
@@ -71,8 +74,8 @@ Null of correct specification is rejected at the 0.1% level
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 74.107 
+Elapsed time = 70.522 
 > 
 > proc.time()
    user  system elapsed 
- 74.431   0.119  74.704 
+ 70.736   0.113  71.092 

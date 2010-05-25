@@ -19,7 +19,7 @@ in one working directory).
 \usage{
 mpi.spawn.Rslaves(Rscript=system.file("slavedaemon.R", package="npRmpi"),
         nslaves=mpi.universe.size(), root = 0, intercomm = 2,
-        comm = 1, hosts = NULL, needlog = TRUE, mapdrive=TRUE)
+        comm = 1, hosts = NULL, needlog = FALSE, mapdrive=TRUE)
 
 mpi.close.Rslaves(dellog = TRUE, comm = 1)
 tailslave.log(nlines = 3, comm = 1)

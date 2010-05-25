@@ -20,10 +20,10 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 ## Generate some data and broadcast it to all slaves (it will be known
 ## to the master node)
 
-n <- 1000
-
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
+
+n <- 1000
 
 x <- rnorm(n)
 y <- 1 + x + rnorm(n)

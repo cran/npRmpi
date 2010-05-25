@@ -22,8 +22,11 @@ mpi.bcast.cmd(data("oecdpanel"),
 mpi.bcast.cmd(attach(oecdpanel),
               caller.execute=TRUE)
 
+oecd <- factor(oecd)
+year <- factor(year)
+
 model <- lm(growth ~ oecd +
-            factor(year) +
+            year +
             initgdp +
             I(initgdp^2) +
             I(initgdp^3) +
@@ -36,7 +39,7 @@ model <- lm(growth ~ oecd +
             x=TRUE, 
             y=TRUE)
 
-X <- data.frame(factor(oecd), factor(year), initgdp, popgro, inv, humancap)
+X <- data.frame(oecd, year, initgdp, popgro, inv, humancap)
 
 mpi.bcast.Robj2slave(model)
 mpi.bcast.Robj2slave(X)

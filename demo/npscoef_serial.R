@@ -8,17 +8,19 @@ options(np.messages=FALSE)
 
 ## Generate some data
 
-n <- 2500
-
 set.seed(42)
+
+n <- 2500
 
 x <- runif(n)
 z <- runif(n, min=-2, max=2)
 y <- x*exp(z)*(1.0+rnorm(n,sd = 0.2))
+mydat <- data.frame(x,y,z)
+rm(x,y,z)
 
 ## A smooth coefficient model example
 
-t <- system.time(bw <- npscoefbw(y~x|z))
+t <- system.time(bw <- npscoefbw(y~x|z,data=mydat))
 
 summary(bw)
 

@@ -19,9 +19,9 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9) + Rmpi 0.5-8
-master (rank 0, comm 1) of size 2 is running on: pc-racine2 
-slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-10) + Rmpi 0.5-9
+master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
+slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -44,22 +44,22 @@ slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2
 > ## Generate some data and broadcast it to all slaves (it will be known
 > ## to the master node so no need to broadcast it)
 > 
-> n <- 2500
-> 
 > mpi.bcast.cmd(set.seed(42),
 +               caller.execute=TRUE)
+> 
+> n <- 2500
 > 
 > x <- runif(n)
 > z <- runif(n, min=-2, max=2)
 > y <- x*exp(z)*(1.0+rnorm(n,sd = 0.2))
+> mydat <- data.frame(x,y,z)
+> rm(x,y,z)
 > 
-> mpi.bcast.Robj2slave(x)
-> mpi.bcast.Robj2slave(z)
-> mpi.bcast.Robj2slave(y)
+> mpi.bcast.Robj2slave(mydat)
 > 
 > ## A smooth coefficient model example
 > 
-> t <- system.time(mpi.bcast.cmd(bw <- npscoefbw(y~x|z),
+> t <- system.time(mpi.bcast.cmd(bw <- npscoefbw(y~x|z,data=mydat),
 +                                caller.execute=TRUE))
 > 
 > summary(bw)
@@ -100,7 +100,7 @@ No. Continuous Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 32.339 
+Elapsed time = 31.705 
 > 
 > ## Clean up properly then quit()
 > 

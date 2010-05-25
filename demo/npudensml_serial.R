@@ -8,9 +8,9 @@ options(np.messages=FALSE)
 
 ## Generate some data
 
-n <- 2500
-
 set.seed(42)
+
+n <- 2500
 
 mydat <- data.frame(x=rnorm(n))
 

@@ -28,16 +28,18 @@ Loading required package: cubature
 Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
 > options(np.messages=FALSE)
 > 
+> set.seed(42)
+> 
 > n <- 1000
 > 
-> set.seed(42)
 > x <- runif(n)
 > z1 <- rbinom(n,1,.5)
 > z2 <- rbinom(n,1,.5)
 > y <- cos(2*pi*x) + z1 + rnorm(n,sd=.25)
-> mydat <- data.frame(y,x,z1=factor(z1),z2=factor(z2))
+> z1 <- factor(z1)
+> z2 <- factor(z2)
+> mydat <- data.frame(y,x,z1,z2)
 > rm(x,y,z1,z2)
-> 
 > 
 > ## A regression example (local linear, least squares cross-validation)
 > 
@@ -67,7 +69,8 @@ Unordered Categorical Kernel Type: Aitchison and Aitken
 No. Unordered Categorical Explanatory Vars.: 2
 
 > 
-> t <- t + system.time(model <- npreg(bws=bw))
+> t <- t + system.time(model <- npreg(bws=bw,
++                                     data=mydat))
 > 
 > summary(model)
 
@@ -88,9 +91,9 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 89.368 
+Elapsed time = 87.042 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 89.675   0.094  89.903 
+ 86.418   0.163  87.565 

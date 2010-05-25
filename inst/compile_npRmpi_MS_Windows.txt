@@ -1,0 +1,68 @@
+Title: Compiling npRmpi from source code under MS Windows XP (32-bit &
+Service Pack 3)
+
+Date: 05/21/2010
+Author: David T. Jacho-Chavez (djachoch@indiana.edu)
+
+These are based on those given in http://www.stats.uwo.ca/faculty/yu/Rmpi/
+
+1) Create the folder "R_temp" in your C:\ drive.
+
+2) Download the following files and place then in "C:\R_temp" (note
+   version numbers may be more recent so use the most recent
+   available):
+
+R-2.11.0-win32.exe         http://www.r-project.org/
+Rtools211.exe              http://www.murdoch-sutherland.com/Rtools/
+mpich2-1.2.1p1-win-ia32    http://www-unix.mcs.anl.gov/mpi/mpich2
+npRmpi_0.30-9.tar.gz       http://cran.r-project.org/web/packages/npRmpi/index.html
+test.R                     http://www.economics.mcmaster.ca/faculty/racinej
+.Rprofile                  http://www.economics.mcmaster.ca/faculty/racinej
+
+ * If you have problems dowloading this file in MS Windows, a local
+   copy will be located in "C:\R_Temp\npRmpi\inst" (See step 3-(i)
+   below) that you can freely move to your working directory (see note
+   (i) at the bottom of this document)
+
+3) Install the following programmes (in this order) using the default
+   directories:
+
+  (i) R-2.11.0-win32.exe (Please kindly refer to installation
+      instructions at http://www.r-project.org/)
+
+ (ii) Rtools211.exe (Please kindly refer to installation instructions
+      at http://www.murdoch-sutherland.com/Rtools/)
+
+(iii) mpich2-1.2.1p1-win-ia32 (Please kindly refer to installation
+      instructions at
+      http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm)
+
+4) Untar npRmpi_0.30-9.tar.gz in the "C:\R_temp" folder.
+
+  * To 'untar' in MS Windows, please download & install the following
+    freeware programme: 7-zip (http://www.7-zip.org)
+
+5) 'Open a command window here' (google this phrase if you don't know
+    how) in "C:\R_Temp\" and type:
+
+  R CMD INSTALL npRmpi
+
+6) To test your installation now type:
+
+  mpiexec -n 2 R --no-save -q < test.R > test_np_2.txt
+
+7) Now open test_np_2.txt and if you find no errors, your installation
+   has been successful!
+
+Notes:
+
+  (i) If you are planning to run R programmes in other folders that
+      use the npRmpi package, simply make sure that the file .Rprofile
+      is always located in the same folder as the programme you are
+      trying to run, otherwise it will not work.
+
+ (ii) The command 'mpiexec' is available only when the proper
+      installation of mpich2-1.2.1p1-win-ia32 is performed. 
+      Kindly refer to
+      http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm for
+      step-by-step instructions.

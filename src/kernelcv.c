@@ -136,9 +136,9 @@ double cv_func_regression_categorical_ls(double *vector_scale_factor){
 /* Compute the cross-validation function */
 /* Tristen's efficient code is broken under MPI, so we comment it out
    here pending a fix */
-/*    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){ 
-      printf("\nHere we are\n");
-      double cv = np_kernel_estimate_regression_categorical_ls_aic(
+#ifndef MPI2
+    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){ 
+      return(np_kernel_estimate_regression_categorical_ls_aic(
         int_ll_extern,
         RBWM_CVLS,
         KERNEL_reg_extern,
@@ -154,12 +154,13 @@ double cv_func_regression_categorical_ls(double *vector_scale_factor){
         matrix_X_continuous_train_extern,
         vector_Y_extern,
         &vector_scale_factor[1],
-        num_categories_extern);
-      printf("\ncv=%f, lambda=%f,h=%f", cv, vector_scale_factor[2],vector_scale_factor[1]);
-      return(cv);
-      } else {*/
+        num_categories_extern));
+      } else {
+#endif
       return(cv_func_regression_categorical_ls_nn(vector_scale_factor));
-      /*    }*/
+#ifndef MPI2
+      }
+#endif
 }
 
 double cv_func_regression_categorical_ls_nn(double *vector_scale_factor)
@@ -680,7 +681,8 @@ double cv_func_regression_categorical_aic_c(double *vector_scale_factor)
 /* Compute the AIC_c function */
 /* Tristen's efficient code is broken under MPI, so we comment it out
    here pending a fix */
-/*    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){
+#ifndef MPI2
+    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){
       return(np_kernel_estimate_regression_categorical_ls_aic(
         int_ll_extern,
         RBWM_CVAIC,
@@ -698,7 +700,8 @@ double cv_func_regression_categorical_aic_c(double *vector_scale_factor)
         vector_Y_extern,
         &vector_scale_factor[1],
         num_categories_extern));
-        } else {*/
+        } else {
+#endif
       return(kernel_estimate_regression_categorical_aic_c(
         int_ll_extern,
         KERNEL_reg_extern,
@@ -715,6 +718,8 @@ double cv_func_regression_categorical_aic_c(double *vector_scale_factor)
         vector_Y_extern,
         &vector_scale_factor[1],
         num_categories_extern));
-      /*    }*/
+#ifndef MPI2
+    }
+#endif
 
 }

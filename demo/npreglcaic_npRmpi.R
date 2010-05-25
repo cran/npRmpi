@@ -20,14 +20,17 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 ## Generate data and broadcast it to all slave nodes in the form of a
 ## data frame
 
+set.seed(42)
+
 n <- 1000
 
-set.seed(42)
 x <- runif(n)
 z1 <- rbinom(n,1,.5)
 z2 <- rbinom(n,1,.5)
 y <- cos(2*pi*x) + z1 + rnorm(n,sd=.25)
-mydat <- data.frame(y,x,z1=factor(z1),z2=factor(z2))
+z1 <- factor(z1)
+z2 <- factor(z2)
+mydat <- data.frame(y,x,z1,z2)
 rm(x,y,z1,z2)
 
 mpi.bcast.Robj2slave(mydat)
@@ -42,7 +45,8 @@ t <- system.time(mpi.bcast.cmd(bw <- npregbw(y~x+z1+z2,
 
 summary(bw)
 
-t <- t + system.time(mpi.bcast.cmd(model <- npreg(bws=bw),
+t <- t + system.time(mpi.bcast.cmd(model <- npreg(bws=bw,
+                                                  data=mydat),
                                    caller.execute=TRUE))
 
 summary(model)

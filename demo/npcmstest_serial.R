@@ -9,8 +9,11 @@ options(np.messages=FALSE)
 data("oecdpanel")
 attach(oecdpanel)
 
+oecd <- factor(oecd)
+year <- factor(year)
+
 model <- lm(growth ~ oecd +
-            factor(year) +
+            year +
             initgdp +
             I(initgdp^2) +
             I(initgdp^3) +
@@ -23,7 +26,7 @@ model <- lm(growth ~ oecd +
             x=TRUE, 
             y=TRUE)
 
-X <- data.frame(factor(oecd), factor(year), initgdp, popgro, inv, humancap)
+X <- data.frame(oecd, year, initgdp, popgro, inv, humancap)
 
 ## Consistent model specification test (we override defaults for
 ## demonstration purposes - don't do this for real problems).

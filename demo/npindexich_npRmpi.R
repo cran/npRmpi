@@ -20,27 +20,29 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 ## Generate some data and broadcast it to all slaves (it will be known
 ## to the master node so no need to broadcast it)
 
-n <- 2500
-
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
+
+n <- 2500
 
 x1 <- runif(n, min=-1, max=1)
 x2 <- runif(n, min=-1, max=1)
 y <- x1 - x2 + rnorm(n)
+mydat <- data.frame(x1,x2,y)
+rm(y,x1,x2)
 
-mpi.bcast.Robj2slave(x1)
-mpi.bcast.Robj2slave(x2)
-mpi.bcast.Robj2slave(y)
+mpi.bcast.Robj2slave(mydat)
 
 ## A single index model example (Ichimura, continuous y)
 
-t <- system.time(mpi.bcast.cmd(bw <- npindexbw(formula=y~x1+x2),
+t <- system.time(mpi.bcast.cmd(bw <- npindexbw(formula=y~x1+x2,
+                                               data=mydat),
                                caller.execute=TRUE))
 
 summary(bw)
 
-t <- t + system.time(mpi.bcast.cmd(model <- npindex(bws=bw, gradients=TRUE),
+t <- t + system.time(mpi.bcast.cmd(model <- npindex(bws=bw,
+                                                    gradients=TRUE),
                                    caller.execute=TRUE))
 
 summary(model)

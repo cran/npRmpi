@@ -305,14 +305,17 @@ npplregbw(\dots)
 \seealso{
   \code{\link{npregbw}}, \code{\link{npreg}} }
 \examples{
-## For the npRmpi package kindly see the examples in the demos directory
-## (npRmpi/demos) and study them carefully. The examples below run only
-## in the np package version (serial) and running parallel programs
-## requires additional care (see the npRmpi vignette for details via
-## vignette("npRmpi",package="npRmpi")).
-\dontrun{
-# EXAMPLE 1 (INTERFACE=FORMULA): For this example, we simulate an
-# example for a partially linear model and perform bandwidth selection
+## The following example is adapted for interactive parallel execution
+## in R. Here we spawn 1 slave so that there will be two compute nodes
+## (master and slave).  Kindly see the batch examples in the demos
+## directory (npRmpi/demos) and study them carefully. Also kindly see
+## the more extensive examples in the np package itself. See the npRmpi
+## vignette for further details on running parallel np programs via
+## vignette("npRmpi",package="npRmpi").
+
+mpi.spawn.Rslaves(nslaves=1)
+mpi.bcast.cmd(np.mpi.initialize(),
+              caller.execute=TRUE)
 
 set.seed(123)
 
@@ -325,99 +328,29 @@ z2 <- rnorm(n)
 
 y <- 1 + x1 + x2 + z1 + sin(z2) + rnorm(n)
 
-X <- data.frame(x1, ordered(x2))
-Z <- data.frame(ordered(z1), z2)
+x2 <- ordered(x2)
+z1 <- ordered(z1)
 
-# Compute data-driven bandwidths... this may take a minute or two
-# depending on the speed of your computer...
+mpi.bcast.Robj2slave(x1)
+mpi.bcast.Robj2slave(x2)
+mpi.bcast.Robj2slave(z1)
+mpi.bcast.Robj2slave(z2)
+mpi.bcast.Robj2slave(y)
 
-bw <- npplregbw(formula=y~x1+ordered(x2)|ordered(z1)+z2, tol=.1, ftol=.1)
-
-summary(bw)
-
-# Note - the default is to use the local constant estimator. If you wish
-# to use instead a local linear estimator, this is accomplished via
-# npplregbw(xdat=X, zdat=Z, ydat=y, regtype="ll", tol=.1, ftol=.1)
-
-# Note - see the example for npudensbw() for multiple illustrations
-# of how to change the kernel function, kernel order, and so forth.
-
-# You may want to manually specify your bandwidths
-bw.mat <- matrix(data =  c(0.19, 0.34,  # y on Z
-                           0.00, 0.74,  # X[,1] on Z
-                           0.99, 0.23), # X[,2] on Z
-                ncol = ncol(Z), byrow=TRUE)
-
-bw <- npplregbw(formula=y~x1+ordered(x2)|ordered(z1)+z2, 
-                          bws=bw.mat, bandwidth.compute=FALSE)
-summary(bw)
-
-# Sleep for 5 seconds so that we can examine the output...
-
-Sys.sleep(5)
-
-# You may want to tweak some of the bandwidths
-bw$bw[[1]] # y on Z, alternatively bw$bw$yzbw
-bw$bw[[1]]$bw <- c(0.17, 0.30)
-
-bw$bw[[2]] # X[,1] on Z
-bw$bw[[2]]$bw[1] <- 0.00054
+mpi.bcast.cmd(bw <- npplregbw(formula=y~x1+x2|z1+z2),
+              caller.execute=TRUE)
 
 summary(bw)
 
-# EXAMPLE 1 (INTERFACE=DATA FRAME): For this example, we simulate an
-# example for a partially linear model and perform bandwidth selection
+## For the interactive run only we close the slaves perhaps to proceed
+## with other examples and so forth. This is redundant in batch mode.
 
-set.seed(123)
+mpi.close.Rslaves()
 
-n <- 250
-x1 <- rnorm(n)
-x2 <- rbinom(n, 5, .3)
+## Note that in order to exit npRmpi properly avoid quit(), and instead
+## use mpi.quit() as follows.
 
-z1 <- rbinom(n, 2, .3)
-z2 <- rnorm(n)
-
-y <- 1 + x1 + x2 + z1 + sin(z2) + rnorm(n)
-
-X <- data.frame(x1, ordered(x2))
-Z <- data.frame(ordered(z1), z2)
-
-# Compute data-driven bandwidths... this may take a minute or two
-# depending on the speed of your computer...
-
-bw <- npplregbw(xdat=X, zdat=Z, ydat=y, tol=.1, ftol=.1)
-
-summary(bw)
-
-# Note - the default is to use the local constant estimator. If you wish
-# to use instead a local linear estimator, this is accomplished via
-# npplregbw(xdat=X, zdat=Z, ydat=y, regtype="ll", tol=.1, ftol=.1)
-
-# Note - see the example for npudensbw() for multiple illustrations
-# of how to change the kernel function, kernel order, and so forth.
-
-# You may want to manually specify your bandwidths
-bw.mat <- matrix(data =  c(0.19, 0.34,  # y on Z
-                           0.00, 0.74,  # X[,1] on Z
-                           0.99, 0.23), # X[,2] on Z
-                ncol = ncol(Z), byrow=TRUE)
-
-bw <- npplregbw(xdat=X, zdat=Z, ydat=y, 
-                          bws=bw.mat, bandwidth.compute=FALSE)
-summary(bw)
-
-# Sleep for 5 seconds so that we can examine the output...
-
-Sys.sleep(5)
-
-# You may want to tweak some of the bandwidths
-bw$bw[[1]] # y on Z, alternatively bw$bw$yzbw
-bw$bw[[1]]$bw <- c(0.17, 0.30)
-
-bw$bw[[2]] # X[,1] on Z
-bw$bw[[2]]$bw[1] <- 0.00054
-
-summary(bw)
-} % enddontrun
+## mpi.bcast.cmd(mpi.quit(),
+##               caller.execute=TRUE)
 }
 \keyword{nonparametric}

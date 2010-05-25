@@ -8,20 +8,23 @@ options(np.messages=FALSE)
 
 ## Generate some data
 
-n <- 2500
-
 set.seed(42)
+
+n <- 2500
 
 x <- rchisq(n, df=3)
 x1 <- (ifelse(x < 6, x, 6) - 2.348)/1.511
 x <- rnorm(n)
 x2 <- ifelse(abs(x) < 2 , x, 2) / 0.8796
 y <- ifelse(x1 + x2 + rnorm(n) > 0, 1, 0)
+mydat <- data.frame(x1,x2,y)
+rm(x,x1,x2,y)
      
 ## A single index model example (Klein & Spady, binary y)
 
 t <- system.time(bw <- npindexbw(formula=y~x1+x2,
-                                 method="kleinspady"))
+                                 method="kleinspady",
+                                 data=mydat))
 
 summary(bw)
 

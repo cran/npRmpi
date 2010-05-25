@@ -127,15 +127,20 @@ npsdeptest(data = NULL,
 }
 
 \examples{
-## For the npRmpi package kindly see the examples in the demos directory
-## (npRmpi/demos) and study them carefully. The examples below run only
-## in the np package version (serial) and running parallel programs
-## requires additional care (see the npRmpi vignette for details via
-## vignette("npRmpi",package="npRmpi")).
-\dontrun{
-set.seed(1234)
+## The following example is adapted for interactive parallel execution
+## in R. Here we spawn 1 slave so that there will be two compute nodes
+## (master and slave).  Kindly see the batch examples in the demos
+## directory (npRmpi/demos) and study them carefully. Also kindly see
+## the more extensive examples in the np package itself. See the npRmpi
+## vignette for further details on running parallel np programs via
+## vignette("npRmpi",package="npRmpi").
 
-## A function to create a time series
+mpi.spawn.Rslaves(nslaves=1)
+mpi.bcast.cmd(np.mpi.initialize(),
+              caller.execute=TRUE)
+
+mpi.bcast.cmd(set.seed(42),
+              caller.execute=TRUE)
 
 ar.series <- function(phi,epsilon) {
   n <- length(epsilon)
@@ -149,32 +154,28 @@ ar.series <- function(phi,epsilon) {
 
 n <- 100
 
-## Stationary persistent time-series
-
 yt <- ar.series(0.95,rnorm(n))
-npsdeptest(yt,lag.num=2,boot.num=99,method="summation")
 
-Sys.sleep(5)
+mpi.bcast.Robj2slave(yt)
 
-## Stationary independent time-series
+mpi.bcast.cmd(output <- npsdeptest(yt,
+                                   lag.num=2,
+                                   boot.num=99,
+                                   method="summation"),
+              caller.execute=TRUE)
 
-yt <- ar.series(0.0,rnorm(n))
-npsdeptest(yt,lag.num=2,boot.num=99,method="summation")
+summary(output)
 
-## Stationary persistent time-series
+## For the interactive run only we close the slaves perhaps to proceed
+## with other examples and so forth. This is redundant in batch mode.
 
-yt <- ar.series(0.95,rnorm(n))
-npsdeptest(yt,lag.num=2,boot.num=99,method="integration")
+mpi.close.Rslaves()
 
-Sys.sleep(5)
+## Note that in order to exit npRmpi properly avoid quit(), and instead
+## use mpi.quit() as follows.
 
-## Stationary independent time-series
-
-yt <- ar.series(0.0,rnorm(n))
-npsdeptest(yt,lag.num=2,boot.num=99,method="integration")
-
-} % enddontrun
-
+## mpi.bcast.cmd(mpi.quit(),
+##               caller.execute=TRUE)
 }
 \keyword{ univar }
 \keyword{ nonparametric }

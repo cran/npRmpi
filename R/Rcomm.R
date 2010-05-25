@@ -1,38 +1,38 @@
 ### Copyright (C) 2002 Hao Yu 
 mpi.barrier <- function(comm=1){
-    .Call("mpi_barrier", as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_barrier", as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.set.errhandler <- function(comm=1){
     .Call("mpi_comm_set_errhandler", as.integer(comm),
-    PACKAGE="npRmpi")
+    PACKAGE = "npRmpi")
 }
 
 mpi.comm.test.inter <- function(comm=2){
     if(mpi.comm.is.null(comm))
         stop("NULL communicator")
-    .Call("mpi_comm_test_inter",as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_comm_test_inter",as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.rank <- function(comm=1){
-    .Call("mpi_comm_rank", as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_comm_rank", as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.size <- function(comm=1){
     if (.Call("mpi_comm_is_null", as.integer(comm),
-        PACKAGE="npRmpi")==1)
+        PACKAGE = "npRmpi")==1)
         0
     else 
-        .Call("mpi_comm_size",as.integer(comm),PACKAGE="npRmpi")
+        .Call("mpi_comm_size",as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.dup <- function(comm, newcomm){
         .Call("mpi_comm_dup", as.integer(comm), as.integer(newcomm),
-    PACKAGE="npRmpi")
+    PACKAGE = "npRmpi")
 }
 
 mpi.comm.remote.size <- function(comm=2){
-    .Call("mpi_comm_remote_size", as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_comm_remote_size", as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.free <- function(comm=1){
@@ -40,7 +40,7 @@ mpi.comm.free <- function(comm=1){
     tmp<-paste("It seems no members(slaves) associated with comm", comm)
     stop(tmp)
      }
-     .Call("mpi_comm_free",as.integer(comm),PACKAGE="npRmpi")
+     .Call("mpi_comm_free",as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.abort <- function(comm=1){
@@ -48,7 +48,7 @@ mpi.abort <- function(comm=1){
     tmp<-paste("It seems no members(slaves) associated with comm", comm)
     stop(tmp)
      }
-     .Call("mpi_abort",as.integer(comm),PACKAGE="npRmpi")
+     .Call("mpi_abort",as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.disconnect <- function(comm=1){
@@ -58,7 +58,7 @@ mpi.comm.disconnect <- function(comm=1){
      }
      if (!is.loaded("mpi_comm_disconnect"))
         stop("MPI_Comm_disconnect is not supported.")
-     .Call("mpi_comm_disconnect",as.integer(comm),PACKAGE="npRmpi")
+     .Call("mpi_comm_disconnect",as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.spawn <- function(slave, 
@@ -85,22 +85,22 @@ mpi.comm.spawn <- function(slave,
                 as.integer(nslaves),
         as.integer(info),
         as.integer(root),
-        as.integer(intercomm),PACKAGE="npRmpi")
+        as.integer(intercomm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.get.parent <- function(comm=2){
     if (!is.loaded("mpi_comm_get_parent"))
         stop("MPI_Comm_get_parent is not supported.")
-    .Call("mpi_comm_get_parent", as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_comm_get_parent", as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.comm.is.null <- function(comm){
     as.logical(.Call("mpi_comm_is_null", as.integer(comm),
-    PACKAGE="npRmpi"))
+    PACKAGE = "npRmpi"))
 }
 
 mpi.intercomm.merge <- function(intercomm=2,high=0,comm=1){
     .Call("mpi_intercomm_merge", as.integer(intercomm),
                      as.integer(high),
-                     as.integer(comm),PACKAGE="npRmpi")
+                     as.integer(comm),PACKAGE = "npRmpi")
 }

@@ -19,9 +19,9 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9) + Rmpi 0.5-8
-master (rank 0, comm 1) of size 2 is running on: pc-racine2 
-slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-10) + Rmpi 0.5-9
+master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
+slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -46,8 +46,11 @@ slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2
 > mpi.bcast.cmd(attach(oecdpanel),
 +               caller.execute=TRUE)
 > 
+> oecd <- factor(oecd)
+> year <- factor(year)
+> 
 > model <- lm(growth ~ oecd +
-+             factor(year) +
++             year +
 +             initgdp +
 +             I(initgdp^2) +
 +             I(initgdp^3) +
@@ -60,7 +63,7 @@ slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2
 +             x=TRUE, 
 +             y=TRUE)
 > 
-> X <- data.frame(factor(oecd), factor(year), initgdp, popgro, inv, humancap)
+> X <- data.frame(oecd, year, initgdp, popgro, inv, humancap)
 > 
 > mpi.bcast.Robj2slave(model)
 > mpi.bcast.Robj2slave(X)
@@ -79,7 +82,7 @@ slave1 (rank 1, comm 1) of size 2 is running on: pc-racine2
 > output
 
 Consistent Model Specification Test
-Parametric null model: lm(formula = growth ~ oecd + factor(year) + initgdp + I(initgdp^2) +     I(initgdp^3) + I(initgdp^4) + popgro + inv + humancap + I(humancap^2) +     I(humancap^3) - 1, x = TRUE, y = TRUE)
+Parametric null model: lm(formula = growth ~ oecd + year + initgdp + I(initgdp^2) +     I(initgdp^3) + I(initgdp^4) + popgro + inv + humancap + I(humancap^2) +     I(humancap^3) - 1, x = TRUE, y = TRUE)
 Number of regressors: 6
 IID Bootstrap (399 replications)
 
@@ -90,7 +93,7 @@ Null of correct specification is rejected at the 0.1% level
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 54.542 
+Elapsed time = 52.606 
 > 
 > ## Clean up properly then quit()
 > 

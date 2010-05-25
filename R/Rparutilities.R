@@ -55,29 +55,44 @@ lamhosts <- function(){
 }
 
 mpichhosts <- function(){
-    if (.Platform$OS!="windows")
-        stop("mpichhosts runs only under MPICH2 for Windows")    
-    hosts <- .Call("RegQuery",as.integer(3), "SOFTWARE\\MPICH\\SMPD", PACKAGE="npRmpi")
-    if (!is.null(hosts)){
-        hosts <- hosts[which(hosts=="hosts")+1] 
-        hosts <- unlist(strsplit(hosts," "))
+    if (.Platform$OS != "windows") 
+        stop("mpichhosts runs only under MPICH2 for Windows")
+    hosts <- system("smpd -get hosts", intern=TRUE)
+    
+    if (length(hosts) == 0) 
+	  hostnames <- "localhost"
+    else if (length(hosts)==1)
+		if (hosts=="default")
+		    hostnames <- "localhost"
+    else	{ 
+        hosts <- unlist(strsplit(hosts, " "))
         hosts <- hosts[which(hosts != "")]
         hostnames <- NULL
-        for (host in hosts){
-            hostsmp <-unlist(strsplit(host,":"))
-            smp <- ifelse(is.na(hostsmp[2]),1,as.integer(hostsmp[2]))
-            hostbase <- unlist(strsplit(hostsmp[1],"\\."))[1]
+        for (host in hosts) {
+            hostsmp <- unlist(strsplit(host, ":"))
+            smp <- ifelse(is.na(hostsmp[2]), 1, as.integer(hostsmp[2]))
+            hostbase <- unlist(strsplit(hostsmp[1], "\\."))[1]
             hostnames <- c(hostnames, rep(hostbase, smp))
-        }                
+        }
     }
-    else 
-        hostnames <- "localhost"
     base <- "master"
-    if (length(hostnames) > 1)
-        base <- c(base,paste("slave",1:(length(hostnames)-1),sep=""))
-
+    if (length(hostnames) == 1) {
+	  out=0
+	  repeat {
+        	out <- out + 1
+            cpus = length(.Call("RegQuery", as.integer(3), 
+            paste("HARDWARE\\DESCRIPTION\\System\\CentralProcessor", 
+                   out, sep = "\\"), PACKAGE = "npRmpi"))
+            if (cpus == 0) 
+                break
+        }
+	  hostnames=c(hostnames,rep("localhost",out))
+    }
+    else
+	  hostnames = c("localhost", hostnames)
+    base <- c(base, paste("slave", 1:(length(hostnames)-1), sep = ""))
     names(hostnames) <- base
-    hostnames   
+    hostnames
 }
 
 mpi.spawn.Rslaves <- 
@@ -87,7 +102,7 @@ mpi.spawn.Rslaves <-
     intercomm=2,
     comm=1,
     hosts=NULL,
-    needlog=TRUE,
+    needlog=FALSE,
     mapdrive=TRUE) {
     if (!is.loaded("mpi_comm_spawn"))
         stop("You cannot use MPI_Comm_spawn API")   

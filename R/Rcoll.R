@@ -2,35 +2,35 @@
 mpi.probe <- function(source, tag, comm=1, status=0){
     .Call("mpi_probe", as.integer(source), as.integer(tag), 
         as.integer(comm), as.integer(status),
-        PACKAGE="npRmpi")
+        PACKAGE = "npRmpi")
 }
 
 mpi.get.count <- function(type, status = 0){
     .Call("mpi_get_count",as.integer(status), 
-        as.integer(type),PACKAGE="npRmpi")
+        as.integer(type),PACKAGE = "npRmpi")
 }
 
 mpi.get.sourcetag <- function(status=0){
-    .Call("mpi_get_sourcetag", as.integer(status),PACKAGE="npRmpi")
+    .Call("mpi_get_sourcetag", as.integer(status),PACKAGE = "npRmpi")
 }
 
 mpi.gather <- function(x, type, rdata, root=0,  comm=1){
-    .Call("mpi_gather",.force.type( x,type), as.integer(type), rdata, as.integer(root), as.integer(comm),PACKAGE="npRmpi")
+    .Call("mpi_gather",.force.type( x,type), as.integer(type), rdata, as.integer(root), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.scatter <- function(x, type, rdata, root=0,  comm=1){
     .Call("mpi_scatter", .force.type(x,type), as.integer(type), rdata, 
-        as.integer(root), as.integer(comm),PACKAGE="npRmpi")
+        as.integer(root), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.gatherv <- function(x, type, rdata, rcounts, root=0,  comm=1){
     .Call("mpi_gatherv", x, as.integer(type),rdata, as.integer(rcounts), 
-        as.integer(root), as.integer(comm),PACKAGE="npRmpi")
+        as.integer(root), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.scatterv <- function(x, scounts, type, rdata, root=0, comm=1){
     .Call("mpi_scatterv", .force.type(x,type), as.integer(scounts), as.integer(type), rdata, 
-        as.integer(root), as.integer(comm),PACKAGE="npRmpi")
+        as.integer(root), as.integer(comm),PACKAGE = "npRmpi")
 }
 #strings.link<-function(manysts,newst){
 #.Call("stringslink",as.character(manysts),as.character(newst),PACKAGE="npRmpi")
@@ -118,76 +118,51 @@ mpi.allgather.Robj <- function(obj=NULL, comm=1){
 
 mpi.allgather <- function(x, type, rdata, comm=1){
     .Call("mpi_allgather", x, as.integer(type), rdata, as.integer(comm),
-        PACKAGE="npRmpi")
+        PACKAGE = "npRmpi")
 }
 
 mpi.allgatherv <- function(x, type, rdata, rcounts, comm=1){
     .Call("mpi_allgatherv", x, as.integer(type), rdata, 
-    as.integer(rcounts), as.integer(comm),PACKAGE="npRmpi")
+    as.integer(rcounts), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.bcast <- function (x, type, rank = 0, comm = 1) {
     .Call("mpi_bcast", .force.type(x,type), as.integer(type), as.integer(rank), 
-        as.integer(comm),PACKAGE="npRmpi")
+        as.integer(comm),PACKAGE = "npRmpi")
 }
 
 bin.nchar <- function(x){
     if (!is.character(x))
         stop("Must be a (binary) character")
-    .Call("bin_nchar", x[1],PACKAGE="npRmpi")
+    .Call("bin_nchar", x[1],PACKAGE = "npRmpi")
 }
 
-oldmpi.bcast.cmd <- function (cmd=NULL, rank=0, comm=1, caller.execute = FALSE){
+mpi.bcast.cmd <- function (cmd=NULL, rank=0, comm=1, caller.execute = FALSE){
   if(mpi.comm.rank(comm) == rank){
-    if(caller.execute) tcmd <- substitute(cmd)
+    if(caller.execute)
+      tcmd <- substitute(cmd)
     cmd <- deparse(substitute(cmd), width.cutoff=500)
     #cmd <- paste(cmd, collapse="\"\"/")
     cmd <- .mpi.serialize(cmd)
     #mpi.bcast(x=nchar(cmd), type=1, rank=rank, comm=comm)
     mpi.bcast(x=length(cmd), type=1, rank=rank, comm=comm)
-    if (caller.execute) 
-      eval(tcmd, envir = parent.frame())
-    else
-      invisible(mpi.bcast(x=cmd, type=4, rank=rank, comm=comm))
-  } 
-  else {
-    charlen <- mpi.bcast(x=integer(1), type=1, rank=rank, comm=comm)
-    if (is.character(charlen))   #error
-      parse(text="break")
-    else {
-        #out <- mpi.bcast(x=.Call("mkstr", as.integer(charlen),
-        #    PACKAGE="npRmpi"), type=3, rank=rank, comm=comm)
-      out <- .mpi.unserialize(mpi.bcast(x=raw(charlen), type=4, rank=rank, comm=comm))
-        #parse(text=unlist(strsplit(out,"\"\"/"))) 
-      parse(text=out) 
-    }
-  }
-}
-
-
-mpi.bcast.cmd <- function (cmd=NULL, rank=0, comm=1, caller.execute = FALSE){
-    if(mpi.comm.rank(comm) == rank){
-      if(caller.execute) tcmd <- substitute(cmd)
-        cmd <- deparse(substitute(cmd), width.cutoff=500)
-    cmd <- paste(cmd, collapse="\"\"/")
-    mpi.bcast(x=nchar(cmd), type=1, rank=rank, comm=comm)
-    bcast.out <- (mpi.bcast(x=cmd, type=3, rank=rank, comm=comm))
+    bcast.out <- mpi.bcast(x=cmd, type=4, rank=rank, comm=comm) ## Was missing
     if (caller.execute)
       eval(tcmd, envir = parent.frame())
     else
       invisible(bcast.out)
-    }
+  } else {
+    charlen <- mpi.bcast(x=integer(1), type=1, rank=rank, comm=comm)
+    if (is.character(charlen))   #error
+      parse(text="break")
     else {
-        charlen <- mpi.bcast(x=integer(1), type=1, rank=rank,
-        comm=comm)
-        if (is.character(charlen))   #error                                                           
-            parse(text="break")
-        else {
-        out <- mpi.bcast(x=.Call("mkstr", as.integer(charlen),
-            PACKAGE = "npRmpi"), type=3, rank=rank, comm=comm)
-        parse(text=unlist(strsplit(out,"\"\"/")))
-        }
+      #out <- mpi.bcast(x=.Call("mkstr", as.integer(charlen),
+      #    PACKAGE = "npRmpi"), type=3, rank=rank, comm=comm)
+      out <- .mpi.unserialize(mpi.bcast(x=raw(charlen), type=4, rank=rank, comm=comm))
+      #parse(text=unlist(strsplit(out,"\"\"/"))) 
+      parse(text=out) 
     }
+  }
 }
 
 mpi.bcast.Robj <- function(obj=NULL, rank=0, comm=1){
@@ -215,13 +190,13 @@ mpi.bcast.Robj2slave <- function(obj, comm=1){
 
 mpi.send <- function (x, type,  dest, tag, comm=1){
     .Call("mpi_send", .force.type(x,type), as.integer(type), as.integer(dest), 
-    as.integer(tag), as.integer(comm),PACKAGE="npRmpi")
+    as.integer(tag), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.recv <- function (x, type, source, tag, comm=1, status=0){
     .Call("mpi_recv", x, as.integer(type), as.integer(source), 
     as.integer(tag), as.integer(comm), as.integer(status),
-    PACKAGE="npRmpi")
+    PACKAGE = "npRmpi")
 }
 
 mpi.send.Robj <- function(obj, dest, tag, comm=1){
@@ -258,7 +233,7 @@ mpi.reduce <- function(x, type=2,
 #   }
         
     .Call("mpi_reduce", x, as.integer(type), as.integer(op), 
-        as.integer(dest), as.integer(comm),PACKAGE="npRmpi")
+        as.integer(dest), as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.allreduce <- function(x,type=2,
@@ -276,13 +251,13 @@ mpi.allreduce <- function(x,type=2,
     else 
         stop("Not implemented.")
     .Call("mpi_allreduce", x, as.integer(type), as.integer(op), 
-        as.integer(comm),PACKAGE="npRmpi")
+        as.integer(comm),PACKAGE = "npRmpi")
 }
 
 mpi.isend <- function (x, type,  dest, tag, comm=1, request=0){
     #mpi.realloc.request(request+1)
     invisible(.Call("mpi_isend", .force.type(x,type), as.integer(type), as.integer(dest), 
-    as.integer(tag), as.integer(comm), as.integer(request), PACKAGE="npRmpi"))
+    as.integer(tag), as.integer(comm), as.integer(request), PACKAGE = "npRmpi"))
 }
 
 mpi.irecv <- function (x, type, source, tag, comm=1, request=0){
@@ -291,7 +266,7 @@ mpi.irecv <- function (x, type, source, tag, comm=1, request=0){
     stop ("Character receiver is not supported")
     invisible(.Call("mpi_irecv", x, as.integer(type), as.integer(source), 
     as.integer(tag), as.integer(comm), as.integer(request),
-    PACKAGE="npRmpi"))
+    PACKAGE = "npRmpi"))
 }
 
 mpi.isend.Robj <- function(obj, dest, tag, comm=1,request=0)
@@ -299,23 +274,23 @@ mpi.isend.Robj <- function(obj, dest, tag, comm=1,request=0)
         comm=comm,request=request)
 
 mpi.wait <- function(request, status=0)
-    invisible(.Call("mpi_wait",  as.integer(request), as.integer(status), PACKAGE="npRmpi"))
+    invisible(.Call("mpi_wait",  as.integer(request), as.integer(status), PACKAGE = "npRmpi"))
     
 mpi.waitany <- function(count, status=0){
     #mpi.realloc.request(count)
-    .Call("mpi_waitany",  as.integer(count), as.integer(status), PACKAGE="npRmpi")
+    .Call("mpi_waitany",  as.integer(count), as.integer(status), PACKAGE = "npRmpi")
 }
 
 mpi.waitall <- function(count){
     #mpi.realloc.request(count)
     #mpi.realloc.status(count)
-    invisible(.Call("mpi_waitall",  as.integer(count), PACKAGE="npRmpi"))
+    invisible(.Call("mpi_waitall",  as.integer(count), PACKAGE = "npRmpi"))
 }
 
 mpi.waitsome <- function(count){
     #mpi.realloc.request(count)
     #mpi.realloc.status(count)
-    tmp<-.Call("mpi_waitsome",  as.integer(count), PACKAGE="npRmpi")
+    tmp<-.Call("mpi_waitsome",  as.integer(count), PACKAGE = "npRmpi")
     if (tmp[1] <0 || tmp[1] > count)
         return(list(count=tmp[1],indices=NULL))
     else 
@@ -323,24 +298,24 @@ mpi.waitsome <- function(count){
 }
 
 mpi.test <- function(request, status=0)
-    as.logical(.Call("mpi_test",  as.integer(request), as.integer(status), PACKAGE="npRmpi"))
+    as.logical(.Call("mpi_test",  as.integer(request), as.integer(status), PACKAGE = "npRmpi"))
 
 mpi.testany <- function(count, status=0){
     #mpi.realloc.request(count)
-    tmp <-.Call("mpi_testany",  as.integer(count), as.integer(status), PACKAGE="npRmpi")
+    tmp <-.Call("mpi_testany",  as.integer(count), as.integer(status), PACKAGE = "npRmpi")
     list(index=tmp[1], flag=as.logical(tmp[2]))
 }
 
 mpi.testall <- function(count){
     #mpi.realloc.request(count)
     #mpi.realloc.status(count)
-    as.logical(.Call("mpi_testall",  as.integer(count), PACKAGE="npRmpi"))
+    as.logical(.Call("mpi_testall",  as.integer(count), PACKAGE = "npRmpi"))
 }
 
 mpi.testsome <- function(count){
     #mpi.realloc.request(count)
     #mpi.realloc.status(count)
-    tmp<-.Call("mpi_testsome",  as.integer(count), PACKAGE="npRmpi")
+    tmp<-.Call("mpi_testsome",  as.integer(count), PACKAGE = "npRmpi")
     if (tmp[1] < 0 || tmp[1] > count)
         return(list(count=tmp[1],indices=NULL))
     else 
@@ -348,24 +323,24 @@ mpi.testsome <- function(count){
 }
 
 mpi.cancel <- function(request)
-    invisible(.Call("mpi_cancel",  as.integer(request), PACKAGE="npRmpi"))
+    invisible(.Call("mpi_cancel",  as.integer(request), PACKAGE = "npRmpi"))
 
 mpi.test.cancelled <- function(status=0)
-    as.logical(.Call("mpi_test_cancelled", as.integer(status), PACKAGE="npRmpi"))
+    as.logical(.Call("mpi_test_cancelled", as.integer(status), PACKAGE = "npRmpi"))
 
 mpi.iprobe <- function(source, tag, comm=1, status=0){
     as.logical(.Call("mpi_iprobe", as.integer(source), as.integer(tag), 
         as.integer(comm), as.integer(status),
-        PACKAGE="npRmpi"))
+        PACKAGE = "npRmpi"))
 }
 
 mpi.realloc.status <- function(newmaxsize)
     if (newmaxsize > mpi.status.maxsize())
-        invisible(.Call("mpi_realloc_status", as.integer(newmaxsize), PACKAGE="npRmpi"))
+        invisible(.Call("mpi_realloc_status", as.integer(newmaxsize), PACKAGE = "npRmpi"))
 
 mpi.realloc.request <- function(newmaxsize)
     if (newmaxsize > mpi.request.maxsize())
-        invisible(.Call("mpi_realloc_request", as.integer(newmaxsize), PACKAGE="npRmpi"))
+        invisible(.Call("mpi_realloc_request", as.integer(newmaxsize), PACKAGE = "npRmpi"))
 
 mpi.realloc.comm <- function(newmaxsize)
     if (newmaxsize > mpi.comm.maxsize())
@@ -409,5 +384,5 @@ mpi.request.maxsize <- function()
  }
 #mpi.request.get.status <- function(request, status=0){
 #    as.logical(.Call("mpi_request_get_status",  as.integer(request), 
-#        as.integer(status), PACKAGE="npRmpi"))
+#        as.integer(status), PACKAGE = "npRmpi"))
 #}
