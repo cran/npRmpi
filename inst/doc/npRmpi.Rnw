@@ -272,8 +272,7 @@ x <- rnorm(n)
 
 ## A simple example with likelihood cross-validation
 
-t <- system.time(bw <- npudensbw(~x,
-                                 bwmethod="cv.ml"))
+t <- system.time(bw <- npudensbw(~x, bwmethod="cv.ml"))
 
 summary(bw)
 
@@ -328,30 +327,26 @@ Below is the same code modified to run in parallel using the
 
 ## Initialize master and slaves.
 
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(), caller.execute=TRUE)
 
 ## Turn off progress i/o as this clutters the output file (if you want
 ## to see search progress you can comment out this command)
 
-mpi.bcast.cmd(options(np.messages=FALSE),
-              caller.execute=TRUE)
+mpi.bcast.cmd(options(np.messages=FALSE), caller.execute=TRUE)
 
 ## Generate some data and broadcast it to all slaves (it will be known
 ## to the master node)
 
 n <- 2500
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+mpi.bcast.cmd(set.seed(42), caller.execute=TRUE)
 
 x <- rnorm(n)
 mpi.bcast.Robj2slave(x)
 
 ## A simple example with likelihood cross-validation
 
-t <- system.time(mpi.bcast.cmd(bw <- npudensbw(~x,
-                                               bwmethod="cv.ml"),
+t <- system.time(mpi.bcast.cmd(bw <- npudensbw(~x, bwmethod="cv.ml"),
                                caller.execute=TRUE))
 
 summary(bw)
@@ -360,8 +355,7 @@ cat("Elapsed time =", t[3], "\n")
 
 ## Clean up properly then quit()
 
-mpi.bcast.cmd(mpi.quit(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(mpi.quit(), caller.execute=TRUE)
 \end{verbatim}
 
 For more examples including regression, conditional density

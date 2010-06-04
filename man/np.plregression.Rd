@@ -248,7 +248,7 @@ mpi.spawn.Rslaves(nslaves=1)
 mpi.bcast.cmd(np.mpi.initialize(),
               caller.execute=TRUE)
 
-set.seed(123)
+set.seed(42)
 
 n <- 250
 x1 <- rnorm(n)

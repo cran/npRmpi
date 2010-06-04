@@ -25,7 +25,7 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.30-9)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-0)
 > options(np.messages=FALSE)
 > 
 > data("Italy")
@@ -60,8 +60,8 @@ No. Ordered Categorical Explanatory Vars.: 1
 > t <- t + system.time(model.q0.75 <- npqreg(bws=bw, tau=0.75))
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 93.322 
+Elapsed time = 92.953 
 > 
 > proc.time()
    user  system elapsed 
- 93.147   0.123  93.901 
+ 93.442   0.057  93.592 

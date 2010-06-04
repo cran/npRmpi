@@ -13,8 +13,8 @@ INSTALLATION:
    recommended.
 
    Before installing MPICH2, you need Microsoft .Net 2.0 .NET
-   Framework Version 2.0 Redistributable Package and Visual C++ 2005
-   SP1 Redistributable Package (x86).
+   Framework Version 2.0 Redistributable Package and Visual C++ 2010
+   Redistributable Package (x86).
 
 2) After installation, add the MPICH2 bin directory to your PATH
    environment variables. This is very important. Otherwise npRmpi
@@ -38,10 +38,10 @@ INSTALLATION:
    left hosts panel, then MPICH2 is running properly. Otherwise open
    "Command Prompt" as the administrator. At the prompt, type
 
-    smpd -install -phrase behappy
+    smpd -install -phrase mypassword
 
-   (change behappy to whatever the pass phrase you choose). click "Get
-   Settings" again to see if your host gets green color.
+   (change `mypassword' to your actual password). click "Get Settings"
+   again to see if your host gets green color.
 
 4) Download the npRmpi binary zip file for windows. Launch R as the
    administrator to install npRmpi.
@@ -64,12 +64,12 @@ TESTING:
 
 (iii) Now type
 
-	   mpiexec -n 2 R --no-save -q < test.R > test_out.txt
+     mpiexec -n 2 R --no-save -q < test.R > test_out.txt
 
      (Change 2 for 3 or 4 if you got a quad-core desktop)
 
 (iv) After execution, type
 
-	test_out.txt
+    test_out.txt
 
     and notepad will open and display the generated output.

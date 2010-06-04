@@ -26,7 +26,7 @@ slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro
 > ## current directory or home directory. It is necessary.
 > 
 > ## To run this on systems with OPENMPI installed and working, try
-> ## mpirun -np 2 R CMD BATCH npcdistccdf_npRmpi. Check the time in the
+> ## mpirun -np 2 R CMD BATCH npplreg_npRmpi. Check the time in the
 > ## output file foo.Rout (the name of this file with extension .Rout),
 > ## then try with, say, 4 processors and compare run time.
 > 
@@ -41,73 +41,100 @@ slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro
 > mpi.bcast.cmd(options(np.messages=FALSE),
 +               caller.execute=TRUE)
 > 
-> ## Load your data and broadcast it to all slave nodes
-> 
-> library(MASS)
+> ## Generate some data and broadcast it to all slaves (it will be known
+> ## to the master node)
 > 
 > mpi.bcast.cmd(set.seed(42),
 +               caller.execute=TRUE)
 > 
-> n <- 100
+> n <- 1000
 > 
-> rho <- 0.25
-> mu <- c(0,0)
-> Sigma <- matrix(c(1,rho,rho,1),2,2)
-> data <- mvrnorm(n=n, mu, Sigma)
-> mydat <- data.frame(x=data[,2],y=data[,1])
+> x1 <- rnorm(n)
+> x2 <- rbinom(n, 5, .3)
 > 
-> mpi.bcast.Robj2slave(mydat)
+> z1 <- rbinom(n, 2, .3)
+> z2 <- rnorm(n)
 > 
-> ## A simple example with experimental conditional cdf bandwidth
-> ## selection (unsupported)
+> y <- 1 + x1 + x2 + z1 + sin(z2) + rnorm(n)
 > 
-> t <- system.time(mpi.bcast.cmd(bw <- npcdensbw(y~x,
-+                                                bwmethod="cv.ccdf",
-+                                                data=mydat),
+> x2 <- ordered(x2)
+> z1 <- ordered(z1)
+> 
+> mpi.bcast.Robj2slave(x1)
+> mpi.bcast.Robj2slave(x2)
+> mpi.bcast.Robj2slave(z1)
+> mpi.bcast.Robj2slave(z2)
+> mpi.bcast.Robj2slave(y)
+> 
+> ## Partially linear model
+> 
+> t <- system.time(mpi.bcast.cmd(bw <- npplregbw(formula=y~x1+x2|z1+z2),
 +                                caller.execute=TRUE))
 > 
 > summary(bw)
 
-Conditional density data (100 observations, 2 variable(s))
-(1 dependent variable(s), and 1 explanatory variable(s))
+Partially Linear Model
+Regression data (1000 observations,
+2 linear parametric variable(s) 2 nonparametric variable(s):
 
-Bandwidth Selection Method: Conditional Distribution Cross-Validation
-Formula: y ~ x
+Regression Type: Local-Constant
+Bandwidth Selection Method: Least Squares Cross-Validation
+Formula: y ~ x1 + x2 | z1 + z2
 Bandwidth Type: Fixed
-Objective Function Value: 0.1619456 (achieved on multistart 2)
 
-Exp. Var. Name: x Bandwidth: 0.7990081 Scale Factor: 1.760743 
+y on z:
+Exp. Var. Name: z1 Bandwidth: 0.04443462   Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 0.5420071  Scale Factor: 2.259953 
 
-Dep. Var. Name: y Bandwidth: 0.3518754 Scale Factor: 0.8798297
+x1 on z:
+Exp. Var. Name: z1 Bandwidth: 1         Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 4096126 Scale Factor: 17079205 
+
+x2 on z:
+Exp. Var. Name: z1 Bandwidth: 0.8855852   Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 9959072   Scale Factor: 41525343
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
-No. Continuous Dependent Vars.: 1
+
+Ordered Categorical Kernel Type: Wang and Van Ryzin
+No. Ordered Categorical Explanatory Vars.: 1
 
 > 
-> t <- t + system.time(mpi.bcast.cmd(model <- npcdens(bws=bw),
+> t <- t + system.time(mpi.bcast.cmd(pl <- npplreg(bws=bw),
 +                                    caller.execute=TRUE))
 > 
-> summary(model)
+> summary(pl)
 
-Conditional Density Data: 100 training points, in 2 variable(s)
-(1 dependent variable(s), and 1 explanatory variable(s))
+Partially Linear Model
+Regression data: 1000 training points, in 4 variable(s)
+With 2 linear parametric regressor(s), 2 nonparametric regressor(s)
 
-                                y
-Dep. Var. Bandwidth(s): 0.3518754
-                                x
-Exp. Var. Bandwidth(s): 0.7990081
+                    y(z)          
+Bandwidth(s): 0.04443462 0.5420071
 
+                   x(z)        
+Bandwidth(s): 1.0000000 4096126
+              0.8855852 9959072
+
+                      x1        x2
+Coefficient(s): 1.004608 0.9393095
+
+Kernel Regression Estimator: Local-Constant
 Bandwidth Type: Fixed
-Log Likelihood: -127.9669
+
+Residual standard error: 1.014616
+R-squared: 0.7223108
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
-No. Continuous Dependent Vars.: 1
+
+Ordered Categorical Kernel Type: Wang and Van Ryzin
+No. Ordered Categorical Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 34.591 
+Elapsed time = 51.287 
 > 
 > ## Clean up properly then quit()
 > 

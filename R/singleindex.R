@@ -1,5 +1,5 @@
 singleindex = 
-  function(bws, index, mean, merr = NA,
+  function(bws,  betavcov = NULL, index, mean, merr = NA,
            grad = NA, gerr = NA,
            mean.grad = NA, mean.gerr = NA,
            resid = NA,
@@ -13,6 +13,7 @@ singleindex =
 
     d = list(
       beta = bws$beta,
+      betavcov = betavcov,
       bw = bws$bw,
       bws = bws,
       pregtype = bws$pregtype,
@@ -77,6 +78,14 @@ coef.singleindex <- function(object, ...) {
   tc <- object$beta
   names(tc) <- object$xnames
   return(tc)
+}
+vcov.singleindex <- function(object, ...) {
+  tc <- object$betavcov
+  if(!is.null(tc)) {
+    return(tc)
+  } else {
+    warning("variance-covariance matrix does not exist: verify gradients=TRUE")
+  }
 }
 fitted.singleindex <- function(object, ...){
  object$mean 
