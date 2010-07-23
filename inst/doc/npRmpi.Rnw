@@ -514,15 +514,6 @@ the number of processors.
   handle quite large data sets by default via the serial
   implementation).
   
-\item The \code{C} code underlying regression cross-validation
-  currently differs between \pkg{np} and \pkg{npRmpi}. Both are
-  correct with the latter being a tad slower (on one processor that is
-  - see the timings above for a comparison). Note that, due to the
-  different numerical implementations, each may deliver slightly
-  different bandwidths. I hope to enlist the assistance of my
-  co-creator on this package in the near future so that the same code
-  underlies both packages throughout.
-  
 \end{enumerate}
 
 \end{document}

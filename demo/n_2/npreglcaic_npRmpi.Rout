@@ -19,7 +19,7 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-0) + Rmpi 0.5-9
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3) + Rmpi 0.5-9
 master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
@@ -75,10 +75,10 @@ Regression Type: Local-Constant
 Bandwidth Selection Method: Expected Kullback-Leibler Cross-Validation
 Formula: y ~ x + z1 + z2
 Bandwidth Type: Fixed
-Objective Function Value: -1.740687 (achieved on multistart 3)
+Objective Function Value: -1.740687 (achieved on multistart 2)
 
-Exp. Var. Name: x  Bandwidth: 0.03867583   Scale Factor: 0.5283297
-Exp. Var. Name: z1 Bandwidth: 1.238257e-05   Lambda Max: 0.5      
+Exp. Var. Name: x  Bandwidth: 0.03867584   Scale Factor: 0.5283298
+Exp. Var. Name: z1 Bandwidth: 6.359386e-06   Lambda Max: 0.5      
 Exp. Var. Name: z2 Bandwidth: 0.5            Lambda Max: 0.5      
 
 Continuous Kernel Type: Second-Order Gaussian
@@ -96,11 +96,11 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 Regression Data: 1000 training points, in 3 variable(s)
                        x           z1  z2
-Bandwidth(s): 0.03867583 1.238257e-05 0.5
+Bandwidth(s): 0.03867584 6.359386e-06 0.5
 
 Kernel Regression Estimator: Local-Constant
 Bandwidth Type: Fixed
-Residual standard error: 0.0616364
+Residual standard error: 0.06163638
 R-squared: 0.925667
 
 Continuous Kernel Type: Second-Order Gaussian
@@ -111,7 +111,7 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 52.529 
+Elapsed time = 39.458 
 > 
 > ## Clean up properly then quit()
 > 

@@ -4,7 +4,7 @@
 ## Actually, the ord/badord paradigm must go, in place of levels caching
 
 npseed <- function(seed){
-  .C("np_set_seed",as.integer(abs(seed)), PACKAGE="npRmpi")
+  .C("np_set_seed",as.integer(abs(seed)), PACKAGE = "npRmpi")
   invisible()
 }
 

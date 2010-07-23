@@ -1,4 +1,23 @@
-Changes from Version 0.40-1 to 0.40-2 [xxx]
+Changes from Version 0.40-1 to 0.40-3 [23-July-2010]
+
+* Added random seed (defaults to 42) to npscoefbw to ensure consistent
+  values for optimization for successive invocations on the same data
+
+* Fixed glitch in multistarting in npscoefbw whereby multistarting was
+  not working (always returned last computed function value and not
+  the minimum)
+
+* Fixed issue for npRmpi where the C code underlying regression
+  cross-validation (code in jksum.c) differs between np and npRmpi
+  (both were correct with the latter being a tad slower, now both use
+  unified code base)
+
+* Fixed a scope issue whereby a user would write a function that calls
+  an np/npRmpi command, however, objects passed to the user's function
+  and called by the np/npRmpi command (i.e. such as newdata) cannot be
+  found in the environment yet they exist outside of the function
+
+* Fixed issue with bwscaling=TRUE and bwmethod="cv.aic" in npreg
 
 Changes from Version 0.40-0 to 0.40-1 [4-June-2010]
 

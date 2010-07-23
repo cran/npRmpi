@@ -19,7 +19,7 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-0) + Rmpi 0.5-9
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3) + Rmpi 0.5-9
 master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
@@ -75,11 +75,11 @@ Regression Type: Local-Linear
 Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: y ~ x + z1 + z2
 Bandwidth Type: Fixed
-Objective Function Value: 0.06464693 (achieved on multistart 1)
+Objective Function Value: 0.06428203 (achieved on multistart 2)
 
-Exp. Var. Name: x  Bandwidth: 0.04065674 Scale Factor: 0.5553898
-Exp. Var. Name: z1 Bandwidth: 0.00375762   Lambda Max: 0.5      
-Exp. Var. Name: z2 Bandwidth: 0.25         Lambda Max: 0.5      
+Exp. Var. Name: x  Bandwidth: 0.04071955  Scale Factor: 0.5562478
+Exp. Var. Name: z1 Bandwidth: 0.002068719   Lambda Max: 0.5      
+Exp. Var. Name: z2 Bandwidth: 0.5           Lambda Max: 0.5      
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -95,13 +95,13 @@ No. Unordered Categorical Explanatory Vars.: 2
 > summary(model)
 
 Regression Data: 1000 training points, in 3 variable(s)
-                       x         z1   z2
-Bandwidth(s): 0.04065674 0.00375762 0.25
+                       x          z1  z2
+Bandwidth(s): 0.04071955 0.002068719 0.5
 
 Kernel Regression Estimator: Local-Linear
 Bandwidth Type: Fixed
-Residual standard error: 0.06041356
-R-squared: 0.9271257
+Residual standard error: 0.06142362
+R-squared: 0.925852
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -111,7 +111,7 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 42.338 
+Elapsed time = 39.701 
 > 
 > ## Clean up properly then quit()
 > 

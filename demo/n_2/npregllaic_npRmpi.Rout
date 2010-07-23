@@ -19,7 +19,7 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-0) + Rmpi 0.5-9
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3) + Rmpi 0.5-9
 master (rank 0, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 slave1 (rank 1, comm 1) of size 2 is running on: jeffrey-racines-macbook-pro 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
@@ -75,11 +75,11 @@ Regression Type: Local-Linear
 Bandwidth Selection Method: Expected Kullback-Leibler Cross-Validation
 Formula: y ~ x + z1 + z2
 Bandwidth Type: Fixed
-Objective Function Value: -1.735248 (achieved on multistart 1)
+Objective Function Value: -1.741976 (achieved on multistart 1)
 
-Exp. Var. Name: x  Bandwidth: 0.04168633 Scale Factor: 0.5694545
-Exp. Var. Name: z1 Bandwidth: 0.0038063    Lambda Max: 0.5      
-Exp. Var. Name: z2 Bandwidth: 0.25         Lambda Max: 0.5      
+Exp. Var. Name: x  Bandwidth: 0.04110872  Scale Factor: 0.5615641
+Exp. Var. Name: z1 Bandwidth: 0.002156054   Lambda Max: 0.5      
+Exp. Var. Name: z2 Bandwidth: 0.5           Lambda Max: 0.5      
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -95,13 +95,13 @@ No. Unordered Categorical Explanatory Vars.: 2
 > summary(model)
 
 Regression Data: 1000 training points, in 3 variable(s)
-                       x        z1   z2
-Bandwidth(s): 0.04168633 0.0038063 0.25
+                       x          z1  z2
+Bandwidth(s): 0.04110872 0.002156054 0.5
 
 Kernel Regression Estimator: Local-Linear
 Bandwidth Type: Fixed
-Residual standard error: 0.06050421
-R-squared: 0.9270387
+Residual standard error: 0.06144742
+R-squared: 0.9258327
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -111,7 +111,7 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 39.877 
+Elapsed time = 52.955 
 > 
 > ## Clean up properly then quit()
 > 

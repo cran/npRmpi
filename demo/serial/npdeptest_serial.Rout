@@ -25,7 +25,7 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-0)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3)
 > options(np.messages=FALSE)
 > 
 > ## Generate some data
@@ -58,8 +58,8 @@ Null of independence is rejected at the 0.1% level
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 65.87 
+Elapsed time = 66.332 
 > 
 > proc.time()
    user  system elapsed 
- 66.272   0.058  66.340 
+ 66.755   0.058  66.804 
