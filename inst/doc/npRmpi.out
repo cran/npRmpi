@@ -1,0 +1,8 @@
+\BOOKMARK [1][-]{Section.0.Overview.1}{Overview}{}% 1
+\BOOKMARK [1][-]{Section.1.Differences Between np and npRmpi.1}{Differences Between np and npRmpi}{}% 2
+\BOOKMARK [2][-]{Subsection.2.0.Parallel Batch Execution.2}{Parallel Batch Execution}{Section.1.Differences Between np and npRmpi.1}% 3
+\BOOKMARK [2][-]{Subsection.2.1.Parallel Execution in an Interactive R Session.2}{Parallel Execution in an Interactive R Session}{Section.1.Differences Between np and npRmpi.1}% 4
+\BOOKMARK [2][-]{Subsection.2.2.Essential Program Elements.2}{Essential Program Elements}{Section.1.Differences Between np and npRmpi.1}% 5
+\BOOKMARK [1][-]{Section.2.Summary.1}{Summary}{}% 6
+\BOOKMARK [1][-]{Section..Illustrative Timed Runs.1}{Illustrative Timed Runs}{}% 7
+\BOOKMARK [1][-]{Section.A.Known Issues.1}{Known Issues}{}% 8

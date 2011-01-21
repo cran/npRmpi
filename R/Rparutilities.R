@@ -343,8 +343,13 @@ mpi.close.Rslaves <- function(dellog=TRUE, comm=1){
         if (dellog){
         tmp <- paste(Sys.getpid(),"+",comm,sep="")  
         logfile <- paste("*.",tmp,".*.log", sep="")
-        if (length(system(paste("ls", logfile),TRUE,ignore.stderr=TRUE))>=1)
-            system(paste("rm", logfile))
+## R 2.12.0 throwing error, from changelog "system(command, intern =
+## TRUE) now gives an error on a Unix-alike (as well as on Windows) if
+## command cannot be run." Added the following and commented out the
+## if(length( that was throwing the error)
+        system("test -e logfile && rm logfile", intern=FALSE)
+##        if (length(system(paste("ls", logfile),TRUE,ignore.stderr=TRUE))>=1)
+##            system(paste("rm", logfile))
         }
     }
 #     mpi.barrier(comm)

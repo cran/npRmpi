@@ -1,7 +1,8 @@
 
-R version 2.11.0 (2010-04-22)
+R version 2.12.0 RC (2010-10-07 r53227)
 Copyright (C) 2010 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
+Platform: x86_64-apple-darwin10.4.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -60,8 +61,8 @@ No. Ordered Categorical Explanatory Vars.: 1
 > t <- t + system.time(model.q0.75 <- npqreg(bws=bw, tau=0.75))
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 91.618 
+Elapsed time = 59.627 
 > 
 > proc.time()
    user  system elapsed 
- 92.148   0.053  92.194 
+ 59.906   0.071  59.973 

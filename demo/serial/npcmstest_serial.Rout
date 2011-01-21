@@ -1,7 +1,8 @@
 
-R version 2.11.0 (2010-04-22)
+R version 2.12.0 RC (2010-10-07 r53227)
 Copyright (C) 2010 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
+Platform: x86_64-apple-darwin10.4.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -74,8 +75,8 @@ Null of correct specification is rejected at the 0.1% level
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 70.558 
+Elapsed time = 46.947 
 > 
 > proc.time()
    user  system elapsed 
- 71.005   0.081  71.075 
+ 47.198   0.075  47.269 

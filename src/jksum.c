@@ -2201,9 +2201,15 @@ int *num_categories){
   free(lambda);
   free_mat(matrix_bandwidth,num_reg_continuous);
 
+	/* Negative penalties are treated as infinite: Hurvich et al pg 277 */
+
   cv /= (double)num_obs;
   if(bwm == RBWM_CVAIC){
-    cv = log(cv) + (1.0+traceH/((double)num_obs))/(1.0-(traceH+2.0)/((double)num_obs));
+    if((1.0+traceH/((double)num_obs))/(1.0-(traceH+2.0)/((double)num_obs)) < 0) {
+      cv = DBL_MAX;
+    } else {
+      cv = log(cv) + (1.0+traceH/((double)num_obs))/(1.0-(traceH+2.0)/((double)num_obs));
+    }
   }
   return(cv);
 }

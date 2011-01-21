@@ -22,11 +22,22 @@
 \usage{
 npindex(bws, \dots)
 
-\method{npindex}{formula}(bws, data = NULL, newdata = NULL, \dots)
+\method{npindex}{formula}(bws,
+        data = NULL,
+        newdata = NULL,
+        ckertype = c("gaussian", "epanechnikov","uniform"), 
+        ckerorder = c(2,4,6,8),
+        \dots)
 
-\method{npindex}{call}(bws, \dots)
+\method{npindex}{call}(bws,
+        \dots)
 
-\method{npindex}{default}(bws, txdat, tydat, \dots) 
+\method{npindex}{default}(bws,
+        txdat,
+        tydat,
+        ckertype = c("gaussian", "epanechnikov","uniform"), 
+        ckerorder = c(2,4,6,8),
+        \dots) 
 
 \method{npindex}{sibandwidth}(bws,
         txdat = stop("training data 'txdat' missing"),
@@ -37,6 +48,8 @@ npindex(bws, \dots)
         residuals = FALSE,
         errors = FALSE,
         boot.num = 399,
+        ckertype = c("gaussian", "epanechnikov","uniform"), 
+        ckerorder = c(2,4,6,8),
         \dots)
 }
 
@@ -109,6 +122,19 @@ npindex(bws, \dots)
     compute the bandwidth object.
   }
 
+  \item{ckertype}{
+    character string used to specify the continuous kernel type.
+    Can be set as \code{gaussian}, \code{epanechnikov}, or
+    \code{uniform}. Defaults to \code{gaussian}.
+  }
+
+  \item{ckerorder}{
+    numeric value specifying kernel order (one of
+    \code{(2,4,6,8)}). Kernel order specified along with a
+  \code{uniform} continuous kernel type will be ignored. Defaults to
+  \code{2}.
+  }
+
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
@@ -170,8 +196,6 @@ npindex(bws, \dots)
   \item{fit.mcfadden}{if \code{method="kleinspady"},  the McFadden-Puig-Kerschner performance measure
     or \code{NA} if outcomes are not available }
 }
-
-
 
 \references{
 
