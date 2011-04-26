@@ -1,8 +1,8 @@
 
-R version 2.12.0 RC (2010-10-07 r53227)
-Copyright (C) 2010 The R Foundation for Statistical Computing
+R version 2.13.0 (2011-04-13)
+Copyright (C) 2011 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.4.1/x86_64 (64-bit)
+Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -20,9 +20,9 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3) + Rmpi 0.5-9
-master (rank 0, comm 1) of size 2 is running on: pc-racine1 
-slave1 (rank 1, comm 1) of size 2 is running on: pc-racine1 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4) + Rmpi 0.5-9
+master (rank 0, comm 1) of size 2 is running on: localhost 
+slave1 (rank 1, comm 1) of size 2 is running on: localhost 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -76,7 +76,7 @@ Formula: y ~ x
 Bandwidth Type: Fixed
 Objective Function Value: 1.399431 (achieved on multistart 1)
 
-Exp. Var. Name: x Bandwidth: 0.616823 Scale Factor: 1.967140 
+Exp. Var. Name: x Bandwidth: 0.6168229 Scale Factor: 1.96714 
 
 Dep. Var. Name: y Bandwidth: 0.3316313 Scale Factor: 1.082349
 
@@ -95,11 +95,11 @@ Conditional Density Data: 1000 training points, in 2 variable(s)
 
                                 y
 Dep. Var. Bandwidth(s): 0.3316313
-                               x
-Exp. Var. Bandwidth(s): 0.616823
+                                x
+Exp. Var. Bandwidth(s): 0.6168229
 
 Bandwidth Type: Fixed
-Log Likelihood: -1376.740
+Log Likelihood: -1376.74
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -107,7 +107,7 @@ No. Continuous Dependent Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 16.452 
+Elapsed time = 17.246 
 > 
 > ## Clean up properly then quit()
 > 

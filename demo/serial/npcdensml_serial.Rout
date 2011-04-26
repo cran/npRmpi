@@ -1,8 +1,8 @@
 
-R version 2.12.0 RC (2010-10-07 r53227)
-Copyright (C) 2010 The R Foundation for Statistical Computing
+R version 2.13.0 (2011-04-13)
+Copyright (C) 2011 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.4.1/x86_64 (64-bit)
+Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -26,7 +26,7 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4)
 > options(np.messages=FALSE)
 > 
 > library(MASS)
@@ -79,7 +79,7 @@ Dep. Var. Bandwidth(s): 0.3316314
 Exp. Var. Bandwidth(s): 0.6168227
 
 Bandwidth Type: Fixed
-Log Likelihood: -1376.740
+Log Likelihood: -1376.74
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -87,9 +87,9 @@ No. Continuous Dependent Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 32.039 
+Elapsed time = 31.617 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 32.363   0.022  32.380 
+ 31.911   0.033  31.945 

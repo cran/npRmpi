@@ -1,8 +1,8 @@
 
-R version 2.12.0 RC (2010-10-07 r53227)
-Copyright (C) 2010 The R Foundation for Statistical Computing
+R version 2.13.0 (2011-04-13)
+Copyright (C) 2011 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.4.1/x86_64 (64-bit)
+Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -20,11 +20,11 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-3) + Rmpi 0.5-9
-master (rank 0, comm 1) of size 4 is running on: pc-racine1 
-slave1 (rank 1, comm 1) of size 4 is running on: pc-racine1 
-slave2 (rank 2, comm 1) of size 4 is running on: pc-racine1 
-slave3 (rank 3, comm 1) of size 4 is running on: pc-racine1 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4) + Rmpi 0.5-9
+master (rank 0, comm 1) of size 4 is running on: localhost 
+slave1 (rank 1, comm 1) of size 4 is running on: localhost 
+slave2 (rank 2, comm 1) of size 4 is running on: localhost 
+slave3 (rank 3, comm 1) of size 4 is running on: localhost 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -87,7 +87,7 @@ Exp. Var. Name: ftv   Bandwidth: 0.7533136    Lambda Max: 1
 Exp. Var. Name: age   Bandwidth: 5.61966    Scale Factor: 2.594345 
 Exp. Var. Name: lwt   Bandwidth: 5.450701   Scale Factor: 0.5871469 
 
-Dep. Var. Name: low   Bandwidth: 0.02541990   Lambda Max: 0.5
+Dep. Var. Name: low   Bandwidth: 0.0254199   Lambda Max: 0.5
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 2
@@ -108,8 +108,8 @@ No. Ordered Categorical Explanatory Vars.: 1
 Conditional Mode data: 189 training points, in 8 variable(s)
 (1 dependent variable(s), and 7 explanatory variable(s))
 
-                               low
-Dep. Var. Bandwidth(s): 0.02541990
+                              low
+Dep. Var. Bandwidth(s): 0.0254199
                         smoke      race         ht         ui       ftv     age
 Exp. Var. Bandwidth(s):   0.5 0.6666667 0.02532511 0.04318312 0.7533136 5.61966
                              lwt
@@ -142,7 +142,7 @@ No. Ordered Categorical Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 17.448 
+Elapsed time = 22.842 
 > 
 > ## Clean up properly then quit()
 > 
