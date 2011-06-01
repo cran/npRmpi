@@ -129,6 +129,7 @@ export(b.star
        ,npudist
        ,npregbw
        ,npreg
+       ,npregiv       
        ,npplreg
        ,npplregbw
        ,npcdensbw
