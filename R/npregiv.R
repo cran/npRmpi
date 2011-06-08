@@ -3,12 +3,13 @@
 ## This functions accepts the following arguments:
 
 ## y: univariate outcome
-## z: endogenous predictor
-## w: instrument
+## z: endogenous predictors
+## w: instruments
+## x: exogenous predictors
 
-## yeval: optional evaluation data for the univariate outcome
-## zeval: optional evaluation data for the endogenous predictor
+## zeval: optional evaluation data for the endogenous predictors
 ## weval: optional evaluation data for the instrument
+## xeval: optional evaluation data for the exogenous predictors
 
 ## alpha.min: minimum value when conducting 1-dimensional search for
 ##            optimal Tikhonov regularization parameter alpha
@@ -27,16 +28,17 @@
 npregiv <- function(y,
                     z,
                     w,
-                    yeval=NULL,
+                    x=NULL,
                     zeval=NULL,
                     weval=NULL,
+                    xeval=NULL,
                     p=1,
+                    alpha=NULL,
                     alpha.min=1.0e-10,
-                    alpha.max=1,
-                    tol=.Machine$double.eps^0.25,
-                    start.iterations=10,
-                    max.iterations=100,
-                    iterate.smoothing=TRUE,
+                    alpha.max=1.0e-01,
+                    alpha.tol=.Machine$double.eps^0.25,
+                    iterate.max=100,
+                    iterate.tol=1.0e-05,
                     constant=0.5,
                     method=c("Landweber-Fridman","Tikhonov"),
                     ...) {
@@ -134,7 +136,7 @@ npregiv <- function(y,
   ## $Id: npregiv.R,v 1.8 2011/05/30 19:17:35 jracine Exp jracine $
 
   ## This function returns the weight matrix for a local polynomial
-  ## mean, gradient of pth order, or cross-partial. The function
+
   ## supports mixed data types. It presumes that Y is in column 1. Basic
   ## error checking is undertaken. j.reg= strips off weights for mean
   ## (1), partials up to order p, and cross-partials. All partials and
@@ -1107,72 +1109,61 @@ npregiv <- function(y,
   if(missing(z)) stop("You must provide z")
   if(missing(w)) stop("You must provide w")
   if(NCOL(y) > 1) stop("y must be univariate")
-  if(NCOL(z) > 1) stop("z must be univariate")
   if(NROW(y) != NROW(z) || NROW(y) != NROW(w)) stop("y, z, and w have differing numbers of rows")
-  if(start.iterations < 2) stop("start.iterations must be at least 2")
+  if(iterate.max < 2) stop("iterate.max must be at least 2")
   if(p < 0) stop("p must be a non-negative integer")
-  if(max.iterations < start.iterations) stop("max.iterations must be larger than start.iterations")
+
+  if(!is.null(alpha) && alpha <= 0) stop("alpha must be positive")
 
   method <- match.arg(method)
   
   ## Check for evaluation data
   
-  if(is.null(yeval)) yeval <- y
   if(is.null(zeval)) zeval <- z
-  if(is.null(weval)) weval <- w  
-    
+  if(is.null(weval)) weval <- w
+  if(is.null(weval)) xeval <- x
+
+  ## Need to determine how many x, w, z are numeric
+
+  z <- data.frame(z)
+  w <- data.frame(w)
+  if(!is.null(x)) z <- data.frame(z,x)
+  if(!is.null(xeval)) zeval <- data.frame(zeval,xeval)
+
+  z.numeric <- sapply(1:NCOL(z),function(i){is.numeric(z[,i])})
+  num.z.numeric <- NCOL(as.data.frame(z[,z.numeric]))
+
+  w.numeric <- sapply(1:NCOL(w),function(i){is.numeric(w[,i])})
+  num.w.numeric <- NCOL(as.data.frame(w[,w.numeric]))
+
   if(method=="Tikhonov") {
   
     ## Now y=phi(z) + u, hence E(y|w)=E(phi(z)|w) so we need two
-    ## bandwidths, one for y on w and one for phi(z) on w (in the first
-    ## step we use z as a proxy for phi(z) and use bandwidths for z on
-    ## w).
+    ## bandwidths, one for y on w and one for phi(z) on w (in the
+    ## first step we use E(y|w) as a proxy for phi(z) and use
+    ## bandwidths for y on w).
     
     console <- printClear(console)
     console <- printPop(console)
     console <- printPush("Computing bandwidths for E(y|w)...", console)
-    hyw <- glpcv(ydat=y, xdat=w, degree=rep(p, NCOL(w)),...)
+    hyw <- glpcv(ydat=y, xdat=w, degree=rep(p, num.w.numeric),...)
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush("Computing E(y|w)...", console)  
-    E.y.w <- glpreg(tydat=y, txdat=w, eydat=yeval, exdat=weval, bws=hyw$bw, degree=rep(p, NCOL(w)),...)$mean
+    console <- printPush("Computing weight matrix and E(y|w)...", console)  
+    E.y.w <- glpreg(tydat=y, txdat=w, exdat=weval, bws=hyw$bw, degree=rep(p, num.w.numeric),...)$mean
+    KYW <- Kmat.lp(mydata.train=data.frame(w), mydata.eval=data.frame(w=weval), bws=hyw$bw, p=rep(p, num.w.numeric))
     
-    ## We conduct local polynomial kernel regression of z on y we
-    ## require two bandwidths, one for r onto z and one for the object
-    ## in w space onto z space
+    ## We conduct local polynomial kernel regression of E(y|w) on z
     
     console <- printClear(console)
     console <- printPop(console)
     console <- printPush("Computing bandwidths for E(E(y|w)|z)...", console)
-    hywz <- glpcv(ydat=E.y.w, xdat=z, degree=rep(p, NCOL(z)),...)
+    hywz <- glpcv(ydat=E.y.w, xdat=z, degree=rep(p, num.z.numeric),...)
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush("Computing E(E(y|w)|z)...", console)  
-    E.E.y.w.z <- glpreg(tydat=E.y.w, txdat=z, eydat=E.y.w, exdat=zeval, bws=hywz$bw, degree=rep(p, NCOL(z)),...)$mean
-    
-    ## Here we use z as a proxy for phi(z) in the first stage
-    
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing bandwidths for E(z|w) (first stage treat z as phi(z))...", console)
-    hzw <- glpcv(ydat=z, xdat=w, degree=rep(p, NCOL(w)),...)
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing weights for E(z|w) (first stage treat z as phi(z))...", console)
-    KZWs <- Kmat.lp(mydata.train=data.frame(w), mydata.eval=data.frame(w=weval), bws=hzw$bw, p=rep(p, NCOL(w)))
-    
-    ## define E(r|z)=E(E(phi(z)|w)|z) 
-    ## E(z|w)
-    E.z.w <- KZWs%*%z
-    
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing bandwidths for E(E(z|w)|z)...", console)
-    hwz <- glpcv(ydat=E.z.w, xdat=z, degree=rep(p, NCOL(z)),...)
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing weights for E(E(z|w)|z)...", console)
-    KWZs <- Kmat.lp(mydata.train=data.frame(z), mydata.eval=data.frame(z=zeval), bws=hwz$bw, p=rep(p, NCOL(w)))
+    console <- printPush("Computing weight matrix and E(E(y|w)|z)...", console)  
+    E.E.y.w.z <- glpreg(tydat=E.y.w, txdat=z, eydat=E.y.w, exdat=zeval, bws=hywz$bw, degree=rep(p, num.z.numeric),...)$mean
+    KYWZ <- Kmat.lp(mydata.train=data.frame(z), mydata.eval=data.frame(z=zeval), bws=hywz$bw, p=rep(p, num.z.numeric))
     
     ## Next, we minimize the function ittik to obtain the optimal value
     ## of alpha (here we use the iterated Tikhonov function) to
@@ -1182,62 +1173,71 @@ npregiv <- function(y,
     
     ## E(r|z)=E(E(phi(z)|w)|z)
     ## \phi^\alpha = (\alpha I+CzCw)^{-1}Cr x r
-    
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Numerically solving for alpha...", console)
-    alpha1 <- optimize(ittik, c(alpha.min, alpha.max), tol = tol, CZ = KZWs, CY = KWZs, Cr.r = E.E.y.w.z, r = E.y.w)$minimum
-    
+
+    if(is.null(alpha)) {
+      console <- printClear(console)
+      console <- printPop(console)
+      console <- printPush("Numerically solving for alpha...", console)
+      alpha <- optimize(ittik, c(alpha.min, alpha.max), tol = alpha.tol, CZ = KYW, CY = KYWZ, Cr.r = E.E.y.w.z, r = E.y.w)$minimum
+    }
+      
     ## Finally, we conduct regularized Tikhonov regression using this
     ## optimal alpha.
     
-    phihat <- as.vector(tikh(alpha1, CZ = KZWs, CY = KWZs, Cr.r = E.E.y.w.z))
+    console <- printClear(console)
+    console <- printPop(console)
+    console <- printPush("Computing initial phi(z) estimate...", console)
+    phihat <- as.vector(tikh(alpha, CZ = KYW, CY = KYWZ, Cr.r = E.E.y.w.z))
     
-    ## KWZs and KZWS no longer used, save memory
+    ## KYWZ and KYWS no longer used, save memory
     
-    rm(KWZs, KZWs)
+    rm(KYWZ, KYW)
     
     console <- printClear(console)
     console <- printPop(console)
     console <- printPush("Computing bandwidths for E(phi(z)|w)...", console)
-    hphiw <- glpcv(ydat=phihat, xdat=w, degree=rep(p, NCOL(w)),...)
+    hphiw <- glpcv(ydat=phihat, xdat=w, degree=rep(p, num.w.numeric),...)
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush("Computing weights for E(phi(z)|w)...", console)
-    KPHWs <- Kmat.lp(mydata.train=data.frame(w), mydata.eval=data.frame(w=weval), bws=hphiw$bw, p=rep(p, NCOL(w)))
-    
-    ## Conduct kernel regression of E(phi(z)|w) on z (we need weights so just use them)
-    
-    E.phi.w.z <- as.vector(KPHWs%*%phihat)
+    console <- printPush("Computing weight matrix for E(phi(z)|w)...", console)
+    E.phihat.w <- glpreg(tydat=phihat, txdat=w, eydat=phihat, exdat=weval, bws=hphiw$bw, degree=rep(p, num.w.numeric),...)$mean
+    KPHIW <- Kmat.lp(mydata.train=data.frame(w), mydata.eval=data.frame(w=weval), bws=hphiw$bw, p=rep(p, num.w.numeric))
     
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush("Iterating and recomputing bandwidths for E(E(phi(z)|w)|z)...", console)
-    hphiwz2 <- glpcv(ydat=E.phi.w.z, xdat=z, degree=rep(p, NCOL(z)))
-    
+    console <- printPush("Computing bandwidths for E(E(phi(z)|w)|z)...", console)
+    hphiwz <- glpcv(ydat=E.phihat.w, xdat=z, degree=rep(p, num.z.numeric))
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush("Iterating and recomputing weights for E(E(phi(z)|w)|z)...", console)
-    KWZ2s <- Kmat.lp(mydata.train=data.frame(z), mydata.eval=data.frame(z=zeval), bws=hphiwz2$bw, p=rep(p, NCOL(z)))
+    console <- printPush("Computing weight matrix for E(E(phi(z)|w)|z)...", console)
+    KPHIWZ <- Kmat.lp(mydata.train=data.frame(z), mydata.eval=data.frame(z=zeval), bws=hphiwz$bw, p=rep(p, num.z.numeric))
     
     ## Next, we minimize the function ittik to obtain the optimal value
     ## of alpha (here we use the iterated Tikhonov approach) to
     ## determine the optimal alpha for the non-iterated scheme.
     
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Iterating and recomputing the numerical solution for alpha...", console)
-    alpha2 <- optimize(ittik, c(alpha.min, alpha.max), tol = tol, CZ = KPHWs, CY = KWZ2s, Cr.r = E.E.y.w.z, r = E.y.w)$minimum
+    if(is.null(alpha)) {
+      console <- printClear(console)
+      console <- printPop(console)
+      console <- printPush("Iterating and recomputing the numerical solution for alpha...", console)
+      alpha <- optimize(ittik, c(alpha.min, alpha.max), tol = alpha.tol, CZ = KPHIW, CY = KPHIWZ, Cr.r = E.E.y.w.z, r = E.y.w)$minimum
+    }
     
     ## Finally, we conduct regularized Tikhonov regression using this
     ## optimal alpha and the updated bandwidths.
     
-    phihat2 <- as.vector(tikh(alpha2, CZ = KPHWs, CY = KWZ2s, Cr.r = E.E.y.w.z))
+    console <- printClear(console)
+    console <- printPop(console)
+    console <- printPush("Computing final phi(z) estimate...", console)
+    phihat <- as.vector(tikh(alpha, CZ = KPHIW, CY = KPHIWZ, Cr.r = E.E.y.w.z))
     
     console <- printClear(console)
     console <- printPop(console)
+
+    if((alpha-alpha.min)/alpha.min < 0.01) warning(paste("Tikhonov parameter alpha (",formatC(alpha,digits=4,format="f"),") is close to the search minimum (",alpha.min,")",sep=""))
+    if((alpha.max-alpha)/alpha.max < 0.01) warning(paste("Tikhonov parameter alpha (",formatC(alpha,digits=4,format="f"),") is close to the search maximum (",alpha.max,")",sep=""))
     
-    return(list(phihat=phihat2, alpha=alpha2))
+    return(list(phihat=phihat, alpha=alpha))
     
   } else {
 
@@ -1248,25 +1248,25 @@ npregiv <- function(y,
     
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(y|z) for iteration ", 0, " of at least ", start.iterations,"...",sep=""),console)
+    console <- printPush(paste("Computing bandwidths and E(y|z) for iteration 0...",sep=""),console)
 
-    h <- glpcv(ydat=y, xdat=z, degree=rep(p, NCOL(z)),...)
-    phi.0 <- glpreg(tydat=y, txdat=z, eydat=yeval, exdat=zeval, bws=h$bw, degree=rep(p, NCOL(z)),...)$mean
+    h <- glpcv(ydat=y, xdat=z, degree=rep(p, num.z.numeric),...)
+    phi.0 <- glpreg(tydat=y, txdat=z, exdat=zeval, bws=h$bw, degree=rep(p, num.z.numeric),...)$mean
     
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration ", 1, " of at least ", start.iterations,"...",sep=""),console)
+    console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration 1...",sep=""),console)
 
     resid <- y - phi.0
-    h <- glpcv(ydat=resid, xdat=w, degree=rep(p, NCOL(w)),...)
-    resid.fitted <- glpreg(tydat=resid, txdat=w, eydat=resid, exdat=weval, bws=h$bw, degree=rep(p, NCOL(w)),...)$mean
+    h <- glpcv(ydat=resid, xdat=w, degree=rep(p, num.w.numeric),...)
+    resid.fitted <- glpreg(tydat=resid, txdat=w, eydat=resid, exdat=weval, bws=h$bw, degree=rep(p, num.w.numeric),...)$mean
 
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration ", 1, " of at least ", start.iterations,"...",sep=""),console)
+    console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration 1...",sep=""),console)
 
-    h <- glpcv(ydat=resid.fitted, xdat=z, degree=rep(p, NCOL(z)),...)
-    phi.j.m.1 <- phi.0 + glpreg(tydat=resid.fitted, txdat=z, eydat=resid.fitted, exdat=zeval, bws=h$bw, degree=rep(p, NCOL(z)),...)$mean
+    h <- glpcv(ydat=resid.fitted, xdat=z, degree=rep(p, num.z.numeric),...)
+    phi.j.m.1 <- phi.0 + glpreg(tydat=resid.fitted, txdat=z, eydat=resid.fitted, exdat=zeval, bws=h$bw, degree=rep(p, num.z.numeric),...)$mean
     
     ## For the stopping rule
     
@@ -1275,107 +1275,54 @@ npregiv <- function(y,
     console <- printPush(paste("Computing bandwidths and E(y|w) for stopping rule...",sep=""),console)
 
     norm.stop <- numeric()
-    h <- glpcv(ydat=y, xdat=w, degree=rep(p, NCOL(w)),...)
-    E.y.w <- glpreg(tydat=y, txdat=w, eydat=yeval, exdat=weval, bws=h$bw, degree=rep(p, NCOL(w)),...)$mean
+    h <- glpcv(ydat=y, xdat=w, degree=rep(p, num.w.numeric),...)
+    E.y.w <- glpreg(tydat=y, txdat=w, exdat=weval, bws=h$bw, degree=rep(p, num.w.numeric),...)$mean
     phihat <- phi.j.m.1
 
     console <- printClear(console)
     console <- printPop(console)
     console <- printPush(paste("Computing bandwidths and E(phi(z)|w) for stopping rule...",sep=""),console)
 
-    h.E.phi.w <- glpcv(ydat=phi.j.m.1, xdat=w, degree=rep(p, NCOL(w)),...)
-    E.phi.w <- glpreg(tydat=phi.j.m.1, txdat=w, eydat=phi.j.m.1, exdat=weval, bws=h.E.phi.w$bw, degree=rep(p, NCOL(w)),...)$mean
+    h.E.phi.w <- glpcv(ydat=phi.j.m.1, xdat=w, degree=rep(p, num.w.numeric),...)
+    E.phi.w <- glpreg(tydat=phi.j.m.1, txdat=w, eydat=phi.j.m.1, exdat=weval, bws=h.E.phi.w$bw, degree=rep(p, num.w.numeric),...)$mean
     norm.stop[1] <- mean(((E.y.w-E.phi.w)/E.y.w)^2)
 
-    ascending <- FALSE
-
-    for(j in 2:start.iterations) {
+    for(j in 2:iterate.max) {
 
       console <- printClear(console)
       console <- printPop(console)
-      console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration ", j, " of at least ", start.iterations,"...",sep=""),console)
+      console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration ", j,"...",sep=""),console)
 
       resid <- y - phi.j.m.1
-      h.resid.w <- glpcv(ydat=resid, xdat=w, degree=rep(p, NCOL(w)),...)
-      resid.fitted <- glpreg(tydat=resid, txdat=w, eydat=resid, exdat=weval, bws=h.resid.w$bw, degree=rep(p, NCOL(w)),...)$mean
+      h.resid.w <- glpcv(ydat=resid, xdat=w, degree=rep(p, num.w.numeric),...)
+      resid.fitted <- glpreg(tydat=resid, txdat=w, eydat=resid, exdat=weval, bws=h.resid.w$bw, degree=rep(p, num.w.numeric),...)$mean
 
       console <- printClear(console)
       console <- printPop(console)
-      console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration ", j, " of at least ", start.iterations,"...",sep=""),console)
+      console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration ", j,"...",sep=""),console)
 
-      h.resid.fitted.z <- glpcv(ydat=resid.fitted, xdat=z, degree=rep(p, NCOL(z)),...)
-      phi.j <- phi.j.m.1 + constant*glpreg(tydat=resid.fitted, txdat=z, eydat=resid.fitted, exdat=zeval, bws=h.resid.fitted.z$bw, degree=rep(p, NCOL(z)),...)$mean
+      h.resid.fitted.z <- glpcv(ydat=resid.fitted, xdat=z, degree=rep(p, num.z.numeric),...)
+      phi.j <- phi.j.m.1 + constant*glpreg(tydat=resid.fitted, txdat=z, eydat=resid.fitted, exdat=zeval, bws=h.resid.fitted.z$bw, degree=rep(p, num.z.numeric),...)$mean
       phi.j.m.1 <- phi.j
 
       console <- printClear(console)
       console <- printPop(console)
-      console <- printPush(paste("Computing stopping rule for iteration ", j, " of at least ", start.iterations,"...",sep=""),console)
+      console <- printPush(paste("Computing stopping rule for iteration ", j,"...",sep=""),console)
 
       ## For the stopping rule (use same smoothing as original)
-      E.phi.w <- glpreg(tydat=phi.j, txdat=w, eydat=phi.j, exdat=weval, bws=h.E.phi.w$bw, degree=rep(p, NCOL(w)),...)$mean
+      E.phi.w <- glpreg(tydat=phi.j, txdat=w, eydat=phi.j, exdat=weval, bws=h.E.phi.w$bw, degree=rep(p, num.w.numeric),...)$mean
       norm.stop[j] <- mean(((E.y.w-E.phi.w)/E.y.w)^2)
 
-      if(norm.stop[j] > norm.stop[j-1]) {
-        ascending <- TRUE
-        break()
-      }
+      ## If objective increases or we are below stopping tolerance then break
+
+      if((norm.stop[j] > norm.stop[j-1]) || ((norm.stop[j-1]-norm.stop[j]) < iterate.tol)) break()
 
     }
 
-    ## If the last start.iterations normed differences are unchanged,
-    ## AND we have not reached max.iterations AND the stopping
-    ## criterion is not ascending, stop.
-
-    if(!ascending) {
-      while((sum(norm.stop[(j-start.iterations+2):j]-norm.stop[(j-start.iterations+1):(j-1)]) != 0) && (j < max.iterations)) {
-        
-        j <- j+1
-        
-        resid <- y - phi.j.m.1
-        
-        console <- printClear(console)
-        console <- printPop(console)
-        
-        if(iterate.smoothing) {
-          console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration ", j, " of a maximum of ", max.iterations, "...",sep=""),console)
-          h.resid.w <- glpcv(ydat=resid, xdat=w, degree=rep(p, NCOL(w)),...)
-        } else {
-          console <- printPush(paste("Computing E(y-phi(z)|w) for iteration ", j, " of a maximum of ", max.iterations, "...",sep=""),console)
-        }
-        
-        resid.fitted <- glpreg(tydat=resid, txdat=w, eydat=resid, exdat=weval, bws=h.resid.w$bw, degree=rep(p, NCOL(w)),...)$mean
-        
-        console <- printClear(console)
-        console <- printPop(console)
-        
-        if(iterate.smoothing) {
-          console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration ", j, " of a maximum of ", max.iterations, "...",sep=""),console)
-          h.resid.fitted.z <- glpcv(ydat=resid.fitted, xdat=z, degree=rep(p, NCOL(z)),...)
-        } else {
-          console <- printPush(paste("Computing E(E(y-phi(z)|w)|z) for iteration ", j, " of a maximum of ", max.iterations, "...",sep=""),console)
-        }
-        
-        phi.j <- phi.j.m.1 + constant*glpreg(tydat=resid.fitted, txdat=z, eydat=resid.fitted, exdat=zeval, bws=h.resid.fitted.z$bw, degree=rep(p, NCOL(z)),...)$mean
-        phi.j.m.1 <- phi.j
-        
-        console <- printClear(console)
-        console <- printPop(console)
-        console <- printPush(paste("Computing stopping rule for iteration ", j, " of a maximum of ", max.iterations, "...",sep=""),console)
-        
-        ## For the stopping rule (use same smoothing as original)
-        E.phi.w <- glpreg(tydat=phi.j, txdat=w, eydat=phi.j, exdat=weval, bws=h.E.phi.w$bw, degree=rep(p, NCOL(w)),...)$mean
-        norm.stop[j] <- mean(((E.y.w-E.phi.w)/E.y.w)^2)
-        
-        if(norm.stop[j] > norm.stop[j-1]) break()
-        
-      }
-
-    }
-    
     console <- printClear(console)
     console <- printPop(console)
 
-    if(j == max.iterations) warning("max.iterations reached: increase max.iterations or inspect norm.stop vector")
+    if(j == iterate.max) warning("iterate.max reached: increase iterate.max or inspect norm.stop vector")
 
     return(list(phihat=phi.j, num.iterations=j, norm.stop=norm.stop))
 

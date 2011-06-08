@@ -8,10 +8,10 @@ Nonparametric Instrumental Regression
 \code{npregiv} computes nonparametric estimation of an instrumental
 regression function \eqn{\varphi}{phi} defined by conditional moment
 restrictions stemming from a structural econometric model: \eqn{E [Y -
-\varphi (Z) | W ] = 0}{E [Y - phi (Z) | W ] = 0}, and involving
-endogenous variables \eqn{Y} and \eqn{Z} and instruments \eqn{W}. The
-function \eqn{\varphi}{phi} is the solution of an ill-posed inverse
-problem.
+\varphi (Z,X) | W ] = 0}{E [Y - phi (Z,X) | W ] = 0}, and involving
+endogenous variables \eqn{Y} and \eqn{Z} and exogenous variables
+\eqn{X} and instruments \eqn{W}. The function \eqn{\varphi}{phi} is the
+solution of an ill-posed inverse problem.
 
 When \code{method="Tikhonov"}, \code{npregiv} uses the approach of
 Darolles, Fan, Florens and Renault (forthcoming) modified for local
@@ -25,16 +25,17 @@ polynomial kernel regression (Horowitz uses B-spline weighting).
 npregiv(y,
         z,
         w,
-        yeval = NULL,
+        x = NULL,
         zeval = NULL,
         weval = NULL,
+        xeval = NULL,
         p = 1,
+        alpha = NULL,
         alpha.min = 1e-10,
-        alpha.max = 1,
-        tol = .Machine$double.eps^0.25,
-        start.iterations = 10,
-        max.iterations = 100,
-        iterate.smoothing = TRUE,
+        alpha.max = 1e-01,
+        alpha.tol = .Machine$double.eps^0.25,
+        iterate.max = 100,
+        iterate.tol = 1.0e-05,
         constant = 0.5,
         method = c("Landweber-Fridman","Tikhonov"),
         ...)
@@ -47,21 +48,22 @@ npregiv(y,
   }
 
   \item{z}{
-    a one (1) dimensional numeric or integer vector for the endogenous
-    regressor.
+    a \eqn{p}-variate data frame of endogenous regressors. The data
+    types may be continuous, discrete (unordered and ordered factors),
+    or some combination thereof.
   }
   \item{w}{
     a \eqn{q}-variate data frame of instruments. The data types may be
     continuous, discrete (unordered and ordered factors), or some
     combination thereof.
   }
-  \item{yeval}{
-    a one (1) dimensional numeric or integer vector on which the
-    regression will be estimated (evaluation data). By default, evaluation
-    takes place on the data provided by \code{y}.
+  \item{x}{
+    an \eqn{r}-variate data frame of exogenous regressors. The data
+    types may be continuous, discrete (unordered and ordered factors),
+    or some combination thereof.
   }
   \item{zeval}{
-    a one (1) dimensional numeric or integer vector on which the
+    a \eqn{p}-variate data frame of endogenous regressors on which the
     regression will be estimated (evaluation data). By default, evaluation
     takes place on the data provided by \code{z}.
   }
@@ -70,51 +72,51 @@ npregiv(y,
     will be estimated (evaluation data). By default, evaluation
     takes place on the data provided by \code{w}.
   }
+  \item{xeval}{
+    an \eqn{r}-variate data frame of exogenous regressors on which the
+    regression will be estimated (evaluation data). By default,
+    evaluation takes place on the data provided by \code{x}.
+  }
   \item{p}{
     the order of the local polynomial regression (defaults to
     \code{p=1}, i.e. local linear)
   }
+  \item{alpha}{
+    a numeric scalar that, if supplied, is used rather than numerically
+    solving for \code{alpha}, when using \code{method="Tikhonov"}.
+    }
   \item{alpha.min}{
     minimum of search range for \eqn{\alpha}{alpha}, the Tikhonov
-    regularization parameter, when using
-    Tikhonov regularization.
-  }
+    regularization parameter, when using \code{method="Tikhonov"}.
+}
   \item{alpha.max}{
     maximum of search range for \eqn{\alpha}{alpha}, the Tikhonov
-    regularization parameter, when using
-    Tikhonov regularization.
+    regularization parameter, when using  \code{method="Tikhonov"}.
   }
-  \item{tol}{
-    the search tolerance for \code{optimize} when solving for
-    \eqn{\alpha}{alpha}, the Tikhonov regularization parameter, when using
-    Tikhonov regularization.
-  }
-  \item{start.iterations}{
-    an integer indicating the minimum number of iterations to conduct
-    when using Landweber-Fridman regularization (here at each iteration
-    the smoothing parameters are refined and optimized).
-  }
-  \item{max.iterations}{
-    an integer indicating the maximum number of iterations permitted
-    before termination occurs.
-  }
-  \item{iterate.smoothing}{
-    a logical value indicating whether, after the initial
-    \code{start.iterations} have been conducted, to continue to optimize the
-    smoothing parameters for each successive iteration.
-  }
-  \item{constant}{
-    the constant to use when using Landweber-Fridman regularization.
-  }
-  \item{method}{
+\item{alpha.tol}{
+  the search tolerance for \code{optimize} when solving for
+  \eqn{\alpha}{alpha}, the Tikhonov regularization parameter, when using
+  when using \code{method="Tikhonov"}.
+}
+\item{iterate.max}{
+  an integer indicating the maximum number of iterations permitted
+  before termination occurs when using \code{method="Landweber-Fridman"}.
+}
+\item{iterate.tol}{
+  the search tolerance for the stopping rule when using \code{method="Landweber-Fridman"}.
+}
+\item{constant}{
+  the constant to use when using  \code{method="Landweber-Fridman"}.
+}
+\item{method}{
   the regularization method employed (defaults to
-  \code{"Landweber-Fridman"}, see Horowitz (2011) for details; see
-  Darolles, Fan, Florens and Renault (forthcoming) for details on
-  \code{"Tikhonov"}).
-  }
-  \item{...}{
-    additional arguments supplied to \code{\link{npksum}}.
-  }
+   \code{"Landweber-Fridman"}, see Horowitz (2011); see Darolles,
+   Fan, Florens and Renault (forthcoming) for details for
+   \code{"Tikhonov"}).
+}
+\item{...}{
+  additional arguments supplied to \code{\link{npksum}}.
+}
 }
 \details{
   Tikhonov regularization requires computation of weight matrices of
@@ -125,28 +127,28 @@ npregiv(y,
   while it also avoids the need for numerical optimization methods to
   determine \eqn{\alpha}{alpha}.
   
-  \code{method="Landweber-Fridman"} uses an optimal stopping rule
-  whereby if \eqn{||E(y|w)-E(\varphi_k(z)|w)||^2
-  }{||E(y|w)-E(phi(z)|w)||^2 } is unchanged for at least
-  \code{num.iterations} then iteration terminates. However, if
-  insufficient training is conducted the estimates can be overly noisy
-  and iteration may fail to terminate when \code{num.iterations} is
-  large. To best guard against this eventuality set \code{nmulti} to a
-  larger number than the default \code{nmulti=0} for
-  \code{\link{npreg}}.
+  \code{method="Landweber-Fridman"} uses an optimal stopping rule based
+  upon \eqn{||E(y|w)-E(\varphi_k(z,x)|w)||^2
+  }{||E(y|w)-E(phi(z,x)|w)||^2 }. However, if insufficient training is
+  conducted the estimates can be overly noisy. To best guard against
+  this eventuality set \code{nmulti} to a larger number than the default
+  \code{nmulti=0} for \code{\link{npreg}}.
 
   When using \code{method="Landweber-Fridman"}, iteration will terminate
-  when either \code{start.iterations} have passed with no change in the
-  value of \eqn{||E(y|w)-E(\varphi_k(z)|w)||^2
-  }{||E(y|w)-E(phi(z)|w)||^2 } or we hit \code{max.iterations} or
-  \eqn{||E(y|w)-E(\varphi_k(z)|w)||^2 }{||E(y|w)-E(phi(z)|w)||^2 } stops
-  falling in value and starts rising.
+  when either the change in the value of
+  \eqn{||(E(y|w)-E(\varphi_k(z,x)|w))/E(y|w)||^2
+  }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } from iteration to iteration is
+  less than \code{iterate.tol} or we hit \code{iterate.max} or
+  \eqn{||E((y|w)-E(\varphi_k(z,x)|w))/E(y|w)||^2
+  }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } stops falling in value and
+  starts rising.  }
+
+\value{ \code{npregiv} returns a list with
+  components \code{phihat} and either \code{alpha} when
+  \code{method="Tikhonov"} or \code{num.iterations} and \code{norm.stop}
+  when \code{method="Landweber-Fridman"}.
 }
-\value{
-  \code{npregiv} returns a list with components \code{phihat} and either
-  \code{alpha} when \code{method="Tikhonov"} or \code{num.iterations}
-   and \code{norm.stop} when \code{method="Landweber-Fridman"}.
-}
+
 \references{
   
   Carrasco, M. and J.P. Florens and E. Renault (2007), \dQuote{Linear
@@ -235,7 +237,7 @@ w <- rnorm(n,mean=0,sd=1)
 fun1 <- function(z) { z^2 }
 fun2 <- function(z) { exp(-abs(z)) }
 
-z <- 0.4*w + v
+z <- 0.2*w + v
 
 ## Generate two y vectors for each function.
 
@@ -294,6 +296,5 @@ legend(quantile(z,trim),quantile(y,1-trim),
        lty=c(1,2,4),
        col=c("black","blue","red"),
        lwd=c(2,2,2))
-       
 }
 \keyword{ instrument }
