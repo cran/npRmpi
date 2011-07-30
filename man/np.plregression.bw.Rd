@@ -268,7 +268,7 @@ npplregbw(\dots)
 
 }
 \author{
-    Tristen Hayfield \email{hayfield@phys.ethz.ch}, Jeffrey S. Racine
+    Tristen Hayfield \email{hayfield@mpia.de}, Jeffrey S. Racine
     \email{racinej@mcmaster.ca}
 }
 
@@ -321,15 +321,15 @@ set.seed(42)
 
 n <- 250
 x1 <- rnorm(n)
-x2 <- rbinom(n, 5, .3)
+x2 <- rbinom(n, 1, .5)
 
-z1 <- rbinom(n, 2, .3)
+z1 <- rbinom(n, 1, .5)
 z2 <- rnorm(n)
 
 y <- 1 + x1 + x2 + z1 + sin(z2) + rnorm(n)
 
-x2 <- ordered(x2)
-z1 <- ordered(z1)
+x2 <- factor(x2)
+z1 <- factor(z1)
 
 mpi.bcast.Robj2slave(x1)
 mpi.bcast.Robj2slave(x2)

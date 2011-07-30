@@ -1,18 +1,16 @@
-Title: Installing the npRmpi binary package for MS Windows XP (32-bit
-& Service Pack 3)
+Title: Installing the npRmpi binary package for MS Windows 7 (32-bit/64-bit)
 
-Date: 05/19/2010
-Author: David T. Jacho-Chavez (djachoch@indiana.edu)
+Date: 07/14/2011
+Author: David T. Jacho-Chavez (djachocha@emory.edu)
 
 These are based on those given in http://www.stats.uwo.ca/faculty/yu/Rmpi/
 
 INSTALLATION:
 
-1) Download and install MPICH2 for Windows from
-   http://www-unix.mcs.anl.gov/mpi/mpich2 Version 1.2.1 or later is
-   recommended.
+1) Download and install MPICH2 for Windows (32-bit) from
+   http://www-unix.mcs.anl.gov/mpi/mpich2 Version 1.3rc1.
 
-   Before installing MPICH2, you need Microsoft .Net 2.0 .NET
+   Before installing MPICH2, you may need Microsoft .Net 2.0 .NET
    Framework Version 2.0 Redistributable Package and Visual C++ 2010
    Redistributable Package (x86).
 
@@ -27,7 +25,7 @@ INSTALLATION:
    variable "PATH" (it is version dependent. Either User or System
    variables will be fine). Click Edit to get a new window.
 
-   At end of Variable value, add ";C:\Program Files\MPICH2\bin" for
+   At end of Variable value, add ";C:\Program Files (x86)\MPICH2\bin" for
    32bit windows. (Remove the double quotations).
 
 3) Next launch wmpiconfig.exe from the Start menu. First it will ask

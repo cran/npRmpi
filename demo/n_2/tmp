@@ -1,5 +1,0 @@
-	mpirun -np 2 R CMD BATCH --no-save ../npplreg_npRmpi.R
-	mpirun -np 2 R CMD BATCH --no-save ../npreglcaic_npRmpi.R
-	mpirun -np 2 R CMD BATCH --no-save ../npreglcls_npRmpi.R
-	mpirun -np 2 R CMD BATCH --no-save ../npregllaic_npRmpi.R
-	mpirun -np 2 R CMD BATCH --no-save ../npregllls_npRmpi.R

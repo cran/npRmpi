@@ -1,21 +1,20 @@
-Title: Compiling npRmpi from source code under MS Windows XP (32-bit &
-Service Pack 3)
+Title: Compiling npRmpi from source code under MS Windows 7 (32-bit/64-bit)
 
-Date: 05/26/2010
-Author: David T. Jacho-Chavez (djachoch@indiana.edu)
+Date: 07/14/2011
+Author: David T. Jacho-Chavez (djachocha@emory.edu)
 
 These are based on those given in http://www.stats.uwo.ca/faculty/yu/Rmpi/
 
 1) Create the folder "R_temp" in your C:\ drive.
 
 2) Download the following files and place then in "C:\R_temp" (note
-   version numbers may be more recent so use the most recent
-   available):
+   version numbers as most recent versions of each program may create
+   undesirable results):
 
-R-2.11.0-win32.exe         http://www.r-project.org/
-Rtools211.exe              http://www.murdoch-sutherland.com/Rtools/
-mpich2-1.2.1p1-win-ia32    http://www-unix.mcs.anl.gov/mpi/mpich2
-npRmpi_0.40-0.tar.gz       http://cran.r-project.org/web/packages/npRmpi/index.html
+R-2.13.1-win.exe           http://www.r-project.org/
+Rtools213.exe              http://www.murdoch-sutherland.com/Rtools/
+mpich2-1.3rc1-win-ia       http://www-unix.mcs.anl.gov/mpi/mpich2
+npRmpi_0.40-7.tar.gz       http://cran.r-project.org/web/packages/npRmpi/index.html
 test.R                     http://www.economics.mcmaster.ca/faculty/racinej
 .Rprofile                  http://www.economics.mcmaster.ca/faculty/racinej
 
@@ -27,7 +26,7 @@ test.R                     http://www.economics.mcmaster.ca/faculty/racinej
 3) Install the following programmes (in this order) using the default
    directories:
 
-  (i) R-2.11.0-win32.exe (If you experience any difficulties, 
+  (i) R-2.13.1-win.exe (If you experience any difficulties, 
       kindly refer to installation instructions at
       http://www.r-project.org/)
 
@@ -43,14 +42,14 @@ test.R                     http://www.economics.mcmaster.ca/faculty/racinej
 
       At the end of Variable value, add
 
-      ;C:\Program Files\R\R-2.11.0\bin;
+      ;C:\Program Files\R\R-2.13.1\bin\i386;
 
- (ii) Rtools211.exe (If you experience any difficulties, kindly
+ (ii) Rtools213.exe (If you experience any difficulties, kindly
       refer to installation instructions at
       http://www.murdoch-sutherland.com/Rtools/)
 
-      After installation, add the Rtools bin directory to your PATH
-      environment variables.
+      During installation, accept all default folders. After installation,
+      add the Rtools bin directory to your PATH environment variables.
 
       Right click "My Computer" and choose "Properties". Click
       "Advanced system settings" to get a new window.
@@ -61,15 +60,15 @@ test.R                     http://www.economics.mcmaster.ca/faculty/racinej
 
       At the beginning of Variable value, add
 
-      C:\Rtools\bin;C:\Rtools\perl\bin;C:\Rtools\MinGW\bin;C:\R\bin;
+      C:\Rtools\bin;C:\Rtools\perl\bin;C:\Rtools\MinGW\bin;
 
-(iii) mpich2-1.2.1p1-win-ia32 (If you experience any difficulties,
+(iii) mpich2-1.3rc1-win-ia (If you experience any difficulties,
       kindly refer to installation instructions at
       http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm)
 
-      Before installing MPICH2, you need Microsoft .Net 2.0 .NET
-      Framework Version 2.0 Redistributable Package and Visual C++
-      2010 Redistributable Package (x86).
+      Before installing MPICH2, you may need Microsoft .Net Framework 4
+      (Standalone Installer) Visual C++ 2010 Redistributable Package
+      (x86).
 
       After installation, add the MPICH2 bin directory to your PATH
       environment variables.
@@ -83,7 +82,7 @@ test.R                     http://www.economics.mcmaster.ca/faculty/racinej
 
       At end of Variable value, add 
 
-      ;C:\Program Files\MPICH2\bin;
+      ;C:\Program Files (x86)\MPICH2\bin;
 
       Next launch wmpiconfig.exe from the Start menu. First it will
       ask you for your account name and password. Enter your account
@@ -99,9 +98,9 @@ test.R                     http://www.economics.mcmaster.ca/faculty/racinej
       (change `mypassword' to your actual password). click "Get
       Settings" again to see if your host gets green color.
 
-4) Copy npRmpi_0.40-0.tar.gz to the "C:\R_temp" folder.
+4) Copy npRmpi_0.40-7.tar.gz to the "C:\R_temp" folder.
 
-5) (i) Untar npRmpi_0.40-0.tar.gz in the "C:\R_temp" folder.
+5) (i) Untar npRmpi_0.40-7.tar.gz in the "C:\R_temp" folder.
 
   * To 'untar' in MS Windows, please download & install the following
     freeware programme: 7-zip (http://www.7-zip.org)
@@ -126,7 +125,7 @@ Notes:
       trying to run, otherwise it will not work.
 
  (ii) The command 'mpiexec' is available only when the proper
-      installation of mpich2-1.2.1p1-win-ia32 is performed. 
+      installation of mpich2-1.2.1p1-win-ia is performed. 
       Kindly refer to
       http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm for
       step-by-step instructions.

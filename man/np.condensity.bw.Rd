@@ -376,7 +376,7 @@ npcdensbw(\dots)
 
 }
 \author{
-  Tristen Hayfield \email{hayfield@phys.ethz.ch}, Jeffrey S. Racine
+  Tristen Hayfield \email{hayfield@mpia.de}, Jeffrey S. Racine
   \email{racinej@mcmaster.ca}
 }
 
@@ -434,8 +434,7 @@ mpi.bcast.cmd(data("Italy"),
 mpi.bcast.cmd(attach(Italy),
               caller.execute=TRUE)
 
-mpi.bcast.cmd(bw <- npcdensbw(formula=gdp~ordered(year), tol=.1,
-ftol=.1),
+mpi.bcast.cmd(bw <- npcdensbw(formula=gdp~ordered(year)),
               caller.execute=TRUE)
 
 summary(bw)

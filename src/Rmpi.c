@@ -38,11 +38,15 @@ SEXP mpidist(){
 #endif
 
 #ifdef LAM
-        i=2;
+  i=2;
 #endif
 
 #ifdef MPICH
 	i=3;
+#endif
+
+#ifdef MPICH2
+	i=4;
 #endif
 
 	return AsInt(i);	

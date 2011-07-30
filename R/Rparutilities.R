@@ -12,7 +12,7 @@ mpi.hostinfo <- function(comm=1){
         "on comm", comm, "\n")
 }
 
-slave.hostinfo <- function(comm=1){
+slave.hostinfo <- function(comm=1, short=TRUE){
     if (!mpi.is.master())
     stop("cannot run slavehostinfo on slaves")
     size <- mpi.comm.size(comm)
@@ -37,10 +37,23 @@ slave.hostinfo <- function(comm=1){
         cat(rank0, "of size", size, "is running on:",master, "\n")
         slavename <- paste("slave", ranks,sep="")
         ranks <- paste("(rank ",ranks, ", comm ",slavecomm,")", sep="")
-        for (i in 1:(size-1)){
+		if (short && size > 8){
+          for (i in 1:3) {
             cat(slavename[i], ranks[i], "of size",size, 
-        "is running on:",slavehost[i], "\n")
-        }
+          "is running on:",slavehost[i], "\n")	
+		  }
+		  cat("... ... ...\n")
+		  for (i in (size-2):(size-1)){
+		    cat(slavename[i], ranks[i], "of size",size, 
+          "is running on:",slavehost[i], "\n")
+		  }
+		}
+		else {
+          for (i in 1:(size-1)){
+            cat(slavename[i], ranks[i], "of size",size, 
+          "is running on:",slavehost[i], "\n")
+          }
+		}
     }
 }
 
@@ -61,20 +74,21 @@ mpichhosts <- function(){
     
     if (length(hosts) == 0) 
 	  hostnames <- "localhost"
-    else if (length(hosts)==1)
+	else {
 		if (hosts=="default")
 		    hostnames <- "localhost"
-    else	{ 
-        hosts <- unlist(strsplit(hosts, " "))
-        hosts <- hosts[which(hosts != "")]
-        hostnames <- NULL
-        for (host in hosts) {
-            hostsmp <- unlist(strsplit(host, ":"))
-            smp <- ifelse(is.na(hostsmp[2]), 1, as.integer(hostsmp[2]))
-            hostbase <- unlist(strsplit(hostsmp[1], "\\."))[1]
-            hostnames <- c(hostnames, rep(hostbase, smp))
-        }
-    }
+    	else	{ 
+        	hosts <- unlist(strsplit(hosts, " "))
+        	hosts <- hosts[which(hosts != "")]
+        	hostnames <- NULL
+        	for (host in hosts) {
+            	hostsmp <- unlist(strsplit(host, ":"))
+            	smp <- ifelse(is.na(hostsmp[2]), 1, as.integer(hostsmp[2]))
+            	hostbase <- unlist(strsplit(hostsmp[1], "\\."))[1]
+            	hostnames <- c(hostnames, rep(hostbase, smp))
+        	}
+    	}
+	}
     base <- "master"
     if (length(hostnames) == 1) {
 	  out=0
@@ -102,7 +116,7 @@ mpi.spawn.Rslaves <-
     intercomm=2,
     comm=1,
     hosts=NULL,
-    needlog=FALSE,
+    needlog=TRUE,
     mapdrive=TRUE) {
     if (!is.loaded("mpi_comm_spawn"))
         stop("You cannot use MPI_Comm_spawn API")   
@@ -113,23 +127,25 @@ mpi.spawn.Rslaves <-
       #  Rslavecmd<-ifelse(.Platform$OS=="windows","Rslalves.cmd","Rslaves.sh")
     if (.Platform$OS=="windows"){
         workdrive <- unlist(strsplit(getwd(),":"))[1]
-        workdir <- paste(unlist(strsplit(getwd(),"/")),collapse="\\")
-        tmpdrive <- unlist(strsplit(tempdir(),":"))[1]
-        worktmp <- as.logical(toupper(workdrive)==toupper(tmpdrive))
-        tmpdir <- unlist(strsplit(tempdir(),"/Rtmp"))[1]
+		workdir <- unlist(strsplit(getwd(),"/"))
+		if (length(workdir) > 1)
+			workdir <-paste(workdir, collapse="\\")
+		else
+        	workdir <- paste(workdir,"\\")
         localhost <- Sys.getenv("COMPUTERNAME")
         networkdrive <-.Call("RegQuery", as.integer(2),paste("NETWORK\\",workdrive,sep=""), 
                         PACKAGE="npRmpi")
         remotepath <-networkdrive[which(networkdrive=="RemotePath")+1]
         mapdrive <- as.logical(mapdrive && !is.null(remotepath))
-        arg <- c(Rscript, R.home(), workdrive, workdir, worktmp, tmpdir, 
-                    localhost, mapdrive, remotepath)
-        realns<-mpi.comm.spawn(slave=system.file("Rslaves.bat", package="npRmpi"),
-        slavearg=arg,
-        nslaves=nslaves,
-        info=0,
-        root=root,
-        intercomm=intercomm)
+        arg <- c(Rscript, R.home(), workdrive, workdir, localhost, mapdrive, remotepath)
+		if (getRversion() >= "2.12.0")
+          realns <- mpi.comm.spawn(slave = system.file("Rslaves32.bat", 
+            package = "npRmpi"), slavearg = arg, nslaves = nslaves, 
+            info = 0, root = root, intercomm = intercomm)
+		else 
+	  	  realns <- mpi.comm.spawn(slave = system.file("Rslaves.bat", 
+            package = "npRmpi"), slavearg = arg, nslaves = nslaves, 
+            info = 0, root = root, intercomm = intercomm)
     }
     else{
         tmp <- paste(Sys.getpid(), "+", comm, sep="")   
@@ -340,16 +356,11 @@ mpi.close.Rslaves <- function(dellog=TRUE, comm=1){
     }
     mpi.bcast.cmd(break, rank=0, comm=comm)
     if (.Platform$OS!="windows"){
-        if (dellog){
+        if (dellog && mpi.comm.size(0) < mpi.comm.size(comm)){
         tmp <- paste(Sys.getpid(),"+",comm,sep="")  
         logfile <- paste("*.",tmp,".*.log", sep="")
-## R 2.12.0 throwing error, from changelog "system(command, intern =
-## TRUE) now gives an error on a Unix-alike (as well as on Windows) if
-## command cannot be run." Added the following and commented out the
-## if(length( that was throwing the error)
-        system("test -e logfile && rm logfile", intern=FALSE)
-##        if (length(system(paste("ls", logfile),TRUE,ignore.stderr=TRUE))>=1)
-##            system(paste("rm", logfile))
+        if (length(system(paste("ls", logfile),TRUE,ignore.stderr=TRUE) )>=1)
+            system(paste("rm", logfile))
         }
     }
 #     mpi.barrier(comm)
