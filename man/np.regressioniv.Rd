@@ -194,6 +194,7 @@ This function should be considered to be in `beta test' status until further not
 \code{\link{npreg}}
 }
 \examples{
+\dontrun{
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -296,5 +297,6 @@ legend(quantile(z,trim),quantile(y,1-trim),
        lty=c(1,2,4),
        col=c("black","blue","red"),
        lwd=c(2,2,2))
+} % enddontrun     
 }
 \keyword{ instrument }

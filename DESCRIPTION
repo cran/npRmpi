@@ -1,6 +1,6 @@
 Package: npRmpi
-Version: 0.40-9
-Date: 2011-07-30
+Version: 0.40-10
+Date: 2011-10-24
 Depends: boot, cubature
 Suggests: quantreg, MASS
 Title: Parallel nonparametric kernel smoothing methods for mixed data
@@ -23,6 +23,6 @@ Description: This package provides a variety of nonparametric (and
         (SHARCNET:www.sharcnet.ca).
 License: GPL
 URL:
-Packaged: 2011-07-30 12:37:01 UTC; jracine
+Packaged: 2011-10-24 18:55:44 UTC; jracine
 Repository: CRAN
-Date/Publication: 2011-07-30 15:03:37
+Date/Publication: 2011-10-24 19:19:40
