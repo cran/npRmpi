@@ -1,6 +1,6 @@
-d97c8382efa475499878012f25eccaf8 *CHANGELOG
+dcf36c62b6b55a93b64e12b42ff19dbc *CHANGELOG
 371ac3437cacde0134516d8db3cb1b74 *COPYRIGHTS
-9ad6afa61515d8d6eed882925e672955 *DESCRIPTION
+919a49bfce124e5565f838bfd984861f *DESCRIPTION
 2c4f86c1b9a13857ecfffd8caa2cbfe5 *NAMESPACE
 e53b8a0a9fb2629ffa808fc5ff10ee01 *R/Rcoll.R
 52ae0edc4da45da917a7ca368782c728 *R/Rcomm.R
@@ -40,7 +40,7 @@ a3c6a56ffbb3a5c6360c984dc104045c *R/np.regression.R
 708d0857d96f6fd5a96aa1d790aabc24 *R/np.regression.bw.R
 77975d3e1c6ad8a054fe1fc7b9ad9c11 *R/np.sdeptest.R
 4f0b8d72bd83545c7eaf968e8e220753 *R/np.sigtest.R
-4cc7a7e254bf6794d2daa5dbb02c1719 *R/np.singleindex.R
+45c9329350c4066cbebb82ddfd694d42 *R/np.singleindex.R
 2ad0949961c5628ae03585b0a0700b14 *R/np.singleindex.bw.R
 838f3057a433e910b8bbd0302984dcee *R/np.smoothcoef.R
 5cc35feae5347dac2f4a1d7df7a53c00 *R/np.smoothcoef.bw.R
@@ -63,7 +63,7 @@ e63526940fcfd31a25408df1b555539a *R/singleindex.R
 067c61c6f97e33bdfddcd73944647a39 *R/symtest.R
 2e9502d45ba2bd09f44655f219058616 *R/unitest.R
 47e59a18117923b5c2a17c8629591c8e *R/util.R
-2b0c35635e133e26a1507ff47003aba7 *R/zzz.R
+0582ae9308b4f00b37a5a4b73490ed5a *R/zzz.R
 33e3413711ff67290678a89d10970251 *README
 55b04530fcb48e6f23aa04eb9f1b52bc *cleanup
 343c037b06be8381257588dae6ec0fd1 *configure
@@ -171,7 +171,7 @@ c684edd92cbfeaabd5906522eea4da8c *inst/cslavePI.c
 92e903f33d4067a7fbc89fa4e7571c92 *inst/doc/jss.bst
 597d284e5204836c015463ad73e972ab *inst/doc/jss.cls
 f7a57df8f31c22744473db5d3ed50ca5 *inst/doc/npRmpi.bib
-198ed70f1dbee086fd1729bebb70f7d9 *inst/doc/np_faq.pdf
+efbe573be64f3d4ced9a29bf5c33b81d *inst/doc/np_faq.pdf
 9287ce81e4d2f78639494f79a482b689 *inst/install_npRmpi_MS_Windows.txt
 3a98d09120684333192a5edb1977e881 *inst/install_npRmpi_SHARCNET.txt
 dc982a62490c8ac184deac03e5e235f4 *inst/merge.sh
@@ -263,7 +263,7 @@ e7cbe5f8451ec61172e4ccedf74a65d2 *man/np.smoothcoef.Rd
 de959b80fe6dbac6bb63e44fb22ac5e5 *man/se.Rd
 ae3defc1a051ef3e60ffd4efc74a1c71 *man/uocquantile.Rd
 feffc471ca4d0be7d64f443e4f106111 *mknpkg.sh
-073c14f3c006aa8ab0827add1422d5fd *npver
+efc5488217ec8e796cb15da1215db44b *npver
 7385dad2df4a137d9cfbc1bbc7a99090 *src/Makevars
 49b3b4f4c92b8436d2b9b218a76696d3 *src/Makevars.in
 c2758c4d64114f6dd2e7d8982ba17850 *src/Makevars.win
