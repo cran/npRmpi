@@ -1,6 +1,6 @@
-dcf36c62b6b55a93b64e12b42ff19dbc *CHANGELOG
+70cb39a818450918141666e6f21aa2cb *CHANGELOG
 371ac3437cacde0134516d8db3cb1b74 *COPYRIGHTS
-919a49bfce124e5565f838bfd984861f *DESCRIPTION
+dd4fcee63a3e2d2f0d5f78c96e737c3a *DESCRIPTION
 2c4f86c1b9a13857ecfffd8caa2cbfe5 *NAMESPACE
 e53b8a0a9fb2629ffa808fc5ff10ee01 *R/Rcoll.R
 52ae0edc4da45da917a7ca368782c728 *R/Rcomm.R
@@ -41,7 +41,7 @@ a3c6a56ffbb3a5c6360c984dc104045c *R/np.regression.R
 77975d3e1c6ad8a054fe1fc7b9ad9c11 *R/np.sdeptest.R
 4f0b8d72bd83545c7eaf968e8e220753 *R/np.sigtest.R
 45c9329350c4066cbebb82ddfd694d42 *R/np.singleindex.R
-2ad0949961c5628ae03585b0a0700b14 *R/np.singleindex.bw.R
+ea8a48f274ed37ba0be82510e88e7a5a *R/np.singleindex.bw.R
 838f3057a433e910b8bbd0302984dcee *R/np.smoothcoef.R
 5cc35feae5347dac2f4a1d7df7a53c00 *R/np.smoothcoef.bw.R
 9b9f909503883260a54bd5042d9196c4 *R/np.symtest.R
@@ -55,7 +55,7 @@ e0b45fc47cbf4625b25754653e6ec321 *R/plregression.R
 923e9a6c9a20f3fcbcf385747bf9bd62 *R/regression.R
 26bd1dd7b08c62085a49cfe9d789cc23 *R/rng.R
 3e7d831e0be4be1df0120e7cca55c9b5 *R/sdeptest.R
-a9f26d5e6300878446889d6f26abf113 *R/sibandwidth.R
+e016c8888161b9fe66a5f1b616b18224 *R/sibandwidth.R
 441c1fcc286157dfb62ac4f68596a3b7 *R/sigtest.R
 e63526940fcfd31a25408df1b555539a *R/singleindex.R
 68c01b8af11e7360e3c496687a131ef8 *R/smoothbandwidth.R
@@ -63,14 +63,14 @@ e63526940fcfd31a25408df1b555539a *R/singleindex.R
 067c61c6f97e33bdfddcd73944647a39 *R/symtest.R
 2e9502d45ba2bd09f44655f219058616 *R/unitest.R
 47e59a18117923b5c2a17c8629591c8e *R/util.R
-0582ae9308b4f00b37a5a4b73490ed5a *R/zzz.R
+9996a66884288e1720f624caa8946c67 *R/zzz.R
 33e3413711ff67290678a89d10970251 *README
 55b04530fcb48e6f23aa04eb9f1b52bc *cleanup
 343c037b06be8381257588dae6ec0fd1 *configure
 d965734f286cd5d48547cb75cbc8f6ad *configure.ac
 6389d84d62cccc437d6f253a491f2b37 *data/Engel95.rda
 d3e01c9812b9b01fffcb9c5e2b8ef6da *data/Italy.rda
-e975f158acf26454162b0799e1b192e5 *data/cps71.rda
+eec323d8f32a44faa4fd35109bfd9701 *data/cps71.rda
 b58744d73b095299ebc00e4fb23d0a0a *data/oecdpanel.rda
 35a2ac3894487b205f3d427a092e2b48 *data/wage1.rda
 b7e41f18b1883c855738badb84b1b0b6 *demo/00Index
@@ -171,7 +171,7 @@ c684edd92cbfeaabd5906522eea4da8c *inst/cslavePI.c
 92e903f33d4067a7fbc89fa4e7571c92 *inst/doc/jss.bst
 597d284e5204836c015463ad73e972ab *inst/doc/jss.cls
 f7a57df8f31c22744473db5d3ed50ca5 *inst/doc/npRmpi.bib
-efbe573be64f3d4ced9a29bf5c33b81d *inst/doc/np_faq.pdf
+331875f8898f00700be062df88db3517 *inst/doc/np_faq.pdf
 9287ce81e4d2f78639494f79a482b689 *inst/install_npRmpi_MS_Windows.txt
 3a98d09120684333192a5edb1977e881 *inst/install_npRmpi_SHARCNET.txt
 dc982a62490c8ac184deac03e5e235f4 *inst/merge.sh
@@ -233,7 +233,7 @@ e319e297a6e84b58b062228ce533241a *man/mpi.spawn.Rslaves.Rd
 5a1780b7d22a7e02463c843698b248b7 *man/mpi.universe.size.Rd
 c1574de5df7f60098fcfb0d6ca2a8d5f *man/mpi.wait.Rd
 6f0c76d9c7d23cea2ee03e3e50a0b992 *man/np-package.Rd
-c9c57fb52deb9ed64f743f676743a126 *man/np.cmstest.Rd
+9d188f0c9146d99d5939be8f6f274b1f *man/np.cmstest.Rd
 adf498482231067266efdebad22e4c8f *man/np.condensity.Rd
 4685c123284eb48b2754c19ddf926f09 *man/np.condensity.bw.Rd
 2bf935e94ed1995732d4c5ef733294c2 *man/np.conmode.Rd
@@ -254,7 +254,7 @@ c7ee2c7628f8f1368fbe5c693add5012 *man/np.regression.Rd
 080b0497a23d9f7acd13d1a1addd7faa *man/np.sdeptest.Rd
 222dc3d0e750a27417c4abeec239f5c9 *man/np.sigtest.Rd
 ce684e5c583560d2b914be6c6b836d68 *man/np.singleindex.Rd
-ea30c6e37ea0d587543731d1323d224c *man/np.singleindex.bw.Rd
+5c2d8cd4f22bb105ee620ba098ed5080 *man/np.singleindex.bw.Rd
 e7cbe5f8451ec61172e4ccedf74a65d2 *man/np.smoothcoef.Rd
 2345416bd0128d4f2f7922271e408ff5 *man/np.smoothcoef.bw.Rd
 006f4f3902154b18cbb0dd022bec7289 *man/np.symtest.Rd
@@ -263,7 +263,7 @@ e7cbe5f8451ec61172e4ccedf74a65d2 *man/np.smoothcoef.Rd
 de959b80fe6dbac6bb63e44fb22ac5e5 *man/se.Rd
 ae3defc1a051ef3e60ffd4efc74a1c71 *man/uocquantile.Rd
 feffc471ca4d0be7d64f443e4f106111 *mknpkg.sh
-efc5488217ec8e796cb15da1215db44b *npver
+2414b846e21ac1b0d64f1fcec335c33f *npver
 7385dad2df4a137d9cfbc1bbc7a99090 *src/Makevars
 49b3b4f4c92b8436d2b9b218a76696d3 *src/Makevars.in
 c2758c4d64114f6dd2e7d8982ba17850 *src/Makevars.win
