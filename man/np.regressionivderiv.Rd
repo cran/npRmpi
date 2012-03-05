@@ -1,53 +1,45 @@
-\name{npregiv}
-\alias{npregiv}
+\name{npregivderiv}
+\alias{npregivderiv}
 
 \title{
-Nonparametric Instrumental Regression
+Nonparametric Instrumental Derivatives
 }
 \description{
-\code{npregiv} computes nonparametric estimation of an instrumental
-regression function \eqn{\varphi}{phi} defined by conditional moment
-restrictions stemming from a structural econometric model: \eqn{E [Y -
-\varphi (Z,X) | W ] = 0}{E [Y - phi (Z,X) | W ] = 0}, and involving
-endogenous variables \eqn{Y} and \eqn{Z} and exogenous variables
-\eqn{X} and instruments \eqn{W}. The function \eqn{\varphi}{phi} is the
-solution of an ill-posed inverse problem.
-
-When \code{method="Tikhonov"}, \code{npregiv} uses the approach of
-Darolles, Fan, Florens and Renault (2011) modified for local
-polynomial kernel regression of any order (Darolles et al use local
-constant kernel weighting which corresponds to setting \code{p=0}; see
-below for details). When \code{method="Landweber-Fridman"},
-\code{npregiv} uses the approach of Horowitz (2011) again using local
-polynomial kernel regression (Horowitz uses B-spline weighting).
+\code{npregivderiv} uses the approach of Florens and Racine (2012) to
+compute the partial derivative of a nonparametric estimation of an
+instrumental regression function \eqn{\varphi}{phi} defined by
+conditional moment restrictions stemming from a structural econometric
+model: \eqn{E [Y - \varphi (Z,X) | W ] = 0}{E [Y - phi (Z,X) | W ] = 0},
+and involving endogenous variables \eqn{Y} and \eqn{Z} and exogenous
+variables \eqn{X} and instruments \eqn{W}. The derivative function
+\eqn{\varphi'}{phi'} is the solution of an ill-posed inverse problem,
+and is computed using Landweber-Fridman regularization.
 }
 \usage{
-npregiv(y,
-        z,
-        w,
-        x = NULL,
-        zeval = NULL,
-        weval = NULL,
-        xeval = NULL,
-        p = 1,
-        nmulti = 1,
-        random.seed = 42,
-        optim.maxattempts = 10,
-        optim.method = c("Nelder-Mead", "BFGS", "CG"),
-        optim.reltol = sqrt(.Machine$double.eps),
-        optim.abstol = .Machine$double.eps,
-        optim.maxit = 500,
-        alpha = NULL,
-        alpha.min = 1e-10,
-        alpha.max = 1e-01,
-        alpha.tol = .Machine$double.eps^0.25,
-        iterate.max = 1000,
-        iterate.tol = 1.0e-04,
-        iterate.diff.tol = 1.0e-08,
-        constant = 0.5,
-        method = c("Landweber-Fridman","Tikhonov"),
-        stop.on.increase = TRUE,
-        ...)
+npregivderiv(y,
+             z,
+             w,
+             x = NULL,
+             zeval = NULL,
+             weval = NULL,
+             xeval = NULL,
+             p = 1,
+             nmulti = 1,
+             random.seed = 42,
+             optim.maxattempts = 10,
+             optim.method = c("Nelder-Mead", "BFGS", "CG"),
+             optim.reltol = sqrt(.Machine$double.eps),
+             optim.abstol = .Machine$double.eps,
+             optim.maxit = 500,
+             iterate.max = 1000,
+             iterate.tol = 1.0e-04,
+             iterate.diff.tol = 1.0e-08,
+             constant = 0.5,
+             start.phi.zero = FALSE,
+             smooth.while.iterating = TRUE,
+             stop.on.increase = TRUE,
+             smooth.residuals = TRUE,
+             ...)
 }
 \arguments{
   \item{y}{
@@ -146,43 +138,31 @@ npregiv(y,
     maximum number of iterations used by \code{\link{optim}}. Defaults
      to \code{500}.
    }
-  \item{alpha}{
-    a numeric scalar that, if supplied, is used rather than numerically
-    solving for \code{alpha}, when using \code{method="Tikhonov"}.
-    }
-  \item{alpha.min}{
-    minimum of search range for \eqn{\alpha}{alpha}, the Tikhonov
-    regularization parameter, when using \code{method="Tikhonov"}.
-  }
-  \item{alpha.max}{
-    maximum of search range for \eqn{\alpha}{alpha}, the Tikhonov
-    regularization parameter, when using  \code{method="Tikhonov"}.
-  }
-\item{alpha.tol}{
-  the search tolerance for \code{optimize} when solving for
-  \eqn{\alpha}{alpha}, the Tikhonov regularization parameter, when using
-  when using \code{method="Tikhonov"}.
-}
 \item{iterate.max}{
   an integer indicating the maximum number of iterations permitted
-  before termination occurs when using \code{method="Landweber-Fridman"}.
+  before termination occurs for Landweber-Fridman iteration.
 }
 \item{iterate.tol}{
-  the search tolerance for the stopping rule when using \code{method="Landweber-Fridman"}.
+  the search tolerance for the stopping rule for Landweber-Fridman iteration.
 }
 \item{iterate.diff.tol}{
   the search tolerance for the difference in the stopping rule from
-  iteration to iteration when using \code{method="Landweber-Fridman"}
+  iteration to iteration when using Landweber-Fridman iteration
   (disable by setting to zero).
 }
 \item{constant}{
-  the constant to use when using  \code{method="Landweber-Fridman"}.
+  the constant to use for Landweber-Fridman iteration.
 }
-\item{method}{
-  the regularization method employed (defaults to
-   \code{"Landweber-Fridman"}, see Horowitz (2011); see Darolles,
-   Fan, Florens and Renault (2011) for details for
-   \code{"Tikhonov"}).
+\item{start.phi.zero}{
+  a logical value indicating whether to commence Landweber-Fridman
+  assuming \eqn{\varphi_{-1}=0}{phi[-1]=0} (proper Landweber-Fridman) or
+  instead begin from \eqn{E(y|z)} (defaults to \code{FALSE}, see details
+  below).
+}
+\item{smooth.while.iterating}{
+  a logical value indicating whether to re-smooth
+  \eqn{E(\varphi|w)}{E(phi|w)} during Landweber-Fridman iteration
+  (defaults to \code{TRUE}).
 }
 \item{stop.on.increase}{
   a logical value (defaults to \code{TRUE}) indicating whether to halt
@@ -190,28 +170,41 @@ npregiv(y,
   course of one iteration (i.e. it may be above the iteration tolerance
   but increased).
 }
-\item{...}{
+\item{smooth.residuals}{
+  a logical value (defaults to \code{TRUE}) indicating whether to
+  optimize bandidths for the regression of \eqn{y-\varphi(z)}{y-phi(z)}
+  on \eqn{w} or for the regression of \eqn{\varphi(z)}{phi(z)} on
+  \eqn{w} during Landweber-Fridman iteration.
+ }
+\item{...}{ 
   additional arguments supplied to \code{\link{npksum}}.
 }
-}
-\details{
-  Tikhonov regularization requires computation of weight matrices of
-  dimension \eqn{n\times n}{n x n} which can be computationally costly
-  in terms of memory requirements and may be unsuitable for large
-  datasets. Landweber-Fridman will be preferred in such settings as it
-  does not require construction and storage of these weight matrices
-  while it also avoids the need for numerical optimization methods to
-  determine \eqn{\alpha}{alpha}.
-  
-  \code{method="Landweber-Fridman"} uses an optimal stopping rule based
-  upon \eqn{||E(y|w)-E(\varphi_k(z,x)|w)||^2
-  }{||E(y|w)-E(phi(z,x)|w)||^2 }. However, if insufficient training is
-  conducted the estimates can be overly noisy. To best guard against
-  this eventuality set \code{nmulti} to a larger number than the default
-  \code{nmulti=0} for \code{\link{npreg}}.
 
-  When using \code{method="Landweber-Fridman"}, iteration will terminate
-  when either the change in the value of
+}
+
+\details{
+
+  Note that Landweber-Fridman iteration presumes that
+  \eqn{\varphi_{-1}=0}{phi[-1]=0}, and so for derivative estimation we
+  commence iterating from a model having derivatives all equal to
+  zero. Given this starting point it may require a fairly large number
+  of iterations in order to converge. Other perhaps more reasonable
+  starting values might present themselves. When \code{start.phi.zero}
+  is set to \code{FALSE} iteration will commence instead using
+  derivatives from the conditional mean model \eqn{E(y|z)}. Should the
+  default iteration terminate quickly or you are concerned about your
+  results, it would be prudent to verify that this alternative starting
+  value produces the same result. Also, check the norm.stop vector for
+  any anomalies (such as the error criterion increasing immediately).
+  
+  Landweber-Fridman iteration uses an optimal stopping rule based upon
+  \eqn{||E(y|w)-E(\varphi_k(z,x)|w)||^2 }{||E(y|w)-E(phi(z,x)|w)||^2
+  }. However, if insufficient training is conducted the estimates can be
+  overly noisy. To best guard against this eventuality set \code{nmulti}
+  to a larger number than the default \code{nmulti=0} for
+  \code{\link{npreg}}.
+
+  Iteration will terminate when either the change in the value of
   \eqn{||(E(y|w)-E(\varphi_k(z,x)|w))/E(y|w)||^2
   }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } from iteration to iteration is
   less than \code{iterate.tol} or we hit \code{iterate.max} or
@@ -219,10 +212,8 @@ npregiv(y,
   }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } stops falling in value and
   starts rising.  }
 
-\value{ \code{npregiv} returns a list with
-  components \code{phi} and either \code{alpha} when
-  \code{method="Tikhonov"} or \code{num.iterations} and \code{norm.stop}
-  when \code{method="Landweber-Fridman"}.
+\value{ \code{npregivderiv} returns a list with components
+  \code{phi.prime}, \code{phi}, \code{num.iterations} and \code{norm.stop}.
 }
 
 \references{
@@ -263,15 +254,16 @@ npregiv(y,
 
 }
 \author{
-  Jeffrey S. Racine \email{racinej@mcmaster.ca}, Samuele Centorrino
- \email{samuele.centorrino@univ-tlse1.fr}
+  Jeffrey S. Racine \email{racinej@mcmaster.ca}
 }
 \note{
-This function should be considered to be in `beta test' status until further notice.
+  This function currently supports univariate \code{z} only.  This
+  function should be considered to be in `beta test' status until
+  further notice.
 }
 
 \seealso{
-\code{\link{npregivderiv},\link{npreg}}
+\code{\link{npregiv},\link{npreg}}
 }
 \examples{
 \dontrun{
@@ -292,6 +284,10 @@ mpi.bcast.cmd(np.mpi.initialize(),
 
 set.seed(42)
 n <- 1500
+
+## For trimming the plot (trim .5\% from each tail)
+
+trim <- 0.005
 
 ## The DGP is as follows:
 
@@ -333,50 +329,29 @@ phi <- fun1
 
 ## Sort on z (for plotting)
 
-ivdata <- data.frame(y,z,w)
+ivdata <- data.frame(y,z,w,u,v)
 ivdata <- ivdata[order(ivdata$z),]
-rm(y,z,w)
+rm(y,z,w,u,v)
 
 mpi.bcast.Robj2slave(ivdata)
 mpi.bcast.cmd(attach(ivdata),
               caller.execute=TRUE)
 
-mpi.bcast.cmd(model.iv <- npregiv(y=y,z=z,w=w),
-              caller.execute=TRUE)
-phi.iv <- model.iv$phi
-
-## Now the non-iv local linear estimator of E(y|z)
-
-mpi.bcast.cmd(ll.mean <- fitted(npreg(y~z,regtype="ll")),
+mpi.bcast.cmd(model.ivderiv <- npregivderiv(y=y,z=z,w=w),
               caller.execute=TRUE)
 
-## For the plots, restrict focal attention to the bulk of the data
-## (i.e. for the plotting area trim out 1/4 of one percent from each
-## tail of y and z)
+ylim <-c(quantile(model.ivderiv$phi.prime,trim),
+         quantile(model.ivderiv$phi.prime,1-trim))
 
-trim <- 0.0025
-
-curve(phi,min(z),max(z),
-      xlim=quantile(z,c(trim,1-trim)),
-      ylim=quantile(y,c(trim,1-trim)),
-      ylab="Y",
-      xlab="Z",
-      main="Nonparametric Instrumental Kernel Regression",
-      lwd=2,lty=1)
-
-points(z,y,type="p",cex=.25,col="grey")
-
-lines(z,phi.iv,col="blue",lwd=2,lty=2)
-
-lines(z,ll.mean,col="red",lwd=2,lty=4)
-
-legend(quantile(z,trim),quantile(y,1-trim),
-       c(expression(paste(varphi(z))),
-         expression(paste("Nonparametric ",hat(varphi)(z))),
-         "Nonparametric E(y|z)"),
-       lty=c(1,2,4),
-       col=c("black","blue","red"),
-       lwd=c(2,2,2))
-} % enddontrun     
+plot(z,model.ivderiv$phi.prime,
+     xlim=quantile(z,c(trim,1-trim)),
+     main="",
+     ylim=ylim,
+     xlab="Z",
+     ylab="Derivative",
+     type="l",
+     lwd=2)
+rug(z)     
+} % enddontrun
 }
 \keyword{ instrument }

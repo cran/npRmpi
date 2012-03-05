@@ -166,7 +166,7 @@ toFrame <- function(frame) {
       stop(deparse(substitute(frame))," must be a data frame, matrix, vector, or factor")
 
     if(!is.matrix(frame))
-      t.names <- deparse(eval(substitute(substitute(frame)), env = parent.frame()))
+      t.names <- deparse(eval(substitute(substitute(frame)), envir = parent.frame()))
     
     frame <- data.frame(frame, check.names=FALSE)
     
@@ -290,7 +290,7 @@ toMatrix <- function(data) {
 ## to die a noisy death anyhow ...
 succeedWithResponse <- function(tt, frame){
   !any(class(try(eval(expr = attr(tt, "variables"),
-                      envir = frame, encl = NULL), silen = TRUE)) == "try-error")
+                      envir = frame, enclos = NULL), silent = TRUE)) == "try-error")
 }
 
 ## determine whether a bandwidth

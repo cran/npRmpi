@@ -32,13 +32,13 @@ mpi.init.sprng <- function(seed = runif(1, 1, 2^31-1),
         }
 
         assign(".Sprng.seed", as.integer(c(seed, kind, para)), 
-        env=.GlobalEnv)
+        envir=.GlobalEnv)
         mpi.bcast(.Sprng.seed, type=1, rank=rank, comm=comm)   
     }
     else {
     assign(".Sprng.seed",  
         mpi.bcast(integer(3), type=1, rank=rank, comm=comm),
-        env = .GlobalEnv)
+        envir = .GlobalEnv)
     }
     kindprng <- switch(.Sprng.seed[2]+1, "LFG","LCG", "LCG64",   
                     "CMRG", "MLFG", "PMLCG")
@@ -107,7 +107,7 @@ mpi.setup.sprng <- function (seed = runif(1, 1, 2^31-1),
 #    if (sum(mpi.remote.exec(as.integer(require(rsprng)),comm=comm))
 #            < commsize-1)
 #        stop("It seems rsprng is not installed properly on slave machines.")
-    assign(".Sprng.seed", as.integer(c(seed, kind, para)), env=.GlobalEnv)
+    assign(".Sprng.seed", as.integer(c(seed, kind, para)), envir=.GlobalEnv)
     #adapted from snow
     initSprngNode <- function (streamno, nstream, seed, kind, para) {
         .Call("r_init_sprng", as.integer(kind), as.integer(streamno), 

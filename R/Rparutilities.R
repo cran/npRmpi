@@ -291,7 +291,7 @@ mpi.remote.exec <- function(cmd, ...,  comm=1, ret=TRUE){
 }
 
 .mpi.slave.exec <- function(){
-    assign(".mpi.err", FALSE,  env = .GlobalEnv)
+    assign(".mpi.err", FALSE,  envir = .GlobalEnv)
     tag.ret <- mpi.bcast(integer(2), type=1, comm=.comm)
     tag <- tag.ret[1]
     ret <- as.logical(tag.ret[2])
@@ -409,7 +409,7 @@ mpi.apply <- function(x, fun, ...,  comm=1){
 }
 
 .mpi.slave.apply <- function(){
-    assign(".mpi.err", FALSE,  env = .GlobalEnv)
+    assign(".mpi.err", FALSE,  envir = .GlobalEnv)
     tag.n <- mpi.bcast(integer(2), type=1, comm=.comm)
     tag <- tag.n[1]
     n <- tag.n[2]
@@ -549,7 +549,7 @@ mpi.parSim <- function(n=100,rand.gen=rnorm, rand.arg=NULL,
 #from snow
 .docall <- function(fun, args) {
     if ((is.character(fun) && length(fun) == 1) || is.name(fun))
-        fun <- get(as.character(fun), env = .GlobalEnv, mode = "function")
+        fun <- get(as.character(fun), envir = .GlobalEnv, mode = "function")
     enquote <- function(x) as.call(list(as.name("quote"), x))
     do.call("fun", lapply(args, enquote))
 }
@@ -639,7 +639,7 @@ mpi.applyLB <- function(x, fun, ...,  apply.seq=NULL, comm=1){
 }
 
 .mpi.slave.applyLB <- function(){
-    assign(".mpi.err", FALSE,  env = .GlobalEnv)
+    assign(".mpi.err", FALSE,  envir = .GlobalEnv)
     n <- mpi.bcast(integer(1), type=1, comm=.comm)
     tmpfunarg <- mpi.bcast.Robj(rank=0, comm=.comm)
     .tmpfun <- tmpfunarg$fun
@@ -740,7 +740,7 @@ mpi.iapplyLB <- function(x, fun, ...,  apply.seq=NULL, comm=1, sleep=0.001){
 }
 
 #.mpi.slave.iapplyLB <- function(){
-#    assign(".mpi.err", FALSE,  env = .GlobalEnv)
+#    assign(".mpi.err", FALSE,  envir = .GlobalEnv)
 #    n <- mpi.bcast(integer(1), type=1, comm=.comm)
 #    tmpfunarg <- mpi.bcast.Robj(rank=0, comm=.comm)
 #    .tmpfun <- tmpfunarg$fun
