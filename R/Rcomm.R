@@ -66,7 +66,8 @@ mpi.comm.spawn <- function(slave,
             nslaves=mpi.universe.size(),
             info=0,
             root=0, 
-            intercomm=2){
+            intercomm=2,
+			quiet=FALSE){
         if (!is.loaded("mpi_comm_spawn"))
             stop("MPI_Comm_spawn is not supported.")
 
@@ -85,7 +86,9 @@ mpi.comm.spawn <- function(slave,
                 as.integer(nslaves),
         as.integer(info),
         as.integer(root),
-        as.integer(intercomm),PACKAGE = "npRmpi")
+        as.integer(intercomm),
+		as.integer(quiet),
+		PACKAGE = "npRmpi")
 }
 
 mpi.comm.get.parent <- function(comm=2){
@@ -103,4 +106,8 @@ mpi.intercomm.merge <- function(intercomm=2,high=0,comm=1){
     .Call("mpi_intercomm_merge", as.integer(intercomm),
                      as.integer(high),
                      as.integer(comm),PACKAGE = "npRmpi")
+}
+
+mpi.comm.c2f <- function(comm=1){
+    .Call("mpi_comm_c2f", as.integer(comm),PACKAGE = "npRmpi")
 }

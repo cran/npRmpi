@@ -1,7 +1,20 @@
-## what is a badord? ... an ordered factor of numeric values
-## to treat them properly one must preserve the numeric value, ie. scale
-## not just their sorted order
-## Actually, the ord/badord paradigm must go, in place of levels caching
+## No Zero Denominator, used in C code for kernel estimation...
+  
+NZD <- function(a) {
+  sapply(1:NROW(a), function(i) {if(a[i] < 0) min(-.Machine$double.xmin,a[i]) else max(.Machine$double.xmin,a[i])})
+}
+
+## Function to test for monotone increasing vector
+
+is.monotone.increasing <- function(x) {
+  ## Sorted and last value > first value
+  !is.unsorted(x) && x[length(x)] > x[1]
+}
+  
+## what is a badord? ... an ordered factor of numeric values to treat
+## them properly one must preserve the numeric value, ie. scale not
+## just their sorted order Actually, the ord/badord paradigm must go,
+## in place of levels caching
 
 matrix.sd <- function(x, na.rm=FALSE) {
   if(is.matrix(x)) apply(x, 2, sd, na.rm=na.rm)
@@ -371,7 +384,7 @@ genOmitStr <- function(x){
 ## Estimation-related rgf's
 genGofStr <- function(x){
   paste(ifelse(is.na(x$MSE),"",paste("\nResidual standard error:",
-                                     format(x$MSE))),
+                                     format(sqrt(x$MSE)))),
         ifelse(is.na(x$R2),"",paste("\nR-squared:",
                                     format(x$R2))), sep="")
 }
@@ -649,6 +662,7 @@ SIGNfunc <- function(y,y.fit) {
   sum(sign(y) == sign(y.fit))/length(y)
 }
 
+
 EssDee <- function(y){
 
   sd.vec <- apply(as.matrix(y),2,sd)
@@ -690,6 +704,10 @@ USE_START_YES = 1
 NP_DO_DENS = 1
 NP_DO_DIST = 0
 
+## initially making an np-wide option via the 'options' mechanism
+DO_TREE_NO = 0
+DO_TREE_YES = 1
+
 ##kernel defs
 CKER_GAUSS = 0
 CKER_EPAN  = 4
@@ -706,6 +724,9 @@ BWM_CVML = 0
 BWM_CVLS = 1
 BWM_CVML_NP= 2
 
+##distribution
+DBWM_CVLS = 0
+
 ##regression
 BWM_CVAIC = 0
 
@@ -718,12 +739,17 @@ CBWM_CVLS = 1
 CBWM_NPLS = 2
 CBWM_CCDF = 3 # Added 7/2/2010 jracine
 
+##conditional distribution
+CDBWM_CVLS = 0
+
 ##integral operators on kernels
 OP_NORMAL      = 0
 OP_CONVOLUTION = 1
 OP_DERIVATIVE  = 2
 OP_INTEGRAL    = 3
 
+ALL_OPERATORS = c(OP_NORMAL, OP_CONVOLUTION, OP_DERIVATIVE, OP_INTEGRAL)
+names(ALL_OPERATORS) <- c("normal","convolution", "derivative", "integral")
 
 ## useful numerical constants of kernel integrals
 int.kernels <- c(0.28209479177387814348, 0.47603496111841936711, 0.62396943688265038571, 0.74785078617543927990,

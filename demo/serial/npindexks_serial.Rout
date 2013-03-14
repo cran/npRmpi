@@ -1,8 +1,8 @@
 
-R version 2.13.0 (2011-04-13)
-Copyright (C) 2011 The R Foundation for Statistical Computing
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -26,7 +26,8 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+[vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > ## Generate some data
@@ -61,6 +62,7 @@ Optimisation Method:  Nelder-Mead
 Regression Type: Local-Constant
 Bandwidth Selection Method: Klein and Spady
 Formula: y ~ x1 + x2
+Bandwidth Type: Fixed
 Objective Function Value: 0.3415126 (achieved on multistart 2)
 
 Continuous Kernel Type: Second-Order Gaussian
@@ -97,9 +99,9 @@ No. Continuous Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 32.623 
+Elapsed time = 23.947 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 32.896   0.025  32.922 
+ 24.211   0.043  24.246 

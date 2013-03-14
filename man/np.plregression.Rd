@@ -8,15 +8,13 @@
 \title{Partially Linear Kernel Regression with Mixed Data Types}
 
 \description{
-  \code{npplreg} computes a partially linear kernel
-  regression estimate of a one (1)
-  dimensional dependent variable on
-  \eqn{p+q}-variate explanatory data, using the model
-  \eqn{Y = X\beta + \Theta (Z) + \epsilon}{Y = XB + theta(Z) + epsilon}
-  given a set of estimation points, training
-  points (consisting of explanatory data and dependent data), and a
-  bandwidth specification, which can be a \code{rbandwidth} object, or a
-  bandwidth vector, bandwidth type and kernel type. 
+  \code{npplreg} computes a partially linear kernel regression estimate
+  of a one (1) dimensional dependent variable on \eqn{p+q}-variate
+  explanatory data, using the model \eqn{Y = X\beta + \Theta (Z) +
+  \epsilon}{Y = XB + theta(Z) + epsilon} given a set of estimation
+  points, training points (consisting of explanatory data and dependent
+  data), and a bandwidth specification, which can be a \code{rbandwidth}
+  object, or a bandwidth vector, bandwidth type and kernel type.
 }
 
 \usage{
@@ -182,7 +180,7 @@ npplreg(bws, \dots)
   \item{bw}{ the bandwidths, stored as a \code{plbandwidth} object }
   \item{resid}{ if \code{residuals = TRUE}, in-sample or out-of-sample
     residuals where appropriate (or possible) }
-  \item{R2}{ coefficient of determination }
+  \item{R2}{ coefficient of determination (Doksum and Samarov (1995))}
   \item{MSE}{ mean squared error }
   \item{MAE}{ mean absolute error }
   \item{MAPE}{ mean absolute percentage error }
@@ -195,7 +193,15 @@ npplreg(bws, \dots)
 \references{
 
  Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
- discrimination by the kernel method,} Biometrika, 63, 413-420.
+   discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+ Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric Estimation of
+ Global Functionals and a Measure of the Explanatory Power of Covariates
+ in Regression,} The Annals of Statistics, 23 1443-1473.
+
+ Gao, Q. and L. Liu and J.S. Racine (forthcoming), \dQuote{A
+ partially linear kernel estimator for categorical data,} Econometric
+ Reviews.
 
  Li, Q. and J.S. Racine (2007), \emph{Nonparametric Econometrics: Theory
  and Practice,} Princeton University Press.
@@ -203,9 +209,6 @@ npplreg(bws, \dots)
  Li, Q. and J.S. Racine (2004), \dQuote{Cross-validated local linear
    nonparametric regression,} Statistica Sinica, 14, 485-512.
  
- Racine, J.S. and L. Liu (2006), \dQuote{A partially linear kernel
-   estimator for categorical data,} manuscript.
-
  Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,}
  Cambridge University Press.
  
@@ -246,8 +249,7 @@ npplreg(bws, \dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 set.seed(42)
 

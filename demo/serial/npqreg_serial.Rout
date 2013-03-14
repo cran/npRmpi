@@ -1,8 +1,8 @@
 
-R version 2.13.0 (2011-04-13)
-Copyright (C) 2011 The R Foundation for Statistical Computing
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -26,28 +26,29 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+[vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > data("Italy")
 > 
 > ## A quantile regression example
 > 
-> t <- system.time(bw <- npcdensbw(gdp~ordered(year),data=Italy))
+> t <- system.time(bw <- npcdistbw(gdp~ordered(year),data=Italy))
 > 
 > summary(bw)
 
-Conditional density data (1008 observations, 2 variable(s))
+Conditional distribution data (1008 observations, 2 variable(s))
 (1 dependent variable(s), and 1 explanatory variable(s))
 
-Bandwidth Selection Method: Maximum Likelihood Cross-Validation
+Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: gdp ~ ordered(year)
 Bandwidth Type: Fixed
-Objective Function Value: 2.656451 (achieved on multistart 1)
+Objective Function Value: 0.08935326 (achieved on multistart 2)
 
-Exp. Var. Name: ordered(year) Bandwidth: 0.6713491   Lambda Max: 1 
+Exp. Var. Name: ordered(year) Bandwidth: 0.7294603   Lambda Max: 1 
 
-Dep. Var. Name: gdp           Bandwidth: 0.7132911 Scale Factor: 0.4011295
+Dep. Var. Name: gdp           Bandwidth: 0.454837 Scale Factor: 0.2557841
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Dependent Vars.: 1
@@ -61,8 +62,8 @@ No. Ordered Categorical Explanatory Vars.: 1
 > t <- t + system.time(model.q0.75 <- npqreg(bws=bw, tau=0.75))
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 54.653 
+Elapsed time = 77.944 
 > 
 > proc.time()
    user  system elapsed 
- 54.955   0.032  54.989 
+ 78.217   0.072  78.287 

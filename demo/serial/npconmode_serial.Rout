@@ -1,8 +1,8 @@
 
-R version 2.13.0 (2011-04-13)
-Copyright (C) 2011 The R Foundation for Statistical Computing
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -26,7 +26,8 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+[vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > library(MASS)
@@ -59,17 +60,17 @@ Conditional density data (189 observations, 8 variable(s))
 Bandwidth Selection Method: Maximum Likelihood Cross-Validation
 Formula: low ~ smoke + race + ht + ui + ftv + age + lwt
 Bandwidth Type: Fixed
-Objective Function Value: 0.5675563 (achieved on multistart 3)
+Objective Function Value: 0.5675531 (achieved on multistart 3)
 
 Exp. Var. Name: smoke Bandwidth: 0.4446024    Lambda Max: 0.5      
 Exp. Var. Name: race  Bandwidth: 0.6666667    Lambda Max: 0.6666667
-Exp. Var. Name: ht    Bandwidth: 0.0252204    Lambda Max: 0.5      
-Exp. Var. Name: ui    Bandwidth: 0.04118838   Lambda Max: 0.5      
-Exp. Var. Name: ftv   Bandwidth: 0.72146      Lambda Max: 1        
-Exp. Var. Name: age   Bandwidth: 5.486306   Scale Factor: 2.532781 
-Exp. Var. Name: lwt   Bandwidth: 5.445919   Scale Factor: 0.5866317 
+Exp. Var. Name: ht    Bandwidth: 0.02528868   Lambda Max: 0.5      
+Exp. Var. Name: ui    Bandwidth: 0.04128181   Lambda Max: 0.5      
+Exp. Var. Name: ftv   Bandwidth: 0.7347429    Lambda Max: 1        
+Exp. Var. Name: age   Bandwidth: 5.500105   Scale Factor: 2.539151 
+Exp. Var. Name: lwt   Bandwidth: 5.45109    Scale Factor: 0.5871888 
 
-Dep. Var. Name: low   Bandwidth: 0.03365099   Lambda Max: 0.5
+Dep. Var. Name: low   Bandwidth: 0.03295107   Lambda Max: 0.5
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 2
@@ -90,11 +91,11 @@ Conditional Mode data: 189 training points, in 8 variable(s)
 (1 dependent variable(s), and 7 explanatory variable(s))
 
                                low
-Dep. Var. Bandwidth(s): 0.03365099
-                            smoke      race        ht         ui     ftv
-Exp. Var. Bandwidth(s): 0.4446024 0.6666667 0.0252204 0.04118838 0.72146
-                             age      lwt
-Exp. Var. Bandwidth(s): 5.486306 5.445919
+Dep. Var. Bandwidth(s): 0.03295107
+                            smoke      race         ht         ui       ftv
+Exp. Var. Bandwidth(s): 0.4446024 0.6666667 0.02528868 0.04128181 0.7347429
+                             age     lwt
+Exp. Var. Bandwidth(s): 5.500105 5.45109
 
 Bandwidth Type: Fixed
 
@@ -123,8 +124,8 @@ No. Ordered Categorical Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 53.243 
+Elapsed time = 74.379 
 > 
 > proc.time()
    user  system elapsed 
- 53.560   0.024  53.590 
+ 67.933   0.175  74.948 

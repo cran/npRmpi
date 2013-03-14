@@ -24,3 +24,4 @@ t <- system.time(output <- npunitest(x,y,
 output
 
 cat("Elapsed time =", t[3], "\n")
+

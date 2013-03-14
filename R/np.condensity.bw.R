@@ -26,11 +26,6 @@ npcdensbw.formula <-
       }
       mf[[2]] <- call[[i]]
       
-      formula.args <- c("data", "subset", "na.action")
-      mc.call <- match(formula.args, names(call), nomatch = 0)
-      mc.mf <- match(formula.args, names(mf), nomatch = 0)
-      if(any(mc.mf > 0))
-        mf[mc.mf] <- call[mc.call]
     }
                      
 
@@ -67,7 +62,7 @@ npcdensbw.conbandwidth <-
   function(xdat = stop("data 'xdat' missing"),
            ydat = stop("data 'ydat' missing"),
            bws, bandwidth.compute = TRUE,
-           fast = FALSE, auto = TRUE,
+           auto = TRUE,
            nmulti, remin = TRUE, itmax = 10000,
            ftol=1.19209e-07, tol=1.49012e-08, small=2.22045e-16,
            ...){
@@ -154,8 +149,7 @@ npcdensbw.conbandwidth <-
         bwmethod = switch(bws$method,
           cv.ml = CBWM_CVML,
           cv.ls = CBWM_CVLS,
-          cv.ls.np = CBWM_NPLS,
-          cv.ccdf = CBWM_CCDF),        
+          cv.ls.np = CBWM_NPLS),        
         xkerneval = switch(bws$cxkertype,
           gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
           epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
@@ -182,7 +176,7 @@ npcdensbw.conbandwidth <-
         xnuno = dim(xuno)[2],
         xnord = dim(xord)[2],
         xncon = dim(xcon)[2],
-        fast = fast,
+        fast = FALSE,
         auto = auto)
       
       myoptd = list(ftol=ftol, tol=tol, small=small)
@@ -333,7 +327,7 @@ npcdensbw.default <-
            ydat = stop("data 'ydat' missing"),
            bws, 
            bandwidth.compute = TRUE,
-           fast, auto, nmulti, remin, itmax,
+           auto, nmulti, remin, itmax,
            ftol, tol, small,
            ## dummy arguments for conbandwidth() function call
            bwmethod, bwscaling, bwtype,
@@ -375,7 +369,7 @@ npcdensbw.default <-
     ## next grab dummies for actual bandwidth selection and perform call
 
     mc.names <- names(match.call(expand.dots = FALSE))
-    margs <- c("bandwidth.compute", "fast", "auto", "nmulti", "remin", "itmax", "ftol",
+    margs <- c("bandwidth.compute", "auto", "nmulti", "remin", "itmax", "ftol",
                "tol", "small")
     m <- match(margs, mc.names, nomatch = 0)
     any.m <- any(m != 0)

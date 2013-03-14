@@ -1,0 +1,104 @@
+
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1) + Rmpi 0.6-2
+[vignette("np_faq",package="npRmpi") provides answers to frequently asked questions]
+master (rank 0, comm 1) of size 2 is running on: pc-racine1 
+slave1 (rank 1, comm 1) of size 2 is running on: pc-racine1 
+> ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
+> ## current directory or home directory. It is necessary.
+> 
+> ## To run this on systems with OPENMPI installed and working, try
+> ## mpirun -np 2 R CMD BATCH npudistml_npRmpi. Check the time in the
+> ## output file foo.Rout (the name of this file with extension .Rout),
+> ## then try with, say, 4 processors and compare run time.
+> 
+> ## Initialize master and slaves.
+> 
+> mpi.bcast.cmd(np.mpi.initialize(),
++               caller.execute=TRUE)
+> 
+> ## Turn off progress i/o as this clutters the output file (if you want
+> ## to see search progress you can comment out this command)
+> 
+> mpi.bcast.cmd(options(np.messages=FALSE),
++               caller.execute=TRUE)
+> 
+> ## Generate some data and broadcast it to all slaves (it will be known
+> ## to the master node)
+> 
+> mpi.bcast.cmd(set.seed(42),
++               caller.execute=TRUE)
+> 
+> require(MASS)
+Loading required package: MASS
+> 
+> set.seed(42)
+> 
+> n <- 2500
+> n.eval <- 25
+> rho <- 0.95
+> mu <- c(0,0)
+> Sigma <- matrix(c(1,rho,rho,1),2,2)
+> mydat <- mvrnorm(n=n, mu, Sigma)
+> mydat <- data.frame(x=mydat[,1],y=mydat[,2])
+> 
+> q.min <- 0.0
+> q.max <- 1.0
+> grid.seq <- seq(q.min,q.max,length=n.eval)
+> grid.dat <- cbind(grid.seq,grid.seq)
+> 
+> mpi.bcast.Robj2slave(mydat)
+> mpi.bcast.Robj2slave(grid.dat)
+> 
+> ## Estimate the copula
+> 
+> t.0 <- system.time(mpi.bcast.cmd(bw <- npudistbw(~x+y,data=mydat),
++                                  caller.execute=TRUE))
+> t.1 <- system.time(mpi.bcast.cmd(copula <- npcopula(bws=bw,data=mydat,u=grid.dat),
++                                  caller.execute=TRUE))
+> 
+> t <- t.0+t.1
+> 
+> summary(bw)
+
+Data (2500 observations, 2 variable(s)):
+
+Bandwidth Selection Method: Least Squares Cross-Validation
+Formula: ~x + y
+Bandwidth Type: Fixed
+Objective Function Value: 0.1636001 (achieved on multistart 1)
+
+Var. Name: x Bandwidth: 0.03775813 Scale Factor: 0.5145592
+Var. Name: y Bandwidth: 0.05585068 Scale Factor: 0.7655824
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Vars.: 2
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 8.89 
+> 
+> ## Clean up properly then quit()
+> 
+> mpi.bcast.cmd(mpi.quit(),
++               caller.execute=TRUE)

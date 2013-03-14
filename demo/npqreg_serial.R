@@ -10,7 +10,7 @@ data("Italy")
 
 ## A quantile regression example
 
-t <- system.time(bw <- npcdensbw(gdp~ordered(year),data=Italy))
+t <- system.time(bw <- npcdistbw(gdp~ordered(year),data=Italy))
 
 summary(bw)
 

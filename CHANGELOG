@@ -1,3 +1,65 @@
+Changes from Version 0.40-13 to 0.50-1 [13-Mar-2013]
+
+* Reworked the interface for npcopula() to avoid two bandwidths and
+  density=TRUE but exploiting passing of either npudistbw (copula) or
+  npudensbw (copula density)
+
+* The functions npudist() and npudistbw() are now uncoupled from npudens
+  and npudensbw (previously they relied on unconditional PDF bandwidths
+  due to the lack of a multivariate mixed-data method for selecting bandwidths
+  for CDFs - now with Li & Racine (2013) we have a robust method hence the
+  split)
+
+* The use of cdf=TRUE is deprecated for npudens and
+  npudensbw objects due to the uncoupling described above
+
+* Fixed glitch in gradient standard errors in npindex where identical
+  standard errors were output in model$gerr
+
+* Fixed glitch in covariance matrix in npindex (ichimura) where covariance
+  matrix was not symmetric
+
+* Fixed glitch in npksum() where use of bwtype="adaptive_nn" and
+  operator="integral" produced the survivor function rather than
+  the cumulative distribution function
+
+* Cleaned up internals for npcmstest()
+
+* Using .onLoad rather than .Last.lib in zzz.R
+
+* Fixed glitch in npreg summary where `Residual standard error' was
+  reporting residual variance
+
+* Added reference to R2 measure (Doksum and Samarov (1995))
+
+* Startup message points to the faq, faq is now a vignette
+
+* npksum() functionality extended
+
+- npksum() can now return the matrix of kernel weights (which can be
+  useful for constrained estimation, by way of illustration, or
+  constructing novel kernel-based procedures without the need to write
+  extensive code)
+
+- npksum() can now accept different operators on a product kernel, for
+  example,
+
+  npksum(txdat=data.frame(x1,x2),operator=c("derivative","normal"),bws=c(1,1))
+
+  will use the derivative kernel for x1 (i.e. the derivative of the
+  gaussian kernel) and the default kernel for x2 (i.e. a standard
+  kernel such as the gaussian) thereby allowing the user to program a
+  number of estimators such as conditional CDFs etc. that were
+  previously not available via npksum()
+
+* Fixed glitch with variable scope where certain objects could not be
+  found in the environment
+
+* Added function `npcopula()' for d-dimensional copula estimation via
+  inversion
+
+* Modified stopping rules in npregiv and npregivderiv
+
 Changes from Version 0.40-12 to 0.40-13 [05-Mar-2012]
 
 * Added new function npregivderiv() that implements the IV derivative

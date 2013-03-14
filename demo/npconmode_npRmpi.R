@@ -17,8 +17,11 @@ mpi.bcast.cmd(np.mpi.initialize(),
 mpi.bcast.cmd(options(np.messages=FALSE),
               caller.execute=TRUE)
 
-library(MASS)
-data(birthwt)
+mpi.bcast.cmd(library(MASS),
+              caller.execute=TRUE)
+
+mpi.bcast.cmd(data(birthwt),
+              caller.execute=TRUE)              
 
 birthwt$low <- factor(birthwt$low)
 birthwt$smoke <- factor(birthwt$smoke)

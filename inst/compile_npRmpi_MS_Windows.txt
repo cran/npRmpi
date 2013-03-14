@@ -1,131 +1,108 @@
 Title: Compiling npRmpi from source code under MS Windows 7 (32-bit/64-bit)
 
-Date: 07/14/2011
+Date: 03/13/2013
+
 Author: David T. Jacho-Chavez (djachocha@emory.edu)
 
-These are based on those given in http://www.stats.uwo.ca/faculty/yu/Rmpi/
+These are based on those given in
 
-1) Create the folder "R_temp" in your C:\ drive.
+http://www.stats.uwo.ca/faculty/yu/Rmpi/
 
-2) Download the following files and place then in "C:\R_temp" (note
-   version numbers as most recent versions of each program may create
-   undesirable results):
+1. Download the following files:
 
-R-2.13.1-win.exe           http://www.r-project.org/
-Rtools213.exe              http://www.murdoch-sutherland.com/Rtools/
-mpich2-1.3rc1-win-ia       http://www-unix.mcs.anl.gov/mpi/mpich2
-npRmpi_0.40-7.tar.gz       http://cran.r-project.org/web/packages/npRmpi/index.html
-test.R                     http://www.economics.mcmaster.ca/faculty/racinej
-.Rprofile                  http://www.economics.mcmaster.ca/faculty/racinej
+   a. Rtools30.exe: http://cran.r-project.org/bin/windows/Rtools/Rtools30.exe
 
- * If you have problems downloading this file in MS Windows, a local
-   copy will be located in "C:\R_Temp\npRmpi\inst" (See step 3-(i)
-   below) that you can freely move to your working directory (see note
-   (i) at the bottom of this document)
+   b. mpich2-1.4.1p1-win-ia32.msi:
 
-3) Install the following programmes (in this order) using the default
-   directories:
+http://www.mpich.org/static/tarballs/1.4.1p1/mpich2-1.4.1p1-win-ia32.msi
 
-  (i) R-2.13.1-win.exe (If you experience any difficulties, 
-      kindly refer to installation instructions at
-      http://www.r-project.org/)
+   c. mpich2-1.4.1p1-win-x86-64.msi:
 
-      After installation, add the R bin directory to your PATH
-      environment variables.
+http://www.mpich.org/static/tarballs/1.4.1p1/mpich2-1.4.1p1-win-x86-64.msi
 
-      Right click "My Computer" and choose "Properties". Click
-      "Advanced system settings" to get a new window.
+   d. R-2.15.3-win.exe: http://cran.r-project.org/mirrors.html
 
-      Click "Environment Variables..." to get a new window. Locate the
-      variable "PATH" (it is version dependent. Either User or System
-      variables will be fine). Click Edit to get a new window.
+   e. npRmpi_0.50-1.tar.gz: http://cran.r-project.org/web/packages/npRmpi/
 
-      At the end of Variable value, add
+2. Run and install the following programs:
 
-      ;C:\Program Files\R\R-2.13.1\bin\i386;
+   a. Install (a) in the previous step, and make sure your system Path
+   starts with: “c:\Rtools\bin;c:\Rtools\MinGW\bin;C:\Program
+   Files\R\R- 2.15.3\bin\i386;...”
 
- (ii) Rtools213.exe (If you experience any difficulties, kindly
-      refer to installation instructions at
-      http://www.murdoch-sutherland.com/Rtools/)
+   b. Run and install (b). Do not change the Passphrase (i.e. behappy)
+   and use the default directory: “C:\Program Files (x86)\MPICH2\”
 
-      During installation, accept all default folders. After installation,
-      add the Rtools bin directory to your PATH environment variables.
+       i. Go to “Start” -> “All Programs” -> “MPICH2” -> “wmpiregister.exe”
+          and enter your PC username and password (the one you use to log in).
 
-      Right click "My Computer" and choose "Properties". Click
-      "Advanced system settings" to get a new window.
+      ii. Open "Command Prompt" with administrator. At prompt,
 
-      Click "Environment Variables..." to get a new window. Locate the
-      variable "PATH" (it is version dependent. Either User or System
-      variables will be fine). Click Edit to get a new window.
+      typesmpd -install -phrase behappy
 
-      At the beginning of Variable value, add
+      change behappy to whatever the pass phrase you choose).
 
-      C:\Rtools\bin;C:\Rtools\perl\bin;C:\Rtools\MinGW\bin;
+      Run smpd -status
 
-(iii) mpich2-1.3rc1-win-ia (If you experience any difficulties,
-      kindly refer to installation instructions at
-      http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm)
+      If it returns "smpd running on your_host_name", then smpd is
+      setup properly.
 
-      Before installing MPICH2, you may need Microsoft .Net Framework 4
-      (Standalone Installer) Visual C++ 2010 Redistributable Package
-      (x86).
+   c. Run and install (c). Do not change the Passphrase (i.e. behappy)
+   and use the default directory: “C:\Program Files\MPICH2\”
 
-      After installation, add the MPICH2 bin directory to your PATH
-      environment variables.
+       i. Go to “Start” -> “All Programs” -> “MPICH2” ->
+       “wmpiregister” and enter your PC username and password (the one
+       you use to log in).
 
-      Right click "My Computer" and choose "Properties". Click
-      "Advanced system settings" to get a new window.
+       ii. Open "Command Prompt" with administrator. At prompt,
 
-      Click "Environment Variables..." to get a new window. Locate the
-      variable "PATH" (it is version dependent. Either User or System
-      variables will be fine). Click Edit to get a new window.
+       typesmpd -install -phrase behappy
 
-      At end of Variable value, add 
+       change behappy to whatever the pass phrase you choose).
 
-      ;C:\Program Files (x86)\MPICH2\bin;
+       Run smpd -status
 
-      Next launch wmpiconfig.exe from the Start menu. First it will
-      ask you for your account name and password. Enter your account
-      name and password. Click "Register" and then "OK". After that
-      MPICH2 Configurable Settings will show up. Click "Get Settings"
-      on the right upper corner. If your machine name gets a green
-      color on the left hosts panel, then MPICH2 is running
-      properly. Otherwise open "Command Prompt" as the
-      administrator. At the prompt, type
+       If it returns "smpd running on your_host_name", then smpd is
+       setup properly.
 
-      smpd -install -phrase mypassword
+   d. Install (d) in the previous step, and make sure the installation
+   directory is: “C:\Program Files\R\R-2.15.3\”
 
-      (change `mypassword' to your actual password). click "Get
-      Settings" again to see if your host gets green color.
+       i. Go to “Start” -> “run” and type “cmd”. Then type
+       “R”. ii. From inside R, run
 
-4) Copy npRmpi_0.40-7.tar.gz to the "C:\R_temp" folder.
+       Install.packages(“cubature”)
 
-5) (i) Untar npRmpi_0.40-7.tar.gz in the "C:\R_temp" folder.
+       Select your mirror and let it run. Close the window. 
 
-  * To 'untar' in MS Windows, please download & install the following
-    freeware programme: 7-zip (http://www.7-zip.org)
+3. Add MPICH2 bin directory to PATH environment variables as follows:
 
-  (ii) 'Open a command window here' (google this phrase if you don't
-   know how) in "C:\R_Temp\" and type:
+   a. Right click "My Computer" and choose "Properties". Click
+   "Advanced system settings" to get a new window.  ￼￼￼￼￼￼￼￼￼
 
-  R CMD INSTALL npRmpi
+   b. Click "Environment Variables..." to get a new window. Locate
+   variable "PATH" (it is version dependent. Either User or System
+   variables will be fine). Click Edit to get a new window.
 
-6) To test your installation now type:
+   c. At end of Variable value, add: ";C:\Program
+   Files\MPICH2\bin;C:\Program Files (x86)\MPICH2\bin" (Remove the
+   double quotations).
 
-  mpiexec -n 2 R --no-save -q < test.R > test_np_2.txt
+4. npRmpi Installation:
 
-7) Now open test_np_2.txt and if you find no errors, your installation
-   has been successful!
+Go to “Start” -> “run” and type “cmd”. Navigate where item (e) in step
+1 is located in your directory, e.g. “cd
+C:\Users\yourusername\Downloads” and write
 
-Notes:
+R CMD INSTALL –preclean npRmpi_0.50-1.tar.gz
 
-  (i) If you are planning to run R programmes in other folders that
-      use the npRmpi package, simply make sure that the file .Rprofile
-      is always located in the same folder as the programme you are
-      trying to run, otherwise it will not work.
+5. Testing:
 
- (ii) The command 'mpiexec' is available only when the proper
-      installation of mpich2-1.2.1p1-win-ia is performed. 
-      Kindly refer to
-      http://www.stats.uwo.ca/faculty/yu/Rmpi/windows.htm for
-      step-by-step instructions.
+From inside your DOS command shell, now navigate where your test R
+code (called it “mytest.R”) is located (along with the .Rprofile
+file). At the command prompt, write
+
+mpiexec –n 2 R –no-save –q < mytest.R > mytest_OUT.txt
+
+Open “mytest_OUT.txt” using notepad or any other text editor and check
+it ran correctly.

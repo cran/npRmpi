@@ -26,6 +26,7 @@ npksum(\dots)
        bandwidth.divide = FALSE,
        operator = c("normal","convolution","derivative","integral"),
        smooth.coefficient = FALSE,
+       return.kernel.weights = FALSE,
        \dots)
 
 \method{npksum}{numeric}(bws,
@@ -38,6 +39,7 @@ npksum(\dots)
        bandwidth.divide,
        operator,
        smooth.coefficient,
+       return.kernel.weights,
        \dots)
 }
 
@@ -132,6 +134,11 @@ npksum(\dots)
     nothing. Defaults to \code{FALSE}.
   }
 
+  \item{return.kernel.weights}{
+    a logical specifying whether or not to return the matrix of
+    generalized product kernel weights. Defaults to \code{FALSE}. See
+    details.
+    }
 }
 \details{
   \code{npksum}
@@ -259,8 +266,7 @@ npksum(\dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 n <- 100000
 x <- rnorm(n)

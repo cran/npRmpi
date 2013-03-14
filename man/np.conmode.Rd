@@ -95,7 +95,7 @@ npconmode(bws, \dots)
   \item{conmode}{ a vector of type \code{factor} (or \code{ordered
       factor}) containing the conditional mode at each evaluation
     point}
-  \item{condens}{ a vector of numeric type containing the density
+  \item{condens}{ a vector of numeric type containing the modal density
     estimates at each evaluation point}
   \item{xeval}{ a data frame of evaluation points }
   \item{yeval}{ a vector of type \code{factor} (or \code{ordered
@@ -167,12 +167,12 @@ npconmode(bws, \dots)
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
 
-library(MASS)
-data(birthwt)
+mpi.spawn.Rslaves(nslaves=1)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+
+mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
+mpi.bcast.cmd(data(birthwt),caller.execute=TRUE)
 
 birthwt$low <- factor(birthwt$low)
 birthwt$smoke <- factor(birthwt$smoke)

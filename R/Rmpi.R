@@ -9,7 +9,7 @@ mpi.exit <- function(){
     if (mpi.is.master())
     	print("Detaching Rmpi. Rmpi cannot be used unless relaunching R.")
     .Call("mpi_finalize",PACKAGE = "npRmpi")
-    detach(package:Rmpi)
+    detach(package:npRmpi)
 }
 
 mpi.quit <- function(save="no"){
@@ -59,7 +59,7 @@ mpi.info.set <- function(info=0, key, value){
 
 mpi.info.get <- function(info=0, key, valuelen){
     .Call("mpi_info_get",as.integer(info), as.character(key), 
-	as.integer(valulen), .as.integer(valuelen),PACKAGE = "npRmpi")
+	as.integer(valuelen), as.integer(valuelen),PACKAGE = "npRmpi")
 }
 
 mpi.info.free <- function(info=0){
@@ -71,16 +71,23 @@ mpi.universe.size <- function(){
         stop("This function is not supported under MPI 1.2")
 	out <-.Call("mpi_universe_size",PACKAGE = "npRmpi")
 	if (out==0){
-	    if (exists(".mpi.universe.size"))
-		out<-.mpi.universe.size
-	    else {
+	   # if (exists(".mpi.universe.size"))
+		#out<-.mpi.universe.size
+	    #else {
 			if (.Platform$OS=="windows") {
 		    	out <- length(mpichhosts())-1
 			}
-	    }		
+	    #}		
 	}
-	if (.Platform$OS!="windows")
+	if (.Call("mpidist",PACKAGE = "npRmpi") == 2)
 	    out <- out-length(grep("no_schedule",system("lamnodes",TRUE,ignore.stderr=TRUE)))
+	if (.Call("mpidist",PACKAGE = "npRmpi") == 1 && out == 1){
+		if (length(unlist(strsplit(.Platform$pkgType,"mac"))) ==2)
+			out <- as.integer(unlist(strsplit(system("sysctl hw.ncpu",TRUE,ignore.stderr=TRUE),":"))[2])
+	}
+	#if (.Call("mpidist",PACKAGE = "npRmpi") == 1 && out > 1)
+	#	if (.Platform$OS!="windows")
+	#		out <- out-1
 	out
 }
 
@@ -89,6 +96,7 @@ mpi.get.processor.name <- function(short=TRUE){
     if (short)
 	name <- unlist(strsplit(name, "\\."))[1]
     name
+
 }
 
 mpi.sendrecv <-  function(senddata, sendtype, dest, sendtag, recvdata, 
@@ -99,7 +107,7 @@ mpi.sendrecv <-  function(senddata, sendtype, dest, sendtag, recvdata,
 	  as.integer(dest), 
           as.integer(sendtag), recvdata, as.integer(recvtype), 
           as.integer(source), as.integer(recvtag), as.integer(comm),
-          as.integer(status), PACKAGE="npRmpi")
+          as.integer(status), PACKAGE = "npRmpi")
 }
 
 mpi.sendrecv.replace <- function(x, type, dest, sendtag, source, recvtag,  
@@ -107,21 +115,21 @@ mpi.sendrecv.replace <- function(x, type, dest, sendtag, source, recvtag,
  {
    .Call("mpi_sendrecv_replace", x, as.integer(type), as.integer(dest),
           as.integer(sendtag), as.integer(source), as.integer(recvtag), 
-          as.integer(comm), as.integer(status), PACKAGE="npRmpi")
+          as.integer(comm), as.integer(status), PACKAGE = "npRmpi")
 }
 
 mpi.cart.create <- function(commold=1, dims, periods, reorder=FALSE, commcart=3) {
         .Call("mpi_cart_create", as.integer(commold), as.integer(dims), 
-        as.integer(periods), as.integer(reorder), as.integer(commcart), PACKAGE="npRmpi")
+        as.integer(periods), as.integer(reorder), as.integer(commcart), PACKAGE = "npRmpi")
 }
 
 mpi.cartdim.get <- function(comm=3) {
-        .Call("mpi_cartdim_get",as.integer(comm), PACKAGE="npRmpi")
+        .Call("mpi_cartdim_get",as.integer(comm), PACKAGE = "npRmpi")
 }
 
 mpi.cart.get <- function(comm=3, maxdims) {
 
-        out <- .Call("mpi_cart_get",as.integer(comm), as.integer(maxdims), PACKAGE="npRmpi")
+        out <- .Call("mpi_cart_get",as.integer(comm), as.integer(maxdims), PACKAGE = "npRmpi")
         dims <- out[1:maxdims]
         periods <- out[(maxdims+1):(maxdims*2)]
         coords <- out[(maxdims*2 + 1):(maxdims*3)]
@@ -129,20 +137,20 @@ mpi.cart.get <- function(comm=3, maxdims) {
 }
 
 mpi.cart.rank <- function(comm=3, coords) {
-        .Call("mpi_cart_rank",as.integer(comm), as.integer(coords), PACKAGE="npRmpi")
+        .Call("mpi_cart_rank",as.integer(comm), as.integer(coords), PACKAGE = "npRmpi")
 }
 
 mpi.cart.coords <- function(comm=3, rank, maxdims) {
         .Call("mpi_cart_coords",as.integer(comm), as.integer(rank), as.integer(maxdims), 
-	PACKAGE="npRmpi")
+	PACKAGE = "npRmpi")
 }
 
 mpi.cart.shift <- function(comm=3, direction, disp){
 	.Call("mpi_cart_shift",   as.integer(comm), as.integer(direction-1), 
-		as.integer(disp), PACKAGE="npRmpi")
+		as.integer(disp), PACKAGE = "npRmpi")
 }
 
 mpi.dims.create <- function(nnodes, ndims, dims=integer(ndims)){
 	.Call("mpi_dims_create",as.integer(nnodes),as.integer(ndims),as.integer(dims),
-	PACKAGE="npRmpi")
+	PACKAGE = "npRmpi")
 }

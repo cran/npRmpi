@@ -44,8 +44,7 @@ se(x)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 x <- rnorm(10)
 mpi.bcast.Robj2slave(x)

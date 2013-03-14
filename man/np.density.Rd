@@ -6,16 +6,14 @@
 \alias{npudens.default}
 \alias{npudens.formula}
 
-\alias{npudist}
-\title{ Kernel Density and Distribution Estimation with Mixed Data Types }
+\title{ Kernel Density Estimation with Mixed Data Types }
 \description{
 
   \code{npudens} computes  kernel unconditional density estimates on
   evaluation data, given a set of training data and a bandwidth
   specification (a \code{bandwidth} object or a bandwidth vector,
   bandwidth type, and kernel type) using the method of Li and Racine
-  (2003).  Similarly \code{\link{npudist}} computes  kernel
-  unconditional cumulative distribution estimates.
+  (2003).
 
 }
 \usage{
@@ -105,12 +103,12 @@ npudens(bws, \dots)
     fhat <- npudens(tdat = y, ckertype="epanechnikov", ckerorder=4)
   }
 
-  \code{npudens} and \code{\link{npudist}} implement a variety
-  of methods for estimating multivariate distributions (\eqn{p}-variate)
-  defined over a set of possibly continuous and/or discrete (unordered,
-  ordered) data. The approach is based on Li and Racine (2003) who
-  employ \sQuote{generalized product kernels} that admit a mix of
-  continuous and discrete data types.
+  \code{npudens} implements a variety of methods for estimating
+  multivariate density functions (\eqn{p}-variate) defined over a set of
+  possibly continuous and/or discrete (unordered, ordered) data. The
+  approach is based on Li and Racine (2003) who employ
+  \sQuote{generalized product kernels} that admit a mix of continuous
+  and discrete data types.
 
   Three classes of kernel estimators for the continuous data types are
   available: fixed, adaptive nearest-neighbor, and generalized
@@ -138,20 +136,17 @@ npudens(bws, \dots)
 }
 \value{
   
-  \code{npudens} returns a \code{npdensity} object, similarly
-  \code{\link{npudist}} returns a \code{npdistribution} object. The
-  generic accessor functions \code{\link{fitted}}, and \code{\link{se}},
-  extract estimated values and asymptotic standard errors on estimates,
+  \code{npudens} returns a \code{npdensity} object. The generic accessor
+  functions \code{\link{fitted}}, and \code{\link{se}}, extract
+  estimated values and asymptotic standard errors on estimates,
   respectively, from the returned object. Furthermore, the functions
   \code{\link{predict}}, \code{\link{summary}} and \code{\link{plot}}
   support objects of both classes. The returned objects have the
   following components:
 
   \item{eval}{ the evaluation points. }
-  \item{dens or dist}{ estimation of the density (cumulative
-   distribution) at the evaluation points }
-  \item{derr}{ standard errors of the density (cumulative distribution)
-   estimates }
+  \item{dens}{ estimation of the density at the evaluation points }
+  \item{derr}{ standard errors of the density estimates }
   \item{log_likelihood}{ log likelihood of the density estimates }
   
 }
@@ -208,8 +203,7 @@ npudens(bws, \dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(data("Italy"),
               caller.execute=TRUE)

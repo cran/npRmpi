@@ -24,7 +24,6 @@ t <- system.time(model <- npreg(y~z+x1+x2,
                                 bwmethod="cv.aic",
                                 data=mydat))
 
-
 ## An example of the consistent nonparametric significance test
 
 t <- t + system.time(output <- npsigtest(model))

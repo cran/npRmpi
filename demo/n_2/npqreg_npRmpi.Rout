@@ -1,8 +1,8 @@
 
-R version 2.13.0 (2011-04-13)
-Copyright (C) 2011 The R Foundation for Statistical Computing
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -20,9 +20,10 @@ Type 'q()' to quit R.
 
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4) + Rmpi 0.5-9
-master (rank 0, comm 1) of size 2 is running on: localhost 
-slave1 (rank 1, comm 1) of size 2 is running on: localhost 
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1) + Rmpi 0.6-2
+[vignette("np_faq",package="npRmpi") provides answers to frequently asked questions]
+master (rank 0, comm 1) of size 2 is running on: pc-racine1 
+slave1 (rank 1, comm 1) of size 2 is running on: pc-racine1 
 > ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
 > ## current directory or home directory. It is necessary.
 > 
@@ -47,22 +48,22 @@ slave1 (rank 1, comm 1) of size 2 is running on: localhost
 > 
 > ## A quantile regression example
 > 
-> t <- system.time(mpi.bcast.cmd(bw <- npcdensbw(gdp~ordered(year),data=Italy),
+> t <- system.time(mpi.bcast.cmd(bw <- npcdistbw(gdp~ordered(year),data=Italy),
 +                                caller.execute=TRUE))
 > 
 > summary(bw)
 
-Conditional density data (1008 observations, 2 variable(s))
+Conditional distribution data (1008 observations, 2 variable(s))
 (1 dependent variable(s), and 1 explanatory variable(s))
 
-Bandwidth Selection Method: Maximum Likelihood Cross-Validation
+Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: gdp ~ ordered(year)
 Bandwidth Type: Fixed
-Objective Function Value: 2.656451 (achieved on multistart 1)
+Objective Function Value: 0.08935326 (achieved on multistart 2)
 
-Exp. Var. Name: ordered(year) Bandwidth: 0.6713505   Lambda Max: 1 
+Exp. Var. Name: ordered(year) Bandwidth: 0.7294602   Lambda Max: 1 
 
-Dep. Var. Name: gdp           Bandwidth: 0.7132718 Scale Factor: 0.4011186
+Dep. Var. Name: gdp           Bandwidth: 0.4548385 Scale Factor: 0.255785
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Dependent Vars.: 1
@@ -79,7 +80,7 @@ No. Ordered Categorical Explanatory Vars.: 1
 +                                    caller.execute=TRUE))
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 35.414 
+Elapsed time = 52.766 
 > 
 > ## Clean up properly then quit()
 > 

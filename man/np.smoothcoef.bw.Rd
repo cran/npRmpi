@@ -384,7 +384,7 @@ npscoefbw(\dots)
 
   Li, Q. and J.S. Racine (2010), \dQuote{Smooth varying-coefficient
     estimation and inference for qualitative and quantitative data,}
-    Econometric Theory, 26, 1607-1637
+    Econometric Theory, 26, 1-31.
 
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,}
  Cambridge University Press.
@@ -449,8 +449,7 @@ npscoefbw(\dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)

@@ -185,8 +185,7 @@ npcmstest(formula,
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(data(cps71),
               caller.execute=TRUE)

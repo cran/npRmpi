@@ -22,7 +22,7 @@ mpi.bcast.Robj2slave(Italy)
 
 ## A quantile regression example
 
-t <- system.time(mpi.bcast.cmd(bw <- npcdensbw(gdp~ordered(year),data=Italy),
+t <- system.time(mpi.bcast.cmd(bw <- npcdistbw(gdp~ordered(year),data=Italy),
                                caller.execute=TRUE))
 
 summary(bw)

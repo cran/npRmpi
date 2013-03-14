@@ -1,5 +1,0 @@
-# -*- Makefile -*-  vim : ft = make
-
-PKG_CPPFLAGS = -DPACKAGE_NAME=\"\" -DPACKAGE_TARNAME=\"\" -DPACKAGE_VERSION=\"\" -DPACKAGE_STRING=\"\" -DPACKAGE_BUGREPORT=\"\" -I/opt/local/include/openmpi  -DMPI2 -DOPENMPI
-PKG_CFLAGS   = $(ARCHCFLAGS)
-PKG_LIBS     = -L/opt/local/lib -lmpi  $(ARCHLIB)

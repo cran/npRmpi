@@ -160,7 +160,8 @@ npindex(bws, \dots)
   \item{gerr}{ standard errors of the gradient estimates }
   \item{mean.grad}{ mean (average) gradient over the evaluation points}
   \item{mean.gerr}{ bootstrapped standard error of the mean gradient estimates }
-  \item{R2}{ if \code{method="ichimura"}, coefficient of determination }
+  \item{R2}{ if \code{method="ichimura"}, coefficient of determination
+  (Doksum and Samarov (1995))}
   \item{MSE}{if \code{method="ichimura"}, mean squared error }
   \item{MAE}{if \code{method="ichimura"}, mean absolute error }
   \item{MAPE}{if \code{method="ichimura"}, mean absolute percentage error }
@@ -182,6 +183,10 @@ npindex(bws, \dots)
 
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric Estimation of
+  Global Functionals and a Measure of the Explanatory Power of
+  Covariates in Regression,} The Annals of Statistics, 23 1443-1473.
 
   Ichimura, H., (1993), \dQuote{Semiparametric least squares (SLS) and
   weighted SLS estimation of single-index models,} Journal of
@@ -229,8 +234,7 @@ npindex(bws, \dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)

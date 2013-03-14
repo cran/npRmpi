@@ -53,7 +53,7 @@ npudist.call <-
           bws = bws, ...)
   }
 
-npudist.bandwidth <-
+npudist.dbandwidth <-
   function(bws,
            tdat = stop("invoked without training data 'tdat'"),
            edat, ...){
@@ -184,7 +184,7 @@ npudist.default <- function(bws, tdat, ...){
 
   mc <- match.call()
   
-  tbw <- eval(parse(text = paste("npudensbw(",
+  tbw <- eval(parse(text = paste("npudistbw(",
                       ifelse(tdat.named, "dat = tdat",
                              ifelse(no.tdat,"","tdat")),
                       ifelse(no.tdat,"",","),

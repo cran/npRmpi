@@ -61,8 +61,7 @@ npseed(seed)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(npseed(42),
               caller.execute=TRUE)

@@ -16,15 +16,6 @@ npregbw.formula <-
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
-
-    if(!missing(call) && is.call(call)){
-      formula.args <- c("data", "subset", "na.action")
-      mc.call <- match(formula.args, names(call), nomatch = 0)
-      mc.mf <- match(formula.args, names(mf), nomatch = 0)
-      if(any(mc.mf > 0))
-        mf[mc.mf] <- call[mc.call]
-    }
-
     
     mf[[1]] <- as.name("model.frame")
     mf <- eval(mf, parent.frame())
@@ -164,7 +155,8 @@ npregbw.rbandwidth <-
         ncon = bws$ncon,
         regtype = switch(bws$regtype,
           lc = REGTYPE_LC,
-          ll = REGTYPE_LL))
+          ll = REGTYPE_LL),
+        int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO))
       
       myoptd = list(ftol=ftol, tol=tol, small=small)
 

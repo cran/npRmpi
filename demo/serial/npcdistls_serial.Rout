@@ -1,0 +1,95 @@
+
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ## This is the serial version of npcdistml_npRmpi.R for comparison
+> ## purposes (bandwidth ought to be identical, timing may
+> ## differ). Study the differences between this file and its MPI
+> ## counterpart for insight about your own problems.
+> 
+> library(np)
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+[vignette("np_faq",package="np") provides answers to frequently asked questions]
+> options(np.messages=FALSE)
+> 
+> library(MASS)
+> 
+> set.seed(42)
+> 
+> n <- 1000
+> 
+> rho <- 0.25
+> mu <- c(0,0)
+> Sigma <- matrix(c(1,rho,rho,1),2,2)
+> data <- mvrnorm(n=n, mu, Sigma)
+> mydat <- data.frame(x=data[,2],y=data[,1])
+> 
+> ## A simple example with least-squares cross-validation
+> 
+> t <- system.time(bw <- npcdistbw(y~x,
++                                  bwmethod="cv.ls",
++                                  data=mydat))
+> 
+> summary(bw)
+
+Conditional distribution data (1000 observations, 2 variable(s))
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+Bandwidth Selection Method: Least Squares Cross-Validation
+Formula: y ~ x
+Bandwidth Type: Fixed
+Objective Function Value: 0.159548 (achieved on multistart 1)
+
+Exp. Var. Name: x Bandwidth: 0.3893473 Scale Factor: 1.270718 
+
+Dep. Var. Name: y Bandwidth: 0.2404688 Scale Factor: 0.7668908
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> t <- t + system.time(model <- npcdist(bws=bw))
+> 
+> summary(model)
+
+Conditional Distribution Data: 1000 training points, in 2 variable(s)
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+                                y
+Dep. Var. Bandwidth(s): 0.2404688
+                                x
+Exp. Var. Bandwidth(s): 0.3893473
+
+Bandwidth Type: Fixed
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 58.064 
+> 
+> 
+> proc.time()
+   user  system elapsed 
+ 58.344   0.053  58.390 

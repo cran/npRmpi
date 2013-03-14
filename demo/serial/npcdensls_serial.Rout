@@ -1,8 +1,8 @@
 
-R version 2.13.0 (2011-04-13)
-Copyright (C) 2011 The R Foundation for Statistical Computing
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
 ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin10.7.3/x86_64 (64-bit)
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -26,7 +26,8 @@ Type 'q()' to quit R.
 > library(np)
 Loading required package: boot
 Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.40-4)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+[vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > library(MASS)
@@ -55,11 +56,11 @@ Conditional density data (500 observations, 2 variable(s))
 Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: y ~ x
 Bandwidth Type: Fixed
-Objective Function Value: -0.2863016 (achieved on multistart 2)
+Objective Function Value: -0.2814004 (achieved on multistart 2)
 
-Exp. Var. Name: x Bandwidth: 0.7376342 Scale Factor: 2.079154 
+Exp. Var. Name: x Bandwidth: 1.227705 Scale Factor: 3.598933 
 
-Dep. Var. Name: y Bandwidth: 0.3752106 Scale Factor: 1.099904
+Dep. Var. Name: y Bandwidth: 0.2065526 Scale Factor: 0.5822052
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -74,12 +75,12 @@ Conditional Density Data: 500 training points, in 2 variable(s)
 (1 dependent variable(s), and 1 explanatory variable(s))
 
                                 y
-Dep. Var. Bandwidth(s): 0.3752106
-                                x
-Exp. Var. Bandwidth(s): 0.7376342
+Dep. Var. Bandwidth(s): 0.2065526
+                               x
+Exp. Var. Bandwidth(s): 1.227705
 
 Bandwidth Type: Fixed
-Log Likelihood: -690.7773
+Log Likelihood: -686.5108
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -87,9 +88,9 @@ No. Continuous Dependent Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 74.396 
+Elapsed time = 76.894 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 74.631   0.068  74.736 
+ 76.998   0.239  77.232 

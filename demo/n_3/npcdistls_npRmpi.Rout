@@ -1,0 +1,116 @@
+
+R version 2.15.3 (2013-03-01) -- "Security Blanket"
+Copyright (C) 2013 The R Foundation for Statistical Computing
+ISBN 3-900051-07-0
+Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+Loading required package: boot
+Loading required package: cubature
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1) + Rmpi 0.6-2
+[vignette("np_faq",package="npRmpi") provides answers to frequently asked questions]
+master (rank 0, comm 1) of size 3 is running on: pc-racine1 
+slave1 (rank 1, comm 1) of size 3 is running on: pc-racine1 
+slave2 (rank 2, comm 1) of size 3 is running on: pc-racine1 
+> ## Make sure you have the .Rprofile file from npRmpi/inst/ in your
+> ## current directory or home directory. It is necessary.
+> 
+> ## To run this on systems with OPENMPI installed and working, try
+> ## mpirun -np 2 R CMD BATCH npcdistml_npRmpi. Check the time in the
+> ## output file foo.Rout (the name of this file with extension .Rout),
+> ## then try with, say, 4 processors and compare run time.
+> 
+> ## Initialize master and slaves.
+> 
+> mpi.bcast.cmd(np.mpi.initialize(),
++               caller.execute=TRUE)
+> 
+> ## Turn off progress i/o as this clutters the output file (if you want
+> ## to see search progress you can comment out this command)
+> 
+> mpi.bcast.cmd(options(np.messages=FALSE),
++               caller.execute=TRUE)
+> 
+> ## Load your data and broadcast it to all slave nodes
+> 
+> library(MASS)
+> 
+> mpi.bcast.cmd(set.seed(42),
++               caller.execute=TRUE)
+> 
+> n <- 1000
+> 
+> rho <- 0.25
+> mu <- c(0,0)
+> Sigma <- matrix(c(1,rho,rho,1),2,2)
+> data <- mvrnorm(n=n, mu, Sigma)
+> mydat <- data.frame(x=data[,2],y=data[,1])
+> 
+> mpi.bcast.Robj2slave(mydat)
+> 
+> ## A conditional density estimation example. 
+> 
+> t <- system.time(mpi.bcast.cmd(bw <- npcdistbw(y~x,
++                                                bwmethod="cv.ls",
++                                                data=mydat),
++                                caller.execute=TRUE))
+> 
+> summary(bw)
+
+Conditional distribution data (1000 observations, 2 variable(s))
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+Bandwidth Selection Method: Least Squares Cross-Validation
+Formula: y ~ x
+Bandwidth Type: Fixed
+Objective Function Value: 0.159548 (achieved on multistart 1)
+
+Exp. Var. Name: x Bandwidth: 0.3893474 Scale Factor: 1.270718 
+
+Dep. Var. Name: y Bandwidth: 0.2404678 Scale Factor: 0.7668874
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> t <- t + system.time(mpi.bcast.cmd(model <- npcdist(bws=bw),
++                                    caller.execute=TRUE))
+> 
+> summary(model)
+
+Conditional Distribution Data: 1000 training points, in 2 variable(s)
+(1 dependent variable(s), and 1 explanatory variable(s))
+
+                                y
+Dep. Var. Bandwidth(s): 0.2404678
+                                x
+Exp. Var. Bandwidth(s): 0.3893474
+
+Bandwidth Type: Fixed
+
+Continuous Kernel Type: Second-Order Gaussian
+No. Continuous Explanatory Vars.: 1
+No. Continuous Dependent Vars.: 1
+
+> 
+> cat("Elapsed time =", t[3], "\n")
+Elapsed time = 23.874 
+> 
+> ## Clean up properly then quit()
+> 
+> mpi.bcast.cmd(mpi.quit(),
++               caller.execute=TRUE)

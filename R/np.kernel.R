@@ -48,7 +48,7 @@ npksum.numeric <-
            exdat,
            weights,
            leave.one.out, kernel.pow, bandwidth.divide,
-           operator, smooth.coefficient,
+           operator, smooth.coefficient, return.kernel.weights,
            ...){
 
     txdat <- toFrame(txdat)
@@ -61,7 +61,7 @@ npksum.numeric <-
 
     mc.names <- names(match.call(expand.dots = FALSE))
     margs <- c("tydat", "exdat", "weights", "leave.one.out", "kernel.pow", "bandwidth.divide",
-               "operator", "smooth.coefficient")
+               "operator", "smooth.coefficient", "return.kernel.weights")
     m <- match(margs, mc.names, nomatch = 0)
     any.m <- any(m != 0)
 
@@ -83,13 +83,19 @@ npksum.default <-
            bandwidth.divide = FALSE,
            operator = c("normal","convolution","derivative","integral"),
            smooth.coefficient = FALSE,
+           return.kernel.weights = FALSE,
            ...){
 
     miss.ty <- missing(tydat)
     miss.ex <- missing(exdat)
     miss.weights <- missing(weights)
 
-    operator <- match.arg(operator)
+    uo.operators <- c("normal","convolution","integral")
+
+    if(missing(operator))
+      operator <- match.arg(operator)
+    else
+      operator <- match.arg(operator, several.ok = TRUE)
     
     txdat = toFrame(txdat)
 
@@ -108,6 +114,17 @@ npksum.default <-
     if (length(bws$bw) != length(txdat))
       stop("length of bandwidth vector does not match number of columns of 'txdat'")
 
+    if(length(operator) == 1)
+      operator = rep(operator, length(txdat))
+    
+    if(length(operator) != length(txdat))
+      stop("operator not specified for all variables")
+
+    if(!all(operator[c(bws$iuno,bws$iord)] %in% uo.operators))
+      stop("unordered and ordered variables may only make use of 'normal', 'convolution' and 'integral' operator types")
+    
+    operator.num <- ALL_OPERATORS[operator]
+    
     ccon = unlist(lapply(txdat[,bws$icon,drop=FALSE],class))
     if ((any(bws$icon) && !all((ccon == class(integer(0))) | (ccon == class(numeric(0))))) ||
         (any(bws$iord) && !all(unlist(lapply(txdat[,bws$iord, drop=FALSE],class)) ==
@@ -213,7 +230,10 @@ npksum.default <-
       econ = data.frame()
     }
 
-    
+    nkw <- ifelse(return.kernel.weights, tnrow*enrow, 0)
+
+    return.names <- c("ksum","kernel.weights")
+      
     myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
@@ -240,41 +260,48 @@ npksum.default <-
       leave.one.out = leave.one.out, 
       ipow = integer.pow,
       bandwidth.divide = bandwidth.divide,
-      operator = switch(operator,
-        normal = OP_NORMAL,
-        convolution = OP_CONVOLUTION,
-        derivative = OP_DERIVATIVE,
-        integral = OP_INTEGRAL),
       mcv.numRow = attr(bws$xmcv, "num.row"),
       smooth.coefficient = smooth.coefficient,
       wncol = dim.in[1],
-      yncol = dim.in[2])
+      yncol = dim.in[2],
+      int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO),
+      return.kernel.weights = return.kernel.weights)
     
 
-    myout=
+
+    myout <- 
       .C("np_kernelsum",
          as.double(tuno), as.double(tord), as.double(tcon),
          as.double(tydat), as.double(weights),
          as.double(euno),  as.double(eord),  as.double(econ), 
          as.double(c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord])),
          as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+         as.integer(c(operator.num[bws$icon],operator.num[bws$iuno],operator.num[bws$iord])),
          as.integer(myopti), as.double(kernel.pow),
          ksum = double(length.out),
-         PACKAGE="npRmpi" )[["ksum"]]
+         kernel.weights = double(nkw),
+         PACKAGE="npRmpi" )[return.names]
 
     if (dim.out[1] > 1){
-      dim(myout) <- dim.out
+      dim(myout[["ksum"]]) <- dim.out
       if (dim.out[2] < 2)
-        dim(myout) <- dim(myout)[-2]
+        dim(myout[["ksum"]]) <- dim(myout[["ksum"]])[-2]
     } else if (max(dim.out) > 1) {
-      dim(myout) <- dim.out[dim.out > 1]
+      dim(myout[["ksum"]]) <- dim.out[dim.out > 1]
       if (miss.weights)
-        myout <- aperm(myout)
+        myout[["ksum"]] <- aperm(myout[["ksum"]])
     }
-        
+
+    if(return.kernel.weights){
+      kw <- matrix(data = myout[["kernel.weights"]], nrow = tnrow, ncol = enrow)
+    } else {
+      kw <- NULL
+    }
+    
     return( npkernelsum(bws = bws,
                         eval = teval,
-                        ksum = myout,
+                        ksum = myout[["ksum"]],
+                        kw = kw,
                         ntrain = tnrow, trainiseval = miss.ex) )
 
   }

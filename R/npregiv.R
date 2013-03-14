@@ -22,6 +22,11 @@
 
 ## phi: the IV estimator of phi(y)
 ## alpha:  the Tikhonov regularization parameter
+## phi.mat: the matrix with colums phi_1, phi_2 etc. over all iterations
+## num.iterations:  the number of Landweber-Fridman iterations
+## norm.stop: the vector of values of the objective function used for stopping
+## norm.value: the norm not multiplied by the number of iterations
+## convergence: a character string indicating whether/why iteration terminated
 
 npregiv <- function(y,
                     z,
@@ -43,10 +48,13 @@ npregiv <- function(y,
                     alpha.max=1.0e-01,
                     alpha.tol=.Machine$double.eps^0.25,
                     iterate.max=1000,
-                    iterate.tol=1.0e-04,
                     iterate.diff.tol=1.0e-08,
                     constant=0.5,
                     method=c("Landweber-Fridman","Tikhonov"),
+                    penalize.iteration=TRUE,
+                    smooth.residuals=TRUE,
+                    start.from=c("Eyz","EEywz"),
+                    starting.values=NULL,
                     stop.on.increase=TRUE,
                     ...) {
 
@@ -423,12 +431,6 @@ npregiv <- function(y,
   ## $Id: npregiv.R,v 1.8 2011/05/30 19:17:35 jracine Exp jracine $
   
   ## Functions for generalized local polynomial regression
-  
-  ## No Zero Denominator, used in C code for kernel estimation...
-  
-  NZD <- function(a) {
-    sapply(1:NROW(a), function(i) {if(a[i] < 0) min(-.Machine$double.xmin,a[i]) else max(.Machine$double.xmin,a[i])})
-  }
   
   mypoly <- function(X,degree) {
   
@@ -1112,6 +1114,8 @@ npregiv <- function(y,
     
   ## Basic error checking
 
+  if(!is.logical(penalize.iteration)) stop("penalize.iteration must be logical (TRUE/FALSE)")    
+  if(!is.logical(smooth.residuals)) stop("smooth.residuals must be logical (TRUE/FALSE)")  
   if(!is.logical(stop.on.increase)) stop("stop.on.increase must be logical (TRUE/FALSE)")  
   
   if(missing(y)) stop("You must provide y")
@@ -1120,13 +1124,13 @@ npregiv <- function(y,
   if(NCOL(y) > 1) stop("y must be univariate")
   if(NROW(y) != NROW(z) || NROW(y) != NROW(w)) stop("y, z, and w have differing numbers of rows")
   if(iterate.max < 2) stop("iterate.max must be at least 2")
-  if(iterate.tol <= 0) stop("iterate.tol must be positive")
   if(iterate.diff.tol < 0) stop("iterate.diff.tol must be non-negative")
   if(constant <= 0 || constant >=1) stop("constant must lie in (0,1)")
   if(p < 0) stop("p must be a non-negative integer")
 
   if(!is.null(alpha) && alpha <= 0) stop("alpha must be positive")
 
+  start.from <- match.arg(start.from)
   method <- match.arg(method)
   
   ## Check for evaluation data
@@ -1154,6 +1158,11 @@ npregiv <- function(y,
     ## bandwidths, one for y on w and one for phi(z) on w (in the
     ## first step we use E(y|w) as a proxy for phi(z) and use
     ## bandwidths for y on w).
+
+    ## Convergence value returned for Landweber-Fridman but value
+    ## required
+
+    convergence <- NULL
     
     console <- printClear(console)
     console <- printPop(console)
@@ -1327,82 +1336,6 @@ npregiv <- function(y,
 
     ## Landweber-Fridman
 
-    ## We begin the iteration computing phi.0 and phi.1 directly, then
-    ## interate.
-    
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(y|z) for iteration 0...",sep=""),console)
-
-    h <- glpcv(ydat=y,
-               xdat=z,
-               degree=rep(p, num.z.numeric),
-               nmulti=nmulti,
-               random.seed=random.seed,
-               optim.maxattempts=optim.maxattempts,
-               optim.method=optim.method,
-               optim.reltol=optim.reltol,
-               optim.abstol=optim.abstol,
-               optim.maxit=optim.maxit,
-               ...)
-
-    phi.0 <- glpreg(tydat=y,
-                    txdat=z,
-                    exdat=zeval,
-                    bws=h$bw,
-                    degree=rep(p, num.z.numeric),
-                    ...)$mean
-    
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration 1...",sep=""),console)
-
-    resid <- y - phi.0
-
-    h <- glpcv(ydat=resid,
-               xdat=w,
-               degree=rep(p, num.w.numeric),
-               nmulti=nmulti,
-               random.seed=random.seed,
-               optim.maxattempts=optim.maxattempts,
-               optim.method=optim.method,
-               optim.reltol=optim.reltol,
-               optim.abstol=optim.abstol,
-               optim.maxit=optim.maxit,
-               ...)
-
-    resid.fitted <- glpreg(tydat=resid,
-                           txdat=w,
-                           eydat=resid,
-                           exdat=weval,
-                           bws=h$bw,
-                           degree=rep(p, num.w.numeric),
-                           ...)$mean
-
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration 1...",sep=""),console)
-
-    h <- glpcv(ydat=resid.fitted,
-               xdat=z,
-               degree=rep(p, num.z.numeric),
-               nmulti=nmulti,
-               random.seed=random.seed,
-               optim.maxattempts=optim.maxattempts,
-               optim.method=optim.method,
-               optim.reltol=optim.reltol,
-               optim.abstol=optim.abstol,
-               optim.maxit=optim.maxit,
-               ...)
-
-    phi.j.m.1 <- phi.0 + constant*glpreg(tydat=resid.fitted,
-                                         txdat=z,
-                                         eydat=resid.fitted,
-                                         exdat=zeval,
-                                         bws=h$bw,
-                                         degree=rep(p, num.z.numeric),
-                                         ...)$mean
-    
     ## For the stopping rule
     
     console <- printClear(console)
@@ -1430,33 +1363,123 @@ npregiv <- function(y,
                     degree=rep(p, num.w.numeric),
                     ...)$mean
 
-    phi <- phi.j.m.1
+    ## We begin the iteration computing phi.0 and phi.1 directly, then
+    ## interate.
+    
+    console <- printClear(console)
+    console <- printPop(console)
+    console <- printPush(paste("Computing bandwidths and E(y|z) for iteration 0...",sep=""),console)
+
+    if(is.null(starting.values)) { 
+
+      h <- glpcv(ydat=if(start.from=="Eyz") y else E.y.w,
+                 xdat=z,
+                 degree=rep(p, num.z.numeric),
+                 nmulti=nmulti,
+                 random.seed=random.seed,
+                 optim.maxattempts=optim.maxattempts,
+                 optim.method=optim.method,
+                 optim.reltol=optim.reltol,
+                 optim.abstol=optim.abstol,
+                 optim.maxit=optim.maxit,
+                 ...)
+
+      phi.0 <- glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                      txdat=z,
+                      exdat=zeval,
+                      bws=h$bw,
+                      degree=rep(p, num.z.numeric),
+                      ...)$mean
+
+    } else {
+
+      ## Starting values input by user
+      
+      phi.0 <- starting.values
+
+    }
+
+    starting.values.phi <- phi.0
+    
+    console <- printClear(console)
+    console <- printPop(console)
+    console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration 1...",sep=""),console)
+
+    if(smooth.residuals) {
+
+      resid <- y - phi.0
+      
+      h <- glpcv(ydat=resid,
+                 xdat=w,
+                 degree=rep(p, num.w.numeric),
+                 nmulti=nmulti,
+                 random.seed=random.seed,
+                 optim.maxattempts=optim.maxattempts,
+                 optim.method=optim.method,
+                 optim.reltol=optim.reltol,
+                 optim.abstol=optim.abstol,
+                 optim.maxit=optim.maxit,
+                 ...)
+      
+      resid.fitted <- glpreg(tydat=resid,
+                             txdat=w,
+                             eydat=resid,
+                             exdat=weval,
+                             bws=h$bw,
+                             degree=rep(p, num.w.numeric),
+                             ...)$mean
+      
+    } else {
+      
+      h <- glpcv(ydat=phi.0,
+                 xdat=w,
+                 degree=rep(p, num.w.numeric),
+                 nmulti=nmulti,
+                 random.seed=random.seed,
+                 optim.maxattempts=optim.maxattempts,
+                 optim.method=optim.method,
+                 optim.reltol=optim.reltol,
+                 optim.abstol=optim.abstol,
+                 optim.maxit=optim.maxit,
+                 ...)
+      
+      resid.fitted <- E.y.w - glpreg(tydat=phi.0,
+                                    txdat=w,
+                                    eydat=resid,
+                                    exdat=weval,
+                                    bws=h$bw,
+                                    degree=rep(p, num.w.numeric),
+                                    ...)$mean
+      
+    }
+
+    norm.stop[1] <- sum(resid.fitted^2)/sum(E.y.w^2)
 
     console <- printClear(console)
     console <- printPop(console)
-    console <- printPush(paste("Computing bandwidths and E(phi(z)|w) for stopping rule...",sep=""),console)
+    console <- printPush(paste("Computing bandwidths and E(E(y-phi(z)|w)|z) for iteration 1...",sep=""),console)
 
-    h.E.phi.w <- glpcv(ydat=phi.j.m.1,
-                       xdat=w,
-                       degree=rep(p, num.w.numeric),
-                       nmulti=nmulti,
-                       random.seed=random.seed,
-                       optim.maxattempts=optim.maxattempts,
-                       optim.method=optim.method,
-                       optim.reltol=optim.reltol,
-                       optim.abstol=optim.abstol,
-                       optim.maxit=optim.maxit,
-                       ...)
+    h <- glpcv(ydat=resid.fitted,
+               xdat=z,
+               degree=rep(p, num.z.numeric),
+               nmulti=nmulti,
+               random.seed=random.seed,
+               optim.maxattempts=optim.maxattempts,
+               optim.method=optim.method,
+               optim.reltol=optim.reltol,
+               optim.abstol=optim.abstol,
+               optim.maxit=optim.maxit,
+               ...)
 
-    E.phi.w <- glpreg(tydat=phi.j.m.1,
-                      txdat=w,
-                      eydat=phi.j.m.1,
-                      exdat=weval,
-                      bws=h.E.phi.w$bw,
-                      degree=rep(p, num.w.numeric),
-                      ...)$mean
-
-    norm.stop[1] <- mean(((E.y.w-E.phi.w)/E.y.w)^2)
+    phi <- phi.0 + constant*glpreg(tydat=resid.fitted,
+                                         txdat=z,
+                                         eydat=resid.fitted,
+                                         exdat=zeval,
+                                         bws=h$bw,
+                                         degree=rep(p, num.z.numeric),
+                                         ...)$mean
+    
+    phi.mat <- phi
 
     for(j in 2:iterate.max) {
 
@@ -1464,26 +1487,54 @@ npregiv <- function(y,
       console <- printPop(console)
       console <- printPush(paste("Computing bandwidths and E(y-phi(z)|w) for iteration ", j,"...",sep=""),console)
 
-      resid <- y - phi.j.m.1
-      h.resid.w <- glpcv(ydat=resid,
-                         xdat=w,
-                         degree=rep(p, num.w.numeric),
-                         nmulti=nmulti,
-                         random.seed=random.seed,
-                         optim.maxattempts=optim.maxattempts,
-                         optim.method=optim.method,
-                         optim.reltol=optim.reltol,
-                         optim.abstol=optim.abstol,
-                         optim.maxit=optim.maxit,
-                         ...)
+      if(smooth.residuals) {
 
-      resid.fitted <- glpreg(tydat=resid,
-                             txdat=w,
-                             eydat=resid,
-                             exdat=weval,
-                             bws=h.resid.w$bw,
-                             degree=rep(p, num.w.numeric),
-                             ...)$mean
+        resid <- y - phi
+        h.resid.w <- glpcv(ydat=resid,
+                           xdat=w,
+                           degree=rep(p, num.w.numeric),
+                           nmulti=nmulti,
+                           random.seed=random.seed,
+                           optim.maxattempts=optim.maxattempts,
+                           optim.method=optim.method,
+                           optim.reltol=optim.reltol,
+                           optim.abstol=optim.abstol,
+                           optim.maxit=optim.maxit,
+                           ...)
+        
+        resid.fitted <- glpreg(tydat=resid,
+                               txdat=w,
+                               eydat=resid,
+                               exdat=weval,
+                               bws=h.resid.w$bw,
+                               degree=rep(p, num.w.numeric),
+                               ...)$mean
+
+      } else {
+
+        h <- glpcv(ydat=phi,
+                   xdat=w,
+                   degree=rep(p, num.w.numeric),
+                   nmulti=nmulti,
+                   random.seed=random.seed,
+                   optim.maxattempts=optim.maxattempts,
+                   optim.method=optim.method,
+                   optim.reltol=optim.reltol,
+                   optim.abstol=optim.abstol,
+                   optim.maxit=optim.maxit,
+                   ...)
+      
+        resid.fitted <- E.y.w - glpreg(tydat=phi,
+                                       txdat=w,
+                                       eydat=resid,
+                                       exdat=weval,
+                                       bws=h$bw,
+                                       degree=rep(p, num.w.numeric),
+                                       ...)$mean
+        
+      }
+
+      norm.stop[j] <- ifelse(penalize.iteration,j*sum(resid.fitted^2)/sum(E.y.w^2),sum(resid.fitted^2)/sum(E.y.w^2))
 
       console <- printClear(console)
       console <- printPop(console)
@@ -1501,7 +1552,7 @@ npregiv <- function(y,
                                 optim.maxit=optim.maxit,
                                 ...)
 
-      phi.j <- phi.j.m.1 + constant*glpreg(tydat=resid.fitted,
+      phi <- phi + constant*glpreg(tydat=resid.fitted,
                                            txdat=z,
                                            eydat=resid.fitted,
                                            exdat=zeval,
@@ -1509,42 +1560,81 @@ npregiv <- function(y,
                                            degree=rep(p, num.z.numeric),
                                            ...)$mean
 
+      phi.mat <- cbind(phi.mat,phi)
+
       console <- printClear(console)
       console <- printPop(console)
       console <- printPush(paste("Computing stopping rule for iteration ", j,"...",sep=""),console)
 
-      ## For the stopping rule (use same smoothing as original)
+      ## The number of iterations in LF is asymptotically equivalent
+      ## to 1/alpha (where alpha is the regularization parameter in
+      ## Tikhonov).  Plus the criterion function we use is increasing
+      ## for very small number of iterations. So we need a threshold
+      ## after which we can pretty much confidently say that the
+      ## stopping criterion is decreasing.  In Darolles et al. (2011)
+      ## \alpha ~ O(N^(-1/(min(beta,2)+2)), where beta is the so
+      ## called qualification of your regularization method. Take the
+      ## worst case in which beta = 0 and then the number of
+      ## iterations is ~ N^0.5.
 
-      E.phi.w <- glpreg(tydat=phi.j,
-                        txdat=w,
-                        eydat=phi.j,
-                        exdat=weval,
-                        bws=h.E.phi.w$bw,
-                        degree=rep(p, num.w.numeric),
-                        ...)$mean
+      if(j > round(sqrt(nrow(z))) && !is.monotone.increasing(norm.stop)) {
 
-      norm.stop[j] <- mean(((E.y.w-E.phi.w)/E.y.w)^2)
-
-      ## If stopping rule criterion increases or we are below stopping
-      ## tolerance then break
-
-      if(norm.stop[j] < iterate.tol) break()
-      if(norm.stop[j-1] - norm.stop[j] < iterate.diff.tol) break()
-      if(stop.on.increase && norm.stop[j] > norm.stop[j-1]) {
-        phi.j <- phi.j.m.1 
-        break()
+        ## If stopping rule criterion increases or we are below stopping
+        ## tolerance then break
+        
+        if(stop.on.increase && norm.stop[j] > norm.stop[j-1]) {
+          convergence <- "STOP_ON_INCREASE"
+          break()
+        }
+        if(abs(norm.stop[j-1]-norm.stop[j]) < iterate.diff.tol) {
+          convergence <- "ITERATE_DIFF_TOL"
+          break()
+        }
+        
       }
-      
-      phi.j.m.1 <- phi.j
+
+      convergence <- "ITERATE_MAX"
 
     }
+
+    ## Extract minimum, and check for monotone increasing function and
+    ## issue warning in that case. Otherwise allow for an increasing
+    ## then decreasing (and potentially increasing thereafter) portion
+    ## of the stopping function, ignore the initial increasing portion,
+    ## and take the min from where the initial inflection point occurs
+    ## to the length of norm.stop
+
+    norm.value <- norm.stop/(1:length(norm.stop))
+
+    if(which.min(norm.stop) == 1 && is.monotone.increasing(norm.stop)) {
+      warning("Stopping rule increases monotonically (consult model$norm.stop):\nThis could be the result of an inspired initial value (unlikely)\nNote: we suggest manually choosing phi.0 and restarting (e.g. instead set `starting.values' to E[E(Y|w)|z])")
+      convergence <- "FAILURE_MONOTONE_INCREASING"
+#      phi <- starting.values.phi
+      j <- 1
+      while(norm.value[j+1] > norm.value[j]) j <- j + 1
+      j <- j-1 + which.min(norm.value[j:length(norm.value)])
+      phi <- phi.mat[,j]
+    } else {
+      ## Ignore the initial increasing portion, take the min to the
+      ## right of where the initial inflection point occurs
+      j <- 1
+      while(norm.stop[j+1] > norm.stop[j]) j <- j + 1
+      j <- j-1 + which.min(norm.stop[j:length(norm.stop)])
+      phi <- phi.mat[,j]
+    }    
 
     console <- printClear(console)
     console <- printPop(console)
 
     if(j == iterate.max) warning("iterate.max reached: increase iterate.max or inspect norm.stop vector")
 
-    return(list(phi=phi.j, num.iterations=j, norm.stop=norm.stop))
+    return(list(phi=phi,
+                phi.mat=phi.mat,
+                num.iterations=j,
+                norm.stop=norm.stop,
+                norm.value=norm.value,
+                convergence=convergence,
+                starting.values.phi=starting.values.phi))
 
   }
   

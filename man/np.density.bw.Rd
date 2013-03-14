@@ -8,11 +8,13 @@
 \title{Kernel Density Bandwidth Selection with Mixed Data Types}
 
 \description{
-  \code{npudensbw} computes a bandwidth object for a
-  \eqn{p}-variate   kernel unconditional density estimator defined over mixed continuous
+
+  \code{npudensbw} computes a bandwidth object for a \eqn{p}-variate
+  kernel unconditional density estimator defined over mixed continuous
   and discrete (unordered, ordered) data using either the normal
   reference rule-of-thumb, likelihood cross-validation, or least-squares
   cross validation using the method of Li and Racine (2003).
+
 }
 
 \usage{
@@ -388,8 +390,7 @@ npudensbw(\dots)
 ## vignette("npRmpi",package="npRmpi").
 
 mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),
-              caller.execute=TRUE)
+mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
 
 mpi.bcast.cmd(data("Italy"),
               caller.execute=TRUE)

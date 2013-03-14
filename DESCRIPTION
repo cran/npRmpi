@@ -1,8 +1,8 @@
 Package: npRmpi
-Version: 0.40-13
-Date: 2012-03-05
+Version: 0.50-1
+Date: 2013-03-14
 Depends: boot, cubature
-Suggests: quantreg, MASS
+Suggests: quantreg, MASS, parallel
 Title: Parallel nonparametric kernel smoothing methods for mixed data
         types
 Author: Tristen Hayfield <hayfield@mpia.de>, Jeffrey S. Racine
@@ -23,6 +23,7 @@ Description: This package provides a variety of nonparametric (and
         (SHARCNET:www.sharcnet.ca).
 License: GPL
 URL: https://github.com/JeffreyRacine/R-Package-npRmpi/
-Packaged: 2012-03-05 19:55:02 UTC; jracine
+Packaged: 2013-03-14 17:56:43 UTC; jracine
+NeedsCompilation: yes
 Repository: CRAN
-Date/Publication: 2012-03-06 06:40:23
+Date/Publication: 2013-03-14 19:24:13

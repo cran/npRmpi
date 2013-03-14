@@ -19,7 +19,8 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 
 ## Load your data and broadcast it to all slave nodes
 
-library(MASS)
+mpi.bcast.cmd(library(MASS),
+              caller.execute=TRUE)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)

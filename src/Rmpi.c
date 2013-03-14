@@ -21,14 +21,14 @@
 #include <dlfcn.h>
 #endif
 
-MPI_Comm	*comm;
+ MPI_Comm	*comm;
 static MPI_Status *status;
 static MPI_Datatype *datatype;
 static MPI_Info *info;
 static MPI_Request *request;
 static int COMM_MAXSIZE=10;
-static int STATUS_MAXSIZE=5000;
-static int REQUEST_MAXSIZE=10000;
+static int STATUS_MAXSIZE=2000;
+static int REQUEST_MAXSIZE=2000;
 
 SEXP mpidist(){
 	int i=0;
@@ -38,7 +38,7 @@ SEXP mpidist(){
 #endif
 
 #ifdef LAM
-  i=2;
+        i=2;
 #endif
 
 #ifdef MPICH
@@ -68,9 +68,14 @@ if (flag)
 	else {
 
 #ifdef OPENMPI
-	dlopen("libmpi.so.0", RTLD_GLOBAL | RTLD_LAZY);
+    if (!dlopen("libmpi.so.0", RTLD_GLOBAL | RTLD_LAZY) 
+	&& !dlopen("libmpi.so", RTLD_GLOBAL | RTLD_LAZY) 
+	&& !dlopen("libmpi.dylib", RTLD_GLOBAL | RTLD_LAZY)) {
+        Rprintf("%s\n",dlerror());
+        return AsInt(0);
+    }
 #endif
-	
+
 #ifndef MPI2
    	fake_argv[0] = (char *)&fake_argv0;
        	MPI_Init(&fake_argc, (char ***)(void*)&fake_argv);
@@ -118,9 +123,11 @@ SEXP mpi_get_processor_name (){
 	return sexp_name;
 }
 
+/*
 SEXP bin_nchar(SEXP sexp_data){
 	return AsInt(LENGTH(STRING_ELT(sexp_data,0)));
 }
+*/
 
 #ifdef MPI2
 SEXP mpi_universe_size(){
@@ -967,6 +974,11 @@ SEXP mpi_comm_dup(SEXP sexp_comm, SEXP sexp_newcomm){
                 &comm[newcommn]))));
 }
 
+SEXP mpi_comm_c2f(SEXP sexp_comm){
+  int c = INTEGER(sexp_comm)[0];
+  return AsInt(MPI_Comm_c2f(comm[c]));
+}
+
 SEXP mpi_comm_free(SEXP sexp_comm){
 	return AsInt(erreturn(mpi_errhandler(MPI_Comm_free(&comm[INTEGER(sexp_comm)[0]]))));
 }
@@ -999,10 +1011,12 @@ SEXP mpi_comm_spawn (SEXP sexp_slave,
 					 SEXP sexp_nslave,
 					 SEXP sexp_info,
 					 SEXP sexp_root,
-					 SEXP sexp_intercomm){
+					 SEXP sexp_intercomm,
+					 SEXP sexp_quiet){
     int i, nslave = INTEGER (sexp_nslave)[0], len = LENGTH (sexp_argv);
 	int infon=INTEGER(sexp_info)[0], root=INTEGER(sexp_root)[0];
 	int intercommn=INTEGER(sexp_intercomm)[0], *slaverrcode, realns;
+    int quiet = INTEGER(sexp_quiet)[0];
 
 	slaverrcode = (int *)Calloc(nslave, int);
 	if (len==0)
@@ -1024,8 +1038,8 @@ SEXP mpi_comm_spawn (SEXP sexp_slave,
 		for (i=0; i < nslave; mpi_errhandler(slaverrcode[i++]));
 
 	Free(slaverrcode);
-	
-	Rprintf("\t%d slaves are spawned successfully. %d failed.\n", realns, nslave-realns);
+	if (!quiet || realns < nslave)
+		Rprintf("\t%d slaves are spawned successfully. %d failed.\n", realns, nslave-realns);
     return AsInt(realns);
 }
 
@@ -1510,3 +1524,4 @@ SEXP mpi_request_get_status(SEXP sexp_request,  SEXP sexp_status){
         return AsInt(flag);
 }
 */
+
