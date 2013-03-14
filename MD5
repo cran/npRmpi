@@ -1,7 +1,6 @@
 60d576c4798a32ecc318cef40ce10d3b *CHANGELOG
-371ac3437cacde0134516d8db3cb1b74 *COPYRIGHTS
-bce091fc7f3c2f88eda46bc92f26f99f *DESCRIPTION
-824efc3e82d7877ec1630de6e89a9574 *NAMESPACE
+f7739ccaa900a42ba134a34e17dbaa9d *DESCRIPTION
+3ab928e74b35d079117a865a2c94fba2 *NAMESPACE
 9d43a013ab019b45744e8d31b6048805 *R/Rcoll.R
 9082f8c909b9ca0a362a759e3ac3f0de *R/Rcomm.R
 9d1033ffb11af5c338c81a6a8380793f *R/Rmpi.R
@@ -71,8 +70,6 @@ beef9877d0f32a858f9d995e44cb0bd0 *R/rbandwidth.R
 6e1f6232a4c9dfe0e028fc8a9078dbf0 *R/util.R
 5b22c044efbc2dc79d43597de3440205 *R/zzz.R
 b44785a5fe8e374a136325e2847ba5c6 *README.md
-223c515f5915d680971bd1d2a1397e78 *a.out.dSYM/Contents/Info.plist
-f94e3e0c194f19c5f6a092737643e67f *a.out.dSYM/Contents/Resources/DWARF/a.out
 b4171176126cb22423979d090c424ed3 *cleanup
 ca4b36b5b9d53fc029c91c61ab38ad7b *configure
 266daff322bdea55dd840223c454aa89 *configure.ac
@@ -239,6 +236,7 @@ c5d13b5d78f1f6185692ca3089df6255 *demo/serial/npudensls_serial.Rout
 7b504ad5a32eff5cb52c57c1d3eb69e4 *demo/serial/npudistcdf_serial.Rout
 bb7a86855beaac1b7b767a72369ca3b5 *demo/serial/npunitest_serial.Rout
 db76c60075997a5c88e8583e70ed274c *inst/CITATION
+371ac3437cacde0134516d8db3cb1b74 *inst/COPYRIGHTS
 4569255257bf552a5acafd1151e14570 *inst/MacR64slaves.sh
 d716884c3577b5e5a5d4ad3625855b0d *inst/Rprofile
 cf25051b76102776342a3e9a2ebb78b7 *inst/Rslaves.sh
@@ -246,9 +244,6 @@ cf25051b76102776342a3e9a2ebb78b7 *inst/Rslaves.sh
 c1de4670770465fe025c0fba8129700b *inst/Rslaves64.cmd
 ebebd1a0394a10fd8c7f4fe6df572ab5 *inst/compile_npRmpi_MS_Windows.txt
 c684edd92cbfeaabd5906522eea4da8c *inst/cslavePI.c
-f7a57df8f31c22744473db5d3ed50ca5 *inst/doc/npRmpi.bib
-612cfe41b4144b5e984e940c438ddc95 *inst/doc/np_faq.Rnw
-b6b9c339a52a58050bf255e02267401e *inst/doc/np_faq.bib
 9809d79f68b65bc68e7bc29e4a795086 *inst/doc/np_faq.pdf
 9287ce81e4d2f78639494f79a482b689 *inst/install_npRmpi_MS_Windows.txt
 3a98d09120684333192a5edb1977e881 *inst/install_npRmpi_SHARCNET.txt
@@ -269,7 +264,7 @@ cd35af8150da2f3d27b97b79ac1dad83 *man/internal.Rd
 f9edc0b67e530da62b96aaee42bac1b3 *man/mpi.barrier.Rd
 5c55a261cf5ad68414dfd29129d8220b *man/mpi.bcast.Rd
 33025ffde46d171270c25f2857e55eb1 *man/mpi.bcast.Robj.Rd
-0dd0cdb4cabe4ec355ac73e532e18e30 *man/mpi.bcast.cmd.Rd
+99f7d7e956293b625e8b377d3312397f *man/mpi.bcast.cmd.Rd
 f40d2702afdba6f4beb4cf4102c73f0d *man/mpi.cart.coords.Rd
 a58297a57221efa27c5a730db50c1196 *man/mpi.cart.create.Rd
 2e523abb2714b9ec2e5813645f7a5aca *man/mpi.cart.get.Rd
@@ -350,7 +345,7 @@ ac9711b9712e7aa3c3513c8c9c624be2 *npver
 49b3b4f4c92b8436d2b9b218a76696d3 *src/Makevars.in
 2731d7717e34360b0bf38b5721ead33e *src/Makevars.win
 1461ce514e6f496f64df876d04e48e14 *src/RegQuery.c
-005408d4684503978a2e06c20af6274d *src/Rmpi.c
+b787f1e814ac1f6e92e618e2937a793f *src/Rmpi.c
 3ea2f33dd2534ea6ce75f2887e30220f *src/Rmpi.h
 ded21a3dfaa785898ff038db9b476020 *src/conversion.c
 2850ee1aabc4e1f46c052bb250249186 *src/headers.h
@@ -369,3 +364,6 @@ a76417c09d028bf59957f216881e3a7d *src/matrix.h
 40e9212d4d073aee25f15ff562cb066e *src/statmods.c
 aca22eef5d3c318112d0554374a14c57 *src/tree.c
 8f64d02c17597d1ebd47ee849fb5a50b *src/tree.h
+f7a57df8f31c22744473db5d3ed50ca5 *vignettes/npRmpi.bib
+612cfe41b4144b5e984e940c438ddc95 *vignettes/np_faq.Rnw
+b6b9c339a52a58050bf255e02267401e *vignettes/np_faq.bib

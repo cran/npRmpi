@@ -67,7 +67,7 @@ if (flag)
 	return AsInt(1);
 	else {
 
-#ifdef OPENMPI
+#if defined(OPENMPI) && !defined(__APPLE__)
     if (!dlopen("libmpi.so.0", RTLD_GLOBAL | RTLD_LAZY) 
 	&& !dlopen("libmpi.so", RTLD_GLOBAL | RTLD_LAZY) 
 	&& !dlopen("libmpi.dylib", RTLD_GLOBAL | RTLD_LAZY)) {

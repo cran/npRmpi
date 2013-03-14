@@ -1,5 +1,5 @@
 Package: npRmpi
-Version: 0.50-1
+Version: 0.50-1.1
 Date: 2013-03-14
 Depends: boot, cubature
 Suggests: quantreg, MASS, parallel
@@ -23,7 +23,7 @@ Description: This package provides a variety of nonparametric (and
         (SHARCNET:www.sharcnet.ca).
 License: GPL
 URL: https://github.com/JeffreyRacine/R-Package-npRmpi/
-Packaged: 2013-03-14 17:56:43 UTC; jracine
+Packaged: 2014-01-01 05:44:04 UTC; ripley
 NeedsCompilation: yes
 Repository: CRAN
-Date/Publication: 2013-03-14 19:24:13
+Date/Publication: 2014-01-01 06:55:07
