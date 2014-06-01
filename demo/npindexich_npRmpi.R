@@ -23,7 +23,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 2500
+n <- 5000
 
 x1 <- runif(n, min=-1, max=1)
 x2 <- runif(n, min=-1, max=1)

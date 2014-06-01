@@ -78,10 +78,14 @@ npcdistbw.condbandwidth <-
            ydat = stop("data 'ydat' missing"),
            gydat = NULL,
            bws, bandwidth.compute = TRUE,
-           auto = TRUE,
            nmulti, remin = TRUE, itmax = 10000,
-           fast.cdf = TRUE, do.full.integral = FALSE, ngrid = 100,
-           ftol=1.19209e-07, tol=1.49012e-08, small=2.22045e-16,
+           do.full.integral = FALSE, ngrid = 100,
+           ftol = 1.490116e-07, tol = 1.490116e-04, small = 1.490116e-05,
+           memfac = 500.0, lbc.dir = 0.5, dfc.dir = 3, cfac.dir = 2.5*(3.0-sqrt(5)),initc.dir = 1.0, 
+           lbd.dir = 0.1, hbd.dir = 1, dfac.dir = 0.25*(3.0-sqrt(5)), initd.dir = 1.0, 
+           lbc.init = 0.1, hbc.init = 2.0, cfac.init = 0.5, 
+           lbd.init = 0.1, hbd.init = 0.9, dfac.init = 0.375, 
+           scale.init.categorical.sample=FALSE,
            ...){
 
     ydat = toFrame(ydat)
@@ -115,6 +119,9 @@ npcdistbw.condbandwidth <-
         (any(bws$ixuno) && !all(unlist(lapply(as.data.frame(xdat[,bws$ixuno]),class)) ==
                                class(factor(0)))))
       stop(paste("supplied bandwidths do not match", "'xdat'", "in type"))
+
+    ##if (bws$type != 'fixed')
+    ##stop("only fixed bandwidths currently supported with ccdf bandwidth selection")
 
     ## catch and destroy NA's
     goodrows <- 1:dim(xdat)[1]
@@ -192,6 +199,11 @@ npcdistbw.condbandwidth <-
       }
 
     }
+
+    mysd <- EssDee(data.frame(xcon,ycon))
+    nconfac <- nrow^(-1.0/(2.0*bws$cxkerorder+bws$ncon))
+    ncatfac <- nrow^(-2.0/(2.0*bws$cxkerorder+bws$ncon))
+
     if (bandwidth.compute){
       myopti = list(num_obs_train = nrow,
         num_obs_grid = nog,
@@ -211,11 +223,13 @@ npcdistbw.condbandwidth <-
         xkerneval = switch(bws$cxkertype,
           gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
           epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
-          uniform = CKER_UNI),
+          uniform = CKER_UNI,
+          "truncated gaussian" = CKER_TGAUSS),
         ykerneval = switch(bws$cykertype,
           gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
           epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
-          uniform = CKER_UNI),
+          uniform = CKER_UNI,
+          "truncated gaussian" = CKER_TGAUSS),
         uxkerneval = switch(bws$uxkertype,
           aitchisonaitken = UKER_AIT,
           liracine = UKER_LR),
@@ -227,30 +241,37 @@ npcdistbw.condbandwidth <-
           liracine = OKER_LR),
         oykerneval = switch(bws$oykertype,
           wangvanryzin = OKER_WANG,
-          liracine = OKER_LR),
+          liracine = OKER_NLR),
         ynuno = dim(yuno)[2],
         ynord = dim(yord)[2],
         yncon = dim(ycon)[2],
         xnuno = dim(xuno)[2],
         xnord = dim(xord)[2],
         xncon = dim(xcon)[2],
-        auto = auto,
-        fast.cdf = fast.cdf,
-        cdf_on_train = cdf_on_train)
+        cdf_on_train = cdf_on_train,
+        int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO),
+        scale.init.categorical.sample=scale.init.categorical.sample,
+        dfc.dir = dfc.dir)
       
-      myoptd = list(ftol=ftol, tol=tol, small=small)
+      myoptd = list(ftol=ftol, tol=tol, small=small, memfac = memfac,
+        lbc.dir = lbc.dir, cfac.dir = cfac.dir, initc.dir = initc.dir, 
+        lbd.dir = lbd.dir, hbd.dir = hbd.dir, dfac.dir = dfac.dir, initd.dir = initd.dir, 
+        lbc.init = lbc.init, hbc.init = hbc.init, cfac.init = cfac.init, 
+        lbd.init = lbd.init, hbd.init = hbd.init, dfac.init = dfac.init, 
+        nconfac = nconfac, ncatfac = ncatfac)
 
       if (bws$method != "normal-reference"){
         myout=
           .C("np_distribution_conditional_bw", as.double(yuno), as.double(yord), as.double(ycon),
              as.double(xuno), as.double(xord), as.double(xcon),
              as.double(gyuno), as.double(gyord), as.double(gycon),
+             as.double(mysd),
              as.integer(myopti), as.double(myoptd), 
              bw = c(bws$xbw[bws$ixcon],bws$ybw[bws$iycon],
                bws$ybw[bws$iyuno],bws$ybw[bws$iyord],
                bws$xbw[bws$ixuno],bws$xbw[bws$ixord]),
-             fval = double(2),
-             PACKAGE="npRmpi" )[c("bw","fval")]
+             fval = double(2),fval.history = double(max(1,nmulti)),
+             PACKAGE="npRmpi" )[c("bw","fval","fval.history")]
       } else {
         nbw = double(yncol+xncol)
         gbw = bws$yncon+bws$xncon
@@ -258,7 +279,7 @@ npcdistbw.condbandwidth <-
           nbw[1:bws$xncon] <- 1.06
           nbw[(bws$xncon+1):gbw] <- 1.587
           if(!bws$scaling)
-            nbw[1:gbw]=nbw[1:gbw]*EssDee(data.frame(xcon,ycon))*nrow^(-1.0/(2.0*bws$cxkerorder+gbw))
+            nbw[1:gbw]=nbw[1:gbw]*mysd*nconfac
         }
         myout= list( bw = nbw, fval = c(NA,NA) )
       }
@@ -287,6 +308,7 @@ npcdistbw.condbandwidth <-
 
       tbw$fval = myout$fval[1]
       tbw$ifval = myout$fval[2]
+      tbw$fval.history <- myout$fval.history
     }
     
     ## bandwidth metadata
@@ -303,7 +325,7 @@ npcdistbw.condbandwidth <-
     myf <- if(tbw$scaling) bwf else sff
     
     if ((tbw$xnuno+tbw$ynuno) > 0){
-      dfactor <- nrow^(-2.0/(2.0*tbw$cxkerorder+tbw$ncon))
+      dfactor <- ncatfac
       dfactor <- list(x = dfactor, y = dfactor)
 
       tl <- list(x = tbw$xdati$iuno, y = tbw$ydati$iuno)
@@ -312,7 +334,7 @@ npcdistbw.condbandwidth <-
     }
 
     if ((tbw$xnord+tbw$ynord) > 0){
-      dfactor <- nrow^(-2.0/(2.0*tbw$cxkerorder+tbw$ncon))
+      dfactor <- ncatfac
       dfactor <- list(x = dfactor, y = dfactor)
 
       tl <- list(x = tbw$xdati$iord, y = tbw$ydati$iord)
@@ -322,7 +344,7 @@ npcdistbw.condbandwidth <-
 
       
     if (tbw$ncon > 0){
-      dfactor <- nrow^(-1.0/(2.0*tbw$cxkerorder+tbw$ncon))
+      dfactor <- nconfac
       dfactor <- list(x = EssDee(xcon)*dfactor, y = EssDee(ycon)*dfactor)
 
       tl <- list(x = tbw$xdati$icon, y = tbw$ydati$icon)
@@ -331,29 +353,33 @@ npcdistbw.condbandwidth <-
     }
   
     tbw <- condbandwidth(xbw = tbw$xbw,
-                        ybw = tbw$ybw,
-                        bwmethod = tbw$method,
-                        bwscaling = tbw$scaling,
-                        bwtype = tbw$type,
-                        cxkertype = tbw$cxkertype,
-                        cxkerorder = tbw$cxkerorder,
-                        uxkertype = tbw$uxkertype,
-                        oxkertype = tbw$oxkertype,
-                        cykertype = tbw$cykertype,
-                        cykerorder = tbw$cykerorder,
-                        uykertype = tbw$uykertype,
-                        oykertype = tbw$oykertype,
-                        fval = tbw$fval,
-                        ifval = tbw$ifval,
-                        nobs = tbw$nobs,
-                        xdati = tbw$xdati,
-                        ydati = tbw$ydati,      
-                        xnames = tbw$xnames,
-                        ynames = tbw$ynames,
-                        sfactor = tbw$sfactor,
-                        bandwidth = tbw$bandwidth,
-                        rows.omit = rows.omit,
-                        bandwidth.compute = bandwidth.compute)
+                         ybw = tbw$ybw,
+                         bwmethod = tbw$method,
+                         bwscaling = tbw$scaling,
+                         bwtype = tbw$type,
+                         cxkertype = tbw$cxkertype,
+                         cxkerorder = tbw$cxkerorder,
+                         uxkertype = tbw$uxkertype,
+                         oxkertype = tbw$oxkertype,
+                         cykertype = tbw$cykertype,
+                         cykerorder = tbw$cykerorder,
+                         uykertype = tbw$uykertype,
+                         oykertype = tbw$oykertype,
+                         fval = tbw$fval,
+                         ifval = tbw$ifval,
+                         fval.history = tbw$fval.history,
+                         nobs = tbw$nobs,
+                         xdati = tbw$xdati,
+                         ydati = tbw$ydati,      
+                         xnames = tbw$xnames,
+                         ynames = tbw$ynames,
+                         sfactor = tbw$sfactor,
+                         bandwidth = tbw$bandwidth,
+                         rows.omit = rows.omit,
+                         nconfac = nconfac,
+                         ncatfac = ncatfac,
+                         sdev = mysd,
+                         bandwidth.compute = bandwidth.compute)
            
     tbw
   }
@@ -389,9 +415,14 @@ npcdistbw.default <-
            gydat,
            bws, 
            bandwidth.compute = TRUE,
-           auto, nmulti, remin, itmax,
-           fast.cdf, do.full.integral, ngrid,
-           ftol, tol, small,
+           nmulti, remin, itmax,
+           do.full.integral, ngrid,
+           ftol, tol, small, memfac,
+           lbc.dir, dfc.dir, cfac.dir,initc.dir, 
+           lbd.dir, hbd.dir, dfac.dir, initd.dir, 
+           lbc.init, hbc.init, cfac.init, 
+           lbd.init, hbd.init, dfac.init, 
+           scale.init.categorical.sample,
            ## dummy arguments for condbandwidth() function call
            bwmethod, bwscaling, bwtype,
            cxkertype, cxkerorder,
@@ -433,8 +464,13 @@ npcdistbw.default <-
     ## next grab dummies for actual bandwidth selection and perform call
 
     mc.names <- names(match.call(expand.dots = FALSE))
-    margs <- c("gydat", "bandwidth.compute", "auto", "nmulti", "remin", "itmax", "fast.cdf", "do.full.integral", "ngrid", "ftol",
-               "tol", "small")
+    margs <- c("gydat", "bandwidth.compute", "nmulti", "remin", "itmax", "do.full.integral", "ngrid", "ftol",
+               "tol", "small", "memfac",
+               "lbc.dir", "dfc.dir", "cfac.dir","initc.dir", 
+               "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir", 
+               "lbc.init", "hbc.init", "cfac.init", 
+               "lbd.init", "hbd.init", "dfac.init", 
+               "scale.init.categorical.sample")
     m <- match(margs, mc.names, nomatch = 0)
     any.m <- any(m != 0)
 

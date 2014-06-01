@@ -10,7 +10,7 @@ options(np.messages=FALSE)
 
 set.seed(42)
 
-n <- 2500
+n <- 5000
 
 x1 <- runif(n, min=-1, max=1)
 x2 <- runif(n, min=-1, max=1)

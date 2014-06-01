@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,9 +23,7 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
@@ -34,7 +31,7 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > 
 > set.seed(42)
 > 
-> n <- 2500
+> n <- 5000
 > 
 > x1 <- runif(n, min=-1, max=1)
 > x2 <- runif(n, min=-1, max=1)
@@ -50,17 +47,17 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > summary(bw)
 
 Single Index Model
-Regression data (2500 observations, 2 variable(s)):
+Regression data (5000 observations, 2 variable(s)):
 
       x1         x2
-Beta:  1 -0.9819115
-Bandwidth:  0.1805395
+Beta:  1 -0.9692335
+Bandwidth:  0.1378902
 Optimisation Method:  Nelder-Mead
 Regression Type: Local-Constant
 Bandwidth Selection Method: Ichimura
 Formula: y ~ x1 + x2
 Bandwidth Type: Fixed
-Objective Function Value: 1.036736 (achieved on multistart 2)
+Objective Function Value: 1.017243 (achieved on multistart 1)
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -72,24 +69,24 @@ No. Continuous Explanatory Vars.: 1
 > summary(model)
 
 Single Index Model
-Regression Data: 2500 training points, in 2 variable(s)
+Regression Data: 5000 training points, in 2 variable(s)
 
       x1         x2
-Beta:  1 -0.9819115
-Bandwidth: 0.1805395
+Beta:  1 -0.9692335
+Bandwidth: 0.1378902
 Kernel Regression Estimator: Local-Constant
 
-Residual standard error: 1.014779
-R-squared: 0.4058975
+Residual standard error: 1.006324
+R-squared: 0.3948122
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 17.988 
+Elapsed time = 71.462 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 18.253   0.035  18.289 
+ 71.638   0.053  71.686 

@@ -23,7 +23,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 1000
+n <- 2500
 
 sample.A <- data.frame(x=rnorm(n))
 sample.B <- data.frame(x=rnorm(n))

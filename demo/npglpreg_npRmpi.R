@@ -21,7 +21,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 ## to the master node)
 
 set.seed(42)
-n <-  250
+n <-  1000
 
 degree.max <- 20
 

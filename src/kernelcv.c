@@ -10,6 +10,8 @@
 
 #include "headers.h"
 
+#include <R.h>
+
 #ifdef MPI2
 
 #include "mpi.h"
@@ -98,8 +100,18 @@ extern double *vector_scale_factor_extern;
 extern double y_min_extern;
 extern double y_max_extern;
 
+// cdens + trees extern
+extern double **matrix_XY_continuous_train_extern;
+extern double **matrix_XY_unordered_train_extern;
+extern double **matrix_XY_ordered_train_extern;
+extern double **matrix_XY_continuous_eval_extern;
+extern double **matrix_XY_unordered_eval_extern;
+extern double **matrix_XY_ordered_eval_extern;
+
 // cdf extern
-extern int int_fast_dls_extern;
+extern double dbl_memfac_ccdf_extern;
+extern double dbl_memfac_dls_extern;
+
 #ifdef RCSID
 static char rcsid[] = "$Id: kernelcv.c,v 1.9 2006/11/02 16:56:49 tristen Exp $";
 #endif
@@ -132,30 +144,31 @@ double cv_func_regression_categorical_ls(double *vector_scale_factor){
         num_categories_extern,
         vector_scale_factor) == 1)
     {
+      //Rprintf("toasty!\n");
+      //for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern; ii++)
+      //Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //Rprintf("\n");
+
         return(DBL_MAX);
     }
 
-    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){ 
-      return(np_kernel_estimate_regression_categorical_ls_aic(
-        int_ll_extern,
-        RBWM_CVLS,
-        KERNEL_reg_extern,
-        KERNEL_reg_unordered_extern,
-        KERNEL_reg_ordered_extern,
-        BANDWIDTH_reg_extern,
-        num_obs_train_extern,
-        num_reg_unordered_extern,
-        num_reg_ordered_extern,
-        num_reg_continuous_extern,
-        matrix_X_unordered_train_extern,
-        matrix_X_ordered_train_extern,
-        matrix_X_continuous_train_extern,
-        vector_Y_extern,
-        &vector_scale_factor[1],
-        num_categories_extern));
-      } else {
-      return(cv_func_regression_categorical_ls_nn(vector_scale_factor));
-      }
+    return(np_kernel_estimate_regression_categorical_ls_aic(
+                                                            int_ll_extern,
+                                                            RBWM_CVLS,
+                                                            KERNEL_reg_extern,
+                                                            KERNEL_reg_unordered_extern,
+                                                            KERNEL_reg_ordered_extern,
+                                                            BANDWIDTH_reg_extern,
+                                                            num_obs_train_extern,
+                                                            num_reg_unordered_extern,
+                                                            num_reg_ordered_extern,
+                                                            num_reg_continuous_extern,
+                                                            matrix_X_unordered_train_extern,
+                                                            matrix_X_ordered_train_extern,
+                                                            matrix_X_continuous_train_extern,
+                                                            vector_Y_extern,
+                                                            &vector_scale_factor[1],
+                                                            num_categories_extern));
 }
 
 double cv_func_regression_categorical_ls_nn(double *vector_scale_factor)
@@ -187,7 +200,7 @@ double cv_func_regression_categorical_ls_nn(double *vector_scale_factor)
 
 #ifdef MPI2
 
-    stride = ceil((double) num_obs_train_extern / (double) iNum_Processors);
+    stride = (int)ceil((double) num_obs_train_extern / (double) iNum_Processors);
     if(stride < 1) stride = 1;
     mean = alloc_vecd(stride*iNum_Processors);
 #endif
@@ -289,6 +302,60 @@ double cv_func_density_categorical_ml(double *vector_scale_factor)
 
 }
 
+double np_cv_func_density_categorical_ml(double *vector_scale_factor)
+{
+
+/* Numerical recipes wrapper function for likelihood density
+                    cross-validation */
+
+/* Declarations */
+
+    double cv = 0.0;
+
+    if(check_valid_scale_factor_cv(
+        KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
+        BANDWIDTH_den_extern,
+        BANDWIDTH_den_extern,
+        0,
+        num_obs_train_extern,
+        0,
+        0,
+        0,
+        num_reg_continuous_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_categories_extern,
+        vector_scale_factor) == 1)
+    {
+        return(DBL_MAX);
+    }
+
+/* Compute the cross-validation function */
+
+    if(np_kernel_estimate_density_categorical_leave_one_out_cv(KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
+        KERNEL_den_ordered_extern,
+        BANDWIDTH_den_extern,
+        num_obs_train_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_reg_continuous_extern,
+        matrix_X_unordered_train_extern,
+        matrix_X_ordered_train_extern,
+        matrix_X_continuous_train_extern,
+        &vector_scale_factor[1],
+        num_categories_extern,
+        &cv)==1)
+    {
+        return(DBL_MAX);
+    }
+
+
+    return(cv);
+
+}
+
 double cv_func_con_distribution_categorical_ls(double *vector_scale_factor)
 {
 
@@ -313,43 +380,64 @@ double cv_func_con_distribution_categorical_ls(double *vector_scale_factor)
         num_reg_unordered_extern,
         num_reg_ordered_extern,
         num_categories_extern,
-        vector_scale_factor) == 1) return(DBL_MAX);
+        vector_scale_factor) == 1) {
+
+      //                        Rprintf("toasty!\n");
+      //                  for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+      //                    Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //                  Rprintf("\n");
+
+      return(DBL_MAX);
+    }
 
 /* Compute the cross-validation function */
 
     if(np_kernel_estimate_con_distribution_categorical_leave_one_out_ls_cv(KERNEL_den_extern,
-                                                                        KERNEL_den_unordered_extern,
-                                                                        KERNEL_den_ordered_extern,
-                                                                        KERNEL_reg_extern,
-                                                                        KERNEL_reg_unordered_extern,
-                                                                        KERNEL_reg_ordered_extern,
-                                                                        BANDWIDTH_den_extern,
-                                                                        num_obs_train_extern,
-                                                                        num_obs_eval_extern,
-                                                                        num_var_unordered_extern,
-                                                                        num_var_ordered_extern,
-                                                                        num_var_continuous_extern,
-                                                                        num_reg_unordered_extern,
-                                                                        num_reg_ordered_extern,
-                                                                        num_reg_continuous_extern,
-                                                                        int_fast_dls_extern,
-                                                                        matrix_Y_unordered_train_extern,
-                                                                        matrix_Y_ordered_train_extern,
-                                                                        matrix_Y_continuous_train_extern,
-                                                                        matrix_X_unordered_train_extern,
-                                                                        matrix_X_ordered_train_extern,
-                                                                        matrix_X_continuous_train_extern,
-                                                                        matrix_Y_unordered_eval_extern,
-                                                                        matrix_Y_ordered_eval_extern,
-                                                                        matrix_Y_continuous_eval_extern,
-                                                                        &vector_scale_factor[1],
-                                                                        num_categories_extern,
-                                                                        matrix_categorical_vals_extern,
-                                                                        &cv)==1)
+                                                                           KERNEL_den_unordered_extern,
+                                                                           KERNEL_den_ordered_extern,
+                                                                           KERNEL_reg_extern,
+                                                                           KERNEL_reg_unordered_extern,
+                                                                           KERNEL_reg_ordered_extern,
+                                                                           BANDWIDTH_den_extern,
+                                                                           num_obs_train_extern,
+                                                                           num_obs_eval_extern,
+                                                                           num_var_unordered_extern,
+                                                                           num_var_ordered_extern,
+                                                                           num_var_continuous_extern,
+                                                                           num_reg_unordered_extern,
+                                                                           num_reg_ordered_extern,
+                                                                           num_reg_continuous_extern,
+                                                                           dbl_memfac_ccdf_extern,
+                                                                           matrix_Y_unordered_train_extern,
+                                                                           matrix_Y_ordered_train_extern,
+                                                                           matrix_Y_continuous_train_extern,
+                                                                           matrix_X_unordered_train_extern,
+                                                                           matrix_X_ordered_train_extern,
+                                                                           matrix_X_continuous_train_extern,
+                                                                           matrix_XY_unordered_train_extern, 
+                                                                           matrix_XY_ordered_train_extern, 
+                                                                           matrix_XY_continuous_train_extern,
+                                                                           matrix_Y_unordered_eval_extern,
+                                                                           matrix_Y_ordered_eval_extern,
+                                                                           matrix_Y_continuous_eval_extern,
+                                                                           &vector_scale_factor[1],
+                                                                           num_categories_extern,
+                                                                           matrix_categorical_vals_extern,
+                                                                           &cv)==1)
       {
+        //                        Rprintf("toaster!\n");
+        //                        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+        //                          Rprintf("%3.15g ", vector_scale_factor[ii]);
+        //                        Rprintf("\n");
+
         return(DBL_MAX);
       }
 
+
+    //        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //          Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //                Rprintf("%3.15g ", cv);
+    //                Rprintf("\n");
 
     return(cv);
 
@@ -415,6 +503,85 @@ double cv_func_con_density_categorical_ml(double *vector_scale_factor)
 
 }
 
+double np_cv_func_con_density_categorical_ml(double *vector_scale_factor){
+
+/* Numerical recipes wrapper function for likelihood density
+                    cross-validation */
+
+/* Declarations */
+
+    double cv = 0.0;
+
+    if(check_valid_scale_factor_cv(
+        KERNEL_den_extern,
+        KERNEL_reg_unordered_extern, /* Only for conditioning vars in conditional den */
+        BANDWIDTH_den_extern,
+        BANDWIDTH_den_extern,
+        0,
+        num_obs_train_extern,
+        num_var_continuous_extern,
+        num_var_unordered_extern,
+        num_var_ordered_extern,
+        num_reg_continuous_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_categories_extern,
+        vector_scale_factor) == 1) {
+
+      //                  Rprintf("toasty!\n");
+      //            for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+      //              Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //            Rprintf("\n");
+
+      return(DBL_MAX);
+    }
+/* Compute the cross-validation function */
+
+    if(np_kernel_estimate_con_density_categorical_leave_one_out_cv(KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
+        KERNEL_den_ordered_extern,
+				KERNEL_reg_extern,
+        KERNEL_reg_unordered_extern,
+        KERNEL_reg_ordered_extern,
+        BANDWIDTH_den_extern,
+        num_obs_train_extern,
+        num_var_unordered_extern,
+        num_var_ordered_extern,
+        num_var_continuous_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_reg_continuous_extern,
+        matrix_Y_unordered_train_extern,
+        matrix_Y_ordered_train_extern,
+        matrix_Y_continuous_train_extern,
+        matrix_X_unordered_train_extern,
+        matrix_X_ordered_train_extern,
+        matrix_X_continuous_train_extern,
+        matrix_XY_unordered_train_extern,
+        matrix_XY_ordered_train_extern,
+        matrix_XY_continuous_train_extern,
+        &vector_scale_factor[1],
+        num_categories_extern,
+        &cv)==1)
+    {
+      //                  Rprintf("toaster!\n");
+      //                  for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+      //                    Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //                  Rprintf("\n");
+
+        return(DBL_MAX);
+    }
+
+    //    for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //      Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //            Rprintf("%3.15g ", cv);
+    //            Rprintf("\n");
+
+
+    return(cv);
+
+}
+
 double np_cv_func_con_density_categorical_ls(double *vector_scale_factor){
 
 /* Numerical recipes wrapper function for least squares conditional density
@@ -437,7 +604,14 @@ double np_cv_func_con_density_categorical_ls(double *vector_scale_factor){
                                  num_reg_unordered_extern,
                                  num_reg_ordered_extern,
                                  num_categories_extern,
-                                 vector_scale_factor) == 1) return(DBL_MAX);
+                                 vector_scale_factor) == 1) {
+    //        Rprintf("toasty\n");
+    //        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //          Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //        Rprintf("\n");
+
+    return(DBL_MAX);
+  }
 
   /* Compute the cross-validation function */
 
@@ -464,8 +638,97 @@ double np_cv_func_con_density_categorical_ls(double *vector_scale_factor){
                                                                &vector_scale_factor[1],
                                                                num_categories_extern,
                                                                matrix_categorical_vals_extern,
-                                                               &cv)==1) return(DBL_MAX);
+                                                               &cv)==1) {
+    //                Rprintf("toaster!!\n");
+    //                for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //                  Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //                Rprintf("\n");
 
+    return(DBL_MAX);
+  }
+
+  //        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+  //          Rprintf("%3.15g ", vector_scale_factor[ii]);
+  //          Rprintf("%3.15g ", cv);
+  //        Rprintf("\n");
+
+  return(cv);
+
+}
+
+double np_cv_func_con_density_categorical_ls_npksum(double *vector_scale_factor){
+
+/* Numerical recipes wrapper function for least squares conditional density
+                    cross-validation */
+
+/* Declarations */
+
+  double cv = 0.0;
+
+  if(check_valid_scale_factor_cv(KERNEL_den_extern,
+                                 KERNEL_reg_unordered_extern,  /* Only for conditioning vars in conditional den */
+                                 BANDWIDTH_den_extern,
+                                 BANDWIDTH_den_extern,
+                                 0,
+                                 num_obs_train_extern,
+                                 num_var_continuous_extern,
+                                 num_var_unordered_extern,
+                                 num_var_ordered_extern,
+                                 num_reg_continuous_extern,
+                                 num_reg_unordered_extern,
+                                 num_reg_ordered_extern,
+                                 num_categories_extern,
+                                 vector_scale_factor) == 1) {
+    //        Rprintf("toasty\n");
+    //        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //          Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //        Rprintf("\n");
+
+    return(DBL_MAX);
+  }
+  /* Compute the cross-validation function */
+
+    if(np_kernel_estimate_con_density_categorical_leave_one_out_ls_cv(KERNEL_den_extern,
+                                                                      KERNEL_den_unordered_extern,
+                                                                      KERNEL_den_ordered_extern,
+                                                                      KERNEL_reg_extern,
+                                                                      KERNEL_reg_unordered_extern,
+                                                                      KERNEL_reg_ordered_extern,
+                                                                      BANDWIDTH_den_extern,
+                                                                      num_obs_train_extern,
+                                                                      num_var_unordered_extern,
+                                                                      num_var_ordered_extern,
+                                                                      num_var_continuous_extern,
+                                                                      num_reg_unordered_extern,
+                                                                      num_reg_ordered_extern,
+                                                                      num_reg_continuous_extern,
+                                                                      dbl_memfac_ccdf_extern,
+                                                                      matrix_Y_unordered_train_extern,
+                                                                      matrix_Y_ordered_train_extern,
+                                                                      matrix_Y_continuous_train_extern,
+                                                                      matrix_X_unordered_train_extern,
+                                                                      matrix_X_ordered_train_extern,
+                                                                      matrix_X_continuous_train_extern,
+                                                                      matrix_XY_unordered_train_extern, 
+                                                                      matrix_XY_ordered_train_extern, 
+                                                                      matrix_XY_continuous_train_extern,
+                                                                      &vector_scale_factor[1],
+                                                                      num_categories_extern,
+                                                                      matrix_categorical_vals_extern,
+                                                                      &cv)==1)
+      {
+        //                Rprintf("toaster!!\n");
+        //                for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+        //                  Rprintf("%3.15g ", vector_scale_factor[ii]);
+        //                Rprintf("\n");
+
+        return(DBL_MAX);
+      }
+
+    //        for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //          Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //          Rprintf("%3.15g ", cv);
+    //        Rprintf("\n");
 
   return(cv);
 
@@ -495,8 +758,15 @@ double cv_func_con_density_categorical_ls(double *vector_scale_factor)
         num_reg_unordered_extern,
         num_reg_ordered_extern,
         num_categories_extern,
-        vector_scale_factor) == 1) return(DBL_MAX);
+        vector_scale_factor) == 1){
 
+      //      Rprintf("toasty!!\n");
+      //      for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+      //        Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //      Rprintf("\n");
+
+      return(DBL_MAX);
+    }
 /* Compute the cross-validation function */
 
     if(kernel_estimate_con_density_categorical_convolution_cv(KERNEL_den_extern,
@@ -524,9 +794,18 @@ double cv_func_con_density_categorical_ls(double *vector_scale_factor)
         matrix_categorical_vals_extern,
         &cv)==1)
     {
-        return(DBL_MAX);
+      //      Rprintf("toaster!!\n");
+      //      for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+      //        Rprintf("%3.15g ", vector_scale_factor[ii]);
+      //      Rprintf("\n");
+
+      return(DBL_MAX);
     }
 
+    //    for(int ii = 1; ii <= num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern + num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern; ii++)
+    //      Rprintf("%3.15g ", vector_scale_factor[ii]);
+    //      Rprintf("%3.15g ", cv);
+    //    Rprintf("\n");
 
     return(cv);
 
@@ -647,6 +926,57 @@ double cv_func_density_categorical_ls(double *vector_scale_factor)
 
 }
 
+double np_cv_func_density_categorical_ls(double *vector_scale_factor){
+
+/* Numerical recipes wrapper function for likelihood density
+                    cross-validation */
+
+/* Declarations */
+
+    double cv = 0.0;
+
+    if(check_valid_scale_factor_cv(
+        KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
+        BANDWIDTH_den_extern,
+        BANDWIDTH_den_extern,
+        0,
+        num_obs_train_extern,
+        0,
+        0,
+        0,
+        num_reg_continuous_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_categories_extern,
+        vector_scale_factor) == 1) return(DBL_MAX);
+
+/* Compute the cross-validation function */
+
+    if(np_kernel_estimate_density_categorical_convolution_cv(KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
+        KERNEL_den_ordered_extern,
+        BANDWIDTH_den_extern,
+        num_obs_train_extern,
+        num_reg_unordered_extern,
+        num_reg_ordered_extern,
+        num_reg_continuous_extern,
+        matrix_X_unordered_train_extern,
+        matrix_X_ordered_train_extern,
+        matrix_X_continuous_train_extern,
+        &vector_scale_factor[1],
+        num_categories_extern,
+        matrix_categorical_vals_extern,
+        &cv)==1)
+    {
+        return(DBL_MAX);
+    }
+
+
+    return(cv);
+
+}
+
 double cv_func_distribution_categorical_ls(double *vector_scale_factor)
 {
 
@@ -676,25 +1006,25 @@ double cv_func_distribution_categorical_ls(double *vector_scale_factor)
 /* Compute the cross-validation function */
 
     if(np_kernel_estimate_distribution_ls_cv(KERNEL_den_extern,
-        KERNEL_den_unordered_extern,
-        KERNEL_den_ordered_extern,
-        BANDWIDTH_den_extern,
-        num_obs_train_extern,
-        num_obs_eval_extern,
-        num_reg_unordered_extern,
-        num_reg_ordered_extern,
-        num_reg_continuous_extern,
-        int_fast_dls_extern,
-        matrix_X_unordered_train_extern,
-        matrix_X_ordered_train_extern,
-        matrix_X_continuous_train_extern,
-        matrix_X_unordered_eval_extern,
-        matrix_X_ordered_eval_extern,
-        matrix_X_continuous_eval_extern,
-        &vector_scale_factor[1],
-        num_categories_extern,
-        matrix_categorical_vals_extern,
-        &cv)==1)
+                                             KERNEL_den_unordered_extern,
+                                             KERNEL_den_ordered_extern,
+                                             BANDWIDTH_den_extern,
+                                             num_obs_train_extern,
+                                             num_obs_eval_extern,
+                                             num_reg_unordered_extern,
+                                             num_reg_ordered_extern,
+                                             num_reg_continuous_extern,
+                                             dbl_memfac_dls_extern,
+                                             matrix_X_unordered_train_extern,
+                                             matrix_X_ordered_train_extern,
+                                             matrix_X_continuous_train_extern,
+                                             matrix_X_unordered_eval_extern,
+                                             matrix_X_ordered_eval_extern,
+                                             matrix_X_continuous_eval_extern,
+                                             &vector_scale_factor[1],
+                                             num_categories_extern,
+                                             matrix_categorical_vals_extern,
+                                             &cv)==1)
     {
         return(DBL_MAX);
     }
@@ -795,41 +1125,20 @@ double cv_func_regression_categorical_aic_c(double *vector_scale_factor)
         return(DBL_MAX);
     }
 
-    if((BANDWIDTH_reg_extern == BW_FIXED)||(int_ll_extern == LL_LC)){
-      return(np_kernel_estimate_regression_categorical_ls_aic(
-        int_ll_extern,
-        RBWM_CVAIC,
-        KERNEL_reg_extern,
-        KERNEL_reg_unordered_extern,
-        KERNEL_reg_ordered_extern,
-        BANDWIDTH_reg_extern,
-        num_obs_train_extern,
-        num_reg_unordered_extern,
-        num_reg_ordered_extern,
-        num_reg_continuous_extern,
-        matrix_X_unordered_train_extern,
-        matrix_X_ordered_train_extern,
-        matrix_X_continuous_train_extern,
-        vector_Y_extern,
-        &vector_scale_factor[1],
-        num_categories_extern));
-        } else {
-      return(kernel_estimate_regression_categorical_aic_c(
-        int_ll_extern,
-        KERNEL_reg_extern,
-        KERNEL_reg_unordered_extern,
-        KERNEL_reg_ordered_extern,
-        BANDWIDTH_reg_extern,
-        num_obs_train_extern,
-        num_reg_unordered_extern,
-        num_reg_ordered_extern,
-        num_reg_continuous_extern,
-        matrix_X_unordered_train_extern,
-        matrix_X_ordered_train_extern,
-        matrix_X_continuous_train_extern,
-        vector_Y_extern,
-        &vector_scale_factor[1],
-        num_categories_extern));
-    }
-
+    return(np_kernel_estimate_regression_categorical_ls_aic(int_ll_extern,
+                                                            RBWM_CVAIC,
+                                                            KERNEL_reg_extern,
+                                                            KERNEL_reg_unordered_extern,
+                                                            KERNEL_reg_ordered_extern,
+                                                            BANDWIDTH_reg_extern,
+                                                            num_obs_train_extern,
+                                                            num_reg_unordered_extern,
+                                                            num_reg_ordered_extern,
+                                                            num_reg_continuous_extern,
+                                                            matrix_X_unordered_train_extern,
+                                                            matrix_X_ordered_train_extern,
+                                                            matrix_X_continuous_train_extern,
+                                                            vector_Y_extern,
+                                                            &vector_scale_factor[1],
+                                                            num_categories_extern));
 }

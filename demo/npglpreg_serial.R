@@ -9,7 +9,8 @@ options(np.messages=FALSE)
 rm(list=ls())
 
 set.seed(42)
-n <-  250
+
+n <-  1000
 
 degree.max <- 20
 

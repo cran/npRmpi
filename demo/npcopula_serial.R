@@ -23,9 +23,9 @@ Sigma <- matrix(c(1,rho,rho,1),2,2)
 mydat <- mvrnorm(n=n, mu, Sigma)
 mydat <- data.frame(x=mydat[,1],y=mydat[,2])
 
-q.min <- 0.0
+q.minm <- 0.0
 q.max <- 1.0
-grid.seq <- seq(q.min,q.max,length=n.eval)
+grid.seq <- seq(q.minm,q.max,length=n.eval)
 grid.dat <- cbind(grid.seq,grid.seq)
 
 ## Estimate the copula

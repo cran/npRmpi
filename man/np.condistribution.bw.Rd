@@ -8,13 +8,14 @@
 \title{Kernel Conditional Distribution Bandwidth Selection with Mixed
 Data Types}
 
-\description{
+\description{ 
   \code{npcdistbw} computes a \code{condbandwidth} object for estimating
   a \eqn{p+q}-variate kernel conditional cumulative distribution
-  estimator defined over mixed continuous and discrete (unordered,
-  ordered) data using either the normal-reference rule-of-thumb or
-  least-squares cross validation using the method of Li and Racine
-  (2008) and Li, Lin and Racine (2013).
+  estimator defined over mixed continuous and discrete (unordered
+  \code{xdat}, ordered \code{xdat} and \code{ydat}) data using either
+  the normal-reference rule-of-thumb or least-squares cross validation
+  using the method of Li and Racine (2008) and Li, Lin and Racine
+  (2013).
 }
 
 \usage{
@@ -31,16 +32,30 @@ npcdistbw(\dots)
           gydat = NULL,
           bws,
           bandwidth.compute = TRUE,
-          auto = TRUE,
           nmulti,
           remin = TRUE,
           itmax = 10000,
-          fast.cdf = TRUE,
           do.full.integral = FALSE,
           ngrid = 100,
-          ftol = 1.19209e-07,
-          tol = 1.49012e-08,
-          small = 2.22045e-16,
+          ftol = 1.490116e-07,
+          tol = 1.490116e-04,
+          small = 1.490116e-05,
+          memfac = 500.0,
+          lbc.dir = 0.5,
+          dfc.dir = 3,
+          cfac.dir = 2.5*(3.0-sqrt(5)),
+          initc.dir = 1.0,
+          lbd.dir = 0.1,
+          hbd.dir = 1,
+          dfac.dir = 0.25*(3.0-sqrt(5)),
+          initd.dir = 1.0,
+          lbc.init = 0.1,
+          hbc.init = 2.0,
+          cfac.init = 0.5,
+          lbd.init = 0.1,
+          hbd.init = 0.9,
+          dfac.init = 0.375, 
+          scale.init.categorical.sample = FALSE,
           \dots)
 
 \method{npcdistbw}{default}(xdat = stop("data 'xdat' missing"),
@@ -48,16 +63,30 @@ npcdistbw(\dots)
           gydat,
           bws,
           bandwidth.compute = TRUE,
-          auto,
           nmulti,
           remin,
           itmax,
-          fast.cdf,
           do.full.integral,
           ngrid,
           ftol,
           tol,
           small,
+          memfac,
+          lbc.dir,
+          dfc.dir,
+          cfac.dir,
+          initc.dir,
+          lbd.dir,
+          hbd.dir,
+          dfac.dir,
+          initd.dir,
+          lbc.init,
+          hbc.init,
+          cfac.init,
+          lbd.init,
+          hbd.init,
+          dfac.init,
+          scale.init.categorical.sample,
           bwmethod,
           bwscaling,
           bwtype,
@@ -117,9 +146,9 @@ npcdistbw(\dots)
   }
 
   \item{ydat}{
-    a \eqn{q}-variate data frame of dependent data which bandwidth selection will
-    be performed. The data types may be continuous, discrete (unordered
-    and ordered factors), or some combination thereof.
+    a \eqn{q}-variate data frame of dependent data which bandwidth
+    selection will be performed. The data types may be continuous,
+    discrete (ordered factors), or some combination thereof.
   }
 
   \item{gydat}{
@@ -147,28 +176,20 @@ npcdistbw(\dots)
     kernel types, selection methods, and so on, detailed below.
   }
 
-  \item{auto}{
-    a logical value specifying whether to allow the code to
-    attempt to automatically select the fastest routine, using a
-    heuristic, to compute the least-squares cross-validation function.
-    Defaults to \code{TRUE}.
-  }
-
     
-  \item{bwmethod}{
-    which method to use to select bandwidths.  \code{cv.ls} specifies
-    least-squares cross-validation (Li, Lin and Racine (2013), and
-    \code{normal-reference} just computes the \sQuote{rule-of-thumb}
-    bandwidth \eqn{h_j}{h[j]} using the standard formula \eqn{h_j = 1.06
-    \sigma_j n^{-1/(2P+l)}}{h[j] = 1.06*sigma[j]*n^(-1.0/(2.0*P+l))},
-    where \eqn{\sigma_j}{sigma[j]} is an adaptive measure of spread of
-    the \eqn{j}th continuous variable defined as min(standard deviation,
+  \item{bwmethod}{ which method to use to select bandwidths.
+    \code{cv.ls} specifies least-squares cross-validation (Li, Lin and
+    Racine (2013), and \code{normal-reference} just computes the
+    \sQuote{rule-of-thumb} bandwidth \eqn{h_j}{h[j]} using the standard
+    formula \eqn{h_j = 1.06 \sigma_j n^{-1/(2P+l)}}{h[j] =
+    1.06*sigma[j]*n^(-1.0/(2.0*P+l))}, where \eqn{\sigma_j}{sigma[j]} is
+    an adaptive measure of spread of the \eqn{j}th continuous variable
+    defined as min(standard deviation, mean absolute deviation/1.4826,
     interquartile range/1.349), \eqn{n} the number of observations,
     \eqn{P} the order of the kernel, and \eqn{l} the number of
     continuous variables. Note that when there exist factors and the
     normal-reference rule is used, there is zero smoothing of the
-    factors. Defaults to \code{cv.ls}.
-  }
+    factors. Defaults to \code{cv.ls}.  }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
     supplied bandwidths are interpreted as `scale factors'
@@ -179,13 +200,14 @@ npcdistbw(\dots)
     related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(2P+l)}}{h[j] =
     c[j]*sigma[j]*n^(-1/(2*P+l))}, where \eqn{\sigma_j}{sigma[j]} is an
     adaptive measure of spread of continuous variable \eqn{j} defined as
-    min(standard deviation, interquartile range/1.349), \eqn{n} the
-    number of observations, \eqn{P}{P} the order of the kernel, and
-    \eqn{l}{l} the number of continuous variables. For discrete data
-    types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are related by the
-    formula \eqn{h_j = c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))},
-    where here \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.
-    Defaults to \code{FALSE}.  }
+    min(standard deviation, mean absolute deviation/1.4826,
+    interquartile range/1.349), \eqn{n} the number of observations,
+    \eqn{P}{P} the order of the kernel, and \eqn{l}{l} the number of
+    continuous variables. For discrete data types, \eqn{c_j}{c[j]} and
+    \eqn{h_j}{h[j]} are related by the formula \eqn{h_j =
+    c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))}, where here
+    \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.  Defaults to
+    \code{FALSE}.  }
 
   \item{bwtype}{
     character string used for the continuous variable bandwidth type,
@@ -260,11 +282,6 @@ npcdistbw(\dots)
     optimization routine. Defaults to \code{10000}.
   }
 
-  \item{fast.cdf}{
-    a logical value which when set as \code{TRUE} uses a computationally
-    efficient but potentially memory intensive computational algorithm.
-  }
-
   \item{do.full.integral}{
     a logical value which when set as \code{TRUE} evaluates the
     moment-based integral on the entire sample.
@@ -275,21 +292,64 @@ npcdistbw(\dots)
     integral. Defaults to \code{100}.
   }
 
-  \item{ftol}{
-    tolerance on the value of the cross-validation function 
-    evaluated at located minima. Defaults to \code{1.19e-07
-      (FLT_EPSILON)}.
+ \item{ftol}{
+    fractional tolerance on the value of the cross-validation function
+    evaluated at located minima (of order the machine precision or
+    perhaps slightly larger so as not to be diddled by
+    roundoff). Defaults to \code{1.490116e-07}
+    (1.0e+01*sqrt(.Machine$double.eps)).
   }
 
   \item{tol}{
-    tolerance on the position of located minima of the 
-    cross-validation function. Defaults to \code{1.49e-08
-      (sqrt(DBL_EPSILON))}.
+    tolerance on the position of located minima of the cross-validation
+    function (tol should generally be no smaller than the square root of
+    your machine's floating point precision). Defaults to \code{
+      1.490116e-04 (1.0e+04*sqrt(.Machine$double.eps))}.
   }
 
-  \item{small}{ a small number, at about the precision of the data type
-    used. Defaults to \code{2.22e-16 (DBL_EPSILON)}.
+  \item{small}{
+    a small number used to bracket a minimum (it is hopeless to ask for
+    a bracketing interval of width less than sqrt(epsilon) times its
+    central value, a fractional width of only about 10-04 (single
+    precision) or 3x10-8 (double prevision)). Defaults to \code{small
+      = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
+  }
 
+  \item{lbc.dir,dfc.dir,cfac.dir,initc.dir}{ lower bound, chi-square
+    degrees of freedom, stretch factor, and initial non-random values
+    for direction set search for Powell's algorithm for \code{numeric}
+    variables. See Details}
+
+  \item{lbd.dir,hbd.dir,dfac.dir,initd.dir}{ lower bound, upper bound,
+    stretch factor, and initial non-random values for direction set
+    search for Powell's algorithm for categorical variables. See
+    Details}
+
+  \item{lbc.init, hbc.init, cfac.init}{ lower bound, upper bound, and
+    non-random initial values for scale factors for \code{numeric}
+    variables for Powell's algorithm. See Details}
+
+  \item{lbd.init, hbd.init, dfac.init}{ lower bound, upper bound, and
+    non-random initial values for scale factors for categorical
+    variables for Powell's algorithm. See Details}
+
+  \item{scale.init.categorical.sample}{ a logical value that when set
+    to \code{TRUE} scales \code{lbd.dir}, \code{hbd.dir},
+    \code{dfac.dir}, and \code{initd.dir} by \eqn{n^{-2/(2P+l)}},
+    \eqn{n} the number of observations, \eqn{P}{P} the order of the
+    kernel, and \eqn{l}{l} the number of \code{numeric} variables. See
+    Details}
+
+  \item{memfac}{
+    The algorithm to compute the least-squares objective function uses
+    a block-based algorithm to eliminate or minimize redundant kernel
+    evaluations. Due to memory, hardware and software constraints, a
+    maximum block size must be imposed by the algorithm. This block size
+    is roughly equal to memfac*10^5 elements. Empirical tests on
+    modern hardware find that a memfac of around 500 performs well. If
+    you experience out of memory errors, or strange behaviour for
+    large data sets (>100k elements) setting memfac to a lower value may
+    fix the problem.
   }
 
 }
@@ -297,10 +357,11 @@ npcdistbw(\dots)
 \details{
   \code{npcdistbw} implements a variety of methods for choosing
   bandwidths for multivariate distributions (\eqn{p+q}-variate) defined
-  over a set of possibly continuous and/or discrete (unordered, ordered)
-  data. The approach is based on Li and Racine (2004) who employ
-  \sQuote{generalized product kernels} that admit a mix of continuous
-  and discrete data types.
+  over a set of possibly continuous and/or discrete (unordered
+  \code{xdat}, ordered \code{xdat} and \code{ydat}) data. The approach
+  is based on Li and Racine (2004) who employ \sQuote{generalized
+  product kernels} that admit a mix of continuous and discrete data
+  types.
 
   The cross-validation methods employ multivariate numerical search
   algorithms (direction set (Powell's) methods in multidimensions).
@@ -318,18 +379,20 @@ npcdistbw(\dots)
   constant over the support of \eqn{x}.
 
   \code{npcdistbw} may be invoked \emph{either} with a formula-like
-  symbolic 
-  description of variables on which bandwidth selection is to be
-  performed \emph{or} through a simpler interface whereby data is passed
-  directly to the function via the \code{xdat} and \code{ydat}
+  symbolic description of variables on which bandwidth selection is to
+  be performed \emph{or} through a simpler interface whereby data is
+  passed directly to the function via the \code{xdat} and \code{ydat}
   parameters. Use of these two interfaces is \bold{mutually exclusive}.
 
-  Data contained in the data frames \code{xdat} and \code{ydat} may be a
-  mix of continuous (default), unordered discrete (to be specified in
-  the data frames using \code{\link{factor}}), and ordered discrete (to be
-  specified in the data frames using \code{\link{ordered}}). Data can be
-  entered in an arbitrary order and data types will be detected
-  automatically by the routine (see \code{\link{np}} for details).
+  Data contained in the data frame \code{xdat} may be a mix of
+  continuous (default), unordered discrete (to be specified in the data
+  frames using \code{\link{factor}}), and ordered discrete (to be
+  specified in the data frames using \code{\link{ordered}}).  Data
+  contained in the data frame \code{ydat} may be a mix of continuous
+  (default) and ordered discrete (to be specified in the data frames
+  using \code{\link{ordered}}). Data can be entered in an arbitrary
+  order and data types will be detected automatically by the routine
+  (see \code{\link{np}} for details).
 
   Data for which bandwidths are to be estimated may be specified
   symbolically. A typical description has the form \code{dependent data
@@ -347,6 +410,24 @@ npcdistbw(\dots)
   kernel. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  The optimizer invoked for search is Powell's conjugate direction
+  method which requires the setting of (non-random) initial values and
+  search directions for bandwidths, and, when restarting, random values
+  for successive invocations. Bandwidths for \code{numeric} variables
+  are scaled by robust measures of spread, the sample size, and the
+  number of \code{numeric} variables where appropriate. Two sets of
+  parameters for bandwidths for \code{numeric} can be modified, those
+  for initial values for the parameters themselves, and those for the
+  directions taken (Powell's algorithm does not involve explicit
+  computation of the function's gradient). The default values are set by
+  considering search performance for a variety of difficult test cases
+  and simulated cases. We highly recommend restarting search a large
+  number of times to avoid the presence of local minima (achieved by
+  modifying \code{nmulti}). Further refinement for difficult cases can
+  be achieved by modifying these sets of parameters. However, these
+  parameters are intended more for the authors of the package to enable
+  \sQuote{tuning} for various methods rather than for the user themself.
 
 }
 \value{
@@ -406,7 +487,7 @@ npcdistbw(\dots)
 
 }
 \author{
-  Tristen Hayfield \email{hayfield@mpia.de}, Jeffrey S. Racine
+  Tristen Hayfield \email{tristen.hayfield@gmail.com}, Jeffrey S. Racine
   \email{racinej@mcmaster.ca}
 }
 

@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,9 +23,7 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
@@ -34,7 +31,7 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > 
 > set.seed(42)
 > 
-> n <- 2500
+> n <- 5000
 > 
 > x <- rchisq(n, df=3)
 > x1 <- (ifelse(x < 6, x, 6) - 2.348)/1.511
@@ -53,17 +50,17 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > summary(bw)
 
 Single Index Model
-Regression data (2500 observations, 2 variable(s)):
+Regression data (5000 observations, 2 variable(s)):
 
-      x1       x2
-Beta:  1 1.013558
-Bandwidth:  0.2024523
+      x1        x2
+Beta:  1 0.9870673
+Bandwidth:  0.212915
 Optimisation Method:  Nelder-Mead
 Regression Type: Local-Constant
 Bandwidth Selection Method: Klein and Spady
 Formula: y ~ x1 + x2
 Bandwidth Type: Fixed
-Objective Function Value: 0.3415126 (achieved on multistart 2)
+Objective Function Value: 0.3561415 (achieved on multistart 2)
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -74,34 +71,34 @@ No. Continuous Explanatory Vars.: 1
 > summary(model)
 
 Single Index Model
-Regression Data: 2500 training points, in 2 variable(s)
+Regression Data: 5000 training points, in 2 variable(s)
 
-      x1       x2
-Beta:  1 1.013558
-Bandwidth: 0.2024523
+      x1        x2
+Beta:  1 0.9870673
+Bandwidth: 0.212915
 Kernel Regression Estimator: Local-Constant
 
 Confusion Matrix
       Predicted
 Actual    0    1
-     0  922  174
-     1  214 1190
+     0 1777  413
+     1  414 2396
 
-Overall Correct Classification Ratio:  0.8448
+Overall Correct Classification Ratio:  0.8346
 Correct Classification Ratio By Outcome:
         0         1 
-0.8412409 0.8475783 
+0.8114155 0.8526690 
 
-McFadden-Puig-Kerschner performance measure:  0.8326285
+McFadden-Puig-Kerschner performance measure:  0.8209214
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 23.947 
+Elapsed time = 93.982 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 24.211   0.043  24.246 
+ 94.147   0.071  94.209 

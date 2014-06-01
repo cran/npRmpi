@@ -43,9 +43,19 @@ npqreg.formula <-
     tbw <-
     eval(parse(text=paste("npqreg(txdat = txdat, tydat = tydat,",
                  ifelse(has.eval,"exdat = exdat,",""), "bws = bws, ...)")))
-    tbw$rows.omit <- as.vector(attr(umf,"na.action"))
+
+    tbw$omit <- attr(umf,"na.action")
+    tbw$rows.omit <- as.vector(tbw$omit)
     tbw$nobs.omit <- length(tbw$rows.omit)
-    tbw
+
+    tbw$quantile <- napredict(tbw$omit, tbw$quantile)
+    tbw$quanterr <- napredict(tbw$omit, tbw$quanterr)
+
+    if(tbw$gradients){
+        tbw$quantgrad <- napredict(tbw$omit, tbw$quantgrad)
+    }
+
+    return(tbw)
   }
 
 npqreg.call <-
@@ -63,8 +73,10 @@ npqreg.condbandwidth <-
            exdat,
            tau = 0.5,
            gradients = FALSE,
-           ftol = 1.19209e-07, tol = 1.49012e-08,
-           small = 2.22045e-16, itmax = 10000,
+           ftol = 1.490116e-07, tol = 1.490116e-04,
+           small = 1.490116e-05, itmax = 10000,
+           lbc.dir = 0.5, dfc.dir = 3, cfac.dir = 2.5*(3.0-sqrt(5)),initc.dir = 1.0, 
+           lbd.dir = 0.1, hbd.dir = 1, dfac.dir = 0.25*(3.0-sqrt(5)), initd.dir = 1.0, 
            ...){
 
     no.ex = missing(exdat)
@@ -155,7 +167,7 @@ npqreg.condbandwidth <-
       excon = data.frame()
       exord = data.frame()
     }
-    
+
     myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
@@ -168,21 +180,25 @@ npqreg.condbandwidth <-
       xkerneval = switch(bws$cxkertype,
         gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
-        uniform = CKER_UNI),
+        uniform = CKER_UNI,
+        "truncated gaussian" = CKER_TGAUSS),
       ykerneval = switch(bws$cykertype,
         gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
-        uniform = CKER_UNI),
+        uniform = CKER_UNI,
+        "truncated gaussian" = CKER_TGAUSS),
       uxkerneval = switch(bws$uxkertype,
         aitchisonaitken = UKER_AIT,
         liracine = UKER_LR),
       uykerneval = switch(bws$uykertype,
-        aitchisonaitken = UKER_AIT),
+        aitchisonaitken = UKER_AIT,
+        liracine = UKER_LR),
       oxkerneval = switch(bws$oxkertype,
         wangvanryzin = OKER_WANG,
         liracine = OKER_LR),
       oykerneval = switch(bws$oykertype,
-        wangvanryzin = OKER_WANG),
+        wangvanryzin = OKER_WANG,
+        liracine = OKER_NLR),
       num_yuno = bws$ynuno,
       num_yord = bws$ynord,
       num_ycon = bws$yncon,
@@ -192,14 +208,16 @@ npqreg.condbandwidth <-
       no.ex = no.ex,
       gradients = gradients,
       itmax = itmax,
-      xmcv.numRow = attr(bws$xmcv, "num.row")
-      )
+      xmcv.numRow = attr(bws$xmcv, "num.row"),
+      nmulti = itmax,
+      dfc.dir = dfc.dir)
 
     myoptd = list(
       ftol = ftol,
       tol = tol,
-      small = small
-      )
+      small = small,
+      lbc.dir = lbc.dir, cfac.dir = cfac.dir,initc.dir = initc.dir, 
+      lbd.dir = lbd.dir, hbd.dir = hbd.dir, dfac.dir = dfac.dir, initd.dir = initd.dir)
     
     myout=
       .C("np_quantile_conditional",
@@ -211,6 +229,7 @@ npqreg.condbandwidth <-
                      bws$ybw[bws$iyuno],bws$ybw[bws$iyord],
                      bws$xbw[bws$ixuno],bws$xbw[bws$ixord])),
          as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+         as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
          as.integer(myopti),
          as.double(myoptd),
          yq = double(enrow),
@@ -238,12 +257,14 @@ npqreg.condbandwidth <-
                 quanterr = myout$yqerr,
                 quantgrad = myout$yqgrad,
                 ntrain = tnrow,
-                trainiseval = no.ex)
+                trainiseval = no.ex,
+                gradients = gradients)
   }
 
 
 npqreg.default <- function(bws, txdat, tydat, ...){
-  sc.names <- names(sys.call())
+  sc <- sys.call()
+  sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -265,40 +286,24 @@ npqreg.default <- function(bws, txdat, tydat, ...){
   if(tydat.named)
     tydat <- toFrame(tydat)
 
-  mc <- match.call()
-
-  tx.str <- ifelse(txdat.named, "xdat = txdat,",
-                   ifelse(no.txdat, "", "txdat,"))
-  ty.str <- ifelse(tydat.named, "ydat = tydat,",
-                   ifelse(no.tydat, "", "tydat,"))
+  sc.bw <- sc
   
-  tbw <- eval(parse(text = paste("npcdistbw(",
-                      ifelse(bws.named,                             
-                             paste(tx.str, ty.str,
-                                   "bws = bws, bandwidth.compute = FALSE,"),
-                             paste(ifelse(no.bws, "", "bws,"), tx.str, ty.str)),
-                      "call = mc, ...",")",sep="")))
+  sc.bw[[1]] <- quote(npcdistbw)
 
-  ## need to do some surgery on the call to
-  ## allow it to work with the formula interface
-
-  repair.args <- c("data", "subset", "na.action")
-  
-  m.par <- match(repair.args, names(mc), nomatch = 0)
-  m.child <- match(repair.args, names(tbw$call), nomatch = 0)
-
-  if(any(m.child > 0)) {
-    tbw$call[m.child] <- mc[m.par]
+  if(bws.named){
+    sc.bw$bandwidth.compute <- FALSE
   }
 
-  ## next we repair arguments portion of the call
-  m.bws.par <- match(c("bws","txdat","tydat"), names(mc), nomatch = 0)
-  m.bws.child <- match(c("bws","txdat","tydat"), as.character(tbw$call), nomatch = 0)
-  m.bws.union <- (m.bws.par > 0) & (m.bws.child > 0)
+  ostxy <- c('txdat','tydat')
+  nstxy <- c('xdat','ydat')
   
-  tbw$call[m.bws.child[m.bws.union]] <- mc[m.bws.par[m.bws.union]]
+  m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  environment(tbw$call) <- parent.frame()
+  if(any(m.txy > 0)) {
+    names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
+  }
+    
+  tbw <- eval.parent(sc.bw)
 
   ## convention: drop 'bws' and up to two unnamed arguments (including bws)
   if(no.bws){

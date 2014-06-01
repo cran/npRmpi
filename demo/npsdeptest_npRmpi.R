@@ -26,16 +26,16 @@ mpi.bcast.cmd(set.seed(42),
 ## A function to create a time series
 
 ar.series <- function(phi,epsilon) {
-  n <- length(epsilon)
-  series <- numeric(n)
+  m <- length(epsilon)
+  series <- numeric(m)
   series[1] <- epsilon[1]/(1-phi)
-  for(i in 2:n) {
+  for(i in 2:m) {
     series[i] <- phi*series[i-1] + epsilon[i]
   }
   return(series)
 }
 
-n <- 500
+n <- 1500
 
 ## Stationary persistent time-series
 

@@ -23,7 +23,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 2500
+n <- 5000
 
 x <- rchisq(n, df=3)
 x1 <- (ifelse(x < 6, x, 6) - 2.348)/1.511

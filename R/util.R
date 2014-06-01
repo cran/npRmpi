@@ -1,7 +1,7 @@
 ## No Zero Denominator, used in C code for kernel estimation...
   
 NZD <- function(a) {
-  sapply(1:NROW(a), function(i) {if(a[i] < 0) min(-.Machine$double.xmin,a[i]) else max(.Machine$double.xmin,a[i])})
+  sapply(1:NROW(a), function(i) {if(a[i] < 0) min(-.Machine$double.eps,a[i]) else max(.Machine$double.eps,a[i])})
 }
 
 ## Function to test for monotone increasing vector
@@ -26,6 +26,39 @@ matrix.sd <- function(x, na.rm=FALSE) {
 npseed <- function(seed){
   .C("np_set_seed",as.integer(abs(seed)), PACKAGE = "npRmpi")
   invisible()
+}
+
+erf <- function(z) { 2 * pnorm(z*sqrt(2)) - 1 }
+
+nptgauss <- function(b){
+
+  rel.tol <- sqrt(.Machine$double.eps)
+
+  b.max <- sqrt(-2*log(.Machine$double.eps))
+
+  if((b < 0) || (b > b.max))
+    stop(paste("b must be between 0 and",b.max))
+
+  alpha <- 1.0/(pnorm(b)-pnorm(-b)-2*b*dnorm(b))
+
+  tgauss <- function(z)
+    ifelse(abs(z) >= b, 0.0, alpha*(dnorm(z) - dnorm(b)))
+
+  c0 <- alpha*dnorm(b)
+
+  k <- integrate(f = function(z) { tgauss(z)^2 }, -b, b)$value
+  k2 <- integrate(f = function(z) { z^2*tgauss(z) }, -b, b)$value
+  k22 <- integrate(f = function(z) { (z*tgauss(z))^2 }, -b, b)$value
+  km <- integrate(f = function(z) { tgauss(z-0.5)*tgauss(z+0.5) }, -b+0.5, b-0.5)$value
+
+  a0 <- (0.5 + 2*b*c0)/integrate(f = function(z){ erf(z/2 + b)*exp(-0.25*z^2) }, -2*b, 0)$value
+  a2 <- (c0 + k - a0*erf(b))/erf(b/sqrt(2))
+  a1 <- -(a2*erf(b/sqrt(2)) + c0)/(2*b)
+
+  int.kernels[CKER_TGAUSS + 1] <- k
+  
+  invisible(.C("np_set_tgauss2",as.double(c(b, alpha, c0, a0, a1, a2, k, k2, k22, km)), PACKAGE = "npRmpi"))
+
 }
 
 numNotIn <- function(x){
@@ -142,6 +175,54 @@ validateBandwidth <- function(bws){
   vbl <- lapply(1:length(vari), bchecker)
   invisible(vbl)
 }
+
+validateBandwidthTF <- function(bws){
+  vari <- names(bws$bandwidth)
+  bchecker <- function(j){
+    v <- vari[j]
+    dati <- bws$dati[[v]]
+    bwv <- bws$bandwidth[[j]]
+
+    if(length(bwv) != length(dati$iord))
+      return(FALSE)
+
+    cd <- function(a,b){
+      (a-b)/(a+b+.Machine$double.eps) > 5.0*.Machine$double.eps
+    }
+    
+    vb <- sapply(1:length(bwv), function(i){
+      falg <- (bwv[i] < 0)
+
+      if (dati$icon[i]) {
+        if(bws$type == "fixed") {
+          if(falg || (!is.finite(bwv[i]))){
+            return(FALSE)
+          }
+        } else if((bwv[i] < 1) || (!is.finite(bwv[i]))) {
+          return(FALSE)
+        }
+      }
+      
+      if (dati$iord[i] &&
+          (falg || cd(bwv[i],oMaxL(dati$all.nlev[[i]],
+                         kertype = bws$klist[[v]]$okertype)))){
+        return(FALSE)
+      }
+      
+      if (dati$iuno[i] &&
+          (falg || cd(bwv[i],uMaxL(dati$all.nlev[[i]],
+                         kertype = bws$klist[[v]]$ukertype)))){
+        return(FALSE)
+      }
+      return(TRUE)
+    })
+    
+    return(all(vb))
+  }
+  vbl <- all(unlist(lapply(1:length(vari), bchecker)))
+  return(vbl)
+}
+
 
 explodeFormula <- function(formula){
   res <- strsplit(strsplit(paste(deparse(formula), collapse=""),
@@ -326,10 +407,11 @@ uMaxL <- function(c, kertype = c("aitchisonaitken","liracine")){
          liracine = 1.0)
 }
 
-oMaxL <- function(c, kertype = c("wangvanryzin", "liracine")){
+oMaxL <- function(c, kertype = c("wangvanryzin", "liracine", "nliracine")){
   switch(kertype,
          wangvanryzin = 1.0,
-         liracine = 1.0)
+         liracine = 1.0,
+         nliracine = 1.0)
 }
 
 ## tested with: rbandwidth
@@ -375,8 +457,8 @@ genOmitStr <- function(x){
   t.str <- ''
   if(!is.null(x$rows.omit) & !identical(x$rows.omit, NA))
     t.str <- paste("\nNo. Complete Observations: ", x$nobs,
-                   "No. NA Observations: ", x$nobs.omit,
-                   "\nObservations omitted: ", paste(x$rows.omit, collapse=" "),
+                   "\nNo. Incomplete (NA) Observations: ", x$nobs.omit,
+                   "\nObservations omitted or excluded: ", paste(x$rows.omit, collapse=" "),
                    "\n")
   return(t.str)
 }
@@ -662,13 +744,77 @@ SIGNfunc <- function(y,y.fit) {
   sum(sign(y) == sign(y.fit))/length(y)
 }
 
-
 EssDee <- function(y){
-
+  if(any(dim(as.matrix(y)) == 0))
+      return(0)
   sd.vec <- apply(as.matrix(y),2,sd)
-  IQR.vec <- apply(as.matrix(y),2,IQR)/(qnorm(.25,lower.tail=F)*2)
-  return(ifelse(sd.vec<IQR.vec|IQR.vec==0,sd.vec,IQR.vec))
-  
+  IQR.vec <- apply(as.matrix(y),2,IQR)/QFAC
+  mad.vec <- apply(as.matrix(y),2,mad)
+  a <- apply(cbind(sd.vec,IQR.vec,mad.vec),1, function(x) max(x))
+  if(any(a<=0)) warning(paste("variable ",which(a<=0)," appears to be constant",sep=""))
+  a <- apply(cbind(sd.vec,IQR.vec,mad.vec),1, function(x) min(x[x>0]))  
+  return(a)
+}
+
+
+##EssDee <- function(y){
+##
+##  sd.vec <- apply(as.matrix(y),2,sd)
+##  IQR.vec <- apply(as.matrix(y),2,IQR)/QFAC
+##  return(ifelse(sd.vec<IQR.vec|IQR.vec==0,sd.vec,IQR.vec))
+##  
+##}
+
+## consolidating various bits of code related to converting internal settings
+## to printable strings
+
+bwmToPrint <- function(s){
+  switch(s,
+         manual = "Manual",
+         cv.aic = "Expected Kullback-Leibler Cross-Validation",
+         cv.ml = "Maximum Likelihood Cross-Validation",
+         cv.cdf = "Least Squares Cross-Validation",
+         cv.ls = "Least Squares Cross-Validation",
+         cv.ls.np = "Least Squares Cross-Validation (block algorithm)",
+         "normal-reference" = "Normal Reference")
+}
+
+bwtToPrint <- function(s){
+  switch(s,
+         fixed = "Fixed",
+         generalized_nn = "Generalized Nearest Neighbour",
+         adaptive_nn = "Adaptive Nearest Neighbour" )
+}
+
+cktToPrint <- function(s, order = ""){
+  switch(s,
+         gaussian = paste(order,"Gaussian"),
+         epanechnikov =  paste(order,"Epanechnikov"),
+         uniform = "Uniform",
+         "truncated gaussian" = "Truncated Gaussian")
+}
+
+uktToPrint <- function(s){
+  switch(s,
+         aitchisonaitken = "Aitchison and Aitken",
+         liracine = "Li and Racine (normalized)")
+}
+
+oktToPrint <- function(s, normalized = FALSE) {
+  if(normalized){
+    pok <- 
+      switch(s,
+             wangvanryzin = "Wang and Van Ryzin", 
+             liracine = "Li and Racine (normalized)",
+             nliracine = "Li and Racine (normalized)")
+  } else {
+    pok <- 
+      switch(s,
+             wangvanryzin = "Wang and Van Ryzin", 
+             liracine = "Li and Racine",
+             nliracine = "Li and Racine (normalized)")
+  }
+  return(pok)
 }
 
 ### holding place for some generic methods
@@ -712,12 +858,14 @@ DO_TREE_YES = 1
 CKER_GAUSS = 0
 CKER_EPAN  = 4
 CKER_UNI   = 8
+CKER_TGAUSS = 9
 
 UKER_AIT = 0
 UKER_LR = 1
 
 OKER_WANG = 0
 OKER_LR = 1
+OKER_NLR = 2
 
 ##density 
 BWM_CVML = 0
@@ -743,6 +891,7 @@ CBWM_CCDF = 3 # Added 7/2/2010 jracine
 CDBWM_CVLS = 0
 
 ##integral operators on kernels
+OP_NOOP        = -1
 OP_NORMAL      = 0
 OP_CONVOLUTION = 1
 OP_DERIVATIVE  = 2
@@ -751,7 +900,12 @@ OP_INTEGRAL    = 3
 ALL_OPERATORS = c(OP_NORMAL, OP_CONVOLUTION, OP_DERIVATIVE, OP_INTEGRAL)
 names(ALL_OPERATORS) <- c("normal","convolution", "derivative", "integral")
 
+PERMUTATION_OPERATORS <- c(OP_NOOP, OP_NORMAL, OP_DERIVATIVE, OP_INTEGRAL)
+names(PERMUTATION_OPERATORS) <- c("none", "normal", "derivative", "integral")
+
 ## useful numerical constants of kernel integrals
 int.kernels <- c(0.28209479177387814348, 0.47603496111841936711, 0.62396943688265038571, 0.74785078617543927990,
                  0.26832815729997476357, 0.55901699437494742410, 0.84658823667359826246, 1.1329342579014329689,
-                 0.5)
+                 0.5, 2.90113075268188e-01)
+
+QFAC <- qnorm(.25,lower.tail=F)*2

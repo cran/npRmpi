@@ -3,10 +3,10 @@ scbandwidth <-
            bwmethod = c("cv.ls", "manual"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian", "epanechnikov","uniform"), 
+           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            ckerorder = c(2,4,6,8),
            ukertype = c("aitchisonaitken", "liracine"),
-           okertype = c("wangvanryzin", "liracine"),
+           okertype = c("liracine","wangvanryzin"),
            fval = NA,
            ifval = NA,
            nobs = NA,
@@ -20,6 +20,9 @@ scbandwidth <-
            znames = NULL,
            sfactor = NA, bandwidth = NA,
            rows.omit = NA,
+           nconfac = NA,
+           ncatfac = NA,
+           sdev = NA,
            bandwidth.compute = TRUE,
            optim.method = "NA",...){
 
@@ -38,6 +41,8 @@ scbandwidth <-
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
 
+  if (ckertype == "truncated gaussian" && ckerorder != 2)
+    warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   ukertype = match.arg(ukertype)
   okertype = match.arg(okertype)
@@ -71,9 +76,7 @@ scbandwidth <-
   mybw = list(
     bw=bw,
     method = bwmethod,
-    pmethod = switch( bwmethod,
-      manual = "Manual",
-      cv.ls = "Least Squares Cross-Validation" ),
+    pmethod = bwmToPrint(bwmethod),
     pomethod = switch(optim.method,
       "Nelder-Mead" = "Nelder-Mead",
       "BFGS" = "BFGS",
@@ -83,24 +86,14 @@ scbandwidth <-
     scaling = bwscaling,
     pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
     type = bwtype,
-    ptype = switch( bwtype,
-      fixed = "Fixed",
-      generalized_nn = "Generalized Nearest Neighbour",
-      adaptive_nn = "Adaptive Nearest Neighbour" ),
+    ptype = bwtToPrint(bwtype),
     ckertype = ckertype,    
     ckerorder = ckerorder,
-    pckertype = switch(ckertype,
-      gaussian = paste(porder,"Gaussian"),
-      epanechnikov =  paste(porder,"Epanechnikov"),
-      uniform = "Uniform"),
+    pckertype = cktToPrint(ckertype, order = porder),
     ukertype = ukertype,
-    pukertype = switch( ukertype,
-      aitchisonaitken = "Aitchison and Aitken",
-      liracine = "Li and Racine"),
+    pukertype = uktToPrint(ukertype),
     okertype = okertype,
-    pokertype = switch( okertype,
-      wangvanryzin = "Wang and Van Ryzin",
-      liracine = "Li and Racine"),
+    pokertype = oktToPrint(okertype),
     nobs = nobs,
     ndim = ndim,
     ncon = sum(tdati$icon),

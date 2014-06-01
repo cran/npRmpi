@@ -196,7 +196,8 @@ npregivderiv <- function(y,
                            txdat=X.train,
                            bws=bws,
                            ukertype="liracine",
-                           okertype="liracine")$ksum
+                           okertype="liracine",
+                           ...)$ksum
 
       } else {
 
@@ -206,7 +207,8 @@ npregivderiv <- function(y,
                            weights=W,
                            bws=bws,
                            ukertype="liracine",
-                           okertype="liracine")$ksum[,,1]
+                           okertype="liracine",
+                           ...)$ksum[,,1]
 
       }
 
@@ -218,7 +220,8 @@ npregivderiv <- function(y,
                   exdat=X.train,
                   bws=bws,
                   ukertype="liracine",
-                  okertype="liracine")$ksum
+                  okertype="liracine",
+                  ...)$ksum
 
       ## p == 0
 
@@ -228,7 +231,7 @@ npregivderiv <- function(y,
 
       ## No singularity problems...
 
-      if(tryCatch(Wmat.sum.inv <- as.matrix(solve(Wmat.sum)),
+      if(tryCatch(Wmat.sum.inv <- as.matrix(chol2inv(chol(Wmat.sum))),
                   error = function(e){
                     return(matrix(FALSE,nc,nc))
                   })[1,1]!=FALSE) {
@@ -253,14 +256,14 @@ npregivderiv <- function(y,
           epsilon <- 1/n.train
           ridge <- 0
 
-          while(tryCatch(as.matrix(solve(Wmat.sum+diag(rep(ridge,nc)))),
+          while(tryCatch(as.matrix(chol2inv(chol(Wmat.sum+diag(rep(ridge,nc))))),
                          error = function(e){
                            return(matrix(FALSE,nc,nc))
                          })[1,1]==FALSE) {
             ridge <- ridge + epsilon
           }
 
-          Wmat.sum.inv <- as.matrix(solve(Wmat.sum+diag(rep(ridge,nc))))
+          Wmat.sum.inv <- as.matrix(chol2inv(chol(Wmat.sum+diag(rep(ridge,nc)))))
 
           ## Add for debugging...
 
@@ -382,13 +385,13 @@ npregivderiv <- function(y,
       xdat.numeric <- as.data.frame(xdat[,xdat.col.numeric])
     }
 
-    if(length(degree) != ncol(xdat.numeric)) stop(" degree vector and number of numeric predictors incompatible")
+    if(length(degree) != k) stop(" degree vector and number of numeric predictors incompatible")
 
     if(all(degree == 0) | k == 0) {
 
       ## Local constant OR no continuous variables
 
-      return(matrix(1,nrow=nrow(xdat.numeric),ncol=1))
+      return(matrix(1,nrow=nrow(xdat),ncol=1))
 
     } else {
 
@@ -408,7 +411,7 @@ npregivderiv <- function(y,
           }
         }
       }
-      res <- rep.int(1,nrow(xdat.numeric))
+      res <- rep.int(1,nrow(xdat))
       if(degree[1] > 0) res <- cbind(1, mypoly(xdat.numeric[,1], degree[1]))[, 1 + z[, 1]]
       if(k > 1) for (i in 2:k) if(degree[i] > 0) res <- res * cbind(1, mypoly(xdat.numeric[,i], degree[i]))[, 1 + z[, i]]
       res <- as.matrix(res)
@@ -542,6 +545,7 @@ npregivderiv <- function(y,
       coef.mat <- matrix(maxPenalty,ncol(W),n.eval)
       epsilon <- 1.0/n.eval
       ridge <- double(n.eval)
+      ridge.lc <- double(n.eval)      
       doridge <- !logical(n.eval)
 
       nc <- ncol(tww[,,1])
@@ -551,9 +555,8 @@ npregivderiv <- function(y,
 
       ridger <- function(i) {
         doridge[i] <<- FALSE
-        ridge.val <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-        tryCatch(solve(tww[,,i]+diag(rep(ridge[i],nc)),
-                       tyw[,i]+c(ridge.val,rep(0,nc-1))),
+        ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
+        tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
                  error = function(e){
                    ridge[i] <<- ridge[i]+epsilon
                    doridge[i] <<- TRUE
@@ -567,7 +570,7 @@ npregivderiv <- function(y,
       }
 
       mhat <- sapply(1:n.eval, function(i) {
-        W.eval[i,, drop = FALSE] %*% coef.mat[,i]
+        (1-ridge[i])*W.eval[i,, drop = FALSE] %*% coef.mat[,i] + ridge.lc[i]
       })
 
       return(list(mean = mhat,grad = t(coef.mat[-1,])))
@@ -648,6 +651,7 @@ npregivderiv <- function(y,
         mean.loo <- rep(maxPenalty,n)
         epsilon <- 1.0/n
         ridge <- double(n)
+        ridge.lc <- double(n)        
         doridge <- !logical(n)
 
         nc <- ncol(tww[,,1])
@@ -657,9 +661,8 @@ npregivderiv <- function(y,
 
         ridger <- function(i) {
           doridge[i] <<- FALSE
-          ridge.val <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-          W[i,, drop = FALSE] %*% tryCatch(solve(tww[,,i]+diag(rep(ridge[i],nc)),
-                  tyw[,i]+c(ridge.val,rep(0,nc-1))),
+          ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
+          W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
                   error = function(e){
                     ridge[i] <<- ridge[i]+epsilon
                     doridge[i] <<- TRUE
@@ -669,7 +672,7 @@ npregivderiv <- function(y,
 
         while(any(doridge)){
           iloo <- (1:n)[doridge]
-          mean.loo[iloo] <- sapply(iloo, ridger)
+          mean.loo[iloo] <- (1-ridge[iloo])*sapply(iloo, ridger) + ridge.lc[iloo]
         }
 
         if (!any(mean.loo == maxPenalty)){
@@ -771,6 +774,7 @@ npregivderiv <- function(y,
         ghat <- rep(maxPenalty,n)
         epsilon <- 1.0/n
         ridge <- double(n)
+        ridge.lc <- double(n)        
         doridge <- !logical(n)
 
         nc <- ncol(tww[,,1])
@@ -780,9 +784,8 @@ npregivderiv <- function(y,
 
         ridger <- function(i) {
           doridge[i] <<- FALSE
-          ridge.val <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-          W[i,, drop = FALSE] %*% tryCatch(solve(tww[,,i]+diag(rep(ridge[i],nc)),
-                  tyw[,i]+c(ridge.val,rep(0,nc-1))),
+          ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
+          W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
                   error = function(e){
                     ridge[i] <<- ridge[i]+epsilon
                     doridge[i] <<- TRUE
@@ -792,19 +795,21 @@ npregivderiv <- function(y,
 
         while(any(doridge)){
           ii <- (1:n)[doridge]
-          ghat[ii] <- sapply(ii, ridger)
+          ghat[ii] <- (1-ridge[ii])*sapply(ii, ridger) + ridge.lc[ii]
         }
 
         trH <- kernel.i.eq.j*sum(sapply(1:n,function(i){
-          W[i,, drop = FALSE] %*% solve(tww[,,i]+diag(rep(ridge[i],nc))) %*% t(W[i,, drop = FALSE])
+          (1-ridge[i])*W[i,, drop = FALSE] %*% chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc)))) %*% t(W[i,, drop = FALSE]) + ridge[i]/NZD(tww[,,i][1,1])
         }))
 
-        if (!any(ghat == maxPenalty)){
-          fv <- log(mean((ydat-ghat)^2)) + (1+trH/n)/(1-(trH+2)/n)
+        aic.penalty <- (1+trH/n)/(1-(trH+2)/n)
+  
+        if (!any(ghat == maxPenalty) & (aic.penalty > 0)){
+          fv <- log(mean((ydat-ghat)^2)) + aic.penalty
         } else {
           fv <- maxPenalty
         }
-
+  
         return(ifelse(is.finite(fv),fv,maxPenalty))
 
       }
@@ -924,7 +929,7 @@ npregivderiv <- function(y,
 
       for(i in 1:ncol(xdat)) {
         if(xdat.numeric[i]==TRUE) {
-          init.search.vals[i] <- runif(1,.5,1.5)*(IQR(xdat[,i])/1.349)*nrow(xdat)^{-1/(4+num.numeric)}
+          init.search.vals[i] <- runif(1,.5,1.5)*EssDee(xdat[,i])*nrow(xdat)^{-1/(4+num.numeric)}
         }
       }
 
@@ -951,7 +956,7 @@ npregivderiv <- function(y,
         while((optim.return$convergence != 0) && (attempts <= optim.maxattempts)) {
           init.search.vals <- runif(ncol(xdat),0,1)
           if(xdat.numeric[i]==TRUE) {
-            init.search.vals[i] <- runif(1,.5,1.5)*(IQR(xdat[,i])/1.349)*nrow(xdat)^{-1/(4+num.numeric)}
+            init.search.vals[i] <- runif(1,.5,1.5)*EssDee(xdat[,i])*nrow(xdat)^{-1/(4+num.numeric)}
           }
           attempts <- attempts + 1
           optim.control$abstol <- optim.control$abstol * 10.0
@@ -980,7 +985,7 @@ npregivderiv <- function(y,
         while((optim.return$convergence != 0) && (attempts <= optim.maxattempts)) {
           init.search.vals <- runif(ncol(xdat),0,1)
           if(xdat.numeric[i]==TRUE) {
-            init.search.vals[i] <- runif(1,.5,1.5)*(IQR(xdat[,i])/1.349)*nrow(xdat)^{-1/(4+num.numeric)}
+            init.search.vals[i] <- runif(1,.5,1.5)*EssDee(xdat[,i])*nrow(xdat)^{-1/(4+num.numeric)}
           }
           attempts <- attempts + 1
           optim.control$abstol <- optim.control$abstol * 10.0
@@ -1100,10 +1105,16 @@ npregivderiv <- function(y,
   ## density for the moment. Use the normal-reference rule for speed
   ## considerations.
 
-  bw <- npudensbw(dat=z,bwmethod="normal-reference")
-  model.fz <- npudens(tdat=z,bws=bw)
+  bw <- npudensbw(dat=z,
+                  bwmethod="normal-reference",
+                  ...)
+  model.fz <- npudens(tdat=z,
+                      bws=bw$bw,
+                      ...)
   f.z <- predict(model.fz,newdata=zeval)
-  model.Sz <- npudist(tdat=z,bws=bw)
+  model.Sz <- npudist(tdat=z,
+                      bws=bw$bw,
+                      ...)
   S.z <- 1-predict(model.Sz,newdata=zeval)
 
   console <- printClear(console)
@@ -1164,7 +1175,8 @@ npregivderiv <- function(y,
                                    txdat=z,
                                    exdat=zeval,
                                    bws=h$bw,
-                                   gradients=TRUE))[,1]
+                                   gradients=TRUE,
+                                   ...))[,1]
 
     } else {
 
@@ -1291,7 +1303,10 @@ npregivderiv <- function(y,
                                  exdat=zeval,
                                  tydat=as.matrix(predicted.E.mu.w),
                                  operator="integral",
-                                 bws=bw$bw)$ksum/length(y)
+                                 ukertype="liracine",
+                                 okertype="liracine",
+                                 bws=bw$bw,
+                                 ...)$ksum/length(y)
 
   survivor.weighted.average <- mean.predicted.E.mu.w - cdf.weighted.average
 
@@ -1400,7 +1415,10 @@ npregivderiv <- function(y,
                                    exdat=zeval,
                                    tydat=as.matrix(predicted.E.mu.w),
                                    operator="integral",
-                                   bws=bw$bw)$ksum/length(y)
+                                   ukertype="liracine",
+                                   okertype="liracine",
+                                   bws=bw$bw,
+                                   ...)$ksum/length(y)
 
     survivor.weighted.average <- mean.predicted.E.mu.w - cdf.weighted.average
 

@@ -70,7 +70,12 @@ npregbw.rbandwidth <-
            ydat = stop("invoked without data 'ydat'"),
            bws, bandwidth.compute = TRUE,
            nmulti, remin = TRUE, itmax = 10000,
-           ftol = 1.19209e-07, tol = 1.49012e-08, small = 2.22045e-16, ...){
+           ftol = 1.490116e-07, tol = 1.490116e-04, small = 1.490116e-05,
+           lbc.dir = 0.5, dfc.dir = 3, cfac.dir = 2.5*(3.0-sqrt(5)),initc.dir = 1.0, 
+           lbd.dir = 0.1, hbd.dir = 1, dfac.dir = 0.25*(3.0-sqrt(5)), initd.dir = 1.0, 
+           lbc.init = 0.1, hbc.init = 2.0, cfac.init = 0.5, 
+           lbd.init = 0.1, hbd.init = 0.9, dfac.init = 0.375, 
+           scale.init.categorical.sample = FALSE,...){
 
     xdat <- toFrame(xdat)
 
@@ -125,6 +130,10 @@ npregbw.rbandwidth <-
 
     tbw <- bws
 
+    mysd <- EssDee(rcon)
+    nconfac <- nrow^(-1.0/(2.0*bws$ckerorder+bws$ncon))
+    ncatfac <- nrow^(-2.0/(2.0*bws$ckerorder+bws$ncon))
+
     if (bandwidth.compute){
       myopti = list(num_obs_train = dim(xdat)[1], 
         iMultistart = ifelse(nmulti==0,IMULTI_FALSE,IMULTI_TRUE),
@@ -143,7 +152,8 @@ npregbw.rbandwidth <-
         kerneval = switch(bws$ckertype,
           gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
           epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
-          uniform = CKER_UNI),
+          uniform = CKER_UNI,
+          "truncated gaussian" = CKER_TGAUSS),
         ukerneval = switch(bws$ukertype,
           aitchisonaitken = UKER_AIT,
           liracine = UKER_LR),
@@ -156,17 +166,25 @@ npregbw.rbandwidth <-
         regtype = switch(bws$regtype,
           lc = REGTYPE_LC,
           ll = REGTYPE_LL),
-        int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO))
+        int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO),
+        scale.init.categorical.sample = scale.init.categorical.sample,
+        dfc.dir = dfc.dir)
       
-      myoptd = list(ftol=ftol, tol=tol, small=small)
+      myoptd = list(ftol=ftol, tol=tol, small=small,
+        lbc.dir = lbc.dir, cfac.dir = cfac.dir, initc.dir = initc.dir, 
+        lbd.dir = lbd.dir, hbd.dir = hbd.dir, dfac.dir = dfac.dir, initd.dir = initd.dir, 
+        lbc.init = lbc.init, hbc.init = hbc.init, cfac.init = cfac.init, 
+        lbd.init = lbd.init, hbd.init = hbd.init, dfac.init = dfac.init, 
+        nconfac = nconfac, ncatfac = ncatfac)
 
       myout=
         .C("np_regression_bw",
            as.double(runo), as.double(rord), as.double(rcon), as.double(ydat),
+           as.double(mysd),
            as.integer(myopti), as.double(myoptd), 
            bw = c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord]),
-           fval = double(2),
-           PACKAGE="npRmpi" )[c("bw","fval")]
+           fval = double(2),fval.history = double(max(1,nmulti)),
+           PACKAGE="npRmpi" )[c("bw","fval","fval.history")]
       
 
       rorder = numeric(ncol)
@@ -175,30 +193,29 @@ npregbw.rbandwidth <-
       tbw$bw <- myout$bw[rorder]
       tbw$fval <- myout$fval[1]
       tbw$ifval <- myout$fval[2]
+      tbw$fval.history <- myout$fval.history
     }
 
     tbw$sfactor <- tbw$bandwidth <- tbw$bw
 
-    nfactor <- nrow^(-2.0/(2.0*tbw$ckerorder+tbw$ncon))
-
     if (tbw$nuno > 0){
       if(tbw$scaling){ 
-        tbw$bandwidth[tbw$xdati$iuno] <- tbw$bandwidth[tbw$xdati$iuno]*nfactor
+        tbw$bandwidth[tbw$xdati$iuno] <- tbw$bandwidth[tbw$xdati$iuno]*ncatfac
       } else {
-        tbw$sfactor[tbw$xdati$iuno] <- tbw$sfactor[tbw$xdati$iuno]/nfactor
+        tbw$sfactor[tbw$xdati$iuno] <- tbw$sfactor[tbw$xdati$iuno]/ncatfac
       }
     }
     
     if (tbw$nord > 0){
       if(tbw$scaling){
-        tbw$bandwidth[tbw$xdati$iord] <- tbw$bandwidth[tbw$xdati$iord]*nfactor
+        tbw$bandwidth[tbw$xdati$iord] <- tbw$bandwidth[tbw$xdati$iord]*ncatfac
       } else {
-        tbw$sfactor[tbw$xdati$iord] <- tbw$sfactor[tbw$xdati$iord]/nfactor
+        tbw$sfactor[tbw$xdati$iord] <- tbw$sfactor[tbw$xdati$iord]/ncatfac
       }
     }
 
     if (tbw$ncon > 0){
-      dfactor <- EssDee(rcon)*nrow^(-1.0/(2.0*tbw$ckerorder+tbw$ncon))
+      dfactor <- mysd*nconfac
 
       if (tbw$scaling) {
         tbw$bandwidth[tbw$xdati$icon] <- tbw$bandwidth[tbw$xdati$icon]*dfactor
@@ -220,6 +237,7 @@ npregbw.rbandwidth <-
                       okertype = tbw$okertype,
                       fval = tbw$fval,
                       ifval = tbw$ifval,
+                      fval.history = tbw$fval.history,
                       nobs = tbw$nobs,
                       xdati = tbw$xdati,
                       ydati = tbw$ydati,
@@ -228,6 +246,9 @@ npregbw.rbandwidth <-
                       sfactor = tbw$sfactor,
                       bandwidth = tbw$bandwidth,
                       rows.omit = rows.omit,
+                      nconfac = nconfac,
+                      ncatfac = ncatfac,
+                      sdev = mysd,
                       bandwidth.compute = bandwidth.compute)
     tbw
   }
@@ -238,6 +259,11 @@ npregbw.default <-
            bws,
            bandwidth.compute = TRUE, nmulti,
            remin, itmax, ftol, tol, small,
+           lbc.dir, dfc.dir, cfac.dir, initc.dir, 
+           lbd.dir, hbd.dir, dfac.dir, initd.dir, 
+           lbc.init, hbc.init, cfac.init, 
+           lbd.init, hbd.init, dfac.init,
+           scale.init.categorical.sample,
            ## dummy arguments for later passing into rbandwidth()
            regtype, bwmethod, bwscaling, bwtype,
            ckertype, ckerorder, ukertype, okertype,
@@ -270,7 +296,12 @@ npregbw.default <-
 
     mc.names <- names(match.call(expand.dots = FALSE))
     margs <- c("bandwidth.compute", "nmulti", "remin", "itmax", "ftol", "tol",
-               "small")
+               "small",
+               "lbc.dir", "dfc.dir", "cfac.dir","initc.dir", 
+               "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir", 
+               "lbc.init", "hbc.init", "cfac.init", 
+               "lbd.init", "hbd.init", "dfac.init", 
+               "scale.init.categorical.sample")
     m <- match(margs, mc.names, nomatch = 0)
     any.m <- any(m != 0)
 

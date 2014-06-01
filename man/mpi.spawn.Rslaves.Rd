@@ -18,9 +18,16 @@ in one working directory).
 }
 \usage{
 mpi.spawn.Rslaves(Rscript=system.file("slavedaemon.R", package="npRmpi"),
-        nslaves=mpi.universe.size(), root = 0, intercomm = 2,
-        comm = 1, hosts = NULL, needlog = TRUE, mapdrive=TRUE, quiet = FALSE, 
-		nonblock=TRUE, sleep=0.1)
+                  nslaves=mpi.universe.size(),
+                  root = 0,
+                  intercomm = 2,
+                  comm = 1,
+                  hosts = NULL,
+                  needlog = FALSE,
+                  mapdrive=TRUE,
+                  quiet = FALSE, 
+		              nonblock=TRUE,
+                  sleep=0.1)
 
 mpi.close.Rslaves(dellog = TRUE, comm = 1)
 tailslave.log(nlines = 3, comm = 1)
@@ -84,7 +91,7 @@ Notice that this is LAM-MPI specific.
 Hao Yu
 }
 \examples{
-\dontrun{
+\donttest{
 mpi.spawn.Rslaves(nslaves=2)
 tailslave.log()
 mpi.remote.exec(rnorm(10))

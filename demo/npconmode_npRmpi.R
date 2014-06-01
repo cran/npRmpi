@@ -23,6 +23,8 @@ mpi.bcast.cmd(library(MASS),
 mpi.bcast.cmd(data(birthwt),
               caller.execute=TRUE)              
 
+n <- nrow(birthwt)
+
 birthwt$low <- factor(birthwt$low)
 birthwt$smoke <- factor(birthwt$smoke)
 birthwt$race <- factor(birthwt$race)

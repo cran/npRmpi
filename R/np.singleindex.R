@@ -4,18 +4,6 @@
 # dimensionality to a one-dimensional nonparametric estimator, though
 # at the potential cost of misspecification.
 
-# Note - klein and spady's estimator requires a binary y with 0/1
-# values only - TRISTEN XXX kindly check that if someone selects this
-# approach their y is 0/1 and if not return an informative message.
-
-# Note - X must have at least two columns (otherwise foolish to reduce
-# dimensionality) XXX - TRISTEN... kindly check that X has at least
-# two columns.
-
-# Note also that identification requires that X contain at least one
-# continuous variable. XXX - TRISTEN - kindly ensure that this check
-# is made and an appropriate error message is passed back.
-
 # Note also that we will use the so-called scale normalization, i.e.,
 # that beta_1=1 (no need to estimate) which reduces search by 1
 # parameter (this is obviously restricted search subject to beta_1=1).
@@ -24,11 +12,6 @@
 # estimator of y on a linear index X\beta where beta_1 is presumed to
 # be 1 by restriction though, at this stage, the user may feed in any
 # value they so desire.
-
-# TRISTEN: I would like this function to accept arguments that
-# npksum will automatically grab... also a pretty print function
-# similar to regression would rock stating `mean in mean, beta in
-# beta' goodness of fit and so forth...
 
 npindex <-
   function(bws, ...){
@@ -53,39 +36,53 @@ npindex <-
   }
 
 npindex.formula <-
-  function(bws, data = NULL, newdata = NULL, ...){
+    function(bws, data = NULL, newdata = NULL, ...){
 
-    tt <- terms(bws)
-    m <- match(c("formula", "data", "subset", "na.action"),
-               names(bws$call), nomatch = 0)
-    tmf <- bws$call[c(1,m)]
-    tmf[[1]] <- as.name("model.frame")
-    tmf[["formula"]] <- tt
-    umf <- tmf <- eval(tmf, envir = environment(tt))
+        tt <- terms(bws)
+        m <- match(c("formula", "data", "subset", "na.action"),
+                   names(bws$call), nomatch = 0)
+        tmf <- bws$call[c(1,m)]
+        tmf[[1]] <- as.name("model.frame")
+        tmf[["formula"]] <- tt
+        umf <- tmf <- eval(tmf, envir = environment(tt))
 
-    tydat <- model.response(tmf)
-    txdat <- tmf[, attr(attr(tmf, "terms"),"term.labels"), drop = FALSE]
+        tydat <- model.response(tmf)
+        txdat <- tmf[, attr(attr(tmf, "terms"),"term.labels"), drop = FALSE]
 
-    if ((has.eval <- !is.null(newdata))) {
-      if (!(has.ey <- succeedWithResponse(tt, newdata)))
-        tt <- delete.response(tt)
+        if ((has.eval <- !is.null(newdata))) {
+            if (!(has.ey <- succeedWithResponse(tt, newdata)))
+                tt <- delete.response(tt)
 
-      umf <- emf <- model.frame(tt, data = newdata)
+            umf <- emf <- model.frame(tt, data = newdata)
 
-      if (has.ey)
-        eydat <- model.response(emf)
+            if (has.ey)
+                eydat <- model.response(emf)
 
-      exdat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
+            exdat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
+        }
+
+        ev <-
+            eval(parse(text=paste("npindex(txdat = txdat, tydat = tydat,",
+                           ifelse(has.eval,paste("exdat = exdat,",ifelse(has.ey,"eydat = eydat,","")),""),
+                           "bws = bws, ...)")))
+
+        ev$omit <- attr(umf,"na.action")
+        ev$rows.omit <- as.vector(ev$omit)
+        ev$nobs.omit <- length(ev$rows.omit)
+
+        ev$mean <- napredict(ev$omit, ev$mean)
+        ev$merr <- napredict(ev$omit, ev$merr)
+
+        if(ev$gradients){
+            ev$grad <- napredict(ev$omit, ev$grad)
+            ev$gerr <- napredict(ev$omit, ev$gerr)
+        }
+
+        if(ev$residuals){
+            ev$resid <- naresid(ev$omit, ev$resid)
+        }    
+        return(ev)
     }
-
-    ev <-
-    eval(parse(text=paste("npindex(txdat = txdat, tydat = tydat,",
-                 ifelse(has.eval,paste("exdat = exdat,",ifelse(has.ey,"eydat = eydat,","")),""),
-                 "bws = bws, ...)")))
-    ev$rows.omit <- as.vector(attr(umf,"na.action"))
-    ev$nobs.omit <- length(ev$rows.omit)
-    ev
-  }
 
 npindex.call <-
   function(bws, ...) {
@@ -95,7 +92,8 @@ npindex.call <-
   }
 
 npindex.default <- function(bws, txdat, tydat, ...){
-  sc.names <- names(sys.call())
+  sc <- sys.call()
+  sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -114,41 +112,24 @@ npindex.default <- function(bws, txdat, tydat, ...){
   if(txdat.named)
     txdat <- toFrame(txdat)
 
-  mc <- match.call()
+  sc.bw <- sc
+  
+  sc.bw[[1]] <- quote(npindexbw)
 
-  tx.str <- ifelse(txdat.named, "xdat = txdat,",
-                   ifelse(no.txdat, "", "txdat,"))
-  ty.str <- ifelse(tydat.named, "ydat = tydat,",
-                   ifelse(no.tydat, "", "tydat,"))
-
-  tbw <- eval(parse(text = paste("npindexbw(",
-                      ifelse(bws.named,
-                             paste(tx.str, ty.str,
-                                   "bws = bws, bandwidth.compute = FALSE,"),
-                             paste(ifelse(no.bws, "", "bws,"), tx.str, ty.str)),
-                      "call = mc, ...",")",sep="")))
-
-  ##tbw <- updateBwNameMetadata(nameList =
-  ##                            list(ynames = deparse(substitute(tydat))),
-  ##                            bws = tbw)
-
-  repair.args <- c("data", "subset", "na.action")
-
-  m.par <- match(repair.args, names(mc), nomatch = 0)
-  m.child <- match(repair.args, names(tbw$call), nomatch = 0)
-
-  if(any(m.child > 0)) {
-    tbw$call[m.child] <- mc[m.par]
+  if(bws.named){
+    sc.bw$bandwidth.compute <- FALSE
   }
 
-  ## next we repair arguments portion of the call
-  m.bws.par <- match(c("bws","txdat","tydat"), names(mc), nomatch = 0)
-  m.bws.child <- match(c("bws","txdat","tydat"), as.character(tbw$call), nomatch = 0)
-  m.bws.union <- (m.bws.par > 0) & (m.bws.child > 0)
+  ostxy <- c('txdat','tydat')
+  nstxy <- c('xdat','ydat')
+  
+  m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  tbw$call[m.bws.child[m.bws.union]] <- mc[m.bws.par[m.bws.union]]
-
-  environment(tbw$call) <- parent.frame()
+  if(any(m.txy > 0)) {
+    names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
+  }
+    
+  tbw <- eval.parent(sc.bw)
 
   ## convention: drop 'bws' and up to two unnamed arguments (including bws)
   if(no.bws){
@@ -285,9 +266,6 @@ npindex.sibandwidth <-
 
     ## from this point on txdat and exdat have been recast as matrices
 
-    ## TRISTEN - how do we cast txdat here so that matrix multiplication
-    ## is permitted? I currently use cbind() but data.frame barfs out...
-
     ## First, create the scalar index (n \times 1 vector)
 
     index <- txdat %*% bws$beta
@@ -312,9 +290,7 @@ npindex.sibandwidth <-
                     ckertype = bws$ckertype,
                     ckerorder = bws$ckerorder)$ksum
 
-      denom <- tww[2,2,]
-      denom[which(denom == 0.0)] <- sqrt(.Machine$double.eps)
-      index.mean <- tww[1,2,]/denom
+      index.mean <- tww[1,2,]/NZD(tww[2,2,])
 
       if(!no.ex & (no.ey | residuals)){
 
@@ -329,9 +305,7 @@ npindex.sibandwidth <-
                       ckertype = bws$ckertype,
                       ckerorder = bws$ckerorder)$ksum
 
-        denom <- tww[2,2,]
-        denom[which(denom == 0.0)] <- sqrt(.Machine$double.eps)
-        index.tmean <- tww[1,2,]/denom
+        index.tmean <- tww[1,2,]/NZD(tww[2,2,])
 
       }
 
@@ -348,9 +322,11 @@ npindex.sibandwidth <-
 
       index.mean <- model$mean
 
-      ## index.grad is a 1-column matrix
+      ## index.grad is a matrix, one column for each variable, each
+      ## equal to its coefficient beta_i times the first derivative of
+      ## the local-constant model
 
-      index.grad <- model$grad
+      index.grad <- as.matrix(model$grad)%*%t(as.vector(bws$beta))
 
       if(!no.ex & (no.ey | residuals)){
 
@@ -413,7 +389,8 @@ npindex.sibandwidth <-
                         ckertype = bws$ckertype,
                         ckerorder = bws$ckerorder)$ksum
 
-      tindex <- npksum(txdat = index, bws = bws$bw,
+      tindex <- npksum(txdat = index,
+                       bws = bws$bw,
                        ckertype = bws$ckertype,
                        ckerorder = bws$ckerorder)$ksum
 
@@ -437,7 +414,7 @@ npindex.sibandwidth <-
 
       uhat <- tydat - index.tmean ## Training y and training mean
 
-      Vinv <- solve(dg.db.xmex%*%t(dg.db.xmex))
+      Vinv <- chol2inv(chol(dg.db.xmex%*%t(dg.db.xmex)))
 
       Sigma <- (uhat*dg.db.xmex)%*%t(uhat*dg.db.xmex)
 
@@ -461,8 +438,8 @@ npindex.sibandwidth <-
 
       q <- ncol(txdat)
       Bvcov <- matrix(0,q,q)
-      Bvcov[-1,-1] <- solve(t(dg.db[keep,])%*%(dg.db[keep,]/(index.tmean[keep]*
-        (1-index.tmean[keep]))))
+      Bvcov[-1,-1] <- chol2inv(chol(t(dg.db[keep,])%*%(dg.db[keep,]/(index.tmean[keep]*
+        (1-index.tmean[keep])))))
 
       dimnames(Bvcov) <- list(bws$xnames,bws$xnames)
 
@@ -470,38 +447,34 @@ npindex.sibandwidth <-
 
     }
 
-    ## TRISTEN XXX - for continuous y we want to return the fitted model
-    ## along with the measures of goodness of fit RSQ, MSE, and other
-    ## measures of goodness of fit. For discrete y (0/1), npconmode()
-    ## type measures. But, I don't want to implement asymptotic standard
-    ## errors however, these can be readily bootstrapped, so perhaps we
-    ## can add a simple bootstrap section that bootstraps beta and the
-    ## mean (and gradients and avgderiv)?
-
     if (gradients){
       boofun = function(data, indices){
-        rindex = txdat[indices,] %*% bws$beta
-        model = npreg(regtype = 'lc', gradients = TRUE,
-          txdat = rindex,
-          tydat = tydat[indices],
-          exdat = index.eval,
-          bws = bws$bw,
-          ckertype = bws$ckertype,
-          ckerorder = bws$ckerorder)[c('mean','grad')]
-
+        rindex <- txdat[indices,] %*% bws$beta
+        model <- npreg(regtype = 'lc',
+                       gradients = TRUE,
+                       txdat = rindex,
+                       tydat = tydat[indices],
+                       exdat = index.eval,
+                       bws = bws$bw,
+                       ckertype = bws$ckertype,
+                       ckerorder = bws$ckerorder)[c('mean','grad')]
+        
         c(model$mean, model$grad, mean(model$grad))
       }
 
     } else {
       boofun = function(data, indices){
         rindex = txdat[indices,] %*% bws$beta
-        npksum(txdat = rindex, tydat = tydat[indices], exdat = index.eval,
-               bws = bws$bw,
-               ckertype = bws$ckertype,
-               ckerorder = bws$ckerorder)$ksum/
-                 npksum(txdat = rindex, exdat = index.eval, bws=bws$bw,
-                        ckertype = bws$ckertype,
-                        ckerorder = bws$ckerorder)$ksum
+        tww <- npksum(txdat = rindex,
+                      tydat = cbind(tydat[indices],1),
+                      weights = cbind(tydat[indices],1),
+                      exdat = index.eval,
+                      bws = bws$bw,
+                      ckertype = bws$ckertype,
+                      ckerorder = bws$ckerorder)$ksum
+
+        tww[1,2,]/NZD(tww[2,2,])
+        
       }
     }
 
@@ -568,7 +541,7 @@ npindex.sibandwidth <-
     eval(parse(text=paste(
                  "singleindex(bws = bws, index = index.eval, mean = index.mean,",
                  ifelse(errors,"merr = index.merr,",""),
-                 ifelse(gradients,"grad = index.grad, mean.grad = mean(index.grad), betavcov = Bvcov,",""),
+                 ifelse(gradients,"grad = index.grad, mean.grad = colMeans(index.grad), betavcov = Bvcov,",""),
                  ifelse(errors & gradients,"gerr = index.gerr, mean.gerr = index.mgerr,",""),
                  strres,
                  "ntrain = nrow(txdat),", strgof,

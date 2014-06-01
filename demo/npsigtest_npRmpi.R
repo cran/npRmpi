@@ -22,7 +22,7 @@ mpi.bcast.cmd(set.seed(42),
 
 ## Significance testing with z irrelevant
 
-n <- 500
+n <- 1000
 
 z <- factor(rbinom(n,1,.5))
 x1 <- rnorm(n)

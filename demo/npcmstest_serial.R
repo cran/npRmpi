@@ -8,6 +8,7 @@ options(np.messages=FALSE)
 
 data("oecdpanel")
 attach(oecdpanel)
+n <- nrow(oecdpanel)
 
 oecd <- factor(oecd)
 year <- factor(year)

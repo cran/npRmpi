@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,14 +23,13 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > data("oecdpanel")
 > attach(oecdpanel)
+> n <- nrow(oecdpanel)
 > 
 > oecd <- factor(oecd)
 > year <- factor(year)
@@ -69,15 +67,15 @@ Parametric null model: lm(formula = growth ~ oecd + year + initgdp + I(initgdp^2
 Number of regressors: 6
 IID Bootstrap (399 replications)
 
-Test Statistic ‘Jn’: 2.516359	P Value: < 2.22e-16 ***
+Test Statistic ‘Jn’: 3.856061	P Value: < 2.22e-16 ***
 ---
 Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 Null of correct specification is rejected at the 0.1% level
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 36.325 
+Elapsed time = 32.739 
 > 
 > proc.time()
    user  system elapsed 
- 36.554   0.095  36.648 
+ 32.950   0.035  32.989 

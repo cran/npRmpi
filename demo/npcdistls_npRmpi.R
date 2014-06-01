@@ -25,7 +25,7 @@ mpi.bcast.cmd(library(MASS),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 1000
+n <- 2000
 
 rho <- 0.25
 mu <- c(0,0)
@@ -35,7 +35,7 @@ mydat <- data.frame(x=data[,2],y=data[,1])
 
 mpi.bcast.Robj2slave(mydat)
 
-## A conditional density estimation example. 
+## A conditional distribution estimation example. 
 
 t <- system.time(mpi.bcast.cmd(bw <- npcdistbw(y~x,
                                                bwmethod="cv.ls",

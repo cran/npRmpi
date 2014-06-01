@@ -3,17 +3,21 @@ bandwidth <-
            bwmethod = c("cv.ml","cv.ls","normal-reference"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian", "epanechnikov","uniform"), 
+           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            ckerorder = c(2,4,6,8),
-           ukertype = c("aitchisonaitken"),
-           okertype = c("wangvanryzin"),
+           ukertype = c("aitchisonaitken","liracine"),
+           okertype = c("liracine","wangvanryzin"),
            fval = NA,
            ifval = NA,
+           fval.history = NA,
            nobs = NA,
            xdati = stop("bandwidth:argument 'xdati' missing"),
            xnames = character(length(bw)),
            sfactor = NA, bandwidth = NA,
-           rows.omit = NA, bandwidth.compute = TRUE, ...){
+           rows.omit = NA, 
+           nconfac = NA, ncatfac = NA, sdev = NA,
+           bandwidth.compute = TRUE,
+           ...){
     
     ndim = length(bw)
     bwmethod = match.arg(bwmethod)
@@ -29,6 +33,9 @@ bandwidth <-
       if (!any(kord == ckerorder))
         stop("ckerorder must be one of ", paste(kord,collapse=" "))
     }
+
+    if (ckertype == "truncated gaussian" && ckerorder != 2)
+      warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
     if (bwmethod == "normal-reference" && (ckertype != "gaussian" || bwtype != "fixed")){    
       warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
@@ -57,36 +64,26 @@ bandwidth <-
     }
 
     if (length(rows.omit) == 0)
-      rows.omit <- NA
+        rows.omit <- NA
 
     mybw = list(
       bw=bw,
       method = bwmethod,
-      pmethod = switch( bwmethod,
-        cv.ml = "Maximum Likelihood Cross-Validation",
-        cv.ls = "Least Squares Cross-Validation",
-        "normal-reference" = "Normal Reference"),
+      pmethod = bwmToPrint(bwmethod),
       fval = fval,
       ifval = ifval,
+      fval.history = fval.history,
       scaling = bwscaling,
       pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
       type = bwtype,
-      ptype = switch( bwtype,
-        fixed = "Fixed",
-        generalized_nn = "Generalized Nearest Neighbour",
-        adaptive_nn = "Adaptive Nearest Neighbour" ),
+      ptype = bwtToPrint(bwtype),
       ckertype = ckertype,    
       ckerorder = ckerorder,
-      pckertype = switch(ckertype,
-        gaussian = paste(porder,"Gaussian"),
-        epanechnikov =  paste(porder,"Epanechnikov"),
-        uniform = "Uniform"),
+      pckertype = cktToPrint(ckertype, order = porder),
       ukertype = ukertype,
-      pukertype = switch( ukertype,
-        aitchisonaitken = "Aitchison and Aitken"),
+      pukertype = uktToPrint(ukertype),
       okertype = okertype,
-      pokertype = switch( okertype,
-        wangvanryzin = "Wang and Van Ryzin"),
+      pokertype = oktToPrint(okertype, normalized = TRUE),
       nobs = nobs,
       ndim = ndim,
       ncon = sum(xdati$icon),
@@ -99,6 +96,9 @@ bandwidth <-
       xdati = xdati,
       sfactor = list(x = sfactor),
       bandwidth = list(x = bandwidth),
+      nconfac = nconfac,
+      ncatfac = ncatfac,
+      sdev = sdev,
       sumNum = list(x = sumNum),
       xmcv = mcvConstruct(xdati),
       dati = list(x = xdati),

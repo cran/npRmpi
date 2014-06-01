@@ -25,7 +25,7 @@ mpi.bcast.cmd(library(MASS),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 1000
+n <- 2500
 
 rho <- 0.25
 mu <- c(0,0)

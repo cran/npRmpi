@@ -10,7 +10,7 @@ options(np.messages=FALSE)
 
 set.seed(42)
 
-n <- 1000
+n <- 2500
 
 x <- rnorm(n)
 y <- 1 + x + rnorm(n)

@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,9 +23,7 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > library(MASS)
 > options(np.messages=FALSE)
@@ -47,9 +44,9 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > mydat <- mvrnorm(n=n, mu, Sigma)
 > mydat <- data.frame(x=mydat[,1],y=mydat[,2])
 > 
-> q.min <- 0.0
+> q.minm <- 0.0
 > q.max <- 1.0
-> grid.seq <- seq(q.min,q.max,length=n.eval)
+> grid.seq <- seq(q.minm,q.max,length=n.eval)
 > grid.dat <- cbind(grid.seq,grid.seq)
 > 
 > ## Estimate the copula
@@ -66,18 +63,18 @@ Data (2500 observations, 2 variable(s)):
 Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: ~x + y
 Bandwidth Type: Fixed
-Objective Function Value: 0.1636001 (achieved on multistart 1)
+Objective Function Value: 0.1655877 (achieved on multistart 2)
 
-Var. Name: x Bandwidth: 0.03775833 Scale Factor: 0.5145619
-Var. Name: y Bandwidth: 0.05585065 Scale Factor: 0.7655819
+Var. Name: x Bandwidth: 0.0506581  Scale Factor: 0.6903571
+Var. Name: y Bandwidth: 0.05222496 Scale Factor: 0.7158822
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 17.521 
+Elapsed time = 113.506 
 > 
 > proc.time()
    user  system elapsed 
- 17.795   0.057  17.849 
+112.790   0.974 113.756 

@@ -198,7 +198,6 @@ npindexbw.sibandwidth <-
       ##c(1,beta) which can be used in the index.model function above.
 
       ichimuraMaxPenalty <- 10*mean(ydat^2)
-      ichimuraFloor <- sqrt(.Machine$double.eps)
 
       ichimura <- function(param) {
 
@@ -234,9 +233,7 @@ npindexbw.sibandwidth <-
                         ckertype = bws$ckertype,
                         ckerorder = bws$ckerorder)$ksum
 
-          denom <- tww[2,2,]
-          denom[which(denom == 0.0)] <- ichimuraFloor
-          fit.loo <- tww[1,2,]/denom
+          fit.loo <- tww[1,2,]/NZD(tww[2,2,])
 
           t.ret <- mean((ydat-fit.loo)^2)
           return(t.ret)
@@ -298,9 +295,7 @@ npindexbw.sibandwidth <-
                         ckertype = bws$ckertype,
                         ckerorder = bws$ckerorder)$ksum
 
-          denom <- tww[2,2,]
-          denom[which(denom == 0.0)] <- kleinspadyFloor
-          ks.loo <- tww[1,2,]/denom
+          ks.loo <- tww[1,2,]/NZD(tww[2,2,])
 
           ## Avoid taking log of zero (ks.loo = 0 or 1 since we take
           ## the log of ks.loo and the log of 1-ks.loo)
@@ -337,12 +332,12 @@ npindexbw.sibandwidth <-
 
       if(bws$method == "ichimura"){
         optim.fn <- if(only.optimize.beta) ichimura.nobw else ichimura
-        optim.control <- c(abstol=optim.abstol,
-                           reltol=optim.reltol,
-                           maxit=optim.maxit)
+        optim.control <- list(abstol=optim.abstol,
+                              reltol=optim.reltol,
+                              maxit=optim.maxit)
       } else if(bws$method == "kleinspady"){
         optim.fn <- if(only.optimize.beta) kleinspady.nobw else  kleinspady
-        optim.control <- c(reltol=optim.reltol,maxit=optim.maxit)
+        optim.control <- list(reltol=optim.reltol,maxit=optim.maxit)
       }
 
       for(i in 1:nmulti) {
@@ -371,11 +366,7 @@ npindexbw.sibandwidth <-
           } else { beta = numeric(0) }
 
           if (bws$bw == 0)
-            if(IQR(fit) > 0) {
-              h <- (4/3)^0.2*min(sd(fit),IQR(fit)/(qnorm(.25,lower.tail=F)*2))*n^(-1/5)
-            } else {
-             h <- (4/3)^0.2*sd(fit)*n^(-1/5)
-            }
+            h <- 1.059224*EssDee(fit)*n^(-1/5)
           else
             h <- bws$bw
         } else {
@@ -383,13 +374,8 @@ npindexbw.sibandwidth <-
 
           beta.length <- length(coef(ols.fit)[3:ncol(ols.fit$x)])
           beta <- runif(beta.length,min=0.5,max=1.5)*coef(ols.fit)[3:ncol(ols.fit$x)]
-          if(!only.optimize.beta){
-            if(IQR(fit) > 0) {
-              h <- runif(1,min=0.5,max=1.5)*min(sd(fit),IQR(fit)/(qnorm(.25,lower.tail=F)*2))*n^(-1/5)
-            } else {
-              h <- runif(1,min=0.5,max=1.5)*sd(fit)*n^(-1/5)
-            }
-          }
+          if (!only.optimize.beta)
+              h <- runif(1,min=0.5,max=1.5)*EssDee(fit)*n^(-1/5)
         }
 
         optim.parm <- if(only.optimize.beta) beta else c(beta,h)
@@ -401,14 +387,22 @@ npindexbw.sibandwidth <-
           attempts <- attempts + 1
           beta.length <- length(coef(ols.fit)[3:ncol(ols.fit$x)])
           beta <- runif(beta.length,min=0.5,max=1.5)*coef(ols.fit)[3:ncol(ols.fit$x)]
-          if(!only.optimize.beta){
-            if(IQR(fit) > 0) {
-              h <- runif(1,min=0.5,max=1.5)*min(sd(fit),IQR(fit)/(qnorm(.25,lower.tail=F)*2))*n^(-1/5)
-            } else {
-              h <- runif(1,min=0.5,max=1.5)*sd(fit)*n^(-1/5)
-            }
+          if(!only.optimize.beta)
+              h <- runif(1,min=0.5,max=1.5)*EssDee(fit)*n^(-1/5)
+
+          if(optim.return$convergence == 1){
+              if(optim.control$maxit < (2^32/10))
+                  optim.control$maxit <- 10*optim.control$maxit
+              else
+                  stop(paste("optim failed to converge after optim.maxattempts = ", optim.maxattempts, " iterations."))
           }
-          optim.control <- lapply(optim.control,'*',10.0)
+
+          if(optim.return$convergence == 10){
+              optim.control$reltol <-  10.0*optim.control$reltol
+              if(!is.null(optim.control$abstol))
+                  optim.control$abstol <-  10.0*optim.control$abstol
+          }
+          
           suppressWarnings(optim.return <- eval(topt))
         }
 
@@ -441,10 +435,6 @@ npindexbw.sibandwidth <-
     ## its minimum, the number of restarts that resulted in an improved
     ## value of the objective function, the restart that resulted in the
     ## smallest value, and the vector of objective function values.
-
-    ## TRISTEN XXX - kindly make sure I have named return vals consistent
-    ## with other functions, e.g., ifval, fval etc? Also, kindly return a
-    ## `pretty print' type of object
 
     ## Restore seed
 

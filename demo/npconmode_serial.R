@@ -8,6 +8,7 @@ options(np.messages=FALSE)
 
 library(MASS)
 data(birthwt)
+n <- nrow(birthwt)
 
 birthwt$low <- factor(birthwt$low)
 birthwt$smoke <- factor(birthwt$smoke)

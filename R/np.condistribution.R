@@ -43,9 +43,20 @@ npcdist.formula <-
     ev <-
     eval(parse(text=paste("npcdist(txdat = txdat, tydat = tydat,",
                  ifelse(has.eval,"exdat = exdat, eydat = eydat,",""), "bws = bws, ...)")))
-    ev$rows.omit <- as.vector(attr(umf,"na.action"))
+
+    ev$omit <- attr(umf,"na.action")
+    ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
-    ev
+
+    ev$condist <- napredict(ev$omit, ev$condist)
+    ev$conderr <- napredict(ev$omit, ev$conderr)
+
+    if(ev$gradients){
+        ev$congrad <- napredict(ev$omit, ev$congrad)
+        ev$congerr <- napredict(ev$omit, ev$congerr)
+    }
+
+    return(ev)
   }
 
 npcdist.call <-
@@ -190,46 +201,49 @@ npcdist.condbandwidth <-
       exord = data.frame()
     }
 
-    myopti = list(
-      num_obs_train = tnrow,
-      num_obs_eval = enrow,
-      int_LARGE_SF = ifelse(bws$scaling, SF_NORMAL, SF_ARB),
-      BANDWIDTH_den_extern = switch(bws$type,
-        fixed = BW_FIXED,
-        generalized_nn = BW_GEN_NN,
-        adaptive_nn = BW_ADAP_NN),
-      int_MINIMIZE_IO=ifelse(options('np.messages'), IO_MIN_FALSE, IO_MIN_TRUE),
-      xkerneval = switch(bws$cxkertype,
-        gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
-        epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
-        uniform = CKER_UNI),
-      ykerneval = switch(bws$cykertype,
-        gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
-        epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
-        uniform = CKER_UNI),
-      uxkerneval = switch(bws$uxkertype,
-        aitchisonaitken = UKER_AIT,
-        liracine = UKER_LR),
-      uykerneval = switch(bws$uykertype,
-        aitchisonaitken = UKER_AIT,
-        liracine = UKER_LR),
-      oxkerneval = switch(bws$oxkertype,
-        wangvanryzin = OKER_WANG,
-        liracine = OKER_LR),
-      oykerneval = switch(bws$oykertype,
-        wangvanryzin = OKER_WANG,
-        liracine = OKER_LR),
-      num_yuno = bws$ynuno,
-      num_yord = bws$ynord,
-      num_ycon = bws$yncon,
-      num_xuno = bws$xnuno,
-      num_xord = bws$xnord,
-      num_xcon = bws$xncon,
-      no.exy = no.exy,
-      gradients = gradients,
-      ymcv.numRow = attr(bws$ymcv, "num.row"),
-      xmcv.numRow = attr(bws$xmcv, "num.row"),
-      densOrDist = NP_DO_DIST)
+    myopti <- list(
+        num_obs_train = tnrow,
+        num_obs_eval = enrow,
+        int_LARGE_SF = ifelse(bws$scaling, SF_NORMAL, SF_ARB),
+        BANDWIDTH_den_extern = switch(bws$type,
+            fixed = BW_FIXED,
+            generalized_nn = BW_GEN_NN,
+            adaptive_nn = BW_ADAP_NN),
+        int_MINIMIZE_IO=ifelse(options('np.messages'), IO_MIN_FALSE, IO_MIN_TRUE),
+        xkerneval = switch(bws$cxkertype,
+            gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
+            epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
+            uniform = CKER_UNI,
+            "truncated gaussian" = CKER_TGAUSS),
+        ykerneval = switch(bws$cykertype,
+            gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
+            epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
+            uniform = CKER_UNI,
+            "truncated gaussian" = CKER_TGAUSS),
+        uxkerneval = switch(bws$uxkertype,
+            aitchisonaitken = UKER_AIT,
+            liracine = UKER_LR),
+        uykerneval = switch(bws$uykertype,
+            aitchisonaitken = UKER_AIT,
+            liracine = UKER_LR),
+        oxkerneval = switch(bws$oxkertype,
+            wangvanryzin = OKER_WANG,
+            liracine = OKER_NLR),
+        oykerneval = switch(bws$oykertype,
+            wangvanryzin = OKER_WANG,
+            liracine = OKER_NLR),
+        num_yuno = bws$ynuno,
+        num_yord = bws$ynord,
+        num_ycon = bws$yncon,
+        num_xuno = bws$xnuno,
+        num_xord = bws$xnord,
+        num_xcon = bws$xncon,
+        no.exy = no.exy,
+        gradients = gradients,
+        ymcv.numRow = attr(bws$ymcv, "num.row"),
+        xmcv.numRow = attr(bws$xmcv, "num.row"),
+        densOrDist = NP_DO_DIST,
+        int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO))
     
     myout=
       .C("np_density_conditional",
@@ -242,6 +256,7 @@ npcdist.condbandwidth <-
                      bws$xbw[bws$ixuno],bws$xbw[bws$ixord])),
          as.double(bws$ymcv), as.double(attr(bws$ymcv, "pad.num")),
          as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+         as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
          as.integer(myopti),
          condist = double(enrow),
          conderr = double(enrow),
@@ -269,12 +284,14 @@ npcdist.condbandwidth <-
                            yeval = tyeval,
                            condist = myout$condist, conderr = myout$conderr,
                            congrad = myout$congrad, congerr = myout$congerr,
-                           ntrain = tnrow, trainiseval = no.exy))
+                           ntrain = tnrow, trainiseval = no.exy, gradients = gradients,
+                           rows.omit = rows.omit))
 
   }
 
 npcdist.default <- function(bws, txdat, tydat, ...){
-  sc.names <- names(sys.call())
+  sc <- sys.call()
+  sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -296,40 +313,24 @@ npcdist.default <- function(bws, txdat, tydat, ...){
   if(tydat.named)
     tydat <- toFrame(tydat)
 
-  mc <- match.call()
-
-  tx.str <- ifelse(txdat.named, "xdat = txdat,",
-                   ifelse(no.txdat, "", "txdat,"))
-  ty.str <- ifelse(tydat.named, "ydat = tydat,",
-                   ifelse(no.tydat, "", "tydat,"))
+  sc.bw <- sc
   
-  tbw <- eval(parse(text = paste("npcdistbw(",
-                      ifelse(bws.named,                             
-                             paste(tx.str, ty.str,
-                                   "bws = bws, bandwidth.compute = FALSE,"),
-                             paste(ifelse(no.bws, "", "bws,"), tx.str, ty.str)),
-                      "call = mc, ...",")",sep="")))
+  sc.bw[[1]] <- quote(npcdistbw)
 
-  ## need to do some surgery on the call to
-  ## allow it to work with the formula interface
-
-  repair.args <- c("data", "subset", "na.action")
-  
-  m.par <- match(repair.args, names(mc), nomatch = 0)
-  m.child <- match(repair.args, names(tbw$call), nomatch = 0)
-
-  if(any(m.child > 0)) {
-    tbw$call[m.child] <- mc[m.par]
+  if(bws.named){
+    sc.bw$bandwidth.compute <- FALSE
   }
 
-  ## next we repair arguments portion of the call
-  m.bws.par <- match(c("bws","txdat","tydat"), names(mc), nomatch = 0)
-  m.bws.child <- match(c("bws","txdat","tydat"), as.character(tbw$call), nomatch = 0)
-  m.bws.union <- (m.bws.par > 0) & (m.bws.child > 0)
+  ostxy <- c('txdat','tydat')
+  nstxy <- c('xdat','ydat')
   
-  tbw$call[m.bws.child[m.bws.union]] <- mc[m.bws.par[m.bws.union]]
+  m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  environment(tbw$call) <- parent.frame()
+  if(any(m.txy > 0)) {
+    names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
+  }
+    
+  tbw <- eval.parent(sc.bw)
 
   ## convention: drop 'bws' and up to two unnamed arguments (including bws)
   if(no.bws){

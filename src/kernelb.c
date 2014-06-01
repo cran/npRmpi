@@ -25,6 +25,10 @@ extern  MPI_Status status;
 #endif
 
 extern int int_LARGE_SF;
+extern double nconfac_extern;
+extern double ncatfac_extern;
+extern double * vector_continuous_stddev_extern;
+
 /*
 int int_DEBUG;
 int int_VERBOSE;
@@ -163,14 +167,14 @@ double **matrix_bandwidth_deriv)
 
 	if(BANDWIDTH == 1)
 	{
-		stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+		stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 		if(stride < 1) stride = 1;
 		nn_distance = alloc_vecd(stride*iNum_Processors);
 	}
 
 	if(BANDWIDTH == 2)
 	{
-		stride = ceil((double) num_obs_train / (double) iNum_Processors);
+		stride = (int)ceil((double) num_obs_train / (double) iNum_Processors);
 		if(stride < 1) stride = 1;
 		nn_distance = alloc_vecd(stride*iNum_Processors);
 	}
@@ -265,6 +269,15 @@ double **matrix_bandwidth_deriv)
 
 			break;
 
+		case 9:
+
+/* Gaussian Kernel */
+
+			temp_pow1 = 1.0/pow((double)num_obs_train, (1.0/(4.0 + (double) num_reg_cont + num_var_cont)));
+			temp_pow2 = 1.0/pow((double)num_obs_train, (1.0/(6.0 + (double) num_reg_cont + num_var_cont)));
+
+			break;
+
 	}
 
 	if(BANDWIDTH == 0)
@@ -317,7 +330,7 @@ double **matrix_bandwidth_deriv)
 
 /* Return 1 for nearest-neighbor which is zero */
 
-			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, matrix_X_train[i], matrix_X_eval[i], fround(vector_scale_factor[i]), nn_distance)==1)
+			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, 0,matrix_X_train[i], matrix_X_eval[i], np_fround(vector_scale_factor[i]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -343,7 +356,7 @@ double **matrix_bandwidth_deriv)
 
 /* Return 1 for nearest-neighbor which is zero */
 
-			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, matrix_Y_train[i], matrix_Y_eval[i], fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
+			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, 0, matrix_Y_train[i], matrix_Y_eval[i], np_fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -372,7 +385,7 @@ double **matrix_bandwidth_deriv)
 		{
 
 /* Return 1 for nearest-neighbor which is zero */
-			if(compute_nn_distance(num_obs_train, matrix_X_train[i], fround(vector_scale_factor[i]), nn_distance)==1)
+			if(compute_nn_distance(num_obs_train, 0, matrix_X_train[i], np_fround(vector_scale_factor[i]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -397,7 +410,7 @@ double **matrix_bandwidth_deriv)
 		{
 
 /* Return 1 for nearest-neighbor which is zero */
-			if(compute_nn_distance(num_obs_train, matrix_Y_train[i], fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
+			if(compute_nn_distance(num_obs_train, 0, matrix_Y_train[i], np_fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -501,24 +514,24 @@ double **matrix_bandwidth_deriv)
 }
 
 int kernel_bandwidth_mean(int KERNEL,
-int BANDWIDTH,
-int num_obs_train,
-int num_obs_eval,
-int num_var_cont,
-int num_var_un,
-int num_var_or,
-int num_reg_cont,
-int num_reg_un,
-int num_reg_or,
-double *vector_scale_factor,
-double **matrix_Y_train,
-double **matrix_Y_eval,
-double **matrix_X_train,
-double **matrix_X_eval,
-double **matrix_bandwidth_Y,
-double **matrix_bandwidth_X,
-double *vector_lambda)
-{
+                          int BANDWIDTH,
+                          int num_obs_train,
+                          int num_obs_eval,
+                          int num_var_cont,
+                          int num_var_un,
+                          int num_var_or,
+                          int num_reg_cont,
+                          int num_reg_un,
+                          int num_reg_or,
+                          int suppress_parallel,
+                          double *vector_scale_factor,
+                          double **matrix_Y_train,
+                          double **matrix_Y_eval,
+                          double **matrix_X_train,
+                          double **matrix_X_eval,
+                          double **matrix_bandwidth_Y,
+                          double **matrix_bandwidth_X,
+                          double *vector_lambda){
 
 /* This computes a matrix of bandwidths for fixed, generalized nearest */
 /* neighbor, or adaptive nearest neighbor estimation for a density or */
@@ -566,7 +579,8 @@ fact constant. */
 		for(i=0; i < num_reg_cont; i++)
 		{
 
-			vec_sdev_x[i] = standerrd(num_obs_train, matrix_X_train[i]);
+			//vec_sdev_x[i] = standerrd(num_obs_train, matrix_X_train[i]);
+      vec_sdev_x[i] = vector_continuous_stddev_extern[i];
 
 			if(vec_sdev_x[i] <= DBL_MIN)
 			{
@@ -582,7 +596,8 @@ fact constant. */
 		for(i=0; i < num_var_cont; i++)
 		{
 
-			vec_sdev_y[i] = standerrd(num_obs_train, matrix_Y_train[i]);
+			//vec_sdev_y[i] = standerrd(num_obs_train, matrix_Y_train[i]);
+      vec_sdev_y[i] = vector_continuous_stddev_extern[i+num_reg_cont];
 
 			if(vec_sdev_y[i] <= DBL_MIN)
 			{
@@ -615,14 +630,14 @@ fact constant. */
 
 	if(BANDWIDTH == 1)
 	{
-		stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+		stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 		if(stride < 1) stride = 1;
 		nn_distance = alloc_vecd(stride*iNum_Processors);
 	}
 
 	if(BANDWIDTH == 2)
 	{
-		stride = ceil((double) num_obs_train / (double) iNum_Processors);
+		stride = (int)ceil((double) num_obs_train / (double) iNum_Processors);
 		if(stride < 1) stride = 1;
 		nn_distance = alloc_vecd(stride*iNum_Processors);
 	}
@@ -630,85 +645,8 @@ fact constant. */
 #endif
 
 /* Set appropriate constants for scaling factor */
-
-	switch(KERNEL)
-	{
-
-		case 0:
-
-/* Gaussian Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(4.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 1:
-
-/* Fourth Order Gaussian Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(8.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 2:
-
-/* Sixth Order Gaussian Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(12.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 3:
-
-/* Eighth Order Gaussian Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(16.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 4:
-
-/* Second Order Epanechnikov Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(4.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 5:
-
-/* Fourth Order Epanechnikov Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(8.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 6:
-
-/* Sixth Order Epanechnikov Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(12.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 7:
-
-/* Eighth Order Epanechnikov Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(16.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-		case 8:
-
-/* Rectangular kernel - using second order Epanechnikov for now */
-
-/* Second Order Epanechnikov Kernel */
-
-			temp_pow = 1.0/pow((double)num_obs_train, (1.0/(4.0 + (double) num_reg_cont + num_var_cont)));
-
-			break;
-
-	}
+  temp_pow = nconfac_extern;
+	
 
 	if(BANDWIDTH == 0)
 	{
@@ -758,7 +696,7 @@ fact constant. */
 
 /* Return 1 for nearest-neighbor which is zero */
 
-			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, matrix_X_train[i], matrix_X_eval[i], fround(vector_scale_factor[i]), nn_distance)==1)
+			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, suppress_parallel, matrix_X_train[i], matrix_X_eval[i], np_fround(vector_scale_factor[i]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -782,7 +720,7 @@ fact constant. */
 
 /* Return 1 for nearest-neighbor which is zero */
 
-			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, matrix_Y_train[i], matrix_Y_eval[i], fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
+			if(compute_nn_distance_train_eval(num_obs_train,num_obs_eval, suppress_parallel, matrix_Y_train[i], matrix_Y_eval[i], np_fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -811,7 +749,7 @@ fact constant. */
 		{
 
 /* Return 1 for nearest-neighbor which is zero */
-			if(compute_nn_distance(num_obs_train, matrix_X_train[i], fround(vector_scale_factor[i]), nn_distance)==1)
+			if(compute_nn_distance(num_obs_train, suppress_parallel, matrix_X_train[i], np_fround(vector_scale_factor[i]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -834,7 +772,7 @@ fact constant. */
 		{
 
 /* Return 1 for nearest-neighbor which is zero */
-			if(compute_nn_distance(num_obs_train, matrix_Y_train[i], fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
+			if(compute_nn_distance(num_obs_train, suppress_parallel, matrix_Y_train[i], np_fround(vector_scale_factor[i+num_reg_cont]), nn_distance)==1)
 			{
 				return(1);
 			}
@@ -858,7 +796,7 @@ fact constant. */
 /* In vector_scale_factor, order is continuous reg, continuous var, */
 /* unordered variables, ordered variables, unordered regressors, ordered regressors */
 
-	temp_inv = ipow(temp_pow, 2);
+	temp_inv = ncatfac_extern;
 
 /* Unordered categorical variables */
 

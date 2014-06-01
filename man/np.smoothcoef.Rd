@@ -228,16 +228,17 @@ npscoef(bws, \dots)
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,}
   Cambridge University Press.
 
- Racine, J.S. and D. Ouyang and Q. Li (2010), \dQuote{Semiparametric
-    Hierarchical Models,} manuscript.
- 
+ Li, Q. and D. Ouyang and J.S. Racine (2013), \dQuote{Categorical
+ Semiparametric Varying-Coefficient Models,} Journal of Applied
+ Econometrics, 28, 551-589.
+
   Wang, M.C. and J. van Ryzin (1981), \dQuote{A class of smooth
     estimators for discrete distributions,}  Biometrika, 68, 301-309.
 
 }
 
 \author{
-  Tristen Hayfield \email{hayfield@mpia.de}, Jeffrey S. Racine \email{racinej@mcmaster.ca}
+  Tristen Hayfield \email{tristen.hayfield@gmail.com}, Jeffrey S. Racine \email{racinej@mcmaster.ca}
 }
 
 \section{Usage Issues}{

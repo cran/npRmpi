@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,16 +23,14 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > ## Generate some data
 > 
 > set.seed(42)
-> n <- 500
+> n <- 2500
 > 
 > ## The DGP is as follows:
 > 
@@ -83,10 +80,10 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > t <- system.time(model.iv <- npregiv(y=y,z=z,w=w))
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 188.464 
+Elapsed time = 1021.305 
 > 
 > ## Clean up properly then quit()
 > 
 > proc.time()
-   user  system elapsed 
-188.525   0.241 188.757 
+    user   system  elapsed 
+1020.997    0.528 1021.519 

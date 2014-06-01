@@ -22,13 +22,13 @@
 
 */
 
-void build_kdtree(double ** p, int nump, int ndim, int nbucket, int ** ip, KDT ** kdt){
+void build_kdtree(double ** p, int nump, int ndim, int nbucket, int * ip, KDT ** kdt){
   KDT * kdx;
   int nodecount;
-  int nf = (1 << (1 + (int)floor(log((double)nump/(double)nbucket)/log(2.0))));
-  int maxnode = (1 << (1 + (int)ceil(log((double)nump/(double)nbucket)/log(2.0)))) - 1; 
+  int nf = (1 << (1 + (int)floor(log(MAX((double)nump,(double)nbucket)/(double)nbucket)/log(2.0))));
+  int maxnode = (1 << (1 + (int)ceil(log(MAX((double)nump,(double)nbucket)/(double)nbucket)/log(2.0)))) - 1; 
   
-  int numnode = MIN(2*nump - (nbucket-1)*nf - 1, maxnode);
+  int numnode = MIN(2*MAX(nump,nbucket) - (nbucket-1)*nf - 1, maxnode);
 
   *kdt = (KDT *)malloc(sizeof(KDT));
   if(!(*kdt != NULL))
@@ -50,23 +50,11 @@ void build_kdtree(double ** p, int nump, int ndim, int nbucket, int ** ip, KDT *
     kdx->kdn[i].childl = -1;
     kdx->kdn[i].childu = -1;
   }
-
   kdx->numnode = numnode;
   kdx->nbucket = nbucket;
   kdx->ndim = ndim;
 
-  // tree is now fully allocated and ready to be built
-
-  // for the tree to work, points need to be put into tree order
-  *ip = (int *)malloc(nump*sizeof(int));
-  if(!(*ip != NULL))
-    error("!(*ip != NULL)");
-
-  for(int i = 0; i < nump; i++){
-    (*ip)[i] = i;
-  }
-
-  nodecount = build_tree(p, kdx, *ip, 0, 0, nump, 0);
+  nodecount = build_tree(p, kdx, ip, 0, 0, nump, 0);
 
   if(!(nodecount == numnode))
     error("!(nodecount == numnode)");
@@ -175,6 +163,25 @@ int boxIntersect(double * bbs, double * bbb, int ndim){
   return(hdone ? KD_HITDONE : KD_HITOPEN);
 }
 
+int boxIntersectPartial(double * bbs, double * bbb, int * restrict idim, int nidim){
+  int i, tt[4], miss;
+  int hdone = 1;
+
+  // here we build up a 'truth table' of sorts
+  // at the same time we test for a total miss and break
+  // away early if that's the case
+  for(i = 0; i < nidim; i++){
+    miss  = tt[0] = bbs[2*idim[i]] < bbb[2*idim[i]];
+    miss += tt[1] = bbs[2*idim[i]] < bbb[2*idim[i]+1];
+    miss += tt[2] = bbs[2*idim[i]+1] < bbb[2*idim[i]];
+    miss += tt[3] = bbs[2*idim[i]+1] < bbb[2*idim[i]+1];
+    if(miss%4 == 0) return(KD_MISS);
+
+    hdone = hdone && (tt[0]^tt[2]) && (tt[1]^tt[3]);
+  }
+  return(hdone ? KD_HITDONE : KD_HITOPEN);
+}
+
 /*
   builds a list of nodes intersected by search box bb
   it uses the nl (node list) structure to aggregate results as the search progresses
@@ -185,7 +192,7 @@ void boxSearch(KDT * kdt, int node, double * bb, NL * nl){
   if(res == KD_MISS) return;
 
   if(nl->n == nl->nalloc){
-    nl->node = realloc(nl->node, MAX(10, 2*nl->nalloc)*sizeof(int));
+    nl->node = (int *)realloc(nl->node, MAX(10, 2*nl->nalloc)*sizeof(int));
     if(!(nl->node != NULL))
       error("!(nl->node != NULL)");
     
@@ -197,6 +204,235 @@ void boxSearch(KDT * kdt, int node, double * bb, NL * nl){
   else { // KD_HITOPEN
     boxSearch(kdt, kdt->kdn[node].childl, bb, nl);
     boxSearch(kdt, kdt->kdn[node].childu, bb, nl);
+  }
+}
+
+// purely iterative version
+void boxSearchNL(KDT * restrict kdt, NL * restrict search, double * restrict bb, NL * restrict nl, XL * restrict xl){
+  NL nls = {.node = NULL, .n = 0, .nalloc = 0};
+  mirror_nl(search, &nls);
+
+  while (nls.n > 0){
+    const int node = nls.node[nls.n - 1];
+
+    int res = boxIntersect(bb, kdt->kdn[node].bb, kdt->ndim);
+
+    if(res == KD_MISS) {
+      nls.n--;
+      continue;
+    }
+
+    if((res == KD_HITDONE) || (kdt->kdn[node].childl == KD_NOCHILD)){
+      if(nl != NULL){
+        check_grow_nl(nl);
+        nl->node[nl->n++] = node;
+      }
+
+      if(xl != NULL){
+        merge_end_xl(xl, &kdt->kdn[node]);
+      }
+
+      nls.n--;
+    }
+    else { // KD_HITOPEN
+      check_grow_nl(&nls);
+      nls.node[nls.n - 1] = kdt->kdn[node].childu;
+      nls.node[nls.n++] = kdt->kdn[node].childl;
+    }
+  }
+  clean_nl(&nls);
+}
+
+// purely iterative version
+void boxSearchNLPartial(KDT * restrict kdt, NL * restrict search, double * restrict bb, NL * restrict nl, XL * restrict xl, int * idim, int nidim){
+  NL nls = {.node = NULL, .n = 0, .nalloc = 0};
+  mirror_nl(search, &nls);
+
+  while (nls.n > 0){
+    const int node = nls.node[nls.n - 1];
+
+    int res;
+
+    if(nidim > 0)
+      res = boxIntersectPartial(bb, kdt->kdn[node].bb, idim, nidim);
+    else
+      res = KD_HITDONE;
+
+    if(res == KD_MISS) {
+      nls.n--;
+      continue;
+    }
+
+    if((res == KD_HITDONE) || (kdt->kdn[node].childl == KD_NOCHILD)){
+      if(nl != NULL){
+        check_grow_nl(nl);
+        nl->node[nl->n++] = node;
+      }
+
+      if(xl != NULL){
+        merge_end_xl(xl, &kdt->kdn[node]);
+      }
+
+      nls.n--;
+    }
+    else { // KD_HITOPEN
+      check_grow_nl(&nls);
+      nls.node[nls.n - 1] = kdt->kdn[node].childu;
+      nls.node[nls.n++] = kdt->kdn[node].childl;
+    }
+  }
+  clean_nl(&nls);
+}
+
+// index-restricted (inclusive) partial search
+// NB - 
+// 1) use create_fake_nodes to ensure that all indices are relative to idx[0], and are clamped to the range idx[0]..idx[1]
+// 2) once you are done with your fake results, call reset_fake_nodes
+// 3) call create_fake_nodes before reuse if reset_fake_nodes has been called in the meanwhile
+
+void boxSearchNLPartialIdx(KDT * restrict kdt, NL * restrict search, double * restrict bb, NL * restrict nl, XL * restrict xl, int * idim, int nidim, int * idx){
+  int res, tt[4];
+
+  NL nls = {.node = NULL, .n = 0, .nalloc = 0};
+  mirror_nl(search, &nls);
+
+  while (nls.n > 0){
+    const int node = nls.node[nls.n - 1];
+    
+    const int il = kdt->kdn[node].istart;
+    const int ih = kdt->kdn[node].istart+kdt->kdn[node].nlev-1;
+
+    tt[0] = (il >= idx[0]);
+    tt[1] = (il > idx[1]);
+
+    tt[2] = (ih < idx[0]);
+    tt[3] = (ih <= idx[1]);
+
+    if(!((tt[0] == tt[1]) && (tt[2] == tt[3]) && (tt[0] != tt[2])))
+      if(nidim > 0)
+        res = boxIntersectPartial(bb, kdt->kdn[node].bb, idim, nidim);
+      else
+        res = KD_HITDONE;
+    else
+      res = KD_MISS;
+
+    if(res == KD_MISS) {
+      nls.n--;
+      continue;
+    }
+
+    if((res == KD_HITDONE) || (kdt->kdn[node].childl == KD_NOCHILD)){
+      if(nl != NULL){
+        check_grow_nl(nl);
+        nl->node[nl->n++] = node;
+      }
+
+      if(xl != NULL){
+        merge_end_xl_idx(xl, &kdt->kdn[node], idx);
+      }
+
+      nls.n--;
+    }
+    else { // KD_HITOPEN
+      check_grow_nl(&nls);
+      nls.node[nls.n - 1] = kdt->kdn[node].childu;
+      nls.node[nls.n++] = kdt->kdn[node].childl;
+    }
+  }
+  clean_nl(&nls);
+}
+
+void check_grow_nl(NL * restrict nl){
+  if(nl->n == nl->nalloc){
+    nl->node = (int *)realloc(nl->node, MAX(10, 2*nl->nalloc)*sizeof(int));
+    if(!(nl->node != NULL))
+      error("!(nl->node != NULL)");
+    
+    nl->nalloc = MAX(10, 2*nl->nalloc);
+  }
+}
+
+void clean_nl(NL * restrict nl){
+  if(nl){
+    if(nl->node != NULL)
+      free(nl->node);
+    nl->node = NULL;
+    nl->n = nl->nalloc = 0;    
+  }
+}
+
+void clean_xl(XL * restrict xl){
+  if(xl){
+    if(xl->istart != NULL)
+      free(xl->istart);
+
+    if(xl->nlev != NULL)
+      free(xl->nlev);
+
+    xl->nlev = xl->istart = NULL;
+    xl->n = xl->nalloc = 0;    
+  }
+}
+
+void mirror_nl(NL * restrict nla, NL * restrict nlb){
+  if(nla->n > nlb->nalloc){
+    nlb->node = (int *)realloc(nlb->node, (1+nla->n)*sizeof(int));
+    nlb->nalloc = nla->n + 1;
+  }
+
+  for(int i = 0; i < nla->n; i++)
+    nlb->node[i] = nla->node[i];
+  
+  nlb->n = nla->n; 
+}
+
+void mirror_xl(XL * restrict xla, XL * restrict xlb){
+  if(xla->n > xlb->nalloc){
+    xlb->istart = (int *)realloc(xlb->istart, (1+xla->n)*sizeof(int));
+    xlb->nlev = (int *)realloc(xlb->nlev, (1+xla->n)*sizeof(int));
+    xlb->nalloc = xla->n + 1;
+  }
+
+  for(int i = 0; i < xla->n; i++){
+    xlb->istart[i] = xla->istart[i];
+    xlb->nlev[i] = xla->nlev[i];
+  }
+  
+  xlb->n = xla->n; 
+}
+
+void merge_end_xl(XL * restrict xl, KDN * restrict kdn){
+  if(xl->n == xl->nalloc){
+    xl->istart = (int *)realloc(xl->istart, MAX(10,2*xl->nalloc)*sizeof(int));
+    xl->nlev = (int *)realloc(xl->nlev, MAX(10,2*xl->nalloc)*sizeof(int));
+
+    xl->nalloc = MAX(10, 2*xl->nalloc);
+  }
+
+  if((xl->n != 0) && (kdn->istart == (xl->istart[xl->n-1] + xl->nlev[xl->n-1]))){
+    xl->nlev[xl->n-1] += kdn->nlev;
+  } else {
+    xl->istart[xl->n] = kdn->istart;
+    xl->nlev[xl->n++] = kdn->nlev;
+  }
+}
+
+void merge_end_xl_idx(XL * restrict xl, KDN * restrict kdn, int * restrict idx){
+  if(xl->n == xl->nalloc){
+    xl->istart = (int *)realloc(xl->istart, MAX(10,2*xl->nalloc)*sizeof(int));
+    xl->nlev = (int *)realloc(xl->nlev, MAX(10,2*xl->nalloc)*sizeof(int));
+
+    xl->nalloc = MAX(10, 2*xl->nalloc);
+  }
+  
+  const int xln = xl->n;
+  if((xln != 0) && ((kdn->istart - idx[0]) == (xl->istart[xln-1] + xl->nlev[xln-1]))){
+    xl->nlev[xln-1] += kdn->nlev;
+    xl->nlev[xln-1] = MIN(idx[1]-idx[0], xl->istart[xln-1] + xl->nlev[xln-1] - 1) - xl->istart[xln-1] + 1;
+  } else {
+    xl->istart[xln] = MAX(0, kdn->istart-idx[0]);
+    xl->nlev[xln] = MIN(idx[1], kdn->istart + kdn->nlev - 1) - idx[0] - xl->istart[xln] + 1;
+    xl->n++;
   }
 }
 

@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,15 +23,13 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
 > set.seed(42)
 > 
-> n <- 1000
+> n <- 5000
 > 
 > x <- runif(n)
 > z1 <- rbinom(n,1,.5)
@@ -52,17 +49,17 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > 
 > summary(bw)
 
-Regression Data (1000 observations, 3 variable(s)):
+Regression Data (5000 observations, 3 variable(s)):
 
 Regression Type: Local-Linear
 Bandwidth Selection Method: Expected Kullback-Leibler Cross-Validation
 Formula: y ~ x + z1 + z2
 Bandwidth Type: Fixed
-Objective Function Value: -1.741976 (achieved on multistart 3)
+Objective Function Value: -1.743471 (achieved on multistart 1)
 
-Exp. Var. Name: x  Bandwidth: 0.04110872  Scale Factor: 0.5615641
-Exp. Var. Name: z1 Bandwidth: 0.002156053   Lambda Max: 0.5      
-Exp. Var. Name: z2 Bandwidth: 0.5           Lambda Max: 0.5      
+Exp. Var. Name: x  Bandwidth: 0.02647916   Scale Factor: 0.4997103
+Exp. Var. Name: z1 Bandwidth: 0.0006043332   Lambda Max: 0.5      
+Exp. Var. Name: z2 Bandwidth: 0.4999999      Lambda Max: 0.5      
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -76,14 +73,14 @@ No. Unordered Categorical Explanatory Vars.: 2
 > 
 > summary(model)
 
-Regression Data: 1000 training points, in 3 variable(s)
-                       x          z1  z2
-Bandwidth(s): 0.04110872 0.002156053 0.5
+Regression Data: 5000 training points, in 3 variable(s)
+                       x           z1        z2
+Bandwidth(s): 0.02647916 0.0006043332 0.4999999
 
 Kernel Regression Estimator: Local-Linear
 Bandwidth Type: Fixed
-Residual standard error: 0.2478859
-R-squared: 0.9258327
+Residual standard error: 0.2519402
+R-squared: 0.9223852
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -93,9 +90,9 @@ No. Unordered Categorical Explanatory Vars.: 2
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 35.01 
+Elapsed time = 298.171 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 35.253   0.080  35.328 
+298.342   0.066 298.398 

@@ -8,6 +8,8 @@ options(np.messages=FALSE)
 
 data("Italy")
 
+n <- nrow(Italy)
+
 ## A quantile regression example
 
 t <- system.time(bw <- npcdistbw(gdp~ordered(year),data=Italy))

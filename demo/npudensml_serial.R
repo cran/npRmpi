@@ -10,7 +10,7 @@ options(np.messages=FALSE)
 
 set.seed(42)
 
-n <- 2500
+n <- 10000
 
 mydat <- data.frame(x=rnorm(n))
 

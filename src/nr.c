@@ -12,7 +12,7 @@ static char rcsid[] = "$Id: nr.c,v 1.10 2006/11/02 16:56:49 tristen Exp $";
 extern int int_VERBOSE;
 
 /* The following routines (sort, powell, nrerror, vector, free_vector,
-   linimn, brent, mnbrak, f1dim, erfun, ran3), are based on the
+   linmin, brent, mnbrak, f1dim, erfun, ran3), are based on the
    routine(s) from the book Numerical Recipes in C (Cambridge
    University Press), Copyright (C) Copyright (C) 1987, 1988 by
    Numerical Recipes Software. Permission to include requested August
@@ -32,7 +32,7 @@ immense;
 typedef struct GREAT {unsigned short l,c,r;}
 great;
 
-#define FREEALL free_vector(xi,1,n);free_vector(h,1,n);free_vector(g,1,n);
+#define FREEALL free_vector(xi,1);free_vector(h,1);free_vector(g,1);
 
 #define GOLD 1.618034
 #define GLIMIT 100.0
@@ -54,7 +54,6 @@ great;
 #define M3 243000
 #define IA3 4561
 #define IC3 51349
-
 
 /*
  * Heapsort algorithm based on Knuth's adaptation
@@ -98,7 +97,6 @@ void sort(int n, double ra[])
         ra[i]=rra;
     }
 }
-
 
 void  powell(int RESTRICT, int INTEGER, double *p_restrict, double *p, double **xi, int n, double ftol, double tol, double small, int itmax, int *iter,
 double *fret, double (*func)(double *))
@@ -159,14 +157,13 @@ double *fret, double (*func)(double *))
 /* Begin checking... */
         if (2.0*fabs(fp-(*fret)) <= ftol*(fabs(fp)+fabs(*fret)))
         {
-            free_vector(xit,1,n);
-            free_vector(ptt,1,n);
-            free_vector(pt,1,n);
+            free_vector(xit,1);
+            free_vector(ptt,1);
+            free_vector(pt,1);
             return;
         }
         if (*iter == itmax)
         {
-/*        nrerror("Too many iterations in routine POWELL");*/
             if(int_VERBOSE == 1)
             {
                 REprintf("\n**Maximum number of iterations reached in routine POWELL\n");
@@ -225,13 +222,11 @@ double *fret, double (*func)(double *))
     }
 }
 
-
 void nrerror(char error_text[])
 {
     REprintf("Numerical Recipes run-time error...\n");
     error("%s\n",error_text);
 }
-
 
 double *vector(int nl,int nh)
 {
@@ -242,15 +237,10 @@ double *vector(int nl,int nh)
     return(v-nl);
 }
 
-
-void free_vector(double *v, int nl, int nh)
+void free_vector(double *v, int nl)
 {
-    nh = nh;                                      /* Simply to avoid warning about unused variable */
     free((char*) (v+nl));
 }
-
-
-
 
 int ncom=0;                                       /* defining declarations */
 double *pcom=0,*xicom=0,(*nrfunc)(double *);
@@ -304,17 +294,20 @@ void  linmin(int RESTRICT, int INTEGER, double *p_restrict, double *p, double *x
 
     }
 
-    mnbrak(&ax,&xx,&bx,&fa,&fx,&fb,small,f1dim);
+    mnbrak(&ax,&xx,&bx,&fa,&fx,&fb,f1dim);
     *fret=brent(ax,xx,bx,f1dim,tol,small,itmax,&xmin);
     for (j=1;j<=n;j++)
     {
         xi[j] *= xmin;
         p[j] += xi[j];
     }
-    free_vector(xicom,1,n);
-    free_vector(pcom,1,n);
+    free_vector(xicom,1);
+    free_vector(pcom,1);
 }
 
+/* In brent() small is ZEPS, (default 1.0e-10), "a small number which
+   protects against trying to achieve fractional accuracy for a
+   minimum that happens to be exactly zero */
 
 double brent(double ax, double bx, double cx, double (*f)(double), double tol, double small, int itmax, double *xmin)
 {
@@ -385,7 +378,6 @@ double brent(double ax, double bx, double cx, double (*f)(double), double tol, d
             }
         }
     }
-/*  nrerror("Too many iterations in BRENT");*/
     if(int_VERBOSE == 1)
     {
         REprintf("\n**Maximum number of iterations reached in routine BRENT\n");
@@ -394,13 +386,15 @@ double brent(double ax, double bx, double cx, double (*f)(double), double tol, d
     return fx;
 }
 
-
 #include <math.h>
 
+/* tiny (`TINY') is used to prevent any possible division by zero
+   (default 1.0e-20) */
+
 void  mnbrak(double *ax, double *bx, double *cx, double *fa, double *fb,
-double *fc, double small, double (*func)(double))
+double *fc, double (*func)(double))
 {
-    double ulim,u,r,q,fu,dum;
+  double ulim,u,r,q,fu,dum,tiny=1.0e-20;
 
     *fa=(*func)(*ax);
     *fb=(*func)(*bx);
@@ -416,7 +410,7 @@ double *fc, double small, double (*func)(double))
         r=(*bx-*ax)*(*fb-*fc);
         q=(*bx-*cx)*(*fb-*fa);
         u= (double)((*bx)-((*bx-*cx)*q-(*bx-*ax)*r)/
-            (2.0*SIGN(MAX(fabs(q-r),small),q-r)));
+                    (2.0*SIGN(MAX(fabs(q-r),tiny),q-r)));
         ulim=(double)((*bx)+GLIMIT*(*cx-*bx));
         if ((*bx-u)*(u-*cx) > 0.0)
         {
@@ -462,7 +456,6 @@ double *fc, double small, double (*func)(double))
     }
 }
 
-
 extern int ncom;                                  /* defined in LINMIN */
 extern double *pcom,*xicom,(*nrfunc)(double *);
 
@@ -474,13 +467,14 @@ double f1dim(double x)
     xt=vector(1,ncom);
     for (j=1;j<=ncom;j++) xt[j]=pcom[j]+x*xicom[j];
     f=(*nrfunc)(xt);
-    free_vector(xt,1,ncom);
+    free_vector(xt,1);
     return f;
 }
+
 /* This is an approximation to the error function good to 1.2e-07.
-     Compared to erfun() above it yields exact output for CDF
-     estimation, and is substantially faster for computation. Now
-     default replacement as of 10/6/03 */
+   Compared to erfun() above it yields exact output for CDF
+   estimation, and is substantially faster for computation. Now
+   default replacement as of 10/6/03 */
 
 double erfun(double x)
 {
@@ -493,10 +487,6 @@ double erfun(double x)
         t*(-0.82215223+t*0.17087277)))))))));
     return(x >= 0.0 ? -(ans-1.0) : (ans-1.0));
 }
-
-
-/* This version uses dlinmin(), line search using derivatives */
-
 
 #undef SIGN
 #undef MOV3
@@ -520,7 +510,6 @@ double erfun(double x)
 #undef IC3
 
 #undef FREEALL
-
 
 #define MBIG 1000000000
 #define MSEED 161803398
@@ -570,8 +559,55 @@ double ran3(int *idum)
     return(mj*FAC);
 }
 
-
 #undef MBIG
 #undef MSEED
 #undef MZ
 #undef FAC
+
+/* This program generates normal random variates and is machine
+independent thus generates the same sequence on any machine. First it
+generates uniform deviates _much_ better than the native generator on
+most machines, then uses a Box-Mueller transformation. */
+
+double gasdev(int *idum)
+{
+    static int iset=0;
+    static double gset;
+    double fac;
+    double r;
+    double v1;
+    double v2;
+
+    if (iset == 0)
+    {
+        do
+        {
+            v1=2.0*ran3(idum)-1.0;
+            v2=2.0*ran3(idum)-1.0;
+            r=v1*v1+v2*v2;
+        } while (r >= 1.0 || r == 0.0);
+        fac= (double) sqrt(-2.0*log(r)/r);
+        gset=v1*fac;
+        iset=1;
+        return v2*fac;
+    }
+    else
+    {
+        iset=0;
+        return gset;
+    }
+}
+
+/* Poor man's chi-square jracine 15/5/2014 */
+
+double chidev(int *idum, int df)
+{
+    double chisq = 0.0;
+    int i;
+
+    for (i=1;i<=df;i++) chisq += ipow(gasdev(idum),2);
+
+    return chisq;
+
+}
+

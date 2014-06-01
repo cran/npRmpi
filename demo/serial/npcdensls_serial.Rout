@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,9 +23,7 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
@@ -34,7 +31,7 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > 
 > set.seed(42)
 > 
-> n <- 500
+> n <- 1000
 > 
 > rho <- 0.25
 > mu <- c(0,0)
@@ -50,17 +47,17 @@ Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
 > 
 > summary(bw)
 
-Conditional density data (500 observations, 2 variable(s))
+Conditional density data (1000 observations, 2 variable(s))
 (1 dependent variable(s), and 1 explanatory variable(s))
 
 Bandwidth Selection Method: Least Squares Cross-Validation
 Formula: y ~ x
 Bandwidth Type: Fixed
-Objective Function Value: -0.2814004 (achieved on multistart 2)
+Objective Function Value: 0.2891467 (achieved on multistart 2)
 
-Exp. Var. Name: x Bandwidth: 1.227705 Scale Factor: 3.598933 
+Exp. Var. Name: x Bandwidth: 0.6193147 Scale Factor: 2.021265 
 
-Dep. Var. Name: y Bandwidth: 0.2065526 Scale Factor: 0.5822052
+Dep. Var. Name: y Bandwidth: 0.3625734 Scale Factor: 1.1563
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -71,16 +68,16 @@ No. Continuous Dependent Vars.: 1
 > 
 > summary(model)
 
-Conditional Density Data: 500 training points, in 2 variable(s)
+Conditional Density Data: 1000 training points, in 2 variable(s)
 (1 dependent variable(s), and 1 explanatory variable(s))
 
                                 y
-Dep. Var. Bandwidth(s): 0.2065526
-                               x
-Exp. Var. Bandwidth(s): 1.227705
+Dep. Var. Bandwidth(s): 0.3625734
+                                x
+Exp. Var. Bandwidth(s): 0.6193147
 
 Bandwidth Type: Fixed
-Log Likelihood: -686.5108
+Log Likelihood: -1372.287
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
@@ -88,9 +85,9 @@ No. Continuous Dependent Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 76.894 
+Elapsed time = 342.618 
 > 
 > 
 > proc.time()
    user  system elapsed 
- 76.998   0.239  77.232 
+342.074   0.815 342.921 

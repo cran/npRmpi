@@ -10,7 +10,7 @@ library(MASS)
 
 set.seed(42)
 
-n <- 1000
+n <- 2500
 
 rho <- 0.25
 mu <- c(0,0)

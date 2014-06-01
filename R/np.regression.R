@@ -51,8 +51,22 @@ npreg.formula <-
                        "bws = bws, ...)")))
     ev$call <- match.call(expand.dots = FALSE)
     environment(ev$call) <- parent.frame()
-    ev$rows.omit <- as.vector(attr(umf,"na.action"))
+
+    ev$omit <- attr(umf,"na.action")
+    ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
+
+    ev$mean <- napredict(ev$omit, ev$mean)
+    ev$merr <- napredict(ev$omit, ev$merr)
+
+    if(ev$gradients){
+        ev$grad <- napredict(ev$omit, ev$grad)
+        ev$gerr <- napredict(ev$omit, ev$gerr)
+    }
+
+    if(ev$residuals){
+        ev$resid <- naresid(ev$omit, ev$resid)
+    }    
     return(ev)
   }
 
@@ -70,7 +84,7 @@ npreg.rbandwidth <-
   function(bws,
            txdat = stop("training data 'txdat' missing"),
            tydat = stop("training data 'tydat' missing"),
-           exdat, eydat, gradients = FALSE, residuals = FALSE,
+           exdat, eydat, gradients = FALSE, residuals = FALSE, 
            ...){
 
     no.ex = missing(exdat)
@@ -221,7 +235,6 @@ npreg.rbandwidth <-
       econ = data.frame()
     }
 
-    
     myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
@@ -236,7 +249,8 @@ npreg.rbandwidth <-
       kerneval = switch(bws$ckertype,
         gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
-        uniform = CKER_UNI),
+        uniform = CKER_UNI,
+        "truncated gaussian" = CKER_TGAUSS),
       ukerneval = switch(bws$ukertype,
         aitchisonaitken = UKER_AIT,
         liracine = UKER_LR),
@@ -249,7 +263,9 @@ npreg.rbandwidth <-
         lc = REGTYPE_LC,
         ll = REGTYPE_LL),
       no.ex = no.ex,
-      mcv.numRow = attr(bws$xmcv, "num.row"))
+      mcv.numRow = attr(bws$xmcv, "num.row"),
+      int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO),
+      old.reg = FALSE)
     
 
     myout=
@@ -258,6 +274,7 @@ npreg.rbandwidth <-
          as.double(euno),  as.double(eord),  as.double(econ), as.double(eydat),
          as.double(c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord])),
          as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+         as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
          as.integer(myopti),
          mean = double(enrow),
          merr = double(enrow),
@@ -278,16 +295,17 @@ npreg.rbandwidth <-
 
 
     ev <- eval(parse(text = paste("npregression(bws = bws,",
-                       "eval = teval,",
-                       "mean = myout$mean, merr = myout$merr,",
-                       ifelse(gradients,
-                              "grad = myout$g, gerr = myout$gerr,",""),
-                       ifelse(residuals, "resid = resid,", ""),
-                       "ntrain = tnrow,",
-                       "trainiseval = no.ex,",
-                       "gradients = gradients,",
-                       "residuals = residuals,",
-                       "xtra = myout$xtra, rows.omit = rows.omit)")))
+                         "eval = teval,",
+                         "mean = myout$mean, merr = myout$merr,",
+                         ifelse(gradients,
+                                "grad = myout$g, gerr = myout$gerr,",""),
+                         ifelse(residuals, "resid = resid,", ""),
+                         "ntrain = tnrow,",
+                         "trainiseval = no.ex,",
+                         "gradients = gradients,",
+                         "residuals = residuals,",
+                         "xtra = myout$xtra, rows.omit = rows.omit)")))
+
 
     ev$call <- match.call(expand.dots = FALSE)
     environment(ev$call) <- parent.frame()
@@ -295,7 +313,8 @@ npreg.rbandwidth <-
   }
 
 npreg.default <- function(bws, txdat, tydat, ...){
-  sc.names <- names(sys.call())
+  sc <- sys.call()
+  sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -314,43 +333,25 @@ npreg.default <- function(bws, txdat, tydat, ...){
   if(txdat.named)
     txdat <- toFrame(txdat)
 
-  mc <- match.call()
-
-  tx.str <- ifelse(txdat.named, "xdat = txdat,",
-                   ifelse(no.txdat, "", "txdat,"))
-  ty.str <- ifelse(tydat.named, "ydat = tydat,",
-                   ifelse(no.tydat, "", "tydat,"))
+  sc.bw <- sc
   
-  tbw <- eval(parse(text = paste("npregbw(",
-                      ifelse(bws.named,                             
-                             paste(tx.str, ty.str,
-                                   "bws = bws, bandwidth.compute = FALSE,"),
-                             paste(ifelse(no.bws, "", "bws,"), tx.str, ty.str)),
-                      "call = mc, ...",")",sep="")))
+  sc.bw[[1]] <- quote(npregbw)
 
-  ## xnames = names(txdat)
-  ##tbw <- updateBwNameMetadata(nameList =
-  ##                            list(ynames = deparse(substitute(tydat))),
-  ##                            bws = tbw)
-
-  repair.args <- c("data", "subset", "na.action")
-  
-  m.par <- match(repair.args, names(mc), nomatch = 0)
-  m.child <- match(repair.args, names(tbw$call), nomatch = 0)
-
-  if(any(m.child > 0)) {
-    tbw$call[m.child] <- mc[m.par]
+  if(bws.named){
+    sc.bw$bandwidth.compute <- FALSE
   }
 
-  ## next we repair arguments portion of the call
-  m.bws.par <- match(c("bws","txdat","tydat"), names(mc), nomatch = 0)
-  m.bws.child <- match(c("bws","txdat","tydat"), as.character(tbw$call), nomatch = 0)
-  m.bws.union <- (m.bws.par > 0) & (m.bws.child > 0)
+  ostxy <- c('txdat','tydat')
+  nstxy <- c('xdat','ydat')
   
-  tbw$call[m.bws.child[m.bws.union]] <- mc[m.bws.par[m.bws.union]]
+  m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  environment(tbw$call) <- parent.frame()
-
+  if(any(m.txy > 0)) {
+    names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
+  }
+    
+  tbw <- eval.parent(sc.bw)
+  
   ## convention: drop 'bws' and up to two unnamed arguments (including bws)
   if(no.bws){
     tx.str <- ",txdat = txdat"

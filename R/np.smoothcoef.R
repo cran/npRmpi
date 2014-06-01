@@ -35,17 +35,16 @@ npscoef.formula <-
     txdat <- tmf[, bws$chromoly[[2]], drop = FALSE]
     if (!(miss.z <- !(length(bws$chromoly) == 3)))
       tzdat <- tmf[, bws$chromoly[[3]], drop = FALSE]
-    
 
     if ((has.eval <- !is.null(newdata))) {
       if (!(has.ey <- succeedWithResponse(tt, newdata)))
         tt <- delete.response(tt)
-      
+
       umf <- emf <- model.frame(tt, data = newdata)
 
       if (has.ey)
         eydat <- model.response(emf)
-      
+
       exdat <- emf[, bws$chromoly[[2]], drop = FALSE]
       if (!miss.z)
         ezdat <- emf[, bws$chromoly[[3]], drop = FALSE]
@@ -54,13 +53,22 @@ npscoef.formula <-
     ev <-
       eval(parse(text=paste("npscoef(txdat = txdat, tydat = tydat,",
                    ifelse(miss.z, '','tzdat = tzdat,'),
-                   ifelse(has.eval,paste("exdat = exdat,", 
+                   ifelse(has.eval,paste("exdat = exdat,",
                                          ifelse(has.ey,"eydat = eydat,",""),
                                          ifelse(miss.z,'', 'ezdat = ezdat,')),""),
                    "bws = bws, ...)")))
-    ev$rows.omit <- as.vector(attr(umf,"na.action"))
+
+    ev$omit <- attr(umf,"na.action")
+    ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
-    ev
+
+    ev$mean <- napredict(ev$omit, ev$mean)
+    ev$merr <- napredict(ev$omit, ev$merr)
+
+    if(ev$residuals){
+        ev$resid <- naresid(ev$omit, ev$resid)
+    }    
+    return(ev)
   }
 
 npscoef.call <-
@@ -71,9 +79,9 @@ npscoef.call <-
                  'bws = bws, ...)')))
   }
 
-
 npscoef.default <- function(bws, txdat, tydat, tzdat, ...) {
-  sc.names <- names(sys.call())
+  sc <- sys.call()
+  sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -90,7 +98,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, ...) {
   no.tzdat <- missing(tzdat)
 
   ## if bws was passed in explicitly, do not compute bandwidths
-    
+
   if(txdat.named)
     txdat <- toFrame(txdat)
 
@@ -100,55 +108,30 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, ...) {
   if(tydat.named)
     tzdat <- toFrame(tzdat)
 
-  mc <- match.call()
-
-  tx.str <- ifelse(txdat.named, "xdat = txdat,",
-                   ifelse(no.txdat, "", "txdat,"))
-  ty.str <- ifelse(tydat.named, "ydat = tydat,",
-                   ifelse(no.tydat, "", "tydat,"))
-  tz.str <- ifelse(tzdat.named, "zdat = tzdat,",
-                   ifelse(no.tzdat, "", "tzdat,"))
+  sc.bw <- sc
   
-  tbw <- eval(parse(text = paste("npscoefbw(",
-                      ifelse(bws.named,                             
-                             paste(tx.str, ty.str, tz.str,
-                                   "bws = bws, bandwidth.compute = FALSE,"),
-                             paste(ifelse(no.bws, "", "bws,"),
-                                   tx.str, ty.str, tz.str)),
-                      "call = mc, ...",")",sep="")))
+  sc.bw[[1]] <- quote(npscoefbw)
 
-  ## tbw <-
-  ##  updateBwNameMetadata(nameList = list(ynames = deparse(substitute(tydat))),
-  ##                       bws = tbw)
-
-  ## need to do some surgery on the call to
-  ## allow it to work with the formula interface
-
-  repair.args <- c("data", "subset", "na.action")
-  
-  m.par <- match(repair.args, names(mc), nomatch = 0)
-  m.child <- match(repair.args, names(tbw$call), nomatch = 0)
-  
-  if(any(m.child > 0)) {
-    tbw$call[m.child] <- mc[m.par]
+  if(bws.named){
+    sc.bw$bandwidth.compute <- FALSE
   }
 
-  ## next we repair arguments portion of the call
-  m.bws.par <- match(c("bws","txdat","tydat","tzdat"), names(mc), nomatch = 0)
-  m.bws.child <- match(c("bws","txdat","tydat","tzdat"), as.character(tbw$call), nomatch = 0)
-  m.bws.union <- (m.bws.par > 0) & (m.bws.child > 0)
+  ostxy <- c('txdat','tydat','tzdat')
+  nstxy <- c('xdat','ydat','zdat')
   
-  tbw$call[m.bws.child[m.bws.union]] <- mc[m.bws.par[m.bws.union]]
+  m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  environment(tbw$call) <- parent.frame()
+  if(any(m.txy > 0)) {
+    names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
+  }
+    
+  tbw <- eval.parent(sc.bw)
 
   ## because of some ambiguities in how the function might be called
-  ## we only drop up to two unnamed arguments, when sometimes dropping three
-  ## would be appropriate. 
-  ## also, for simplicity, we don't allow for inconsistent
-  ## mixes of named/unnamed arguments
-  ## so bws is named or unnamed, and t[xyz]dat collectively either
-  ## named or unnamed
+  ## we only drop up to two unnamed arguments, when sometimes dropping
+  ## three would be appropriate.  also, for simplicity, we don't allow
+  ## for inconsistent mixes of named/unnamed arguments so bws is named
+  ## or unnamed, and t[xyz]dat collectively either named or unnamed
 
   tz.str <- ifelse(tzdat.named, ",tzdat = tzdat",
                    ifelse(no.tzdat, "", "tzdat"))
@@ -164,7 +147,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, ...) {
                        ifelse(no.tydat, "", "tydat"))
     }
   }
-  
+
   eval(parse(text=paste("npscoef(bws = tbw", tx.str, ty.str, tz.str, ",...)")))
 
 }
@@ -184,19 +167,18 @@ npscoef.scbandwidth <-
            tol = .Machine$double.eps,
            leave.one.out = FALSE,
            betas = FALSE, ...){
-    
+
     miss.z <- missing(tzdat)
-    
+
     miss.ex = missing(exdat)
     miss.ey = missing(eydat)
-    
 
     ## if miss.ex then if !miss.ey then ey and tx must match, to get
     ## oos errors alternatively if miss.ey you get is errors if
-    ## !miss.ex then if !miss.ey then ey and ex must match, to get
-    ## oos errors alternatively if miss.ey you get NO errors since we
+    ## !miss.ex then if !miss.ey then ey and ex must match, to get oos
+    ## errors alternatively if miss.ey you get NO errors since we
     ## don't evaluate on the training data
-    
+
     txdat <- toFrame(txdat)
 
     if (!(is.vector(tydat) | is.factor(tydat)))
@@ -205,21 +187,20 @@ npscoef.scbandwidth <-
     if (!miss.z)
       tzdat <- toFrame(tzdat)
 
-
     if (!miss.ex){
       exdat <- toFrame(exdat)
 
-      if (!miss.z) 
+      if (!miss.z)
         ezdat <- toFrame(ezdat)
-      
+
       if (! txdat %~% exdat )
         stop("'txdat' and 'exdat' are not similar data frames!")
-      
+
       if (!miss.ey){
         if (dim(exdat)[1] != length(eydat))
           stop("number of evaluation data 'exdat' and dependent data 'eydat' do not match")
       }
-      
+
     } else if(!miss.ey) {
       if (dim(txdat)[1] != length(eydat))
         stop("number of training data 'txdat' and dependent data 'eydat' do not match")
@@ -235,7 +216,7 @@ npscoef.scbandwidth <-
     rows.omit =
       eval(parse(text = paste("attr(na.omit(data.frame(txdat, tydat",
                    ifelse(miss.z,'',',tzdat'),')), "na.action")')))
-    
+
     goodrows[rows.omit] = 0
 
     if (all(goodrows==0))
@@ -245,7 +226,6 @@ npscoef.scbandwidth <-
     tydat = tydat[goodrows]
     if (!miss.z)
       tzdat <- tzdat[goodrows,, drop = FALSE]
-
 
     if (!miss.ex){
       goodrows = 1:dim(exdat)[1]
@@ -262,7 +242,6 @@ npscoef.scbandwidth <-
       if (!miss.z)
         ezdat <- ezdat[goodrows,, drop = FALSE]
 
-
       if (all(goodrows==0))
         stop("Evaluation data has no rows without NAs")
     }
@@ -277,7 +256,6 @@ npscoef.scbandwidth <-
     else
       tydat <- as.double(tydat)
 
-
     if (miss.ey)
       eydat <- double()
     else {
@@ -291,11 +269,11 @@ npscoef.scbandwidth <-
 
     ## re-assign levels in training and evaluation data to ensure correct
     ## conversion to numeric type.
-    
+
     txdat <- adjustLevels(txdat, bws$xdati)
     if (!miss.z)
       tzdat <- adjustLevels(tzdat, bws$zdati)
-      
+
     if (!miss.ex){
       exdat <- adjustLevels(exdat, bws$xdati)
       if (!miss.z)
@@ -313,10 +291,9 @@ npscoef.scbandwidth <-
         teval <- list(exdat = exdat, ezdat = ezdat)
     }
 
-
     ## put the unordered, ordered, and continuous data in their own objects
     ## data that is not a factor is continuous.
-    
+
     txdat <- toMatrix(txdat)
 
     if (!miss.ex){
@@ -324,8 +301,8 @@ npscoef.scbandwidth <-
     }
 
     ## from this point on txdat and exdat have been recast as matrices
-
     ## construct 'W' matrix
+
     W.train <- W <- as.matrix(data.frame(1,txdat))
     yW <- as.matrix(data.frame(tydat,1,txdat))
 
@@ -334,27 +311,15 @@ npscoef.scbandwidth <-
       if (!miss.ex)
         ezdat <- exdat
     }
-      
-    ## need to conserve + propagate desired bandwidth properties
 
-    tyw <- eval(parse(text=paste("npksum(txdat = tzdat, tydat = tydat, weights = W,",
+    tww <- eval(parse(text=paste("npksum(txdat = tzdat, tydat = yW, weights = yW,",
                     ifelse(miss.ex, "", "exdat = ezdat,"),
                     "bws = bws)$ksum")))
 
-    tww <- eval(parse(text=paste("npksum(txdat = tzdat, tydat = W, weights = W,",
-                    ifelse(miss.ex, "", "exdat = ezdat,"),
-                    "bws = bws)$ksum")))
-
-# jracine - this ought to work but barfs on evaluation data. Reverting to old code.
-#    
-#    tww <- eval(parse(text=paste("npksum(txdat = tzdat, tydat = yW, weights = yW,",
-#                    ifelse(miss.ex, "", "exdat = ezdat,"),
-#                    "bws = bws)$ksum")))
-
-#    tyw <- tww[-1,1,]
-#    tww <- tww[-1,-1,]
-
-#    stop(cat("dim tww = ", dim(tww),"dim tyw = ", dim(tyw)))
+    tyw <- tww[-1,1,,drop=FALSE]
+    dim(tyw) <- dim(tyw)[-2]
+    
+    tww <- tww[-1,-1,,drop=FALSE]
 
     tnrow <- nrow(txdat)
     enrow <- ifelse(miss.ex, nrow(txdat), nrow(exdat))
@@ -362,7 +327,7 @@ npscoef.scbandwidth <-
     if (!miss.ex)
       W <- as.matrix(data.frame(1,exdat))
 
-## ridging jracine Jan 28 2009
+    ## ridging jracine Jan 28 2009
 
     maxPenalty <- sqrt(.Machine$double.xmax)
     coef.mat <- matrix(maxPenalty,ncol(W),enrow)
@@ -372,11 +337,9 @@ npscoef.scbandwidth <-
 
     nc <- ncol(tww[,,1])
 
-    
     ridger <- function(i) {
       doridge[i] <<- FALSE
-      ridge.val <- ridge[i]*tyw[,i][1]/
-        (ifelse(tww[,,i][1,1]>=0, 1, -1)*max(.Machine$double.eps,abs(tww[,,i][1,1])))
+      ridge.val <- ridge[i]*tyw[,i][1]/NZD(tww[,,i][1,1])
       tryCatch(solve(tww[,,i]+diag(rep(ridge[i],nc)),
                      tyw[,i]+c(ridge.val,rep(0,nc-1))),
                error = function(e){
@@ -391,36 +354,32 @@ npscoef.scbandwidth <-
       coef.mat[,iloo] <- sapply(iloo, ridger)
     }
 
-##    coef.mat <- sapply(1:enrow, function(i) { solve(tww[,,i], tyw[,i]) })
-
     if (do.iterate <- (iterate && !is.null(bws$bw.fitted) && miss.ex)){
       resid <- tydat - sapply(1:enrow, function(i) { W[i,, drop = FALSE] %*% coef.mat[,i] })
-      
+
       i = 0
       max.err <- .Machine$double.xmax
       aydat <- abs(tydat) + .Machine$double.eps
 
       n.part <- (ncol(txdat)+1)
- 
+
       while((max.err > tol) & ((i <- i + 1) <= maxiter)){
         resid.old <- resid
         for(j in 1:n.part){
           ## estimate partial residuals
           partial <- W[,j] * coef.mat[j,] + resid
-          
+
           ## use to calculate new beta implicitly
 
-          ksum1 <- npksum(txdat = tzdat,
-                          tydat = partial * W[,j],
-                          bws = bws, leave.one.out = leave.one.out)$ksum
-          ksum2 <- npksum(txdat = tzdat,
-                          tydat = W[,j]^2,
-                          bws = bws, leave.one.out = leave.one.out)$ksum
+          twww <- npksum(txdat=tzdat,
+                         tydat=cbind(partial * W[,j],W[,j]^2),
+                         weights=cbind(partial * W[,j],1),
+                         bws=bws,
+                         leave.one.out=leave.one.out)$ksum
 
-          coef.mat[j,] <- ksum1/
-            (ifelse(ksum2>=0, 1, -1)*max(.Machine$double.eps,abs(ksum2)))
+          coef.mat[j,] <- twww[1,2,]/NZD(twww[2,2,])
 
-          ## estimate new full residuals 
+          ## estimate new full residuals
           resid <- partial - W[,j] * coef.mat[j,]
           ## repeat for consistency ?
         }
@@ -448,10 +407,16 @@ npscoef.scbandwidth <-
       CORR = CORRfunc(tydat, mean)
       SIGN = SIGNfunc(tydat, mean)
     }
-      
+
     if(errors | (residuals & miss.ex)){
-      tyw <- npksum(txdat = tzdat, tydat = tydat, weights = W.train, bws = bws)$ksum
-      tm <- npksum(txdat = tzdat, tydat = W.train, weights = W.train, bws = bws)$ksum
+
+      tywtm <- npksum(txdat = tzdat,
+                      tydat = yW,
+                      weights = yW,
+                      bws = bws)$ksum
+
+      tyw <- tywtm[-1,1,]
+      tm <- tywtm[-1,-1,]
 
       mean.fit <- rep(maxPenalty,nrow(txdat))
       epsilon <- 1.0/nrow(txdat)
@@ -462,8 +427,7 @@ npscoef.scbandwidth <-
 
       ridger <- function(i) {
         doridge[i] <<- FALSE
-        ridge.val <- ridge.tm[i]*tyw[,i][1]/
-          (ifelse(tm[,,i][1,1]>=0, 1, -1)*max(.Machine$double.eps,abs(tm[,,i][1,1])))
+        ridge.val <- ridge.tm[i]*tyw[,i][1]/NZD(tm[,,i][1,1])
         W.train[i,, drop = FALSE] %*% tryCatch(solve(tm[,,i]+diag(rep(ridge.tm[i],nc)),
                       tyw[,i]+c(ridge.val,rep(0,nc-1))),
                       error = function(e){
@@ -479,16 +443,16 @@ npscoef.scbandwidth <-
       }
 
       u2.W <- (resid <- tydat - mean.fit)^2
+
     }
 
     if(errors){
       ## kernel^2 integrals
       k <- (int.kernels[switch(bws$ckertype,
+                               "truncated gaussian" = CKER_TGAUSS,
                               gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
                               epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
                               uniform = CKER_UNI)+1])^length(bws$bw)
-      
-
 
       u2.W <- sapply(1:tnrow, function(i) { W.train[i,, drop=FALSE]*u2.W[i] })
       u2.W <- t(u2.W)

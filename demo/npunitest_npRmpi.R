@@ -23,7 +23,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
 
-n <- 1000
+n <- 5000
 
 x <- rnorm(n)
 y <- rnorm(n)

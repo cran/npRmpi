@@ -106,6 +106,9 @@ extern double *vector_scale_factor_dep_met_univar_lag_extern;
 extern double y_min_extern;
 extern double y_max_extern;
 
+// so that quantile stuff gives a more sensible multistart message
+extern int imstot;
+
 int kernel_estimate_density_categorical(
 int KERNEL_den,
 int KERNEL_unordered_den,
@@ -157,7 +160,7 @@ double *log_likelihood)
 
 	#ifdef MPI2
 	double log_likelihood_MPI;
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -675,7 +678,7 @@ double *cv)
 
 	#ifdef MPI2
 	double cv_MPI;
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -704,6 +707,7 @@ double *cv)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_X_continuous,				 /* Not used */
 		matrix_X_continuous,				 /* Not used */
@@ -1028,7 +1032,7 @@ double *cv)
 		}
 	}
 
-	*cv /= (double) num_obs;
+
 	#endif
 
 	#ifdef MPI2
@@ -1339,7 +1343,6 @@ double *cv)
 
 	/* Now reduce */
 
-	cv_MPI /= (double) num_obs;
 	MPI_Reduce(&cv_MPI, cv, 1, MPI_DOUBLE, MPI_SUM, 0, comm[1]);
 	MPI_Bcast(cv, 1, MPI_DOUBLE, 0, comm[1]);
 	#endif
@@ -1410,7 +1413,7 @@ double *cv)
 
 	#ifdef MPI2
 	double cv_MPI;
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -1433,6 +1436,7 @@ double *cv)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous,
 		matrix_Y_continuous,
@@ -2063,7 +2067,7 @@ int itmax)
 	double **matrix_bandwidth_deriv = NULL;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -2433,7 +2437,9 @@ double *SIGN)
 	double temp_var;
 	double temp_mean_y;
 	double *pointer_yi;
+#ifndef MPI2
 	double *pointer_m;
+#endif
 	double temp;
 	double temp1 = DBL_MAX;
 
@@ -2452,7 +2458,7 @@ double *SIGN)
 	int num_reg_cat_cont;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -3686,7 +3692,7 @@ double *SIGN)
 
 				mean[j-my_rank*stride] = sum_y_ker/sum_ker;
 
-				temp_var = (sum_y_sq_ker/sum_ker) - ipow(*pointer_m++, 2);
+				temp_var = (sum_y_sq_ker/sum_ker) - ipow(mean[j-my_rank*stride], 2);
 
 				/* With no continuous variables, need to drop K_INT_KERNEL_P */
 
@@ -3786,7 +3792,7 @@ double *SIGN)
 
 				mean[j-my_rank*stride] = sum_y_ker/sum_ker;
 
-				temp_var = (sum_y_sq_ker/sum_ker) - ipow(*pointer_m++, 2);
+				temp_var = (sum_y_sq_ker/sum_ker) - ipow(mean[j-my_rank*stride], 2);
 
 				/* With no continuous variables, need to drop K_INT_KERNEL_P */
 
@@ -4568,12 +4574,14 @@ double *mean)
 	MATRIX  DELTA;
 
 	double *pointer_yi;
-	double *pointer_m;
 
+#ifndef MPI2
+	double *pointer_m;
+#endif
 	int num_reg_cat_cont;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -4613,6 +4621,7 @@ double *mean)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			matrix_X_continuous,			 /* Not used */
 			matrix_X_continuous,			 /* Not used */
@@ -4804,6 +4813,7 @@ double *mean)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			matrix_X_continuous,			 /* Not used */
 			matrix_X_continuous,			 /* Not used */
@@ -5376,6 +5386,7 @@ double *mean)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			/* Not used */
 			matrix_X_continuous,
@@ -5563,6 +5574,7 @@ double *mean)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			/* Not used */
 			matrix_X_continuous,
@@ -6203,7 +6215,9 @@ double **gradient)
 	double temp1 = DBL_MAX;
 
 	double *pointer_yi;
+#ifndef MPI2
 	double *pointer_m;
+#endif
 
 	double *pointer_matrix_weights_K;
 	double *pointer_matrix_weights_K_deriv;
@@ -6219,7 +6233,7 @@ double **gradient)
 	int num_reg_cat_cont;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -10734,7 +10748,7 @@ double *log_likelihood)
 
 	#ifdef MPI2
 	double log_likelihood_MPI;
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -10764,6 +10778,7 @@ double *log_likelihood)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -11433,7 +11448,7 @@ int itmax)
 	double **matrix_bandwidth_reg = NULL;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -11465,6 +11480,7 @@ int itmax)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -11959,7 +11975,7 @@ int itmax)
 	double **matrix_bandwidth_reg = NULL;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -11991,6 +12007,7 @@ int itmax)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -12487,7 +12504,7 @@ int itmax)
 	double **matrix_Y_continuous_eval;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_train / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_train / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -12694,6 +12711,7 @@ int itmax)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -13002,7 +13020,7 @@ double *log_likelihood)
 
 	#ifdef MPI2
 	double log_likelihood_MPI;
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -13038,6 +13056,7 @@ double *log_likelihood)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -13955,12 +13974,14 @@ double **pdf_deriv_stderr)
 	double **matrix_X_unordered_temp;
 	double **matrix_X_ordered_temp;
 
+#ifndef MPI2
 	double *pointer_m;
 	double *pointer_me;
 	double *pointer_g;
+#endif
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -14479,7 +14500,7 @@ int itmax)
 	double DIFF_KER_PPM;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -14515,6 +14536,7 @@ int itmax)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous_train,
 		matrix_Y_continuous_eval,
@@ -15272,12 +15294,14 @@ int itmax)
 	double **matrix_X_unordered_temp;
 	double **matrix_X_ordered_temp;
 
+#ifndef MPI2
 	double *pointer_m;
 	double *pointer_me;
 	double *pointer_g;
+#endif
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -15773,7 +15797,7 @@ double *cv)
 
 	#ifdef MPI2
 	double cv_MPI;
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -15793,6 +15817,7 @@ double *cv)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		/* Not used */
 		matrix_X_continuous,
@@ -16303,7 +16328,7 @@ double *cv)
 
 	#ifdef MPI2
 	double cv_MPI;
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -16326,6 +16351,7 @@ double *cv)
 		num_reg_continuous,
 		num_reg_unordered,
 		num_reg_ordered,
+    0, // do not suppress_parallel
 		vector_scale_factor,
 		matrix_Y_continuous,
 		matrix_Y_continuous,
@@ -17433,7 +17459,15 @@ double tol,
 double small,
 int itmax,
 int iMax_Num_Multistart,
-double zero)
+double zero,
+double lbc_dir,
+int dfc_dir,
+double c_dir,
+double initc_dir,
+double lbd_dir,
+double  hbd_dir,
+double  d_dir,
+double  initd_dir)
 {
 
 	int i;
@@ -17457,7 +17491,7 @@ double zero)
 	double **matrix_bandwidth_reg = NULL;
 
 	#ifdef MPI2
-	int stride = ceil((double) num_obs_eval / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	#endif
 
@@ -17490,6 +17524,7 @@ double zero)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			matrix_Y_continuous_train,
 			matrix_Y_continuous_train, /* Same Y for training and evaluation */
@@ -17551,7 +17586,14 @@ double zero)
 
 		quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		initialize_nr_hessian(1, matrix_y);
+    initialize_nr_directions(1, 0, 0,
+                             0, 0, 0,
+                             vector_scale_factor,
+                             NULL,
+                             matrix_y,
+                             0, seed, 
+                             lbc_dir, c_dir, dfc_dir, initc_dir, 
+                             lbd_dir, hbd_dir, d_dir, initd_dir);
 
 		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17560,12 +17602,22 @@ double zero)
 			fret_best = fret;
 			quantile_multistart[1] = quantile[1];
 
+      Rprintf("iMax_Num_Multistart: %d\n", iMax_Num_Multistart);
+      imstot = iMax_Num_Multistart;
 			for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
 			{
 
 				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				initialize_nr_hessian(1, matrix_y);
+        initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y,
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17618,7 +17670,14 @@ double zero)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-				initialize_nr_hessian(1, matrix_y);
+		    initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y,
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17632,7 +17691,14 @@ double zero)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-						initialize_nr_hessian(1, matrix_y);
+				    initialize_nr_directions(1, 0, 0,
+                                     0, 0, 0,
+                                     vector_scale_factor,
+                                     NULL,
+                                     matrix_y,
+                                     0, seed, 
+                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                     lbd_dir, hbd_dir, d_dir, initd_dir);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17674,7 +17740,14 @@ double zero)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-				initialize_nr_hessian(1, matrix_y);
+		    initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y, 
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17688,7 +17761,14 @@ double zero)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-						initialize_nr_hessian(1, matrix_y);
+				    initialize_nr_directions(1, 0, 0,
+                                     0, 0, 0,
+                                     vector_scale_factor,
+                                     NULL,
+                                     matrix_y,
+                                     0, seed, 
+                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                     lbd_dir, hbd_dir, d_dir, initd_dir);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17778,7 +17858,14 @@ double zero)
 
 		quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		initialize_nr_hessian(1, matrix_y);
+    initialize_nr_directions(1, 0, 0,
+                             0, 0, 0,
+                             vector_scale_factor,
+                             NULL,
+                             matrix_y,
+                             0, seed, 
+                             lbc_dir, c_dir, dfc_dir, initc_dir, 
+                             lbd_dir, hbd_dir, d_dir, initd_dir);
 
 		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17792,7 +17879,14 @@ double zero)
 
 				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				initialize_nr_hessian(1, matrix_y);
+		    initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y,
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17844,7 +17938,14 @@ double zero)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-				initialize_nr_hessian(1, matrix_y);
+		    initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y,
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17858,7 +17959,14 @@ double zero)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-						initialize_nr_hessian(1, matrix_y);
+				    initialize_nr_directions(1, 0, 0,
+                                     0, 0, 0,
+                                     vector_scale_factor,
+                                     NULL,
+                                     matrix_y,
+                                     0, seed, 
+                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                     lbd_dir, hbd_dir, d_dir, initd_dir);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17905,7 +18013,14 @@ double zero)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-				initialize_nr_hessian(1, matrix_y);
+		    initialize_nr_directions(1, 0, 0,
+                                 0, 0, 0,
+                                 vector_scale_factor,
+                                 NULL,
+                                 matrix_y,
+                                 0, seed, 
+                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                 lbd_dir, hbd_dir, d_dir, initd_dir);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17919,7 +18034,14 @@ double zero)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-						initialize_nr_hessian(1, matrix_y);
+				    initialize_nr_directions(1, 0, 0,
+                                     0, 0, 0,
+                                     vector_scale_factor,
+                                     NULL,
+                                     matrix_y,
+                                     0, seed, 
+                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
+                                     lbd_dir, hbd_dir, d_dir, initd_dir);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -18049,7 +18171,9 @@ int *num_categories)
 	MATRIX  DELTA;
 
 	double *pointer_yi;
+#ifndef MPI2
 	double *pointer_m;
+#endif
 
 	int num_reg_cat_cont;
 
@@ -18061,7 +18185,7 @@ int *num_categories)
 
 	#ifdef MPI2
 	double trace_H_MPI = 0.0;
-	int stride = ceil((double) num_obs / (double) iNum_Processors);
+	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
 	if(stride < 1) stride = 1;
 	mean = alloc_vecd(stride*iNum_Processors);
 	#endif
@@ -18105,6 +18229,7 @@ int *num_categories)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			matrix_X_continuous,			 /* Not used */
 			matrix_X_continuous,			 /* Not used */
@@ -18304,6 +18429,7 @@ int *num_categories)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			matrix_X_continuous,			 /* Not used */
 			matrix_X_continuous,			 /* Not used */
@@ -18883,6 +19009,7 @@ int *num_categories)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			/* Not used */
 			matrix_X_continuous,
@@ -19079,6 +19206,7 @@ int *num_categories)
 			num_reg_continuous,
 			num_reg_unordered,
 			num_reg_ordered,
+      0, // do not suppress_parallel
 			vector_scale_factor,
 			/* Not used */
 			matrix_X_continuous,
@@ -19741,7 +19869,7 @@ double **gradient_categorical)
 	double *iord;
 
 	#ifdef MPI2
-	num_obs_eval_alloc = MAX(ceil((double) num_obs_eval / (double) iNum_Processors),1)*iNum_Processors;
+	num_obs_eval_alloc = MAX((int)ceil((double) num_obs_eval / (double) iNum_Processors),1)*iNum_Processors;
 	#else
 	num_obs_eval_alloc = num_obs_eval;
 	#endif

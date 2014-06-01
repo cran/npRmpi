@@ -10,7 +10,7 @@ options(np.messages=FALSE)
 
 set.seed(42)
 
-n <- 1000
+n <- 2500
 
 sample.A <- data.frame(x=rnorm(n))
 sample.B <- data.frame(x=rnorm(n))

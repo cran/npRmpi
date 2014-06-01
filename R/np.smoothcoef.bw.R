@@ -216,17 +216,30 @@ npscoefbw.scbandwidth <-
     else
       dati <- bws$zdati
 
+    mysd <- EssDee(zdat[, dati$icon, drop = FALSE])
+    nconfac <- n^(-1.0/(2.0*bws$ckerorder+bws$ncon))
+    ncatfac <- n^(-2.0/(2.0*bws$ckerorder+bws$ncon))
+
+    bws$sdev <- mysd
+    bws$nconfac <- nconfac
+    bws$ncatfac <- ncatfac
+    
     if (bandwidth.compute){
       maxPenalty <- sqrt(.Machine$double.xmax)
-
       overall.cv.ls <- function(param) {
-        if (any(param < 0) || ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
+        sbw <- bws
+        sbw$bw <- param
+        sbw$bandwidth[[1]] <- param
+        if (!validateBandwidthTF(sbw) || ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
           return(maxPenalty)
         
         bws$bw <- param
+
+        if(bws$scaling)
+            bws$bandwidth[[1]] <- sapply(1:bws$ndim, function(i) { bws$bw[i]*ifelse(bws$icon[i],nconfac*bws$sdev[sum(dati$icon[1:i])], ncatfac) })
+        else
+            bws$bandwidth[[1]] <- bws$bw
         
-        ##tyw <- npksum(txdat = zdat, tydat = ydat, weights = W, bws = bws,
-        ##              leave.one.out = TRUE)$ksum
         
         tww <- npksum(txdat = zdat, tydat = yW, weights = yW, bws = bws,
                       leave.one.out = TRUE)$ksum
@@ -240,8 +253,7 @@ npscoefbw.scbandwidth <-
 
         ridger <- function(i) {
           doridge[i] <<- FALSE
-          ridge.val <- ridge[i]*tww[-1,1,i][1]/
-            (ifelse(tww[-1,-1,i][1,1]>=0, 1, -1)*max(.Machine$double.eps,abs(tww[-1,-1,i][1,1])))
+          ridge.val <- ridge[i]*tww[-1,1,i][1]/NZD(tww[-1,-1,i][1,1])
           W[i,, drop = FALSE] %*% tryCatch(solve(tww[-1,-1,i]+diag(rep(ridge[i],nc)),
                   tww[-1,1,i]+c(ridge.val,rep(0,nc-1))),
                   error = function(e){
@@ -280,7 +292,11 @@ npscoefbw.scbandwidth <-
                             'betas = TRUE)'))
       
       partial.cv.ls <- function(param, partial.index) {
-        if (any(param < 0) || ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
+        sbw <- bws
+        sbw$bw <- param
+        sbw$bandwidth[[1]] <- param
+
+        if (!validateBandwidthTF(sbw) || ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
           return(maxPenalty)
         
         if (backfit.iterate){
@@ -289,15 +305,20 @@ npscoefbw.scbandwidth <-
           partial.loo <- W[,partial.index]*scoef.loo$beta[,partial.index]
         } else {
           bws$bw <- param
-          partial.loo <- W[,partial.index]*
-            npksum(txdat = zdat,
-                   tydat = partial.orig * W[,partial.index],
-                   bws = bws,
-                   leave.one.out = TRUE)$ksum/
-                     npksum(txdat = zdat,
-                            tydat = W[,partial.index]^2,
-                            bws = bws,
-                            leave.one.out = TRUE)$ksum
+
+          if(bws$scaling)
+              bws$bandwidth[[1]] <- sapply(1:bws$ndim, function(i) { bws$bw[i]*ifelse(bws$icon[i],nconfac*bws$sdev[sum(dati$icon[1:i])], ncatfac) })
+          else
+              bws$bandwidth[[1]] <- bws$bw
+
+          tww <- npksum(txdat=zdat,
+                        tydat=cbind(partial.orig * W[,partial.index],W[,partial.index]^2),
+                        weights=cbind(partial.orig * W[,partial.index],1),
+                        bws=bws,
+                        leave.one.out=TRUE)$ksum
+
+          partial.loo <- W[,partial.index]*tww[1,2,]/NZD(tww[2,2,])
+          
         }
         
 
@@ -318,24 +339,16 @@ npscoefbw.scbandwidth <-
 
       x.scale <- sapply(1:bws$ndim, function(i){
         if (dati$icon[i]){
-          if(IQR(zdat[,i]) > 0) {
-            return((4/3)^0.2*(ifelse(bws$scaling, 1.0,
-                                     min(sd(zdat[,i]), IQR(zdat[,i])/(qnorm(.25,lower.tail=F)*2)) *
-                                     n^(-1.0/(2.0*bws$ckerorder+bws$ncon)))))
-          } else {
-            return((4/3)^0.2*(ifelse(bws$scaling, 1.0,
-                                     sd(zdat[,i]) *
-                                     n^(-1.0/(2.0*bws$ckerorder+bws$ncon)))))
-          }
+            return(1.059224*(ifelse(bws$scaling, 1.0, mysd[sum(dati$icon[1:i])]*nconfac)))
         }
         
         if (dati$iord[i])
           return(0.5*oMaxL(dati$all.nlev[[i]], kertype = bws$okertype)*
-                 ifelse(bws$scaling,n^(2.0/(2.0*bws$ckerorder+bws$ncon)),1.0))
+                 ifelse(bws$scaling,ncatfac,1.0))
         
         if (dati$iuno[i])
           return(0.5*uMaxL(dati$all.nlev[[i]], kertype = bws$ukertype)*
-                 ifelse(bws$scaling,n^(2.0/(2.0*bws$ckerorder+bws$ncon)),1.0))       
+                 ifelse(bws$scaling,ncatfac,1.0))       
       })
 
       console <- newLineConsole()
@@ -437,13 +450,19 @@ npscoefbw.scbandwidth <-
             } else {
               bws$bw <- bws$bw.fitted[,j]
               ## estimate new beta.hats
-              scoef$beta[,j] <-
-                npksum(txdat = zdat,
-                       tydat = partial.orig * W[,j],
-                       bws = bws)$ksum/
-                         npksum(txdat = zdat,
-                                tydat = W[,j]^2,
-                                bws = bws)$ksum
+
+              if(bws$scaling)
+                  bws$bandwidth[[1]] <- sapply(1:bws$ndim, function(i) { bws$bw[i]*ifelse(bws$icon[i],nconfac*bws$sdev[sum(dati$icon[1:i])], ncatfac) })
+              else
+                  bws$bandwidth[[1]] <- bws$bw
+
+              tww <- npksum(txdat=zdat,
+                            tydat=cbind(partial.orig * W[,j],W[,j]^2),
+                            weights=cbind(partial.orig * W[,j],1),
+                            bws=bws)$ksum
+              
+              scoef$beta[,j] <- tww[1,2,]/NZD(tww[2,2,])
+              
               bws$bw <- param.overall
               ## estimate new full residuals 
               resid.full <- partial.orig - W[,j] * scoef$beta[,j]

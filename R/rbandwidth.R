@@ -4,12 +4,13 @@ rbandwidth <-
            bwmethod = c("cv.ls","cv.aic"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian", "epanechnikov","uniform"), 
+           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"),
            ckerorder = c(2,4,6,8),
            ukertype = c("aitchisonaitken", "liracine"),
-           okertype = c("wangvanryzin", "liracine"),
+           okertype = c("liracine","wangvanryzin"),
            fval = NA,
            ifval = NA,
+           fval.history = NA,
            nobs = NA,
            xdati = stop("rbandwidth:argument 'xdati' missing"),
            ydati = stop("rbandwidth:argument 'ydati' missing"),
@@ -17,6 +18,9 @@ rbandwidth <-
            ynames = character(1),
            sfactor = NA, bandwidth = NA,
            rows.omit = NA,
+           nconfac = NA,
+           ncatfac = NA,
+           sdev = NA,
            bandwidth.compute = TRUE,...){
 
   ndim = length(bw)
@@ -34,6 +38,9 @@ rbandwidth <-
     if (!any(kord == ckerorder))
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
+
+  if (ckertype == "truncated gaussian" && ckerorder != 2)
+    warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   ukertype = match.arg(ukertype)
   okertype = match.arg(okertype)
@@ -66,34 +73,21 @@ rbandwidth <-
       lc = "Local-Constant",
       ll = "Local-Linear"),
     method = bwmethod,
-    pmethod = switch( bwmethod,
-      cv.ls = "Least Squares Cross-Validation",
-      cv.aic = "Expected Kullback-Leibler Cross-Validation"
-##      ,"normal-reference" = "Normal Reference"
-      ),
+    pmethod = bwmToPrint(bwmethod),
     fval = fval,
     ifval = ifval,
+    fval.history = fval.history,
     scaling = bwscaling,
     pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
     type = bwtype,
-    ptype = switch( bwtype,
-      fixed = "Fixed",
-      generalized_nn = "Generalized Nearest Neighbour",
-      adaptive_nn = "Adaptive Nearest Neighbour" ),
+    ptype = bwtToPrint(bwtype),
     ckertype = ckertype,    
     ckerorder = ckerorder,
-    pckertype = switch(ckertype,
-      gaussian = paste(porder,"Gaussian"),
-      epanechnikov =  paste(porder,"Epanechnikov"),
-      uniform = "Uniform"),
+    pckertype = cktToPrint(ckertype, order = porder),
     ukertype = ukertype,
-    pukertype = switch( ukertype,
-      aitchisonaitken = "Aitchison and Aitken",
-      liracine = "Li and Racine"),
+    pukertype = uktToPrint(ukertype),
     okertype = okertype,
-    pokertype = switch( okertype,
-      wangvanryzin = "Wang and Van Ryzin",
-      liracine = "Li and Racine"),
+    pokertype = oktToPrint(okertype),
     nobs = nobs,
     ndim = ndim,
     ncon = sum(xdati$icon),
@@ -109,6 +103,9 @@ rbandwidth <-
     xmcv = mcvConstruct(xdati),
     sfactor = list(x = sfactor),
     bandwidth = list(x = bandwidth),
+    nconfac = nconfac,
+    ncatfac = ncatfac,
+    sdev = sdev,
     sumNum = list(x = sumNum),
     dati = list(x = xdati, y = ydati),
     varnames = list(x = xnames, y = ynames),

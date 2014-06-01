@@ -7,7 +7,12 @@
   spawned by using slavedaemon.R script.
 }
 \usage{
-mpi.bcast.cmd(cmd=NULL, ..., rank = 0, comm = 1, nonblock=FALSE, sleep=0.1,
+mpi.bcast.cmd(cmd=NULL,
+              ...,
+              rank = 0,
+              comm = 1,
+              nonblock=FALSE,
+              sleep=0.1,
               caller.execute = FALSE)
 }
 \arguments{

@@ -1,8 +1,7 @@
 
-R version 2.15.3 (2013-03-01) -- "Security Blanket"
-Copyright (C) 2013 The R Foundation for Statistical Computing
-ISBN 3-900051-07-0
-Platform: x86_64-apple-darwin12.2.1/x86_64 (64-bit)
+R version 3.1.0 (2014-04-10) -- "Spring Dance"
+Copyright (C) 2014 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin13.1.0/x86_64 (64-bit)
 
 R is free software and comes with ABSOLUTELY NO WARRANTY.
 You are welcome to redistribute it under certain conditions.
@@ -24,9 +23,7 @@ Type 'q()' to quit R.
 > ## counterpart for insight about your own problems.
 > 
 > library(np)
-Loading required package: boot
-Loading required package: cubature
-Nonparametric Kernel Methods for Mixed Datatypes (version 0.50-1)
+Nonparametric Kernel Methods for Mixed Datatypes (version 0.60-0)
 [vignette("np_faq",package="np") provides answers to frequently asked questions]
 > options(np.messages=FALSE)
 > 
@@ -63,37 +60,37 @@ Formula: y ~ x1 + x2 | z1 + z2
 Bandwidth Type: Fixed
 
 y on z:
-Exp. Var. Name: z1 Bandwidth: 0.04443462   Lambda Max: 1       
-Exp. Var. Name: z2 Bandwidth: 0.5420071  Scale Factor: 2.259953 
+Exp. Var. Name: z1 Bandwidth: 0.02394953   Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 0.5415512  Scale Factor: 2.258052 
 
 x1 on z:
-Exp. Var. Name: z1 Bandwidth: 1         Lambda Max: 1       
-Exp. Var. Name: z2 Bandwidth: 4096126 Scale Factor: 17079205 
+Exp. Var. Name: z1 Bandwidth: 0.9999991   Lambda Max: 1      
+Exp. Var. Name: z2 Bandwidth: 964042.4  Scale Factor: 4019671 
 
 x2.L on z:
-Exp. Var. Name: z1 Bandwidth: 0.8855852   Lambda Max: 1      
-Exp. Var. Name: z2 Bandwidth: 1413572   Scale Factor: 5894031 
+Exp. Var. Name: z1 Bandwidth: 0.6052281   Lambda Max: 1      
+Exp. Var. Name: z2 Bandwidth: 1554832   Scale Factor: 6483027 
 
 x2.Q on z:
-Exp. Var. Name: z1 Bandwidth: 1         Lambda Max: 1      
-Exp. Var. Name: z2 Bandwidth: 1360761 Scale Factor: 5673830 
+Exp. Var. Name: z1 Bandwidth: 0.9999997   Lambda Max: 1      
+Exp. Var. Name: z2 Bandwidth: 835510.1  Scale Factor: 3483743 
 
 x2.C on z:
-Exp. Var. Name: z1 Bandwidth: 1          Lambda Max: 1       
-Exp. Var. Name: z2 Bandwidth: 0.297902 Scale Factor: 1.242132 
+Exp. Var. Name: z1 Bandwidth: 0.8270069   Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 0.2987962 Scale Factor: 1.245861 
 
 x2^4 on z:
-Exp. Var. Name: z1 Bandwidth: 0.1518035   Lambda Max: 1       
-Exp. Var. Name: z2 Bandwidth: 0.5613092 Scale Factor: 2.340435 
+Exp. Var. Name: z1 Bandwidth: 0.07780557   Lambda Max: 1       
+Exp. Var. Name: z2 Bandwidth: 0.5627928  Scale Factor: 2.346621 
 
 x2^5 on z:
-Exp. Var. Name: z1 Bandwidth: 1          Lambda Max: 1      
-Exp. Var. Name: z2 Bandwidth: 853930.2 Scale Factor: 3560547
+Exp. Var. Name: z1 Bandwidth: 0.9999999   Lambda Max: 1      
+Exp. Var. Name: z2 Bandwidth: 419608.7  Scale Factor: 1749600
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
 
-Ordered Categorical Kernel Type: Wang and Van Ryzin
+Ordered Categorical Kernel Type: Li and Racine
 No. Ordered Categorical Explanatory Vars.: 1
 
 > 
@@ -106,36 +103,36 @@ Regression data: 1000 training points, in 8 variable(s)
 With 6 linear parametric regressor(s), 2 nonparametric regressor(s)
 
                     y(z)          
-Bandwidth(s): 0.04443462 0.5420071
+Bandwidth(s): 0.02394953 0.5415512
 
-                   x(z)             
-Bandwidth(s): 1.0000000 4.096126e+06
-              0.8855852 1.413572e+06
-              1.0000000 1.360761e+06
-              1.0000000 2.979020e-01
-              0.1518035 5.613092e-01
-              1.0000000 8.539302e+05
+                    x(z)             
+Bandwidth(s): 0.99999908 9.640424e+05
+              0.60522810 1.554832e+06
+              0.99999969 8.355101e+05
+              0.82700687 2.987962e-01
+              0.07780557 5.627928e-01
+              0.99999994 4.196087e+05
 
-                      x1     x2.L      x2.Q      x2.C       x2^4       x2^5
-Coefficient(s): 1.006495 4.729434 0.6836408 0.3690275 0.08902926 0.05456585
+                      x1     x2.L     x2.Q    x2.C      x2^4       x2^5
+Coefficient(s): 1.006346 4.801638 0.751783 0.41694 0.1139748 0.06322659
 
 Kernel Regression Estimator: Local-Constant
 Bandwidth Type: Fixed
 
-Residual standard error: 1.005394
-R-squared: 0.7233481
+Residual standard error: 1.005512
+R-squared: 0.723314
 
 Continuous Kernel Type: Second-Order Gaussian
 No. Continuous Explanatory Vars.: 1
 
-Ordered Categorical Kernel Type: Wang and Van Ryzin
+Ordered Categorical Kernel Type: Li and Racine
 No. Ordered Categorical Explanatory Vars.: 1
 
 > 
 > cat("Elapsed time =", t[3], "\n")
-Elapsed time = 110.843 
+Elapsed time = 60.155 
 > 
 > 
 > proc.time()
    user  system elapsed 
-111.080   0.076 111.148 
+ 60.359   0.029  60.381 

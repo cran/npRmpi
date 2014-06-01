@@ -18,6 +18,7 @@ mpi.bcast.cmd(options(np.messages=FALSE),
              caller.execute=TRUE)
 
 data("Italy")
+n <- nrow(Italy)
 mpi.bcast.Robj2slave(Italy)
 
 ## A quantile regression example
