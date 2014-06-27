@@ -1,4 +1,27 @@
-Changes from Version 0.50-1 to 0.60-0 [XXX]
+Changes from Version 0.60-1 to 0.60-2 [27-Jun-2014]
+
+* added timeseries support for all relevant objects (i.e. for a
+  ts() vector data object x, npreg(x~lag(x,-1)+lag(x,-2)) is now
+  supported)
+
+* added total time to summary for bandwidth objects
+
+* npqreg no longer accepts gradients=TRUE when gradients are in fact not
+  supported
+
+* npqreg fails with an informative message when passed a conditional
+  density bandwidth object
+
+Changes from Version 0.60-0 to 0.60-1 [6-Jun-2014]
+
+* Fixed glitch in adaptive_nn/generalized_nn bandwidths that affected all
+  routines that rely on non-fixed bandwidths
+
+* Tweaks to search for adaptive_nn/generalized_nn initial search values
+
+* Fixed glitch in local linear estimation with adaptive_nn bandwidths
+
+Changes from Version 0.50-1 to 0.60-0 [1-Jun-2014]
 
 * Ordered kernel types now default to liracine/liracine (normalized) for
   conditional/unconditional objects, respectively (the previous default,

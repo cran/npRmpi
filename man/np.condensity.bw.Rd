@@ -133,7 +133,7 @@ npcdensbw(\dots)
   }
 
   \item{ydat}{
-    a \eqn{q}-variate data frame of dependent data which bandwidth selection will
+    a \eqn{q}-variate data frame of dependent data on which bandwidth selection will
     be performed. The data types may be continuous, discrete (unordered
     and ordered factors), or some combination thereof.
   }
@@ -239,7 +239,7 @@ npcdensbw(\dots)
   }
   \item{uykertype}{
     character string used to specify the unordered categorical
-    kernel type. Can be set as \code{aitchisonaitken}.
+    kernel type. Can be set as \code{aitchisonaitken} or \code{liracine}.
   }
   \item{oxkertype}{
     character string used to specify the ordered categorical
@@ -248,7 +248,7 @@ npcdensbw(\dots)
   }
   \item{oykertype}{
     character string used to specify the ordered categorical
-    kernel type. Can be set as \code{wangvanryzin}.
+    kernel type. Can be set as \code{wangvanryzin} or \code{liracine}.
   }
 
   \item{nmulti}{
@@ -259,7 +259,7 @@ npcdensbw(\dots)
   \item{remin}{
     a logical value which when set as \code{TRUE} the search routine
     restarts from located minima for a minor gain in accuracy. Defaults
-    to \code{TRUE}. Defaults to \code{TRUE}.
+    to \code{TRUE}.
   }
 
   \item{itmax}{
@@ -286,7 +286,7 @@ npcdensbw(\dots)
     a small number used to bracket a minimum (it is hopeless to ask for
     a bracketing interval of width less than sqrt(epsilon) times its
     central value, a fractional width of only about 10-04 (single
-    precision) or 3x10-8 (double prevision)). Defaults to \code{small
+    precision) or 3x10-8 (double precision)). Defaults to \code{small
       = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
   }
 
@@ -301,7 +301,7 @@ npcdensbw(\dots)
     Details}
 
   \item{lbc.init, hbc.init, cfac.init}{ lower bound, upper bound, and
-    non-randqom initial values for scale factors for \code{numeric}
+    non-random initial values for scale factors for \code{numeric}
     variables for Powell's algorithm. See Details}
 
   \item{lbd.init, hbd.init, dfac.init}{ lower bound, upper bound, and
@@ -398,7 +398,7 @@ npcdensbw(\dots)
   modifying \code{nmulti}). Further refinement for difficult cases can
   be achieved by modifying these sets of parameters. However, these
   parameters are intended more for the authors of the package to enable
-  \sQuote{tuning} for various methods rather than for the user themself.
+  \sQuote{tuning} for various methods rather than for the user themselves.
 
 }
 \value{

@@ -209,12 +209,12 @@ npudensbw(\dots)
 
   \item{ukertype}{
     character string used to specify the unordered categorical kernel type.
-    Can be set as \code{aitchisonaitken}.
+    Can be set as \code{aitchisonaitken} or \code{liracine}.
   }
 
   \item{okertype}{
     character string used to specify the ordered categorical kernel type.
-    Can be set as \code{wangvanryzin}.
+    Can be set as \code{wangvanryzin} or \code{liracine}.
   }
 
   \item{nmulti}{
@@ -252,7 +252,7 @@ npudensbw(\dots)
     a small number used to bracket a minimum (it is hopeless to ask for
     a bracketing interval of width less than sqrt(epsilon) times its
     central value, a fractional width of only about 10-04 (single
-    precision) or 3x10-8 (double prevision)). Defaults to \code{small
+    precision) or 3x10-8 (double precision)). Defaults to \code{small
       = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
   }
 
@@ -366,7 +366,7 @@ npudensbw(\dots)
   modifying \code{nmulti}). Further refinement for difficult cases can
   be achieved by modifying these sets of parameters. However, these
   parameters are intended more for the authors of the package to enable
-  \sQuote{tuning} for various methods rather than for the user themself.
+  \sQuote{tuning} for various methods rather than for the user themselves.
 
 }
 \value{

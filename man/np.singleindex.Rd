@@ -25,6 +25,7 @@ npindex(bws, \dots)
 \method{npindex}{formula}(bws,
         data = NULL,
         newdata = NULL,
+        y.eval = FALSE,
         \dots)
 
 \method{npindex}{call}(bws,
@@ -101,6 +102,12 @@ npindex(bws, \dots)
   \item{newdata}{
     An optional data frame in which to look for evaluation data. If
     omitted, the training data are used.  
+  }
+
+  \item{y.eval}{
+    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
+    \code{\link{np}} will compute goodness of fit statistics on these
+    data and return them. Defaults to \code{FALSE}.
   }
 
   \item{txdat}{
@@ -184,9 +191,9 @@ npindex(bws, \dots)
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
 
-  Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric Estimation of
-  Global Functionals and a Measure of the Explanatory Power of
-  Covariates in Regression,} The Annals of Statistics, 23 1443-1473.
+  Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric estimation of
+  global functionals and a measure of the explanatory power of
+  covariates  regression,} The Annals of Statistics, 23 1443-1473.
 
   Ichimura, H., (1993), \dQuote{Semiparametric least squares (SLS) and
   weighted SLS estimation of single-index models,} Journal of

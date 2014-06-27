@@ -11,12 +11,15 @@ npcdensbw <-
 
 npcdensbw.formula <-
   function(formula, data, subset, na.action, call, ...){
+    orig.class <- if (missing(data))
+      sapply(eval(attr(terms(formula), "variables"), environment(formula)),class)
+    else sapply(eval(attr(terms(formula), "variables"), data, environment(formula)),class)
 
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
-
+    
     if(!missing(call) && is.call(call)){
       ## rummage about in the call for the original formula
       for(i in 1:length(call)){
@@ -38,6 +41,18 @@ npcdensbw.formula <-
     mf[["formula"]] <- as.formula(paste(" ~ ", varsPlus[[1]]," + ",
                                         varsPlus[[2]]),
                                   env = environment(formula))
+    mf[["formula"]] <- terms(mf[["formula"]])
+    if(all(orig.class == "ts")){
+      args <- (as.list(attr(mf[["formula"]], "variables"))[-1])
+      attr(mf[["formula"]], "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
+    }else if(any(orig.class == "ts")){
+      arguments <- (as.list(attr(mf[["formula"]], "variables"))[-1])
+      arguments.normal <- arguments[which(orig.class != "ts")]
+      arguments.timeseries <- arguments[which(orig.class == "ts")]
+
+      ix <- sort(c(which(orig.class == "ts"),which(orig.class != "ts")),index.return = TRUE)$ix
+      attr(mf[["formula"]], "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
+    }
 
     mf <- eval(mf, parent.frame())
 
@@ -200,7 +215,8 @@ npcdensbw.conbandwidth <-
         nconfac = nconfac, ncatfac = ncatfac)
 
       if (bws$method != "normal-reference"){
-        myout=
+        total.time <-
+          system.time(myout <- 
           .C("np_density_conditional_bw", as.double(yuno), as.double(yord), as.double(ycon),
              as.double(xuno), as.double(xord), as.double(xcon),
              as.double(mysd),
@@ -209,7 +225,8 @@ npcdensbw.conbandwidth <-
                bws$ybw[bws$iyuno],bws$ybw[bws$iyord],
                bws$xbw[bws$ixuno],bws$xbw[bws$ixord]),
              fval = double(2), fval.history = double(max(1,nmulti)),
-             PACKAGE="npRmpi" )[c("bw","fval","fval.history")]
+             timing = double(1),
+             PACKAGE="npRmpi" )[c("bw","fval","fval.history","timing")])[1]
       } else {
         nbw = double(yncol+xncol)
         gbw = bws$yncon+bws$xncon
@@ -219,6 +236,7 @@ npcdensbw.conbandwidth <-
             nbw[1:gbw]=nbw[1:gbw]*mysd*nconfac
         }
         myout= list( bw = nbw, fval = c(NA,NA) )
+        total.time <- NA
       }
 
       yr = 1:yncol
@@ -246,6 +264,8 @@ npcdensbw.conbandwidth <-
       tbw$fval = myout$fval[1]
       tbw$ifval = myout$fval[2]
       tbw$fval.history <- myout$fval.history
+      tbw$timing <- myout$timing
+      tbw$total.time <- total.time
     }
     
     ## bandwidth metadata
@@ -316,7 +336,9 @@ npcdensbw.conbandwidth <-
                         nconfac = nconfac,
                         ncatfac = ncatfac,
                         sdev = mysd,
-                        bandwidth.compute = bandwidth.compute)
+                        bandwidth.compute = bandwidth.compute,
+                        timing = tbw$timing,
+                        total.time = tbw$total.time)
            
     tbw
   }

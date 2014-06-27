@@ -10,12 +10,31 @@ npudensbw <- function(...){
 
 npudensbw.formula <-
   function(formula, data, subset, na.action, call, ...){
-    
+    orig.class <- if (missing(data))
+      sapply(eval(attr(terms(formula), "variables"), environment(formula)),class)
+    else sapply(eval(attr(terms(formula), "variables"), data, environment(formula)),class)
+   
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
-                     
+
+    if(all(orig.class == "ts")){
+      args <- (as.list(attr(terms(formula), "variables"))[-1])
+      formula <- terms(formula)
+      attr(formula, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
+      mf[["formula"]] <- formula
+    }else if(any(orig.class == "ts")){
+      arguments <- (as.list(attr(terms(formula), "variables"))[-1])
+      arguments.normal <- arguments[which(orig.class != "ts")]
+      arguments.timeseries <- arguments[which(orig.class == "ts")]
+
+      ix <- sort(c(which(orig.class == "ts"),which(orig.class != "ts")),index.return = TRUE)$ix
+      formula <- terms(formula)
+      attr(formula, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
+      mf[["formula"]] <- formula
+    }
+    
     mf[[1]] <- as.name("model.frame")
     mf <- eval(mf, envir = parent.frame())
 
@@ -152,13 +171,15 @@ npudensbw.bandwidth <-
         nconfac = nconfac, ncatfac = ncatfac)
 
       if (bws$method != "normal-reference"){
-        myout=
-          .C("np_density_bw", as.double(duno), as.double(dord), as.double(dcon),
-             as.double(mysd),
-             as.integer(myopti), as.double(myoptd), 
-             bw = c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord]),
-             fval = double(2), fval.history = double(max(1,nmulti)),
-             PACKAGE="npRmpi" )[c("bw","fval","fval.history")]
+        total.time <-
+          system.time(myout <- 
+                      .C("np_density_bw", as.double(duno), as.double(dord), as.double(dcon),
+                         as.double(mysd),
+                         as.integer(myopti), as.double(myoptd), 
+                         bw = c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord]),
+                         fval = double(2), fval.history = double(max(1,nmulti)),
+                         timing = double(1),
+                         PACKAGE="npRmpi" )[c("bw","fval","fval.history","timing")])[1]
       } else {
         nbw = double(ncol)
         if (bws$ncon > 0){
@@ -167,6 +188,7 @@ npudensbw.bandwidth <-
             nbw[1:bws$ncon]=nbw[1:bws$ncon]*mysd*nconfac
         }
         myout= list( bw = nbw, fval = c(NA,NA) )
+        total.time <- NA
       }
 
       rorder = numeric(ncol)
@@ -177,6 +199,8 @@ npudensbw.bandwidth <-
       tbw$fval = myout$fval[1]
       tbw$ifval = myout$fval[2]
       tbw$fval.history <- myout$fval.history
+      tbw$timing <- myout$timing
+      tbw$total.time <- total.time
     }
     
     tbw$sfactor <- tbw$bandwidth <- tbw$bw
@@ -228,7 +252,9 @@ npudensbw.bandwidth <-
                      nconfac = nconfac,
                      ncatfac = ncatfac,
                      sdev = mysd,
-                     bandwidth.compute = bandwidth.compute)
+                     bandwidth.compute = bandwidth.compute,
+                     timing = tbw$timing,
+                     total.time = tbw$total.time)
     
     tbw
   }

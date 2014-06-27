@@ -21,7 +21,8 @@
 \usage{
 npreg(bws, \dots)
 
-\method{npreg}{formula}(bws, data = NULL, newdata = NULL, \dots)
+\method{npreg}{formula}(bws, data = NULL, newdata = NULL, y.eval =
+FALSE, \dots)
 
 \method{npreg}{call}(bws, \dots)
 
@@ -63,6 +64,12 @@ npreg(bws, \dots)
   \item{newdata}{
     An optional data frame in which to look for evaluation data. If
     omitted, the training data are used.  
+  }
+  
+  \item{y.eval}{
+    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
+    \code{\link{np}} will compute goodness of fit statistics on these
+    data and return them. Defaults to \code{FALSE}.
   }
   
   \item{txdat}{
@@ -198,9 +205,9 @@ npreg(bws, \dots)
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
   discrimination by the kernel method,} Biometrika, 63, 413-420.
 
-  Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric Estimation of
-  Global Functionals and a Measure of the Explanatory Power of
-  Covariates in Regression,} The Annals of Statistics, 23 1443-1473.
+  Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric estimation of
+  global functionals and a measure of the explanatory power of
+  covariates in regression,} The Annals of Statistics, 23 1443-1473.  
 
   Hall, P. and Q. Li and J.S. Racine (2007), \dQuote{Nonparametric
   estimation of regression functions in the presence of irrelevant
@@ -216,7 +223,7 @@ npreg(bws, \dots)
   Cambridge University Press.
   
   Racine, J.S. and Q. Li (2004), \dQuote{Nonparametric estimation of
-    regression functions with both categorical and continuous Data,}
+    regression functions with both categorical and continuous data,}
   Journal of Econometrics, 119, 99-130.
   
   Wang, M.C. and J. van Ryzin (1981), \dQuote{A class of smooth

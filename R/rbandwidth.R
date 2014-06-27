@@ -21,7 +21,10 @@ rbandwidth <-
            nconfac = NA,
            ncatfac = NA,
            sdev = NA,
-           bandwidth.compute = TRUE,...){
+           bandwidth.compute = TRUE,
+           timing = NA,
+           total.time = NA,
+           ...){
 
   ndim = length(bw)
   regtype = match.arg(regtype)
@@ -112,7 +115,9 @@ rbandwidth <-
     vartitle = list(x = "Explanatory", y = "Dependent"),
     vartitleabb = list(x = "Exp.", y = "Dep."),
     rows.omit = rows.omit,
-    nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)))
+    nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+    timing = timing,
+    total.time = total.time)
 
   
   mybw$klist = list(
@@ -167,6 +172,7 @@ summary.rbandwidth <- function(object, ...){
   cat(genBwScaleStrs(object))
   cat(genBwKerStrs(object))
 
+  cat(genTimingStr(object))
   cat("\n\n")
 
 }

@@ -151,10 +151,10 @@ npksum(\dots)
   }
 
   \item{compute.ocg}{
-    a logical specifying whether or not to return a separate
-    result for each unordered and ordered dimension, where the product
-    kernel term for that dimension is evaluation at an appropriate
-    reference category. This is used primarily in \code{np} to compute ordered and
+    a logical specifying whether or not to return a separate result for
+    each unordered and ordered dimension, where the product kernel term
+    for that dimension is evaluated at an appropriate reference
+    category. This is used primarily in \code{np} to compute ordered and
     unordered categorical gradients. See details.
   }
 
@@ -196,13 +196,11 @@ npksum(\dots)
   with the point at which the sum is computed, \eqn{x}. Fixed bandwidths
   are constant over the support of \eqn{x}.
 
-  \code{npksum} computes
-  \eqn{\sum_{j=1}^{n}{W_j^\prime Y_j K(X_j)}}{sum(t(W[j]) \%*\% Y[j] *
-  K(X[j]))}, where \eqn{A_j}{A[j]} represents a row vector extracted
-  from \eqn{A}.
-  That is, it computes the kernel 
-  weighted sum of the outer product of the rows of \eqn{W} and \eqn{Y}. In the
-  examples, the uses of such sums are illustrated.
+  \code{npksum} computes \eqn{\sum_{j=1}^{n}{W_j^\prime Y_j
+  K(X_j)}}{sum(t(W[j]) \%*\% Y[j] * K(X[j]))}, where \eqn{W_j}{W[j]}
+  represents a row vector extracted from \eqn{W}.  That is, it computes
+  the kernel weighted sum of the outer product of the rows of \eqn{W}
+  and \eqn{Y}. In the examples, the uses of such sums are illustrated.
 
   \code{npksum} may be invoked \emph{either} with a formula-like
   symbolic 
@@ -258,7 +256,7 @@ npksum(\dots)
   \code{operator = c("normal","derivative")}. This makes the computation
   of gradients much easier.
 
-  The option \code{compute.score=} can be used compute the gradients
+  The option \code{compute.score=} can be used to compute the gradients
   with respect to \eqn{h} in addition to the normal kernel sum. Like
   permutations, the additional results are returned in the
   \code{p.ksum}. This option does not work in conjunction with

@@ -12,14 +12,34 @@ npregbw <-
 npregbw.formula <-
   function(formula, data, subset, na.action, call, ...){
 
+    orig.class <- if (missing(data))
+      sapply(eval(attr(terms(formula), "variables"), environment(formula)),class)
+    else sapply(eval(attr(terms(formula), "variables"), data, environment(formula)),class)
+
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
-    
+
+    if(all(orig.class == "ts")){
+      args <- (as.list(attr(terms(formula), "variables"))[-1])
+      formula <- terms(formula)
+      attr(formula, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
+      mf[["formula"]] <- formula
+    }else if(any(orig.class == "ts")){
+      arguments <- (as.list(attr(terms(formula), "variables"))[-1])
+      arguments.normal <- arguments[which(orig.class != "ts")]
+      arguments.timeseries <- arguments[which(orig.class == "ts")]
+
+      ix <- sort(c(which(orig.class == "ts"),which(orig.class != "ts")),index.return = TRUE)$ix
+      formula <- terms(formula)
+      attr(formula, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
+      mf[["formula"]] <- formula
+    }
+      
     mf[[1]] <- as.name("model.frame")
     mf <- eval(mf, parent.frame())
-    
+
     ydat <- model.response(mf)
     xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
     
@@ -177,14 +197,16 @@ npregbw.rbandwidth <-
         lbd.init = lbd.init, hbd.init = hbd.init, dfac.init = dfac.init, 
         nconfac = nconfac, ncatfac = ncatfac)
 
-      myout=
+        total.time <-
+          system.time(myout <- 
         .C("np_regression_bw",
            as.double(runo), as.double(rord), as.double(rcon), as.double(ydat),
            as.double(mysd),
            as.integer(myopti), as.double(myoptd), 
            bw = c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord]),
            fval = double(2),fval.history = double(max(1,nmulti)),
-           PACKAGE="npRmpi" )[c("bw","fval","fval.history")]
+           timing = double(1),
+           PACKAGE="npRmpi" )[c("bw","fval","fval.history","timing")])[1]
       
 
       rorder = numeric(ncol)
@@ -194,6 +216,8 @@ npregbw.rbandwidth <-
       tbw$fval <- myout$fval[1]
       tbw$ifval <- myout$fval[2]
       tbw$fval.history <- myout$fval.history
+      tbw$timing <- myout$timing
+      tbw$total.time <- total.time
     }
 
     tbw$sfactor <- tbw$bandwidth <- tbw$bw
@@ -249,7 +273,9 @@ npregbw.rbandwidth <-
                       nconfac = nconfac,
                       ncatfac = ncatfac,
                       sdev = mysd,
-                      bandwidth.compute = bandwidth.compute)
+                      bandwidth.compute = bandwidth.compute,
+                      timing = tbw$timing,
+                      total.time = tbw$total.time)
     tbw
   }
 

@@ -2435,7 +2435,6 @@ double *SIGN)
 	double **matrix_bandwidth_deriv = NULL;
 
 	double temp_var;
-	double temp_mean_y;
 	double *pointer_yi;
 #ifndef MPI2
 	double *pointer_m;
@@ -2853,7 +2852,6 @@ double *SIGN)
 
 		/* Local linear */
 
-		temp_mean_y = meand(num_obs_train, vector_Y);
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -3821,7 +3819,6 @@ double *SIGN)
 
 		/* Local linear */
 
-		temp_mean_y = meand(num_obs_train, vector_Y);
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -6209,7 +6206,6 @@ double **gradient)
 	double sum_ker_deriv_scalar;
 	double sum_y_ker_deriv_scalar;
 
-	double temp_mean_y;
 
 	double temp;
 	double temp1 = DBL_MAX;
@@ -6615,7 +6611,6 @@ double **gradient)
 
 				/* Local linear */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -7393,7 +7388,6 @@ double **gradient)
 
 				/* Local linear using weights (also need data) */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -7736,7 +7730,6 @@ double **gradient)
 
 				/* Local linear */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -8302,7 +8295,6 @@ double **gradient)
 
 				/* Local linear using weights (also need data) */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -8830,7 +8822,6 @@ double **gradient)
 
 				/* Local linear */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -9582,7 +9573,6 @@ double **gradient)
 
 				/* Local linear using weights (also need data) */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -9919,7 +9909,6 @@ double **gradient)
 
 				/* Local linear */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -10482,7 +10471,6 @@ double **gradient)
 
 				/* Local linear using weights (also need data) */
 
-				temp_mean_y = meand(num_obs_train, vector_Y);
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
@@ -17477,7 +17465,6 @@ double  initd_dir)
 	double fret_best;
 	double quantile[2];
 	double quantile_multistart[2];
-	int iImproved;
 	int iMs_counter;
 	int iter;
 	int iNum_Ms;
@@ -17586,14 +17573,18 @@ double  initd_dir)
 
 		quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-    initialize_nr_directions(1, 0, 0,
+    initialize_nr_directions(BANDWIDTH_den,
+                             num_obs_train,
+                             1, 0, 0,
                              0, 0, 0,
                              vector_scale_factor,
                              NULL,
                              matrix_y,
                              0, seed, 
                              lbc_dir, c_dir, dfc_dir, initc_dir, 
-                             lbd_dir, hbd_dir, d_dir, initd_dir);
+                             lbd_dir, hbd_dir, d_dir, initd_dir,
+                             matrix_X_continuous_train,
+                             matrix_Y_continuous_train);
 
 		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17609,14 +17600,18 @@ double  initd_dir)
 
 				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-        initialize_nr_directions(1, 0, 0,
+        initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y,
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
@@ -17624,16 +17619,11 @@ double  initd_dir)
 				if(fret < fret_best)
 				{
 					fret_best = fret;
-					iImproved = 1;
 					quantile_multistart[1] = quantile[1];
 					if(fret <= zero)
 					{
 						iMs_counter = iMax_Num_Multistart;
 					}
-				}
-				else
-				{
-					iImproved = 0;
 				}
 
 			}
@@ -17670,14 +17660,18 @@ double  initd_dir)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		    initialize_nr_directions(1, 0, 0,
+		    initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y,
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17691,30 +17685,29 @@ double  initd_dir)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				    initialize_nr_directions(1, 0, 0,
+				    initialize_nr_directions(BANDWIDTH_den,
+                                     num_obs_train,
+                                     1, 0, 0,
                                      0, 0, 0,
                                      vector_scale_factor,
                                      NULL,
                                      matrix_y,
                                      0, seed, 
                                      lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir);
+                                     lbd_dir, hbd_dir, d_dir, initd_dir,
+                                     matrix_X_continuous_train,
+                                     matrix_Y_continuous_train);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
 						if(fret < fret_best)
 						{
 							fret_best = fret;
-							iImproved = 1;
 							quantile_multistart[1] = quantile[1];
 							if(fret <= zero)
 							{
 								iMs_counter = iMax_Num_Multistart;
 							}
-						}
-						else
-						{
-							iImproved = 0;
 						}
 
 					}
@@ -17740,14 +17733,18 @@ double  initd_dir)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		    initialize_nr_directions(1, 0, 0,
+		    initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y, 
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17761,30 +17758,29 @@ double  initd_dir)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				    initialize_nr_directions(1, 0, 0,
+				    initialize_nr_directions(BANDWIDTH_den,
+                                     num_obs_train,
+                                     1, 0, 0,
                                      0, 0, 0,
                                      vector_scale_factor,
                                      NULL,
                                      matrix_y,
                                      0, seed, 
                                      lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir);
+                                     lbd_dir, hbd_dir, d_dir, initd_dir,
+                                     matrix_X_continuous_train,
+                                     matrix_Y_continuous_train);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
 						if(fret < fret_best)
 						{
 							fret_best = fret;
-							iImproved = 1;
 							quantile_multistart[1] = quantile[1];
 							if(fret <= zero)
 							{
 								iMs_counter = iMax_Num_Multistart;
 							}
-						}
-						else
-						{
-							iImproved = 0;
 						}
 
 					}
@@ -17858,14 +17854,18 @@ double  initd_dir)
 
 		quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-    initialize_nr_directions(1, 0, 0,
+    initialize_nr_directions(BANDWIDTH_den,
+                             num_obs_train,
+                             1, 0, 0,
                              0, 0, 0,
                              vector_scale_factor,
                              NULL,
                              matrix_y,
                              0, seed, 
                              lbc_dir, c_dir, dfc_dir, initc_dir, 
-                             lbd_dir, hbd_dir, d_dir, initd_dir);
+                             lbd_dir, hbd_dir, d_dir, initd_dir,
+                             matrix_X_continuous_train,
+                             matrix_Y_continuous_train);
 
 		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17879,30 +17879,29 @@ double  initd_dir)
 
 				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-		    initialize_nr_directions(1, 0, 0,
+		    initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y,
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
 				if(fret < fret_best)
 				{
 					fret_best = fret;
-					iImproved = 1;
 					quantile_multistart[1] = quantile[1];
 					if(fret <= zero)
 					{
 						iMs_counter = iMax_Num_Multistart;
 					}
-				}
-				else
-				{
-					iImproved = 0;
 				}
 
 			}
@@ -17938,14 +17937,18 @@ double  initd_dir)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		    initialize_nr_directions(1, 0, 0,
+		    initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y,
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -17959,30 +17962,29 @@ double  initd_dir)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				    initialize_nr_directions(1, 0, 0,
+				    initialize_nr_directions(BANDWIDTH_den,
+                                     num_obs_train,
+                                     1, 0, 0,
                                      0, 0, 0,
                                      vector_scale_factor,
                                      NULL,
                                      matrix_y,
                                      0, seed, 
                                      lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir);
+                                     lbd_dir, hbd_dir, d_dir, initd_dir,
+                                     matrix_X_continuous_train,
+                                     matrix_Y_continuous_train);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
 						if(fret < fret_best)
 						{
 							fret_best = fret;
-							iImproved = 1;
 							quantile_multistart[1] = quantile[1];
 							if(fret <= zero)
 							{
 								iMs_counter = iMax_Num_Multistart;
 							}
-						}
-						else
-						{
-							iImproved = 0;
 						}
 
 					}
@@ -18013,14 +18015,18 @@ double  initd_dir)
 
 				quantile[1] = (y_max_extern-y_min_extern)/2.0;
 
-		    initialize_nr_directions(1, 0, 0,
+		    initialize_nr_directions(BANDWIDTH_den,
+                                 num_obs_train,
+                                 1, 0, 0,
                                  0, 0, 0,
                                  vector_scale_factor,
                                  NULL,
                                  matrix_y,
                                  0, seed, 
                                  lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir);
+                                 lbd_dir, hbd_dir, d_dir, initd_dir,
+                                 matrix_X_continuous_train,
+                                 matrix_Y_continuous_train);
 
 				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
@@ -18034,30 +18040,29 @@ double  initd_dir)
 
 						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
 
-				    initialize_nr_directions(1, 0, 0,
+				    initialize_nr_directions(BANDWIDTH_den,
+                                     num_obs_train,
+                                     1, 0, 0,
                                      0, 0, 0,
                                      vector_scale_factor,
                                      NULL,
                                      matrix_y,
                                      0, seed, 
                                      lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir);
+                                     lbd_dir, hbd_dir, d_dir, initd_dir,
+                                     matrix_X_continuous_train,
+                                     matrix_Y_continuous_train);
 
 						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
 
 						if(fret < fret_best)
 						{
 							fret_best = fret;
-							iImproved = 1;
 							quantile_multistart[1] = quantile[1];
 							if(fret <= zero)
 							{
 								iMs_counter = iMax_Num_Multistart;
 							}
-						}
-						else
-						{
-							iImproved = 0;
 						}
 
 					}

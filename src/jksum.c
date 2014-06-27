@@ -930,7 +930,6 @@ double np_aconvol_gauss2(const double x, const double y,const double hx,const do
 }
 
 double np_aconvol_gauss4(const double x, const double y,const double hx,const double hy){
-  const double a = sqrt(2);
   const double hx2 = hx*hx;
   const double hy2 = hy*hy;
   const double hxy2 = hx2+hy2;
@@ -1586,7 +1585,6 @@ double np_aconvol_epan8_total(const double x, const double y,const double hx,con
 
   const double hs2 = hs*hs;
   const double hs4 = hs2*hs2;
-  const double hs6 = hs4*hs2;
   const double hs8 = hs4*hs4;
 
   return(63*hs
@@ -1641,15 +1639,12 @@ double np_aconvol_epan8_xlessy(const double x, const double y,const double hx,co
   const double hx4 = hx2*hx2;
   const double hx5 = hx3*hx2;
   const double hx6 = hx3*hx3;
-  const double hx7 = hx4*hx3;
   const double hx8 = hx4*hx4;
   const double hx9 = hx5*hx4;
   const double hx10 = hx6*hx4;
-  const double hx11 = hx7*hx4;
   const double hx12 = hx8*hx4;
   const double hx13 = hx9*hx4;
   const double hx14 = hx10*hx4;
-  const double hx15 = hx11*hx4;
   const double hx16 = hx12*hx4;
   const double hx17 = hx13*hx4;
 
@@ -1658,15 +1653,12 @@ double np_aconvol_epan8_xlessy(const double x, const double y,const double hx,co
   const double hy4 = hy2*hy2;
   const double hy5 = hy3*hy2;
   const double hy6 = hy3*hy3;
-  const double hy7 = hy4*hy3;
   const double hy8 = hy4*hy4;
   const double hy9 = hy5*hy4;
   const double hy10 = hy6*hy4;
-  const double hy11 = hy7*hy4;
   const double hy12 = hy8*hy4;
   const double hy13 = hy9*hy4;
   const double hy14 = hy10*hy4;
-  const double hy15 = hy11*hy4;
   const double hy16 = hy12*hy4;
   const double hy17 = hy13*hy4;
 
@@ -1899,15 +1891,12 @@ double np_aconvol_epan8_ylessx(const double x, const double y,const double hx,co
   const double hx4 = hx2*hx2;
   const double hx5 = hx3*hx2;
   const double hx6 = hx3*hx3;
-  const double hx7 = hx4*hx3;
   const double hx8 = hx4*hx4;
   const double hx9 = hx5*hx4;
   const double hx10 = hx6*hx4;
-  const double hx11 = hx7*hx4;
   const double hx12 = hx8*hx4;
   const double hx13 = hx9*hx4;
   const double hx14 = hx10*hx4;
-  const double hx15 = hx11*hx4;
   const double hx16 = hx12*hx4;
   const double hx17 = hx13*hx4;
 
@@ -1916,15 +1905,12 @@ double np_aconvol_epan8_ylessx(const double x, const double y,const double hx,co
   const double hy4 = hy2*hy2;
   const double hy5 = hy3*hy2;
   const double hy6 = hy3*hy3;
-  const double hy7 = hy4*hy3;
   const double hy8 = hy4*hy4;
   const double hy9 = hy5*hy4;
   const double hy10 = hy6*hy4;
-  const double hy11 = hy7*hy4;
   const double hy12 = hy8*hy4;
   const double hy13 = hy9*hy4;
   const double hy14 = hy10*hy4;
-  const double hy15 = hy11*hy4;
   const double hy16 = hy12*hy4;
   const double hy17 = hy13*hy4;
 
@@ -3286,7 +3272,7 @@ double * const kw){
   const int ws_step = is_adaptive? 0 :
                                  (MAX(ncol_Y, 1) * MAX(ncol_W, 1));
 
-  double *lambda, **matrix_bandwidth, **matrix_alt_bandwidth = NULL, *m = NULL;
+  double *lambda, **matrix_bandwidth, **matrix_alt_bandwidth = NULL, **m = NULL;
   double *tprod, dband, *ws, * p_ws, * tprod_mp = NULL, * p_dband = NULL;
 
   double * const * const xtc = is_adaptive?
@@ -3324,7 +3310,7 @@ double * const kw){
       } 
       matrix_bandwidth = matrix_bw_train;
     } else {
-      assert(0);
+      matrix_bandwidth = matrix_bw_train;
     }
     lambda = lambda_pre;
   } else {
@@ -3566,11 +3552,14 @@ double * const kw){
   const int leave_or_drop = leave_one_out || (drop_one_train && (BANDWIDTH_reg != BW_ADAP_NN));
   if(drop_one_train && (BANDWIDTH_reg != BW_ADAP_NN)) lod = drop_which_train;
 
+  m = matrix_bandwidth;
+
     /* do sums */
   for(j=js; j <= je; j++, ws += ws_step, p_ws += ws_step){
     R_CheckUserInterrupt();
 
     dband = 1.0;
+    const int jbw = (BANDWIDTH_reg != BW_FIXED) ? j:0;
 
     for (ii = 0; ii < p_nvar; ii++)
       p_dband[ii] = 1.0;
@@ -3579,12 +3568,6 @@ double * const kw){
     // we need to skip here
 
     if(leave_one_out) lod = j + leave_one_out_offset;
-
-    if (num_reg_continuous > 0){
-      m = matrix_bandwidth[0];
-      if (BANDWIDTH_reg != BW_FIXED)
-        m += j;
-    }
 
     // do a hail mary, then generate the interaction list
     // anything but a fixed bandwidth is not yet supported
@@ -3602,7 +3585,7 @@ double * const kw){
       xl.n = 0;
       if(!do_partial_tree){
         for(i = 0; i < num_reg_continuous; i++){
-          const double sf = (BANDWIDTH_reg != BW_FIXED) ? (*(m+i*mstep)):m[i];
+          const double sf = m[i][jbw];
           if(!is_adaptive){
             bb[2*i] = -cksup[KERNEL_reg_np[i]][1];
             bb[2*i+1] = -cksup[KERNEL_reg_np[i]][0];
@@ -3617,7 +3600,7 @@ double * const kw){
         boxSearchNL(kdt, &nls, bb, NULL, pxl);
       } else {
         for(i = 0; i < num_reg_continuous; i++){
-          const double sf = (BANDWIDTH_reg != BW_FIXED) ? (*(m+i*mstep)):m[i];
+          const double sf = m[i][jbw];
           if(!is_adaptive){
             bb[2*nld[i]] = -cksup[KERNEL_reg_np[i]][1];
             bb[2*nld[i]+1] = -cksup[KERNEL_reg_np[i]][0];
@@ -3652,7 +3635,7 @@ double * const kw){
                   bb[2*i] = cksup[knp][0];
                   bb[2*i+1] = cksup[knp][1];
                 }
-                const double sf = (BANDWIDTH_reg != BW_FIXED) ? (*(m+i*mstep)):m[i];
+                const double sf = m[i][jbw];
                 bb[2*i] = (fabs(bb[2*i]) == DBL_MAX) ? bb[2*i] : (xc[i][j] + bb[2*i]*sf);
                 bb[2*i+1] = (fabs(bb[2*i+1]) == DBL_MAX) ? bb[2*i+1] : (xc[i][j] + bb[2*i+1]*sf);
               }
@@ -3668,7 +3651,7 @@ double * const kw){
                   bb[2*nld[i]] = cksup[knp][0];
                   bb[2*nld[i]+1] = cksup[knp][1];
                 }
-                const double sf = (BANDWIDTH_reg != BW_FIXED) ? (*(m+i*mstep)):m[i];
+                const double sf = m[i][jbw];
                 bb[2*nld[i]] = (fabs(bb[2*nld[i]]) == DBL_MAX) ? bb[2*nld[i]] : (xc[i][j] + bb[2*nld[i]]*sf);
                 bb[2*nld[i]+1] = (fabs(bb[2*nld[i]+1]) == DBL_MAX) ? bb[2*nld[i]+1] : (xc[i][j] + bb[2*nld[i]+1]*sf);
               }
@@ -3698,28 +3681,28 @@ double * const kw){
 
     /* for the first iteration, no weights */
     /* for the rest, the accumulated products are the weights */
-    for(i = 0, l = 0, ip = 0, k = 0; i < num_reg_continuous; i++, l++, m += mstep, ip += do_perm){
+    for(i = 0, l = 0, ip = 0, k = 0; i < num_reg_continuous; i++, l++, ip += do_perm){
       if((BANDWIDTH_reg != BW_ADAP_NN) || (operator[l] != OP_CONVOLUTION)){
         if(p_nvar == 0){
-          np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, l, xc[i][j], *m, tprod, pxl, swap_xxt);
+          np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, l, xc[i][j], m[i][jbw], tprod, pxl, swap_xxt);
         } else {
-          np_p_ckernelv(KERNEL_reg_np[i], (do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]), k, p_nvar, xtc[i], num_xt, l, xc[i][j], *m, tprod, tprod_mp, pxl, p_pxl+k, swap_xxt, bpso[l], do_score);
+          np_p_ckernelv(KERNEL_reg_np[i], (do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]), k, p_nvar, xtc[i], num_xt, l, xc[i][j], m[i][jbw], tprod, tprod_mp, pxl, p_pxl+k, swap_xxt, bpso[l], do_score);
         }
       }
       else
         np_convol_ckernelv(KERNEL_reg[i], xtc[i], num_xt, l, xc[i][j], 
-                           matrix_alt_bandwidth[i], *m, tprod, bpow[i]);
-      dband *= ipow(*m, bpow[i]);
+                           matrix_alt_bandwidth[i], m[i][jbw], tprod, bpow[i]);
+      dband *= ipow(m[i][jbw], bpow[i]);
 
       if(do_perm){
         for(ii = 0, kk = 0; ii < num_reg_continuous; ii++){
           if(bpso[ii]){
             if (i != ii){
-              p_dband[kk] *= ipow(*m, bpow[i]);              
+              p_dband[kk] *= ipow(m[i][jbw], bpow[i]);              
             } else {
-              p_dband[kk] *= ipow(*m, p_ipow);
+              p_dband[kk] *= ipow(m[i][jbw], p_ipow);
               if(((BANDWIDTH_reg == BW_FIXED) && (int_LARGE_SF == 0) && do_score)){
-                p_dband[kk] *= vector_scale_factor[ii]/(*m);
+                p_dband[kk] *= vector_scale_factor[ii]/(m[i][jbw]);
               }
             }
             kk++;
@@ -4331,7 +4314,7 @@ int *num_categories){
   // Allocate memory for objects 
 
   lambda = alloc_vecd(num_reg_unordered+num_reg_ordered);
-  matrix_bandwidth = alloc_matd(num_obs,num_reg_continuous);
+  matrix_bandwidth = alloc_tmatd(BANDWIDTH_reg==BW_FIXED?1:num_obs, num_reg_continuous);  
 
   if(kernel_bandwidth_mean(KERNEL_reg,
                            BANDWIDTH_reg,
@@ -4354,7 +4337,7 @@ int *num_categories){
                            lambda)==1){
     
     free(lambda);
-    free_mat(matrix_bandwidth,num_reg_continuous);
+    free_tmat(matrix_bandwidth);
     
     return(DBL_MAX);
   }
@@ -4381,7 +4364,7 @@ int *num_categories){
                            0, // do not leave out 
                            0,
                            1, // kernel_pow = 1
-                           (BANDWIDTH_reg == BW_ADAP_NN)?1:0, // bandwidth_divide = FALSE when not adaptive
+                           0, // bandwidth_divide = FALSE 
                            0, 
                            0, // not symmetric
                            0, // do not gather-scatter
@@ -4411,7 +4394,10 @@ int *num_categories){
                            NULL,
                            NULL,
                            vector_scale_factor,
-                           0,NULL,NULL,NULL,
+                           1,
+                           matrix_bandwidth,
+                           matrix_bandwidth,
+                           lambda,
                            num_categories,
                            NULL,
                            NULL,
@@ -4480,7 +4466,10 @@ int *num_categories){
                            NULL,
                            NULL,
                            vector_scale_factor,
-                           0,NULL,NULL,NULL,
+                           1,
+                           matrix_bandwidth,
+                           matrix_bandwidth,
+                           lambda,
                            num_categories,
                            NULL,
                            NULL,
@@ -4496,9 +4485,17 @@ int *num_categories){
       const double sk = copysign(DBL_MIN, mean[ii2+1]) + mean[ii2+1];
       const double dy = vector_Y[ii]-mean[ii2]/sk;
       cv += dy*dy;
-      if(bwm == RBWM_CVAIC)
-        traceH += aicc/sk;
-
+      if(bwm == RBWM_CVAIC){
+        if(BANDWIDTH_reg != BW_ADAP_NN){
+          traceH += aicc/sk;
+        }else{
+          double pnh = 1.0;
+          for(int jj = 0; jj < num_reg_continuous; jj++)
+            pnh /= matrix_bandwidth[jj][ii];
+          traceH += pnh*aicc/sk;
+        }
+        
+      }
       //fprintf(stderr,"mj: %e\n",mean[ii2]/(MAX(DBL_MIN, mean[ii2+1])));
     }
 
@@ -4532,6 +4529,8 @@ int *num_categories){
     const int nrc2 = (num_reg_continuous+2);
     const int nrc1 = (num_reg_continuous+1);
     const int nrcc22 = nrc2*nrc2;
+
+    double ** matrix_bandwidth_eval = NULL;
 
     double * PKWM[nrc1], * PXTKY[nrc1], * PXTKX[nrc2];
 
@@ -4576,6 +4575,8 @@ int *num_categories){
 
     }
 
+    matrix_bandwidth_eval = alloc_tmatd(1,num_reg_continuous);
+
     const double epsilon = 1.0/num_obs;
     double nepsilon;
 
@@ -4598,7 +4599,7 @@ int *num_categories){
       }
 
 #ifdef MPI2
-      if(ks_tree_use){
+      if(ks_tree_use || (BANDWIDTH_reg == BW_ADAP_NN)){
         if((j % iNum_Processors) == 0){
           if((j+my_rank) < (num_obs)){
             for(l = 0; l < num_reg_continuous; l++){
@@ -4607,6 +4608,9 @@ int *num_categories){
                 XTKX[l+2][i] = matrix_X_continuous[l][i]-matrix_X_continuous[l][j+my_rank];
               }
               TCON[l][0] = matrix_X_continuous[l][j+my_rank]; // temporary storage
+
+              if(BANDWIDTH_reg == BW_GEN_NN)
+                matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j+my_rank]; // temporary storage
             }
 
 
@@ -4658,7 +4662,10 @@ int *num_categories){
                                    XTKX,
                                    NULL,
                                    vsf,
-                                   0,NULL,NULL,NULL,
+                                   1,
+                                   matrix_bandwidth,
+                                   matrix_bandwidth_eval,
+                                   lambda,
                                    num_categories,
                                    NULL,
                                    NULL,
@@ -4696,6 +4703,9 @@ int *num_categories){
                 XTKX[l+2][i] = matrix_X_continuous[l][i+j+1+my_rank]-matrix_X_continuous[l][j+my_rank];
               }
               TCON[l][0] = matrix_X_continuous[l][j+my_rank]; // temporary storage
+
+              if(BANDWIDTH_reg == BW_GEN_NN)
+                matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j+my_rank]; // temporary storage
             }
 
             for(l = 0; l < num_reg_unordered; l++)
@@ -4743,7 +4753,10 @@ int *num_categories){
                                    XTKX,
                                    sgn,
                                    vsf,
-                                   0,NULL,NULL,NULL,
+                                   1,
+                                   matrix_bandwidth,
+                                   matrix_bandwidth_eval,
+                                   lambda,
                                    num_categories,
                                    NULL,
                                    NULL,
@@ -4785,6 +4798,9 @@ int *num_categories){
             XTKX[l+2][i] = matrix_X_continuous[l][i]-matrix_X_continuous[l][j];
           }
           TCON[l][0] = matrix_X_continuous[l][j]; // temporary storage
+
+          if(BANDWIDTH_reg == BW_GEN_NN)
+            matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j]; // temporary storage
         }
 
 
@@ -4834,7 +4850,10 @@ int *num_categories){
                                XTKX,
                                NULL,
                                vsf,
-                               0,NULL,NULL,NULL,
+                               1,
+                               matrix_bandwidth,
+                               matrix_bandwidth_eval,
+                               lambda,
                                num_categories,
                                NULL,
                                NULL,
@@ -4864,6 +4883,9 @@ int *num_categories){
               XTKX[l+2][i] = matrix_X_continuous[l][i+j+1]-matrix_X_continuous[l][j];
             }
             TCON[l][0] = matrix_X_continuous[l][j]; // temporary storage
+
+            if(BANDWIDTH_reg == BW_GEN_NN)
+              matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j]; // temporary storage
           }
 
       
@@ -4912,7 +4934,10 @@ int *num_categories){
                                  XTKX,
                                  sgn,
                                  vsf,
-                                 0,NULL,NULL,NULL,
+                                 1,
+                                 matrix_bandwidth,
+                                 matrix_bandwidth_eval,
+                                 lambda,
                                  num_categories,
                                  NULL,
                                  NULL,
@@ -4937,12 +4962,17 @@ int *num_categories){
         }
       }
 #endif
-      
-      // need to manipulate KWM pointers and XTKY - done
+      double pnh = 1.0;
 
+      if((BANDWIDTH_reg == BW_ADAP_NN)&&(bwm == RBWM_CVAIC)){
+        for(int jj = 0; jj < num_reg_continuous; jj++)
+          pnh /= matrix_bandwidth[jj][j];
+      }
+
+      // need to manipulate KWM pointers and XTKY - done
       if(bwm == RBWM_CVAIC){
-        KWM[0][0] += aicc;
-        XTKY[0][0] += aicc*vector_Y[j];
+        KWM[0][0] += pnh*aicc;
+        XTKY[0][0] += pnh*aicc*vector_Y[j];
       }
 
       while(mat_inv(KWM, XTKXINV) == NULL){ // singular = ridge about
@@ -4952,7 +4982,7 @@ int *num_categories){
       }
       
       if(bwm == RBWM_CVAIC)
-        traceH += XTKXINV[0][0]*aicc;
+        traceH += XTKXINV[0][0]*pnh*aicc;
    
       XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(KWM[0][0]);
 
@@ -4987,6 +5017,8 @@ int *num_categories){
 
     free(kwm);
     free(sgn);
+
+    free_tmat(matrix_bandwidth_eval);
   }
 
   free(operator);
@@ -4994,7 +5026,7 @@ int *num_categories){
   free(kernel_u);
   free(kernel_o);
   free(lambda);
-  free_mat(matrix_bandwidth,num_reg_continuous);
+  free_tmat(matrix_bandwidth);
 
 	/* Negative penalties are treated as infinite: Hurvich et al pg 277 */
 
@@ -5297,8 +5329,8 @@ double *cv){
   double vsfx[num_reg_tot];
   double vsfy[num_var_tot];
   double vsfxy[num_var_tot+num_reg_tot];
-  double lambdax[num_reg_unordered+num_reg_ordered];
-  double lambday[num_var_unordered+num_var_ordered];
+  double lambdax[MAX(1,num_reg_unordered+num_reg_ordered)];
+  double lambday[MAX(1,num_var_unordered+num_var_ordered)];
   double xyj;
 
   double **matrix_wY_unordered_train;
@@ -5705,11 +5737,11 @@ double *cv){
 
     XL xl = {.istart = NULL, .nlev = NULL, .n = 0, .nalloc = 0};
 
-    int icx[num_reg_continuous], icy[num_var_continuous];
+    int icx[MAX(num_reg_continuous,1)], icy[MAX(num_var_continuous,1)];
 
-    double bb[2*num_all_cvar];
+    double bb[MAX(1,2*num_all_cvar)];
 
-    int KERNEL_XY[num_all_cvar], m;
+    int KERNEL_XY[MAX(1,num_all_cvar)], m;
 
     for(l = 0; l < num_reg_continuous; l++)
       KERNEL_XY[l] = KERNEL_reg + OP_CFUN_OFFSETS[xy_operator[l]];
@@ -6090,7 +6122,7 @@ double *cv){
   nls.node[0] = 0;
   nls.n = 1;
   
-  int xyd[num_all_cvar];
+  int xyd[MAX(1,num_all_cvar)];
   int idxj[2], idxk[2];
 
   for(i = 0; i < num_all_cvar; i++)
@@ -6274,7 +6306,7 @@ double *cv){
 
   // special bandwidths
   if(BANDWIDTH_den != BW_FIXED){
-    matrix_bandwidth_x = alloc_matd(num_obs_train, num_reg_continuous);
+    matrix_bandwidth_x = alloc_tmatd(num_obs_train, num_reg_continuous);
     lambdax = alloc_vecd(num_reg_unordered+num_reg_ordered);
 
     kernel_bandwidth_mean(KERNEL_reg,
@@ -6299,7 +6331,7 @@ double *cv){
 
 
 
-    matrix_bandwidth_y = alloc_matd(num_obs_train, num_var_continuous);
+    matrix_bandwidth_y = alloc_tmatd(num_obs_train, num_var_continuous);
     lambday = alloc_vecd(num_var_unordered+num_var_ordered);
 
     kernel_bandwidth_mean(KERNEL_var,
@@ -6322,7 +6354,7 @@ double *cv){
                           matrix_bandwidth_y,
                           lambday);
 
-    matrix_bandwidth_xy = alloc_matd(num_obs_train, num_all_cvar);
+    matrix_bandwidth_xy = alloc_tmatd(num_obs_train, num_all_cvar);
     lambdaxy = alloc_vecd(num_all_ovar+num_all_uvar);
 
     kernel_bandwidth_mean(KERNEL_reg,
@@ -6361,8 +6393,8 @@ double *cv){
   }
 
   // extra kernel bookkeeping for trees
-  int KERNEL_XY[num_all_cvar];
-  double bb[2*num_all_cvar];
+  int KERNEL_XY[MAX(1,num_all_cvar)];
+  double bb[MAX(1,2*num_all_cvar)];
 
   for(l = 0; l < num_reg_continuous; l++)
     KERNEL_XY[l] = KERNEL_reg + OP_CFUN_OFFSETS[x_operator[l]];
@@ -6913,9 +6945,9 @@ double *cv){
       free(matrix_bandwidth_yj);
       free(matrix_bandwidth_yk);
 
-      free_mat(matrix_bandwidth_x, num_reg_continuous);
-      free_mat(matrix_bandwidth_xy, num_all_cvar);
-      free_mat(matrix_bandwidth_y, num_var_continuous);
+      free_tmat(matrix_bandwidth_x);
+      free_tmat(matrix_bandwidth_xy);
+      free_tmat(matrix_bandwidth_y);
       free(lambdax);
       free(lambday);
       free(lambdaxy);
@@ -7013,7 +7045,6 @@ double *SIGN){
   int num_obs_eval_alloc = stride_e*iNum_Processors;
 
 #else
-  int num_obs_train_alloc = num_obs_train;
   int num_obs_eval_alloc = num_obs_eval;
 #endif
 
@@ -7050,7 +7081,7 @@ double *SIGN){
   // Allocate memory for objects 
 
   lambda = alloc_vecd(num_reg_unordered+num_reg_ordered);
-  matrix_bandwidth = alloc_matd(bwmdim,num_reg_continuous);
+  matrix_bandwidth = alloc_tmatd(bwmdim,num_reg_continuous);
 
   matrix_bandwidth_deriv = alloc_matd(bwmdim,num_reg_continuous);
 
@@ -7213,7 +7244,10 @@ double *SIGN){
                            NULL, // no W matrix
                            NULL, // no sgn 
                            vector_scale_factor,
-                           0,NULL,NULL,NULL,
+                           1,
+                           matrix_bandwidth,
+                           matrix_bandwidth,
+                           lambda,
                            num_categories,
                            matrix_categorical_vals,
                            matrix_ordered_indices, 
@@ -7324,6 +7358,8 @@ double *SIGN){
     const int nrc1 = (num_reg_continuous+1);
     const int nrcc33 = nrc3*nrc3;
 
+    double ** matrix_bandwidth_eval = NULL;
+
     double * PKWM[nrc1], * PXTKY[nrc1], * PXTKX[nrc3];
 
     double * PXC[MAX(1,num_reg_continuous)]; 
@@ -7380,6 +7416,8 @@ double *SIGN){
       XTKY[ii] = &kwm[ii+nrc3+2];
     }
 
+    matrix_bandwidth_eval = alloc_tmatd(1,num_reg_continuous);
+
     const double epsilon = 1.0/num_obs_train;
     double nepsilon;
 
@@ -7399,6 +7437,7 @@ double *SIGN){
       }
     }
 
+    int Sentinel = 1;
     for(j = 0; j < num_obs_eval; j++){ // main loop
       nepsilon = 0.0;
 
@@ -7417,6 +7456,10 @@ double *SIGN){
               XTKX[l+3][i] = matrix_X_continuous_train[l][i]-matrix_X_continuous_eval[l][j+my_rank];
             }
             TCON[l][0] = matrix_X_continuous_eval[l][j+my_rank]; // temporary storage
+
+            if(BANDWIDTH_reg == BW_GEN_NN)
+              matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j+my_rank]; // temporary storage
+
           }
 
 
@@ -7466,7 +7509,10 @@ double *SIGN){
                                  XTKX,
                                  NULL,
                                  vsf,
-                                 0,NULL,NULL,NULL,
+                                 1,
+                                 matrix_bandwidth,
+                                 matrix_bandwidth_eval,
+                                 lambda,
                                  num_categories,
                                  matrix_categorical_vals,
                                  moo,
@@ -7489,6 +7535,10 @@ double *SIGN){
           XTKX[l+3][i] = matrix_X_continuous_train[l][i]-matrix_X_continuous_eval[l][j];
         }
         TCON[l][0] = matrix_X_continuous_eval[l][j]; // temporary storage
+
+        if(BANDWIDTH_reg == BW_GEN_NN)
+          matrix_bandwidth_eval[l][0] = matrix_bandwidth[l][j]; // temporary storage
+
       }
 
 
@@ -7538,7 +7588,10 @@ double *SIGN){
                              XTKX,
                              NULL,
                              vsf,
-                             0,NULL,NULL,NULL,
+                             Sentinel,
+                             matrix_bandwidth,
+                             matrix_bandwidth_eval,
+                             lambda,
                              num_categories,
                              matrix_categorical_vals,
                              moo,
@@ -7689,6 +7742,7 @@ double *SIGN){
       free(moo);
     }
 
+    free_tmat(matrix_bandwidth_eval);
   }
 
   // clean up hash stuff
@@ -7705,7 +7759,7 @@ double *SIGN){
   free(kernel_u);
   free(kernel_o);
   free(lambda);
-  free_mat(matrix_bandwidth,num_reg_continuous);
+  free_tmat(matrix_bandwidth);
   free_mat(matrix_bandwidth_deriv,num_reg_continuous);
 
 	if(vector_Y_eval != NULL)
@@ -8259,7 +8313,7 @@ int np_kernel_estimate_con_density_categorical_leave_one_out_cv(int KERNEL_den,
   const int num_ovar = num_reg_ordered + num_var_ordered;
   const int num_all_var = num_reg + num_var_continuous + num_var_unordered + num_var_ordered;
 
-	const double log_DBL_MIN = log(DBL_MIN);
+	//const double log_DBL_MIN = log(DBL_MIN);
 
   int i; 
   int ret = 0;

@@ -17,6 +17,8 @@ bandwidth <-
            rows.omit = NA, 
            nconfac = NA, ncatfac = NA, sdev = NA,
            bandwidth.compute = TRUE,
+           timing = NA,
+           total.time = NA,
            ...){
     
     ndim = length(bw)
@@ -106,7 +108,9 @@ bandwidth <-
       vartitle = list(x = ""),
       vartitleabb = list(x = ""),
       rows.omit = rows.omit,
-      nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)))
+      nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+      timing = timing,
+      total.time = total.time)
 
     mybw$klist = list(
       x =
@@ -158,6 +162,8 @@ summary.bandwidth <- function(object, ...) {
 
   cat(genBwKerStrs(object))
 
+  cat(genTimingStr(object))
+  
   cat("\n\n")
 }
 
