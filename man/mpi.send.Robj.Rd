@@ -1,5 +1,5 @@
 \name{mpi.send.Robj}
-\title{Extensions of MPI\_Send and MPI\_Recv APIs}
+\title{Extensions of MPI_Send and MPI_Recv APIs}
 \alias{mpi.send.Robj}
 \alias{mpi.isend.Robj}
 \alias{mpi.recv.Robj}
@@ -42,8 +42,8 @@ be used to check the object has been sent.
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.send}},

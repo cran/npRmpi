@@ -1,5 +1,5 @@
 \name{mpi.barrier}
-\title{MPI\_Barrier API}
+\title{MPI_Barrier API}
 \usage{
   mpi.barrier(comm = 1)
 }
@@ -17,8 +17,8 @@
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 %\examples{
 %}

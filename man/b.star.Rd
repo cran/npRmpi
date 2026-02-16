@@ -42,7 +42,7 @@ b.star(data,
 \details{
   \code{b.star} is a function which computes optimal block lengths for
   the stationary and circular bootstraps. This allows the use of
-  \code{tsboot} from the \code{\link{boot}} package to be fully
+  \code{tsboot} from the \pkg{boot} package to be fully
   automatic by using the output from \code{b.star} as an input to the
   argument \code{l = } in \code{tsboot}. See below for an example.
 }
@@ -70,7 +70,8 @@ b.star(data,
 
 \examples{
 \dontrun{
-set.seed(42)
+## Not run in checks: excluded to keep MPI examples stable and check times short.
+set.seed(12345)
 
 # Function to generate an AR(1) series
 

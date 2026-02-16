@@ -89,9 +89,9 @@ npsigtest(bws, \dots)
   }
 
   \item{boot.type}{
-    a character string specifying whether to use a `Bootstrap I' or
-    `Bootstrap II' method (see Racine, Hart, and Li (2006) for
-    details). The `Bootstrap II' method re-runs cross-validation for
+    a character string specifying whether to use a \sQuote{Bootstrap I} or
+    \sQuote{Bootstrap II} method (see Racine, Hart, and Li (2006) for
+    details). The \sQuote{Bootstrap II} method re-runs cross-validation for
     each bootstrap replication and uses the new cross-validated
     bandwidth for variable \eqn{i} and the original ones for the
     remaining variables. Defaults to \code{boot.type="I"}.
@@ -222,6 +222,7 @@ npsigtest(bws, \dots)
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -230,8 +231,11 @@ npsigtest(bws, \dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
@@ -255,7 +259,7 @@ mpi.bcast.cmd(model <- npreg(y~z+x1+x2,
                              data=mydat),
               caller.execute=TRUE)
 
-mpi.bcast.cmd(output <- npsigtest(model,boot.num=99),
+mpi.bcast.cmd(output <- npsigtest(model,boot.num=29),
               caller.execute=TRUE)
 
 summary(output)
@@ -263,7 +267,18 @@ summary(output)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

@@ -1,5 +1,5 @@
 \name{mpi.cartdim.get}
-\title{MPI\_Cartdim\_get}
+\title{MPI_Cartdim_get}
 \alias{mpi.cartdim.get}
 \description{
  \code{mpi.cartdim.get} gets dim information about a Cartesian topology. 
@@ -23,11 +23,12 @@ Alek Hunchak and Hao Yu
 \code{\link{mpi.cart.get}}
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a Cartesian communicator built from spawned slaves.
 #Need at least 9 slaves
 mpi.bcast.cmd(mpi.cart.create(1,c(3,3),c(F,T)))
 mpi.cart.create(1,c(3,3),c(F,T))

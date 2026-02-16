@@ -4,7 +4,7 @@
 
 \description{
   \code{npcopula} implements the nonparametric mixed data kernel copula
-  approach of Racine (2012) for an arbitrary number of dimensions
+  approach of Racine (2015) for an arbitrary number of dimensions
 }
 
 \usage{
@@ -68,8 +68,8 @@ npcopula(bws,
   Nelsen, R. B. (2006), \emph{An Introduction to Copulas,} Second
   Edition, Springer-Verlag.
 
-  Racine, J.S. (2012), \dQuote{Mixed Data Kernel Copulas,}
-  manuscript.
+  Racine, J.S. (2015), \dQuote{Mixed Data Kernel Copulas,} Empirical
+  Economics, 48, 37-59.
 
 }
 \author{
@@ -132,6 +132,7 @@ npcopula(bws,
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## Example 1: Bivariate Mixed Data
 
 ## The following example is adapted for interactive parallel execution
@@ -142,8 +143,11 @@ npcopula(bws,
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
 
@@ -214,7 +218,18 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.
@@ -232,8 +247,11 @@ mpi.close.Rslaves()
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
 
@@ -299,7 +317,18 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),ticktype="detailed",
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

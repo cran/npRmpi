@@ -1,5 +1,12 @@
 useDynLib(npRmpi)
 import(stats, boot, cubature)
+importFrom("grDevices", "boxplot.stats", "extendrange", "grey", "n2mfrow", "rgb")
+importFrom("graphics", "axis", "lines", "mtext", "par", "persp", "plot", "plot.new", "plot.window", "points", "polygon")
+importFrom("utils", "combn", "flush.console")
+importFrom("methods", "is")
+importFrom("parallel", "nextRNGStream", "detectCores")
+importFrom("quantreg", "rq")
+importFrom("quadprog", "solve.QP")
 export(b.star
        ,.docall
        ,.force.type
@@ -121,6 +128,9 @@ export(b.star
        ,string
        ,tailslave.log
        ,np.mpi.initialize
+       ,npRmpi.start
+       ,npRmpi.stop
+       ,npRmpi.session.info
        ,npudensbw
        ,npudistbw
        ,npudens
@@ -149,6 +159,11 @@ export(b.star
        ,npindexbw
        ,npqcmstest       
        ,npseed
+       ,npuniden.boundary
+       ,npuniden.reflect
+       ,npuniden.sc
+       ,np.pairs
+       ,np.pairs.plot
        ,npscoef
        ,npscoefbw
        ,npsigtest
@@ -389,6 +404,7 @@ S3method(npksum, default)
 S3method(npqreg, formula)
 S3method(npqreg, call)
 S3method(npqreg, default)
+S3method(npqreg, conbandwidth)
 S3method(npqreg, condbandwidth)
 
 S3method(npconmode, formula)
@@ -415,4 +431,3 @@ S3method(npscoef, default)
 S3method(npscoef, call)
 S3method(npscoef, formula)
 S3method(npscoef, scbandwidth)
-

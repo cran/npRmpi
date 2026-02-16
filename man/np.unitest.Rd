@@ -27,7 +27,7 @@ npunitest(data.x = NULL,
     a character string used to specify whether to compute
     the integral version or the summation version of the statistic. Can
     be set as \code{integration} or \code{summation}. Defaults to
-    \code{integration}. See `Details' below for important information
+    \code{integration}. See \sQuote{Details} below for important information
     regarding the use of \code{summation} when \code{data.x} and
     \code{data.y} lack common support and/or are sparse.
   }
@@ -106,7 +106,7 @@ npunitest(data.x = NULL,
    overlap is sparse (the summation version involves division of
    densities while the integration version involves differences, and the
    statistic in such cases can be reported as exactly 0.5 or 0). Warning
-   messages are produced when this occurs (`integration recommended')
+   messages are produced when this occurs (\sQuote{integration recommended})
    and should be heeded.
 
    Numerical integration can occasionally fail when the \code{data.x}
@@ -131,6 +131,7 @@ npunitest(data.x = NULL,
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -139,8 +140,11 @@ npunitest(data.x = NULL,
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
@@ -156,7 +160,7 @@ mpi.bcast.Robj2slave(y)
 mpi.bcast.cmd(output <- npunitest(x,y,
                                   method="summation",
                                   bootstrap=TRUE,
-                                  boot.num=99),
+                                  boot.num=29),
               caller.execute=TRUE)
 
 summary(output)
@@ -164,7 +168,18 @@ summary(output)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

@@ -1,5 +1,5 @@
 \name{mpi.abort}
-\title{MPI\_Abort API}
+\title{MPI_Abort API}
 \usage{
   mpi.abort(comm = 1)
 }
@@ -18,8 +18,8 @@
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
  \code{\link{mpi.finalize}}

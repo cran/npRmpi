@@ -1,5 +1,5 @@
 \name{mpi.sendrecv}
-\title{MPI\_Sendrecv and MPI\_Sendrecv\_replace APIs}
+\title{MPI_Sendrecv and MPI_Sendrecv_replace APIs}
 \alias{mpi.sendrecv}
 \alias{mpi.sendrecv.replace}
 \description{
@@ -55,8 +55,8 @@ can receive a message sent by a regular send.
 Kris Chen
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.send.Robj}},
@@ -65,10 +65,11 @@ Kris Chen
   \code{\link{mpi.get.sourcetag}}. 
 } 
 \examples{
-\donttest{
+\dontrun{
+## Not run in checks when toggled to dontrun: paired send/recv calls are
+## documented for manual MPI sessions.
 mpi.sendrecv(as.integer(11:20),1,0,33,integer(10),1,0,33,comm=0)
 mpi.sendrecv.replace(seq(1,2,by=0.1),2,0,99,0,99,comm=0)
-} 
+} % enddontrun
 }
 \keyword{interface}
-

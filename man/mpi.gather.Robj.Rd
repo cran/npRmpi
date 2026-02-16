@@ -1,5 +1,5 @@
 \name{mpi.gather.Robj}
-\title{Extentions of MPI\_Gather and MPI\_Allgather APIs}
+\title{Extentions of MPI_Gather and MPI_Allgather APIs}
 \alias{mpi.gather.Robj}
 \alias{mpi.allgather.Robj}
 \description{
@@ -36,14 +36,15 @@ for all members.
 Hao Yu and Wei Xia
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.gather}}, \code{\link{mpi.allgatherv}}.
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires pre-spawned slaves and a live worker communicator.
 #Assume that there are some slaves running
 mpi.bcast.cmd(id<-mpi.comm.rank())
 mpi.bcast.cmd(x<-rnorm(id))
@@ -59,4 +60,3 @@ mpi.remote.exec(nn)
 }
 }
 \keyword{interface}
-

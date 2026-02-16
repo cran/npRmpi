@@ -105,7 +105,7 @@ npscoefbw(\dots)
   
   \item{call}{
     the original function call. This is passed internally by
-    \code{\link{np}} when a bandwidth search has been implied by a call to
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
     another function. It is not recommended that the user set this.
   }
 
@@ -162,18 +162,18 @@ npscoefbw(\dots)
   }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
-    supplied bandwidths are interpreted as `scale factors'
+    supplied bandwidths are interpreted as \sQuote{scale factors}
     (\eqn{c_j}{c[j]}), otherwise when the value is \code{FALSE} they are
-    interpreted as `raw bandwidths' (\eqn{h_j}{h[j]} for continuous data
+    interpreted as \sQuote{raw bandwidths} (\eqn{h_j}{h[j]} for continuous data
     types, \eqn{\lambda_j}{lambda[j]} for discrete data types). For
     continuous data types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are
     related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(2P+l)}}{h[j] =
     c[j]*sigma[j]*n^(-1/(2*P+l))}, where \eqn{\sigma_j}{sigma[j]} is an
     adaptive measure of spread of continuous variable \eqn{j} defined as
-    min(standard deviation, mean absolute deviation/1.4826,
-    interquartile range/1.349), \eqn{n} the number of observations,
-    \eqn{P}{P} the order of the kernel, and \eqn{l}{l} the number of
-    continuous variables. For discrete data types, \eqn{c_j}{c[j]} and
+    min(standard deviation, mean absolute deviation, interquartile
+    range/1.349), \eqn{n} the number of observations, \eqn{P}{P} the
+    order of the kernel, and \eqn{l}{l} the number of continuous
+    variables. For discrete data types, \eqn{c_j}{c[j]} and
     \eqn{h_j}{h[j]} are related by the formula \eqn{h_j =
     c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))}, where here
     \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.  Defaults to
@@ -210,7 +210,7 @@ npscoefbw(\dots)
   \item{okertype}{
     character string used to specify the ordered categorical kernel type.
     Can be set as \code{wangvanryzin} or \code{liracine}. Defaults to
-    \code{wangvanryzin}.
+    \code{liracine}.
   }
   
   \item{nmulti}{
@@ -324,7 +324,7 @@ npscoefbw(\dots)
  Data contained in the data frame \code{xdat} may be continuous and in
  \code{zdat} may be of mixed type. Data can be entered in an arbitrary
  order and data types will be detected automatically by the routine (see
- \code{\link{np}} for details).
+ \code{\link{npRmpi}} for details).
 
  Data for which bandwidths are to be estimated may be specified
  symbolically. A typical description has the form \code{dependent}
@@ -442,6 +442,7 @@ npscoefbw(\dots)
   \code{\link{npregbw}}, \code{\link{npreg}} }
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -450,8 +451,11 @@ npscoefbw(\dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
@@ -481,7 +485,18 @@ summary(model)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

@@ -1,6 +1,6 @@
 \name{mpi.finalize}
 \alias{mpi.finalize}
-\title{MPI\_Finalize API}
+\title{MPI_Finalize API}
 \description{
   Terminates MPI execution environment. 
 }
@@ -27,8 +27,8 @@ Hao Yu
   \code{\link{mpi.exit}}
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 %\examples{ 
 %}

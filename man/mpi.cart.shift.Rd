@@ -1,5 +1,5 @@
 \name{mpi.cart.shift}
-\title{MPI\_Cart\_shift}
+\title{MPI_Cart_shift}
 \alias{mpi.cart.shift}
 \description{
  \code{mpi.cart.shift} shifts the Cartesian topology in both manners, displacement
@@ -31,11 +31,12 @@ Alek Hunchak and Hao Yu
 \code{\link{mpi.cart.create}},\code{\link{mpi.proc.null}}
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a Cartesian communicator built from spawned slaves.
 #Need at least 9 slaves
 mpi.bcast.cmd(mpi.cart.create(1,c(3,3),c(F,T)))
 mpi.cart.create(1,c(3,3),c(F,T))

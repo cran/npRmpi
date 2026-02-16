@@ -1,5 +1,5 @@
 \name{mpi.scatter}
-\title{MPI\_Scatter and MPI\_Scatterv APIs}
+\title{MPI_Scatter and MPI_Scatterv APIs}
 \alias{mpi.scatter}
 \alias{mpi.scatterv}
 \description{
@@ -38,14 +38,16 @@ scattered message and ignores whatever is in x (or scounts). For the root
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.gather}}, \code{\link{mpi.gatherv}}.
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a fixed number of spawned slaves and rank-specific buffers.
+# Running this with a different communicator layout can deadlock.
 #Need 3 slaves to run properly
 #Or run  mpi.spawn.Rslaves(nslaves=3)
   num="123456789abcd"

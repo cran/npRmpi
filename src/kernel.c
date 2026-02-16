@@ -25,10 +25,6 @@ extern  MPI_Status status;
 
 #include <R.h>
 
-#ifdef RCSID
-static char rcsid[] = "$Id: kernel.c,v 1.3 2006/11/02 16:56:49 tristen Exp $";
-#endif
-
 extern double np_tgauss2_b, np_tgauss2_alpha, np_tgauss2_c0;
 // convolution kernel constants
 extern double np_tgauss2_a0, np_tgauss2_a1, np_tgauss2_a2;
@@ -537,7 +533,7 @@ double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2)
 
 /* Second Order Epanechnikov */
 
-/* Error pointed out by Alicia Pérez-Alonso and colleagues May 22
+/* Error pointed out by Alicia Perez-Alonso and colleagues May 22
    2009, previous version incorporated incorrect limits of
    integration. Confirmed May 27 and incorporated. New version
    requires additional test for negative and positive values, and

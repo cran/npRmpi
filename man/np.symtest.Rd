@@ -103,13 +103,13 @@ npsymtest(data = NULL,
   conducts simple random resampling, while \code{geom} conducts Politis
   and Romano's (1994) stationary bootstrap using automatic block length
   selection via the \code{\link{b.star}} function in the
-  \code{\link{np}} package. See the \code{\link{boot}} package for
+  \code{\link{npRmpi}} package. See the \pkg{boot} package for
   details.
 
   The summation version of this statistic may be numerically unstable
   when \code{y} is sparse (the summation version involves division of
   densities while the integration version involves differences). Warning
-  messages are produced should this occur (`integration recommended')
+  messages are produced should this occur (\sQuote{integration recommended})
   and should be heeded.
  
 }
@@ -131,6 +131,7 @@ npsymtest(data = NULL,
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -139,8 +140,11 @@ npsymtest(data = NULL,
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
@@ -168,7 +172,7 @@ mpi.bcast.Robj2slave(yt)
 ## A simple example of the test for symmetry
 
 mpi.bcast.cmd(output <- npsymtest(yt,
-                                  boot.num=99,
+                                  boot.num=29,
                                   boot.method="geom",
                                   method="summation"),
               caller.execute=TRUE)
@@ -178,7 +182,18 @@ summary(output)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

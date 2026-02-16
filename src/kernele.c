@@ -35,10 +35,6 @@ extern int int_MINIMIZE_IO;
 extern int int_TAYLOR;
 extern int int_WEIGHTS;
 
-#ifdef RCSID
-static char rcsid[] = "$Id: kernele.c,v 1.12 2006/11/02 19:50:13 tristen Exp $";
-#endif
-
 /* Some externals for numerical routines */
 
 extern int num_obs_train_extern;
@@ -17593,7 +17589,6 @@ double  initd_dir)
 			fret_best = fret;
 			quantile_multistart[1] = quantile[1];
 
-      Rprintf("iMax_Num_Multistart: %d\n", iMax_Num_Multistart);
       imstot = iMax_Num_Multistart;
 			for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
 			{

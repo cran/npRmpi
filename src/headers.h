@@ -224,9 +224,9 @@ double np_cv_func_con_density_categorical_ls(double *vector_scale_factor);
 double np_cv_func_con_density_categorical_ml(double *vector_scale_factor);
 double np_cv_func_con_density_categorical_ls_npksum(double *vector_scale_factor);
 
-double np_kernel_estimate_distribution_ls_cv(int KERNEL_den,int KERNEL_den_unordered,int KERNEL_den_ordered,int BANDWIDTH_den,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double memfac,double ** matrix_X_unordered_train,double ** matrix_X_ordered_train,double ** matrix_X_continuous_train,double ** matrix_X_unordered_eval,double ** matrix_X_ordered_eval,double ** matrix_X_continuous_eval,double * vsf,int * num_categories,double ** matrix_categorical_vals,double * cv);
+double np_kernel_estimate_distribution_ls_cv(int KERNEL_den,int KERNEL_den_unordered,int KERNEL_den_ordered,int BANDWIDTH_den,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,int cdfontrain, double memfac,double ** matrix_X_unordered_train,double ** matrix_X_ordered_train,double ** matrix_X_continuous_train,double ** matrix_X_unordered_eval,double ** matrix_X_ordered_eval,double ** matrix_X_continuous_eval,double * vsf,int * num_categories,double ** matrix_categorical_vals,double * cv);
 
-int np_kernel_estimate_con_distribution_categorical_leave_one_out_ls_cv(int KERNEL_den,int KERNEL_unordered_den,int KERNEL_ordered_den,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int64_t num_obs_train,int64_t num_obs_eval,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double memfac, double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_Y_unordered_eval,double **matrix_Y_ordered_eval,double **matrix_Y_continuous_eval,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv);
+int np_kernel_estimate_con_distribution_categorical_leave_one_out_ls_cv(int KERNEL_den,int KERNEL_unordered_den,int KERNEL_ordered_den,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int64_t num_obs_train,int64_t num_obs_eval,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,int cdfontrain, double memfac, double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_Y_unordered_eval,double **matrix_Y_ordered_eval,double **matrix_Y_continuous_eval,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv);
 
 int np_kernel_estimate_con_density_categorical_leave_one_out_ls_cv(int KERNEL_var,int KERNEL_unordered_var,int KERNEL_ordered_var,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int64_t num_obs_train,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double memfac,double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_XY_unordered_train,double **matrix_XY_ordered_train,double **matrix_XY_continuous_train,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv);
 
@@ -334,6 +334,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define RBW_DOTREEI 17
 #define RBW_SCATI 18
 #define RBW_DFC_DIRI 19
+#define RBW_TBNDI 20
 
 #define RBW_FTOLD  0
 #define RBW_TOLD   1
@@ -377,6 +378,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define BW_DOTREEI 17
 #define BW_SCATI 18
 #define BW_DFC_DIRI 19
+#define BW_TBNDI 20
 
 #define BW_FTOLD  0
 #define BW_TOLD   1
@@ -419,6 +421,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define DBW_DOTREEI 18
 #define DBW_SCATI 19
 #define DBW_DFC_DIRI 20
+#define DBW_TBNDI 21
 
 #define DBW_FTOLD  0
 #define DBW_TOLD   1
@@ -468,6 +471,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define CBW_TREEI 24
 #define CBW_SCATI 25
 #define CBW_DFC_DIRI 26
+#define CBW_TBNDI 27
 
 #define CBW_FTOLD  0
 #define CBW_TOLD   1
@@ -525,6 +529,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define CDBW_TREEI 24
 #define CDBW_SCATI 25
 #define CDBW_DFC_DIRI 26
+#define CDBW_TBNDI 27
 
 #define CDBW_FTOLD  0
 #define CDBW_TOLD   1

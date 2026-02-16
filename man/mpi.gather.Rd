@@ -1,5 +1,5 @@
 \name{mpi.gather}
-\title{MPI\_Gather, MPI\_Gatherv, MPI\_Allgather, and MPI\_Allgatherv APIs}
+\title{MPI_Gather, MPI_Gatherv, MPI_Allgather, and MPI_Allgatherv APIs}
 \alias{mpi.gather}
 \alias{mpi.gatherv}
 \alias{mpi.allgather}
@@ -49,14 +49,16 @@ integer(sum(rcounts)) or double(sum(rcounts)).
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.scatter}}, \code{\link{mpi.scatterv}}.
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a fixed number of spawned slaves and rank-specific buffers.
+# Running this with a different communicator layout can deadlock.
 #Need 3 slaves to run properly
 #Or use mpi.spawn.Rslaves(nslaves=3)
  mpi.bcast.cmd(id <-mpi.comm.rank(.comm), comm=1)

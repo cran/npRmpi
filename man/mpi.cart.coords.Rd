@@ -1,5 +1,5 @@
 \name{mpi.cart.coords}
-\title{MPI\_Cart\_coords}
+\title{MPI_Cart_coords}
 \alias{mpi.cart.coords}
 \description{
  \code{mpi.cart.coords} translates a rank to its Cartesian topology coordinate.
@@ -27,11 +27,12 @@ Alek Hunchak and Hao Yu
 \code{\link{mpi.cart.rank}}
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a Cartesian communicator built from spawned slaves.
 #Need at least 9 slaves
 mpi.bcast.cmd(mpi.cart.create(1,c(3,3),c(F,T)))
 mpi.cart.create(1,c(3,3),c(F,T))

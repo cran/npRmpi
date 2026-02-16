@@ -175,16 +175,17 @@ npqreg(bws, \dots)
 }
 
 \value{
-  \code{npqreg} returns a \code{npqregression} object.
-  The generic
+
+  \code{npqreg} returns a \code{npqregression} object.  The generic
   functions \code{\link{fitted}} (or \code{\link{quantile}}),
-  \code{\link{se}}, \code{\link{predict}}, and
+  \code{\link{se}}, \code{\link{predict}} (when using
+  \code{\link{predict}} you must add the argument \code{tau=} to
+  generate predictions other than the median), and
   \code{\link{gradients}}, extract (or generate) estimated values,
-  asymptotic standard 
-  errors on estimates, predictions, and gradients, respectively, from
-  the returned object. Furthermore, the functions \code{\link{summary}}
-  and \code{\link{plot}} support objects of this type. The returned object
-  has the following components:
+  asymptotic standard errors on estimates, predictions, and gradients,
+  respectively, from the returned object. Furthermore, the functions
+  \code{\link{summary}} and \code{\link{plot}} support objects of this
+  type. The returned object has the following components:
 
   \item{eval}{ evaluation points }
   \item{quantile}{ estimation of the quantile regression function
@@ -243,6 +244,7 @@ npqreg(bws, \dots)
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -251,8 +253,11 @@ npqreg(bws, \dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 data("Italy")
 mpi.bcast.Robj2slave(Italy)
@@ -272,7 +277,18 @@ summary(model)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

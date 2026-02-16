@@ -4,7 +4,7 @@
 \alias{mpi.proc.null}
 \title{MPI Constants}
 \description{
-  Find MPI constants: MPI\_ANY\_SOURCE, MPI\_ANY\_TAG, or MPI\_PROC\_NULL
+  Find MPI constants: MPI_ANY_SOURCE, MPI_ANY_TAG, or MPI_PROC_NULL
 }
 \usage{
 mpi.any.source()
@@ -22,13 +22,13 @@ mpi.proc.null()
 \code{\link{mpi.send}}, \code{\link{mpi.recv}}, and 
 \code{\link{mpi.probe}}. 
 Different implementation of MPI may use different 
-  integers for MPI\_ANY\_SOURCE, MPI\_ANY\_TAG, and MPI\_PROC\_NULL. Hence one 
+  integers for MPI_ANY_SOURCE, MPI_ANY_TAG, and MPI_PROC_NULL. Hence one 
   should use these functions instead of real integers for MPI communications.
 } 
 \seealso{
   \code{\link{mpi.send}}, \code{\link{mpi.recv}}.
 }
 \references{
-  \url{http://www.lam-mpi.org}, \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org}, \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \keyword{utilities}

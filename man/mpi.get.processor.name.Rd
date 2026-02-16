@@ -1,5 +1,5 @@
 \name{mpi.get.processor.name}
-\title{MPI\_Get\_processor\_name API}
+\title{MPI_Get_processor_name API}
 \usage{
   mpi.get.processor.name(short = TRUE)
 }
@@ -18,8 +18,8 @@ a base host name if \code{short = TRUE} and a full host name otherwise.
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 %\examples{
 %}

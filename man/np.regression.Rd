@@ -65,10 +65,10 @@ FALSE, \dots)
     An optional data frame in which to look for evaluation data. If
     omitted, the training data are used.  
   }
-  
+
   \item{y.eval}{
     If \code{newdata} contains dependent data and \code{y.eval = TRUE},
-    \code{\link{np}} will compute goodness of fit statistics on these
+    \code{\link{npRmpi}} will compute goodness of fit statistics on these
     data and return them. Defaults to \code{FALSE}.
   }
   
@@ -118,21 +118,55 @@ FALSE, \dots)
     Usage 1: first compute the bandwidth object via npregbw and then
     compute the conditional mean:
     
-    bw <- npregbw(y~x)
-    ghat <- npreg(bw)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(x)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(bw <- npregbw(y~x),caller.execute=TRUE)
+    mpi.bcast.cmd(ghat <- npreg(bw),caller.execute=TRUE)
+    npRmpi.stop()
     
     Usage 2: alternatively, compute the bandwidth object indirectly:
     
-    ghat <- npreg(y~x)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(x)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(ghat <- npreg(y~x),caller.execute=TRUE)
+    npRmpi.stop()
     
     Usage 3: modify the default kernel and order:
     
-    ghat <- npreg(y~x, ckertype="epanechnikov", ckerorder=4)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(x)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(ghat <- npreg(y~x, ckertype="epanechnikov", ckerorder=4),
+                  caller.execute=TRUE)
+    npRmpi.stop()
 
     Usage 4: use the data frame interface rather than the formula
     interface:
 
-    ghat <- npreg(tydat=y, txdat=x, ckertype="epanechnikov", ckerorder=4)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(x)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(ghat <- npreg(tydat=y, txdat=x, ckertype="epanechnikov", ckerorder=4),
+                  caller.execute=TRUE)
+    npRmpi.stop()
   }
 
 
@@ -157,7 +191,7 @@ FALSE, \dots)
   (to be specified in the data frame \code{txdat} using
   \code{\link{ordered}}). Data can be entered in an arbitrary order and
   data types will be detected automatically by the routine (see
-  \code{\link{np}} for details).
+  \code{\link{npRmpi}} for details).
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
@@ -165,6 +199,14 @@ FALSE, \dots)
   kernel. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  The use of compactly supported kernels or the occurrence of small
+  bandwidths can lead to numerical problems for the local linear
+  estimator when computing the locally weighted least squares
+  solution. To overcome this problem we rely on a form or
+  \sQuote{ridging} proposed by Cheng, Hall, and Titterington (1997),
+  modified so that we solve the problem pointwise rather than globally
+  (i.e. only when it is needed).
 
 }
 
@@ -204,6 +246,10 @@ FALSE, \dots)
 
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
   discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Cheng, M.-Y. and P. Hall and D.M. Titterington (1997), \dQuote{On the
+  shrinkage of local linear curve estimators,} Statistics and Computing,
+  7, 11-17.
 
   Doksum, K. and A. Samarov (1995), \dQuote{Nonparametric estimation of
   global functionals and a measure of the explanatory power of
@@ -248,6 +294,7 @@ FALSE, \dots)
 }
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -256,8 +303,11 @@ FALSE, \dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 set.seed(42)
 
@@ -291,7 +341,14 @@ summary(model)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.
@@ -301,4 +358,3 @@ mpi.close.Rslaves()
 } % enddontrun     
 }
 \keyword{nonparametric}
-

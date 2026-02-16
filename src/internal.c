@@ -15,18 +15,20 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
    
+#include <R.h>
+
 #include "Rmpi.h"
 
 
 int mpi_errhandler(int errcode)
 {
-	int errmsglen;
+/*	int errmsglen;
 	char errmsg[MPI_MAX_ERROR_STRING];
 
-    if (errcode != MPI_SUCCESS) {
+	if (errcode != MPI_SUCCESS) {
 		MPI_Error_string(errcode, errmsg, &errmsglen);
 		error(errmsg);
-	}
+	} */
 	
 	return errcode;
 }
@@ -87,6 +89,7 @@ char *charsxp2char(SEXP x)
 }
 
 */
+
 
 /*
 void *R_chk_calloc2(size_t nelem, size_t elsize)

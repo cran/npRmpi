@@ -86,21 +86,51 @@ npudens(bws, \dots)
     Usage 1: first compute the bandwidth object via npudensbw and then
     compute the density:
     
-    bw <- npudensbw(~y)
-    fhat <- npudens(bw)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(bw <- npudensbw(~y),caller.execute=TRUE)
+    mpi.bcast.cmd(fhat <- npudens(bw),caller.execute=TRUE)
+    npRmpi.stop()
     
     Usage 2: alternatively, compute the bandwidth object indirectly:
     
-    fhat <- npudens(~y)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(fhat <- npudens(~y),caller.execute=TRUE)
+    npRmpi.stop()
     
     Usage 3: modify the default kernel and order:
     
-    fhat <- npudens(~y, ckertype="epanechnikov", ckerorder=4)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(fhat <- npudens(~y, ckertype="epanechnikov", ckerorder=4),
+                  caller.execute=TRUE)
+    npRmpi.stop()
 
     Usage 4: use the data frame interface rather than the formula
     interface:
 
-    fhat <- npudens(tdat = y, ckertype="epanechnikov", ckerorder=4)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(fhat <- npudens(tdat = y, ckertype="epanechnikov", ckerorder=4),
+                  caller.execute=TRUE)
+    npRmpi.stop()
   }
 
   \code{npudens} implements a variety of methods for estimating
@@ -124,7 +154,7 @@ npudens(bws, \dots)
   command), and ordered discrete (to be specified in the data frame
   \code{tdat} using the \code{\link{ordered}} command). Data can be
   entered in an arbitrary order and data types will be detected
-  automatically by the routine (see \code{\link{np}} for details).
+  automatically by the routine (see \code{\link{npRmpi}} for details).
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and
@@ -194,6 +224,7 @@ npudens(bws, \dots)
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -202,8 +233,11 @@ npudens(bws, \dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(data("Italy"),
               caller.execute=TRUE)
@@ -221,7 +255,18 @@ summary(fhat)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.
@@ -231,4 +276,3 @@ mpi.close.Rslaves()
 } % enddontrun
 }
 \keyword{ nonparametric }% at least one, from doc/KEYWORDS
-

@@ -1,5 +1,5 @@
 \name{mpi.scatter.Robj}
-\title{Extensions of MPI\_ SCATTER and MPI\_SCATTERV }
+\title{Extensions of MPI_ SCATTER and MPI_SCATTERV }
 \alias{mpi.scatter.Robj}
 \alias{mpi.scatter.Robj2slave}
 \description{
@@ -35,7 +35,8 @@ Hao Yu  and   Wei Xia
   \code{\link{mpi.gather.Robj}},
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires pre-spawned slaves and a live worker communicator.
 #assume that there are three slaves running
 mpi.bcast.cmd(x<-mpi.scatter.Robj())
 
@@ -53,4 +54,3 @@ mpi.remote.exec(dat2)
 }
 }
 \keyword{utilities}
-

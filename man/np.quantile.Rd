@@ -4,10 +4,10 @@
 \title{ Kernel Univariate Quantile Estimation }
 \description{
 
-  \code{npquantile} computes smooth quantiles from a univariate kernel
-  unconditional cumulative distribution estimate given data and,
+  \code{npquantile} computes smooth quantiles from a univariate
+  unconditional kernel cumulative distribution estimate given data and,
   optionally, a bandwidth specification i.e. a \code{dbandwidth} object
-  using the bandwidth selection method of Li and Racine (2013).
+  using the bandwidth selection method of Li, Li and Racine (2017).
 
 }
 \usage{
@@ -58,8 +58,16 @@ npquantile(x = NULL,
 
   Typical usage is
   \preformatted{
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    set.seed(42)
     x <- rchisq(100,df=10)
-    npquantile(x)
+    mpi.bcast.Robj2slave(x)
+    mpi.bcast.cmd(npquantile(x),caller.execute=TRUE)
+    npRmpi.stop()
   }
 
   The quantile function \eqn{q_\tau} is defined to be the
@@ -103,19 +111,32 @@ npquantile(x = NULL,
 }
 \references{
 
-  Hyndman, R. J. and Fan, Y. (1996), \dQuote{Sample quantiles in
+
+  Cheng, M.-Y. and Sun, S. (2006), \dQuote{Bandwidth selection for
+  kernel quantile estimation,} Journal of the Chinese Statistical
+  Association, \bold{44}, 271-295.
+  
+  Hyndman, R.J. and Fan, Y. (1996), \dQuote{Sample quantiles in
   statistical packages,} American Statistician, \bold{50}, 361-365.
 
-  Li, H. and J.S. Racine (2013), \dQuote{Cross-validated estimation of
-  cumulative distribution functions with categorical and continuous
-  data,} manuscript.
+  Li, Q. and J.S. Racine (2017), \dQuote{Smooth Unconditional Quantile
+  Estimation,} Manuscript.
 
-  Nelsen, R. B. (2006), \emph{An Introduction to Copulas,} Second
+  Li, C. and H. Li and J.S. Racine (2017), \dQuote{Cross-Validated Mixed
+  Datatype Bandwidth Selection for Nonparametric Cumulative
+  Distribution/Survivor Functions,} Econometric Reviews, \bold{36},
+  970-987.
+
+  Nelsen, R.B. (2006), \emph{An Introduction to Copulas,} Second
   Edition, Springer-Verlag.
 
-  Sheather, S. and J. S. Marron (1990), \dQuote{Kernel quantile
-  estimators,} Journal of the American Statistical Association,
-  Vol. 85, No. 410, 410-416.
+  Sheather, S. and J.S. Marron (1990), \dQuote{Kernel quantile
+  estimators,} Journal of the American Statistical Association, Vol. 85,
+  No. 410, 410-416.
+
+  Yang, S.-S. (1985), \dQuote{A Smooth Nonparametric Estimator of a
+  Quantile Function,} Journal of the American Statistical Association,
+  \bold{80}, 1004-1011.
   
 }
 \section{Usage Issues}{
@@ -145,6 +166,23 @@ npquantile(x = NULL,
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
+## The following example is adapted for interactive parallel execution
+## in R. Here we spawn 1 slave so that there will be two compute nodes
+## (master and slave).  Kindly see the batch examples in the demos
+## directory (npRmpi/demos) and study them carefully. Also kindly see
+## the more extensive examples in the np package itself. See the npRmpi
+## vignette for further details on running parallel np programs via
+## vignette("npRmpi",package="npRmpi").
+
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
+
+set.seed(42)
+
 ## Simulate data from a chi-square distribution
 df <- 50
 x <- rchisq(100,df=df)
@@ -152,15 +190,42 @@ x <- rchisq(100,df=df)
 ## Vector of quantiles desired
 tau <- c(0.01,0.05,0.25,0.50,0.75,0.95,0.99)
 
+mpi.bcast.Robj2slave(x)
+mpi.bcast.Robj2slave(tau)
+
 ## Compute kernel smoothed sample quantiles
-npquantile(x,tau)
+mpi.bcast.cmd(q <- npquantile(x,tau),
+              caller.execute=TRUE)
+
+q
 
 ## Compute sample quantiles using the default method in R (Type 7)
 quantile(x,tau)
 
 ## True quantiles based on known distribution
 qchisq(tau,df=df)
+
+## For the interactive run only we close the slaves perhaps to proceed
+## with other examples and so forth. This is redundant in batch mode.
+
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
+
+## Note that in order to exit npRmpi properly avoid quit(), and instead
+## use mpi.quit() as follows.
+
+## mpi.bcast.cmd(mpi.quit(),
+##               caller.execute=TRUE)
 } % enddontrun
 }
 \keyword{ nonparametric }% at least one, from doc/KEYWORDS
-

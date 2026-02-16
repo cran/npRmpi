@@ -9,9 +9,9 @@
 \description{
   \code{npudistbw} computes a bandwidth object for a \eqn{p}-variate
   kernel cumulative distribution estimator defined over mixed continuous
-  and discrete (ordered) data using either the normal
-  reference rule-of-thumb or least-squares cross validation using the
-  method of Li and Racine (2013).
+  and discrete (ordered) data using either the normal reference
+  rule-of-thumb or least-squares cross validation using the method of
+  Li, Li and Racine (2017).
 }
 
 \usage{
@@ -31,7 +31,7 @@ npudistbw(\dots)
           nmulti,
           remin = TRUE,
           itmax = 10000,
-          do.full.integral = TRUE,
+          do.full.integral = FALSE,
           ngrid = 100,
           ftol = 1.490116e-07,
           tol = 1.490116e-04,
@@ -52,6 +52,9 @@ npudistbw(\dots)
           dfac.init = 0.375, 
           scale.init.categorical.sample = FALSE,
           memfac = 500.0,
+          transform.bounds = FALSE,
+          invalid.penalty = c("baseline","dbmax"),
+          penalty.multiplier = 10,
           \dots)
 
 \method{npudistbw}{default}(dat = stop("invoked without input data 'dat'"),
@@ -82,6 +85,9 @@ npudistbw(\dots)
           dfac.init,
           scale.init.categorical.sample,
           memfac,
+          transform.bounds,
+          invalid.penalty,
+          penalty.multiplier,
           bwmethod,
           bwscaling,
           bwtype,
@@ -121,7 +127,7 @@ npudistbw(\dots)
   
   \item{call}{
     the original function call. This is passed internally by
-    \code{\link{np}} when a bandwidth search has been implied by a call to
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
     another function. It is not recommended that the user set this.
   }
     
@@ -161,7 +167,7 @@ npudistbw(\dots)
   
   \item{bwmethod}{ a character string specifying the bandwidth selection
     method.  \code{cv.cdf} specifies least-squares cross-validation for
-    cumulative distribution functions (Li and Racine (2013)), and
+    cumulative distribution functions (Li, Li and Racine (2017)), and
     \code{normal-reference} just computes the \sQuote{rule-of-thumb}
     bandwidth \eqn{h_j}{h[j]} using the standard formula \eqn{h_j =
     1.587 \sigma_j n^{-1/(P+l)}}{h[j] = 1.587*sigma[j]*n^(-1.0/(P+l))},
@@ -174,9 +180,9 @@ npudistbw(\dots)
     smoothing of the factors. Defaults to \code{cv.cdf}.  }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
-    supplied bandwidths are interpreted as `scale factors'
+    supplied bandwidths are interpreted as \sQuote{scale factors}
     (\eqn{c_j}{c[j]}), otherwise when the value is \code{FALSE} they are
-    interpreted as `raw bandwidths' (\eqn{h_j}{h[j]} for continuous data
+    interpreted as \sQuote{raw bandwidths} (\eqn{h_j}{h[j]} for continuous data
     types, \eqn{\lambda_j}{lambda[j]} for discrete data types). For
     continuous data types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are
     related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(P+l)}}{h[j] =
@@ -245,7 +251,8 @@ npudistbw(\dots)
 
   \item{do.full.integral}{
     a logical value which when set as \code{TRUE} evaluates the
-    moment-based integral on the entire sample.
+    moment-based integral on the entire sample. Defaults
+    to \code{FALSE}.
   }
 
   \item{ngrid}{
@@ -301,13 +308,28 @@ npudistbw(\dots)
     kernel, and \eqn{l}{l} the number of \code{numeric} variables. See
     Details}
 
-    \item{memfac}{
+  \item{transform.bounds}{ a logical value that when set to \code{TRUE}
+    applies an internal transformation that maps the unconstrained
+    search to the feasible bandwidth domain. Defaults to
+    \code{FALSE}.}
+
+  \item{invalid.penalty}{ a character string specifying the penalty
+    used when the optimizer encounters invalid bandwidths.
+    \code{"baseline"} returns a finite penalty based on a baseline
+    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
+    \code{"baseline"}.}
+
+  \item{penalty.multiplier}{ a numeric multiplier applied to the
+    baseline penalty when \code{invalid.penalty="baseline"}.
+    Defaults to \code{10}.}
+
+  \item{memfac}{
     The algorithm to compute the least-squares objective function uses
     a block-based algorithm to eliminate or minimize redundant kernel
     evaluations. Due to memory, hardware and software constraints, a
     maximum block size must be imposed by the algorithm. This block size
     is roughly equal to memfac*10^5 elements. Empirical tests on
-    modern hardware find that a memfac of around 500 performs well. If
+    modern hardware find that a memfac of 500 performs well. If
     you experience out of memory errors, or strange behaviour for
     large data sets (>100k elements) setting memfac to a lower value may
     fix the problem.
@@ -322,12 +344,27 @@ npudistbw(\dots)
     
     Usage 1: compute a bandwidth object using the formula interface:
     
-    bw <- npudistbw(~y)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(bw <- npudistbw(~y),caller.execute=TRUE)
+    npRmpi.stop()
     
     Usage 2: compute a bandwidth object using the data frame interface
     and change the default kernel and order:
 
-    Fhat <- npudistbw(tdat = y, ckertype="epanechnikov", ckerorder=4)
+    ## Start npRmpi for interactive execution. If slaves are already running and
+    ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+    ## reuse the existing pool instead of respawning. To change the number of
+    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+    npRmpi.start(nslaves=1)
+    mpi.bcast.Robj2slave(y)
+    mpi.bcast.cmd(Fhat <- npudistbw(tdat = y, ckertype="epanechnikov", ckerorder=4),
+                  caller.execute=TRUE)
+    npRmpi.stop()
     
   }
 
@@ -363,7 +400,7 @@ npudistbw(\dots)
   (default) and ordered discrete (to be specified in the data frame
   \code{dat} using \code{\link{ordered}}). Data can be entered in an
   arbitrary order and data types will be detected automatically by the
-  routine (see \code{\link{np}} for details).
+  routine (see \code{\link{npRmpi}} for details).
 
   Data for which bandwidths are to be estimated may be specified
   symbolically. A typical description has the form \code{~ data}, where
@@ -394,7 +431,8 @@ npudistbw(\dots)
   modifying \code{nmulti}). Further refinement for difficult cases can
   be achieved by modifying these sets of parameters. However, these
   parameters are intended more for the authors of the package to enable
-  \sQuote{tuning} for various methods rather than for the user themselves.
+  \sQuote{tuning} for various methods rather than for the user them
+  self.
 
 }
 \value{
@@ -421,8 +459,12 @@ npudistbw(\dots)
 }
 \references{
 
-  Aitchison, J. and , C.G.G. Aitken (1976), \dQuote{Multivariate binary
-   discrimination by the kernel method,} Biometrika, 63, 413-420.
+  Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
+    discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Bowman, A. and P. Hall and T. Prvan (1998), \dQuote{Bandwidth
+    selection for the smoothing of distribution functions,} Biometrika,
+    85, 799-808.
 
   Li, Q. and J.S. Racine (2007), \emph{Nonparametric Econometrics: Theory
   and Practice,} Princeton University Press.
@@ -431,9 +473,10 @@ npudistbw(\dots)
    distributions with categorical and continuous data,} Journal
   of Multivariate Analysis, 86, 266-292.
 
-  Li, H. and J.S. Racine (2013), \dQuote{Cross-validated estimation of
-  cumulative distribution functions with categorical and continuous
-  data,} manuscript.
+  Li, C. and H. Li and J.S. Racine (2017), \dQuote{Cross-Validated Mixed
+  Datatype Bandwidth Selection for Nonparametric Cumulative
+  Distribution/Survivor Functions,} Econometric Reviews, \bold{36},
+  970-987.
 
   Ouyang, D. and Q. Li and J.S. Racine (2006), \dQuote{Cross-validation
     and the estimation of probability distributions with categorical
@@ -493,6 +536,8 @@ npudistbw(\dots)
   \code{\link{npudist}}, \code{\link{npudist}} }
 \examples{
 \dontrun{
+## Not run in checks: data-driven CDF bandwidth selection on this dataset is
+## computationally intensive and can hang/timeout in some MPI setups.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -501,8 +546,11 @@ npudistbw(\dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 data("Italy")
 
@@ -517,7 +565,18 @@ summary(bw)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

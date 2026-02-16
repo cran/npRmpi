@@ -60,6 +60,11 @@ With the default value of argument \code{job.num} which is slave.num, \code{mpi.
 parSapply, parRapply, parCapply, parSapply, and parMM, respectively. When \code{job.num} is 
 bigger than slave.num, a load balancing approach is used.
  }
+\value{
+Returns an object with the same structure as the corresponding base
+apply call (typically a list or simplified vector/array when
+`simplify = TRUE`).
+}
 \section{Warning}{
 When using the argument \code{apply.seq} with \code{.mpi.applyLB}, be sure all settings are the same 
 as before, i.e., the same data, job.num, slave.num, and seed. Otherwise a deadlock could occur. 
@@ -69,7 +74,9 @@ Notice that \code{apply.seq} is useful only if \code{job.num} is bigger than sla
 \code{\link{mpi.apply}}
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires pre-spawned slaves and load-balancing state.
+# A mismatched communicator or apply.seq can deadlock.
 #Assume that there are some slaves running
 
 #mpi.applyLB

@@ -1,5 +1,5 @@
 \name{mpi.reduce}
-\title{MPI\_Reduce and MPI\_Allreduce APIs}
+\title{MPI_Reduce and MPI_Allreduce APIs}
 \alias{mpi.allreduce}
 \alias{mpi.reduce}
 \description{
@@ -44,8 +44,8 @@ mpi.allreduce(x, type=2, op=c("sum","prod","max","min","maxloc","minloc"),
   Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/},  
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},  
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.gather}}.

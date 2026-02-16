@@ -1,5 +1,5 @@
 \name{mpi.intercomm.merge}
-\title{MPI\_Intercomm\_merge API}
+\title{MPI_Intercomm_merge API}
 \usage{
 mpi.intercomm.merge(intercomm=2, high=0, comm=1)
 }
@@ -31,7 +31,7 @@ can use \code{\link{mpi.comm.test.inter}} to test if a
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org}, \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org}, \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
  \code{\link{mpi.comm.test.inter}}

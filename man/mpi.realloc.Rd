@@ -17,6 +17,14 @@ arrays respectively.
 status arrays to \code{newmaxsize} respectively if \code{newmaxsize} is 
 bigger than the original maximum size. 
 }
+\value{
+\itemize{
+  \item \code{mpi.realloc.comm}, \code{mpi.realloc.request}, \code{mpi.realloc.status}:
+        no return value (called for side effects).
+  \item \code{mpi.comm.maxsize}, \code{mpi.request.maxsize}, \code{mpi.status.maxsize}:
+        integer size limits.
+}
+}
 \usage{
 mpi.realloc.comm(newmaxsize)
 mpi.realloc.request(newmaxsize)
@@ -38,8 +46,8 @@ use \code{mpi.realloc.comm}, \code{mpi.realloc.request} and
   Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/},  
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},  
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 %\examples{
 %}

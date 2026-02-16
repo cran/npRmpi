@@ -56,6 +56,9 @@ npcdistbw(\dots)
           hbd.init = 0.9,
           dfac.init = 0.375, 
           scale.init.categorical.sample = FALSE,
+          transform.bounds = FALSE,
+          invalid.penalty = c("baseline","dbmax"),
+          penalty.multiplier = 10,
           \dots)
 
 \method{npcdistbw}{default}(xdat = stop("data 'xdat' missing"),
@@ -87,6 +90,9 @@ npcdistbw(\dots)
           hbd.init,
           dfac.init,
           scale.init.categorical.sample,
+          transform.bounds,
+          invalid.penalty,
+          penalty.multiplier,
           bwmethod,
           bwscaling,
           bwtype,
@@ -129,7 +135,7 @@ npcdistbw(\dots)
   
   \item{call}{
     the original function call. This is passed internally by
-    \code{\link{np}} when a bandwidth search has been implied by a call to
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
     another function. It is not recommended that the user set this.
   }
 
@@ -160,15 +166,15 @@ npcdistbw(\dots)
   \item{bws}{
     a bandwidth specification. This can be set as a \code{condbandwidth}
     object returned from a previous invocation, or as a \eqn{p+q}-vector
-    of bandwidths, with each element \eqn{i} up to \eqn{i=p}
-    corresponding to the bandwidth for column \eqn{i} in \code{xdat}, 
-    and each element \eqn{i} from \eqn{i=p+1} to \eqn{i=p+q} corresponding to the
-    bandwidth for column \eqn{i-p} in \code{ydat}. In either case, the
-    bandwidth supplied will serve as a starting point in the numerical
-    search for optimal bandwidths. If specified as a vector, then
-    additional arguments will need to be supplied as necessary to
-    specify the bandwidth type, kernel types, selection methods, and so
-    on. This can be left unset.
+    of bandwidths, with each element \eqn{i} up to \eqn{i=q}
+    corresponding to the bandwidth for column \eqn{i} in \code{ydat},
+    and each element \eqn{i} from \eqn{i=q+1} to \eqn{i=p+q}
+    corresponding to the bandwidth for column \eqn{i-q} in
+    \code{xdat}. In either case, the bandwidth supplied will serve as a
+    starting point in the numerical search for optimal bandwidths. If
+    specified as a vector, then additional arguments will need to be
+    supplied as necessary to specify the bandwidth type, kernel types,
+    selection methods, and so on. This can be left unset.
   }
 
   \item{\dots}{
@@ -192,18 +198,18 @@ npcdistbw(\dots)
     factors. Defaults to \code{cv.ls}.  }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
-    supplied bandwidths are interpreted as `scale factors'
+    supplied bandwidths are interpreted as \sQuote{scale factors}
     (\eqn{c_j}{c[j]}), otherwise when the value is \code{FALSE} they are
-    interpreted as `raw bandwidths' (\eqn{h_j}{h[j]} for continuous data
+    interpreted as \sQuote{raw bandwidths} (\eqn{h_j}{h[j]} for continuous data
     types, \eqn{\lambda_j}{lambda[j]} for discrete data types). For
     continuous data types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are
     related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(2P+l)}}{h[j] =
     c[j]*sigma[j]*n^(-1/(2*P+l))}, where \eqn{\sigma_j}{sigma[j]} is an
     adaptive measure of spread of continuous variable \eqn{j} defined as
-    min(standard deviation, mean absolute deviation/1.4826,
-    interquartile range/1.349), \eqn{n} the number of observations,
-    \eqn{P}{P} the order of the kernel, and \eqn{l}{l} the number of
-    continuous variables. For discrete data types, \eqn{c_j}{c[j]} and
+    min(standard deviation, mean absolute deviation/1.4826, interquartile
+    range/1.349), \eqn{n} the number of observations, \eqn{P}{P} the
+    order of the kernel, and \eqn{l}{l} the number of continuous
+    variables. For discrete data types, \eqn{c_j}{c[j]} and
     \eqn{h_j}{h[j]} are related by the formula \eqn{h_j =
     c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))}, where here
     \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.  Defaults to
@@ -259,7 +265,7 @@ npcdistbw(\dots)
   \item{oxkertype}{
     character string used to specify the ordered categorical
     kernel type. Can be set as \code{wangvanryzin} or
-    \code{liracine}. Defaults to \code{wangvanryzin}.
+    \code{liracine}. Defaults to \code{liracine}.
   }
   \item{oykertype}{
     character string used to specify the ordered categorical
@@ -340,6 +346,21 @@ npcdistbw(\dots)
     kernel, and \eqn{l}{l} the number of \code{numeric} variables. See
     Details}
 
+  \item{transform.bounds}{ a logical value that when set to \code{TRUE}
+    applies an internal transformation that maps the unconstrained
+    search to the feasible bandwidth domain. Defaults to
+    \code{FALSE}.}
+
+  \item{invalid.penalty}{ a character string specifying the penalty
+    used when the optimizer encounters invalid bandwidths.
+    \code{"baseline"} returns a finite penalty based on a baseline
+    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
+    \code{"baseline"}.}
+
+  \item{penalty.multiplier}{ a numeric multiplier applied to the
+    baseline penalty when \code{invalid.penalty="baseline"}.
+    Defaults to \code{10}.}
+
   \item{memfac}{
     The algorithm to compute the least-squares objective function uses
     a block-based algorithm to eliminate or minimize redundant kernel
@@ -373,15 +394,15 @@ npcdistbw(\dots)
   available: fixed, adaptive nearest-neighbor, and generalized
   nearest-neighbor. Adaptive nearest-neighbor bandwidths change with
   each sample realization in the set, \eqn{x_i}{x[i]}, when estimating
-  the cumulative distribution at the point \eqn{x}. Generalized
-  nearest-neighbor bandwidths change with the point at which the
-  cumulative distribution is estimated, \eqn{x}. Fixed bandwidths are
-  constant over the support of \eqn{x}.
+  the cumulative distribution at the point \eqn{x}. Generalized nearest-neighbor
+  bandwidths change with the point at which the cumulative distribution is estimated,
+  \eqn{x}. Fixed bandwidths are constant over the support of \eqn{x}.
 
   \code{npcdistbw} may be invoked \emph{either} with a formula-like
-  symbolic description of variables on which bandwidth selection is to
-  be performed \emph{or} through a simpler interface whereby data is
-  passed directly to the function via the \code{xdat} and \code{ydat}
+  symbolic 
+  description of variables on which bandwidth selection is to be
+  performed \emph{or} through a simpler interface whereby data is passed
+  directly to the function via the \code{xdat} and \code{ydat}
   parameters. Use of these two interfaces is \bold{mutually exclusive}.
 
   Data contained in the data frame \code{xdat} may be a mix of
@@ -392,7 +413,7 @@ npcdistbw(\dots)
   (default) and ordered discrete (to be specified in the data frames
   using \code{\link{ordered}}). Data can be entered in an arbitrary
   order and data types will be detected automatically by the routine
-  (see \code{\link{np}} for details).
+  (see \code{\link{npRmpi}} for details).
 
   Data for which bandwidths are to be estimated may be specified
   symbolically. A typical description has the form \code{dependent data
@@ -529,6 +550,8 @@ npcdistbw(\dots)
 
 \examples{
 \dontrun{
+## Not run in checks: data-driven conditional CDF bandwidth selection is
+## computationally intensive and may exceed check limits under MPI.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -537,8 +560,11 @@ npcdistbw(\dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 data("Italy")
 
@@ -553,7 +579,18 @@ summary(bw)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

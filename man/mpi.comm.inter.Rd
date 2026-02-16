@@ -1,5 +1,5 @@
 \name{mpi.comm.get.parent}
-\title{MPI\_Comm\_get\_parent, MPI\_Comm\_remote\_size, MPI\_Comm\_test\_inter 
+\title{MPI_Comm_get_parent, MPI_Comm_remote_size, MPI_Comm_test_inter 
 APIs}
 \usage{
   mpi.comm.get.parent(comm = 2)
@@ -34,8 +34,8 @@ group in an intercomm.
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
  \code{\link{mpi.intercomm.merge}}

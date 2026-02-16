@@ -1,5 +1,5 @@
 \name{mpi.comm.disconnect}
-\title{MPI\_Comm\_disconnect API}
+\title{MPI_Comm_disconnect API}
 \usage{
 mpi.comm.disconnect(comm=1)
 }
@@ -9,7 +9,7 @@ mpi.comm.disconnect(comm=1)
 }
 \description{
   \code{mpi.comm.disconnect} disconnects itself from a communicator and then 
-  deallocates the communicator so it points to MPI\_COMM\_NULL.
+  deallocates the communicator so it points to MPI_COMM_NULL.
 }
 \details{
   When members associated with a communicator finish jobs or exit, they have to 
@@ -25,8 +25,8 @@ mpi.comm.disconnect(comm=1)
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
  \code{\link{mpi.comm.free}}

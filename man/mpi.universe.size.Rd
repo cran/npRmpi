@@ -1,5 +1,5 @@
 \name{mpi.universe.size}
-\title{MPI\_Universe\_size API}
+\title{MPI_Universe_size API}
 \usage{
   mpi.universe.size()
 }
@@ -11,12 +11,16 @@
   \code{mpi.universe.size} returns the total number of CPUs available in a 
 cluster. Some MPI implements may not have this MPI call available.
 }
+\value{
+An integer giving the total number of CPUs available in the MPI universe
+for the current configuration.
+}
 \author{
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 %\examples{
 %}

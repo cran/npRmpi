@@ -39,16 +39,15 @@ npcdens(bws, \dots)
 \arguments{
   \item{bws}{
     a bandwidth specification. This can be set as a \code{conbandwidth}
-    object returned from a previous invocation of \code{\link{npcdensbw}}, or
-    as a \eqn{p+q}-vector 
-    of bandwidths, with each element \eqn{i} up to \eqn{i=p}
-    corresponding to the bandwidth for column \eqn{i} in \code{txdat}, 
-    and each element \eqn{i} from \eqn{i=p+1} to \eqn{i=p+q}
-    corresponding to the bandwidth for column \eqn{i-p} in
-    \code{tydat}. If specified as a vector, then
-    additional arguments will need to be supplied as necessary to
-    specify the bandwidth type, kernel types, training data, and so
-    on. 
+    object returned from a previous invocation of
+    \code{\link{npcdensbw}}, or as a \eqn{p+q}-vector of bandwidths,
+    with each element \eqn{i} up to \eqn{i=q} corresponding to the
+    bandwidth for column \eqn{i} in \code{tydat}, and each element
+    \eqn{i} from \eqn{i=q+1} to \eqn{i=p+q} corresponding to the
+    bandwidth for column \eqn{i-q} in \code{txdat}. If specified as a
+    vector, then additional arguments will need to be supplied as
+    necessary to specify the bandwidth type, kernel types, training
+    data, and so on.
   }
 
   \item{gradients}{
@@ -129,7 +128,7 @@ npcdens(bws, \dots)
   the data frames using \code{\link{factor}}), and ordered discrete (to be
   specified in the data frames using \code{\link{ordered}}). Data can be
   entered in an arbitrary order and data types will be detected
-  automatically by the routine (see \code{\link{np}} for details).
+  automatically by the routine (see \code{\link{npRmpi}} for details).
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
@@ -210,6 +209,7 @@ npcdens(bws, \dots)
 }
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -218,8 +218,11 @@ npcdens(bws, \dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(data("Italy"),
               caller.execute=TRUE)
@@ -237,7 +240,18 @@ summary(fhat)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.
@@ -247,4 +261,3 @@ mpi.close.Rslaves()
 } % enddontrun     
 }
 \keyword{nonparametric}
-

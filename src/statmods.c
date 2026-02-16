@@ -8,10 +8,6 @@
 #include "headers.h"
 #include "matrix.h"
 
-#ifdef RCSID
-static char rcsid[] = "$Id: statmods_Rprintf_all_random.c,v 1.4 2014/05/13 17:02:42 jracine Exp jracine $";
-#endif
-
 #ifdef MPI2
 
 #include "mpi.h"
@@ -63,9 +59,16 @@ int np_fround(double x)
 int simple_unique(int n, double * vector){
   int i, m;
 
-  double * v=NULL;
+  /* gcc 11 Found the following significant warnings: statmods.c:73:3:
+     warning: 'sort' accessing 8 bytes in a region of size 0
+     [-Wstringop-overflow=] */
+  
+  /*  double * v=NULL; */
+  double *v;
 
-  v=(double *)malloc(sizeof(double)*n);
+  /* v=(double *)malloc(sizeof(double)*n); */
+
+  v = alloc_vecd(n);
 
   for(i=0; i<n; i++)
     v[i]=vector[i];
@@ -261,7 +264,7 @@ double max_unordered_bw(int num_categories,
 int is_valid_unordered_bw(double lambda,
                           int num_categories,
                           int kernel){
-  return ((lambda >= 0.0) || (lambda <= max_unordered_bw(num_categories, kernel)));
+  return ((lambda >= 0.0) && (lambda <= max_unordered_bw(num_categories, kernel)));
 }
 
 /* Population variance, double precision */

@@ -1,5 +1,5 @@
 \name{mpi.cart.create}
-\title{MPI\_Cart\_create}
+\title{MPI_Cart_create}
 \alias{mpi.cart.create}
 \description{
  \code{mpi.cart.create} creates a Cartesian structure of arbitrary dimension.
@@ -30,11 +30,12 @@
 Alek Hunchak and Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
+\dontrun{
+# Not run in checks: requires a multi-rank MPI session with spawned slaves.
 #Need at least 9 slaves
 mpi.bcast.cmd(mpi.cart.create(1,c(3,3),c(F,T)))
 mpi.cart.create(1,c(3,3),c(F,T))

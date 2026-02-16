@@ -1,5 +1,5 @@
 \name{mpi.comm.size}
-\title{MPI\_Comm\_c2f, MPI\_Comm\_dup, MPI\_Comm\_rank, and MPI\_Comm\_size APIs}
+\title{MPI_Comm_c2f, MPI_Comm_dup, MPI_Comm_rank, and MPI_Comm_size APIs}
 \usage{
   mpi.comm.c2f(comm=1)
   mpi.comm.dup(comm, newcomm)
@@ -21,28 +21,29 @@ used as the communicator in external FORTRAN code. \code{mpi.comm.dup} duplicate
 returns its rank in a comm. \code{mpi.comm.size} returns 
 the total number of members in a comm. 
 }
+\value{
+\itemize{
+  \item \code{mpi.comm.c2f}: integer communicator for use in FORTRAN code.
+  \item \code{mpi.comm.dup}: integer identifier of the duplicated communicator.
+  \item \code{mpi.comm.rank}: integer rank within the communicator.
+  \item \code{mpi.comm.size}: integer size of the communicator.
+}
+}
 \author{
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
-#Assume that there are some slaves running
-mpi.comm.size(comm=1)
+\dontrun{
+## Not run in checks when toggled to dontrun: communicator examples are
+## documented for manual MPI sessions.
+mpi.comm.rank(comm=0)
 mpi.comm.size(comm=0)
-
-mpi.remote.exec(mpi.comm.rank(comm=1))
-mpi.remote.exec(mpi.comm.rank(comm=0))
-
-mpi.remote.exec(mpi.comm.size(comm=1))
-mpi.remote.exec(mpi.comm.size(comm=0))
-
-mpi.bcast.cmd(mpi.comm.dup(comm=1,newcomm=5))
-mpi.comm.dup(comm=1,newcomm=5)
-}
+mpi.comm.dup(comm=0, newcomm=5)
+} % enddontrun
 }
 \keyword{interface}
  

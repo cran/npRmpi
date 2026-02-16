@@ -13,7 +13,8 @@ npsigtest <-
       if (is.recursive(bws)){
         if (!is.null(bws$formula) && is.null(args$xdat))
           UseMethod("npsigtest",bws$formula)
-        else if (!is.null(bws$call) && is.null(args$xdat) && (class(bws) != "npregression"))
+#        else if (!is.null(bws$call) && is.null(args$xdat) && (class(bws) != "npregression"))
+        else if (!is.null(bws$call) && is.null(args$xdat) && (!isa(bws,"npregression")))
           UseMethod("npsigtest",bws$call)
         else if (!is.call(bws))
           UseMethod("npsigtest",bws)
@@ -120,7 +121,7 @@ npsigtest.rbandwidth <- function(bws,
 
   ## Test for valid entries in index
 
-  if(any(index < 1 || index>NCOL(xdat))) stop(paste("invalid index provided: index entries must lie between 1 and ",NCOL(xdat),sep=""))
+  if(any(index < 1 | index > NCOL(xdat))) stop(paste("invalid index provided: index entries must lie between 1 and ",NCOL(xdat),sep=""))
   if(length(unique(index))<length(unique)) stop("index contains repeated values (must be unique)")
 
   if(!joint) {
@@ -195,7 +196,14 @@ npsigtest.rbandwidth <- function(bws,
       ## xdat[,i] constant at its median (numeric) or mode
       ## (factor/ordered) using uocquantile()
 
-      for(i in index) xdat.eval[,i] <- uocquantile(xdat[,i], 0.5)
+      for(i in index) {
+        xq <- uocquantile(xdat[,i], 0.5)
+        if (is.factor(xdat[,i]) || is.ordered(xdat[,i])) {
+          xdat.eval[,i] <- cast(xq, xdat[,i], same.levels = TRUE)
+        } else {
+          xdat.eval[,i] <- xq
+        }
+      }
       
       mhat.xi <-  npreg(txdat = xdat,
                         tydat = ydat,
@@ -397,7 +405,12 @@ npsigtest.rbandwidth <- function(bws,
         ## xdat[,i] constant at its median (numeric) or mode
         ## (factor/ordered) using uocquantile()
         
-        xdat.eval[,i] <- uocquantile(xdat[,i], 0.5)
+        xq <- uocquantile(xdat[,i], 0.5)
+        if (is.factor(xdat[,i]) || is.ordered(xdat[,i])) {
+          xdat.eval[,i] <- cast(xq, xdat[,i], same.levels = TRUE)
+        } else {
+          xdat.eval[,i] <- xq
+        }
         
         mhat.xi <-  npreg(txdat = xdat,
                           tydat = ydat,
@@ -625,4 +638,3 @@ npsigtest.default <- function(bws, xdat, ydat, ...){
   environment(ev$call) <- parent.frame()
   return(ev)
 }
-

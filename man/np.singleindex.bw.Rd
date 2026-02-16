@@ -8,9 +8,15 @@
 \title{Semiparametric Single Index Model Parameter and Bandwidth Selection}
 
 \description{
-  \code{npindexbw} computes a \code{npindexbw} bandwidth
-  specification using the model \eqn{Y = G(X\beta) + \epsilon}{Y = G(XB)
-    + epsilon}. The bandwidth object contains parameters for the single
+  \code{npindexbw} computes a \code{npindexbw} bandwidth specification
+  using the model \eqn{Y = G(X\beta) + \epsilon}{Y = G(XB) +
+  epsilon}. For continuous \eqn{Y}, the approach is that of Hardle, Hall
+  and Ichimura (1993) which jointly minimizes a least-squares
+  cross-validation function with respect to the parameters and
+  bandwidth. For binary \eqn{Y}, a likelihood-based cross-validation
+  approach is employed which jointly maximizes a likelihood
+  cross-validation function with respect to the parameters and
+  bandwidth. The bandwidth object contains parameters for the single
   index model and the (scalar) bandwidth for the index function.
 }
 
@@ -85,7 +91,7 @@ npindexbw(\dots)
   
   \item{call}{
     the original function call. This is passed internally by
-    \code{\link{np}} when a bandwidth search has been implied by a call to
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
     another function. It is not recommended that the user set this.
   }
 
@@ -191,7 +197,9 @@ npindexbw(\dots)
   \item{\dots}{
     additional arguments supplied to specify the parameters to the
     \code{sibandwidth} S3 method, which is called during the numerical
-    search. 
+    search. In particular, \code{bwtype} may be supplied here to request
+    \code{"fixed"}, \code{"generalized_nn"}, or \code{"adaptive_nn"} bandwidth
+    types.
   }
 
   
@@ -219,7 +227,7 @@ npindexbw(\dots)
   passed directly to the function via the \code{xdat} and \code{ydat}
   parameters. Use of these two interfaces is \bold{mutually exclusive}.
   
-  Note that, unlike most other bandwidth methods in the \code{np}
+  Note that, unlike most other bandwidth methods in the \code{npRmpi}
   package, this implementation uses the R \code{\link{optim}} nonlinear
   minimization routines and \code{\link{npksum}}. We have implemented
   multistarting and strongly encourage its use in practice. For
@@ -266,6 +274,10 @@ npindexbw(\dots)
 
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Hardle, W. and P. Hall and H. Ichimura (1993), \dQuote{Optimal
+  Smoothing in Single-Index Models,} The Annals of Statistics, 21,
+  157-178.
 
   Ichimura, H., (1993), \dQuote{Semiparametric least squares (SLS) and
   weighted SLS estimation of single-index models,} Journal of
@@ -318,6 +330,7 @@ npindexbw(\dots)
 
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -326,8 +339,11 @@ npindexbw(\dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 mpi.bcast.cmd(set.seed(42),
               caller.execute=TRUE)
@@ -353,7 +369,18 @@ summary(bw)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

@@ -51,6 +51,9 @@ npregbw(\dots)
         hbd.init,
         dfac.init,
         scale.init.categorical.sample,
+        transform.bounds = FALSE,
+        invalid.penalty = c("baseline","dbmax"),
+        penalty.multiplier = 10,
         regtype,
         bwmethod,
         bwscaling,
@@ -86,6 +89,9 @@ npregbw(\dots)
         hbd.init = 0.9,
         dfac.init = 0.375, 
         scale.init.categorical.sample = FALSE,
+        transform.bounds = FALSE,
+        invalid.penalty = c("baseline","dbmax"),
+        penalty.multiplier = 10,
         \dots)
 }
 \arguments{
@@ -117,7 +123,7 @@ npregbw(\dots)
   
   \item{call}{
     the original function call. This is passed internally by
-    \code{\link{np}} when a bandwidth search has been implied by a call to
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
     another function. It is not recommended that the user set this.
   }
 
@@ -165,22 +171,22 @@ npregbw(\dots)
   }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
-    supplied bandwidths are interpreted as `scale factors'
+    supplied bandwidths are interpreted as \sQuote{scale factors}
     (\eqn{c_j}{c[j]}), otherwise when the value is \code{FALSE} they are
-    interpreted as `raw bandwidths' (\eqn{h_j}{h[j]} for continuous data
-    types, \eqn{\lambda_j}{lambda[j]} for discrete data types). For
-    continuous data types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are
-    related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(2P+l)}}{h[j] =
-    c[j]*sigma[j]*n^(-1/(2*P+l))}, where \eqn{\sigma_j}{sigma[j]} is an
-    adaptive measure of spread of continuous variable \eqn{j} defined as
-    min(standard deviation, mean absolute deviation/1.4826,
-    interquartile range/1.349), \eqn{n} the number of observations,
-    \eqn{P}{P} the order of the kernel, and \eqn{l}{l} the number of
-    continuous variables. For discrete data types, \eqn{c_j}{c[j]} and
-    \eqn{h_j}{h[j]} are related by the formula \eqn{h_j =
-    c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))}, where here
-    \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.  Defaults to
-    \code{FALSE}.  }
+    interpreted as \sQuote{raw bandwidths} (\eqn{h_j}{h[j]} for
+    continuous data types, \eqn{\lambda_j}{lambda[j]} for discrete data
+    types). For continuous data types, \eqn{c_j}{c[j]} and
+    \eqn{h_j}{h[j]} are related by the formula \eqn{h_j = c_j \sigma_j
+    n^{-1/(2P+l)}}{h[j] = c[j]*sigma[j]*n^(-1/(2*P+l))}, where
+    \eqn{\sigma_j}{sigma[j]} is an adaptive measure of spread of
+    continuous variable \eqn{j} defined as min(standard deviation, mean
+    absolute deviation/1.4826, interquartile range/1.349), \eqn{n} the
+    number of observations, \eqn{P}{P} the order of the kernel, and
+    \eqn{l}{l} the number of continuous variables. For discrete data
+    types, \eqn{c_j}{c[j]} and \eqn{h_j}{h[j]} are related by the
+    formula \eqn{h_j = c_jn^{-2/(2P+l)}}{h[j] = c[j]*n^(-2/(2*P+l))},
+    where here \eqn{j}{[j]} denotes discrete variable \eqn{j}{j}.
+    Defaults to \code{FALSE}.  }
 
   \item{bwtype}{
     character string used for the continuous variable bandwidth type,
@@ -223,7 +229,7 @@ npregbw(\dots)
   \item{okertype}{
     character string used to specify the ordered categorical kernel type.
     Can be set as \code{wangvanryzin} or \code{liracine}. Defaults to
-    \code{wangvanryzin}.
+    \code{liracine}.
   }
 
   \item{nmulti}{
@@ -291,13 +297,27 @@ npregbw(\dots)
     kernel, and \eqn{l}{l} the number of \code{numeric} variables. See
     Details}
 
+  \item{transform.bounds}{ a logical value that when set to \code{TRUE}
+    applies an internal transformation that maps the unconstrained
+    search to the feasible bandwidth domain. Defaults to
+    \code{FALSE}.}
+
+  \item{invalid.penalty}{ a character string specifying the penalty
+    used when the optimizer encounters invalid bandwidths.
+    \code{"baseline"} returns a finite penalty based on a baseline
+    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
+    \code{"baseline"}.}
+
+  \item{penalty.multiplier}{ a numeric multiplier applied to the
+    baseline penalty when \code{invalid.penalty="baseline"}.
+    Defaults to \code{10}.}
+
 }
 \details{
-
-  \code{npregbw} implements a variety of methods for choosing bandwidths
-  for multivariate (\eqn{p}-variate) regression data defined over a set
-  of possibly continuous and/or discrete (unordered, ordered) data. The
-  approach is based on Li and Racine (2003) who employ
+  \code{npregbw} implements a variety of methods for choosing
+  bandwidths for multivariate (\eqn{p}-variate) regression data defined
+  over a set of possibly continuous and/or discrete (unordered, ordered)
+  data. The approach is based on Li and Racine (2003) who employ
   \sQuote{generalized product kernels} that admit a mix of continuous
   and discrete data types.
 
@@ -310,15 +330,16 @@ npregbw(\dots)
   Three classes of kernel estimators for the continuous data types are
   available: fixed, adaptive nearest-neighbor, and generalized
   nearest-neighbor. Adaptive nearest-neighbor bandwidths change with
-  each sample realization in the set, \eqn{x_i}{x[i]}, when estimating
-  the density at the point \eqn{x}. Generalized nearest-neighbor
-  bandwidths change with the point at which the density is estimated,
-  \eqn{x}. Fixed bandwidths are constant over the support of \eqn{x}.
+  each sample realization in the set, \eqn{x_i}{x[i]}, when estimating the
+  density at the point \eqn{x}. Generalized nearest-neighbor bandwidths change
+  with the point at which the density is estimated, \eqn{x}. Fixed bandwidths
+  are constant over the support of \eqn{x}.
 
   \code{npregbw} may be invoked \emph{either} with a formula-like
-  symbolic description of variables on which bandwidth selection is to
-  be performed \emph{or} through a simpler interface whereby data is
-  passed directly to the function via the \code{xdat} and \code{ydat}
+  symbolic 
+  description of variables on which bandwidth selection is to be
+  performed \emph{or} through a simpler interface whereby data is passed
+  directly to the function via the \code{xdat} and \code{ydat}
   parameters. Use of these two interfaces is \bold{mutually exclusive}.
 
   Data contained in the data frame \code{xdat} may be a mix of
@@ -327,18 +348,19 @@ npregbw(\dots)
   (to be specified in the data frame \code{xdat} using
   \code{\link{ordered}}). Data can be entered in an arbitrary order and
   data types will be detected automatically by the routine (see
-  \code{\link{np}} for details).
+  \code{\link{npRmpi}} for details).
 
   Data for which bandwidths are to be estimated may be specified
   symbolically. A typical description has the form \code{dependent data
-  ~ explanatory data}, where \code{dependent data} is a univariate
-  response, and \code{explanatory data} is a series of variables
-  specified by name, separated by the separation character '+'. For
-  example, \code{ y1 ~ x1 + x2 } specifies that the bandwidths for the
-  regression of response \code{y1} and nonparametric regressors
-  \code{x1} and \code{x2} are to be estimated.  See below for further
-  examples.
-
+    ~ explanatory data},
+  where \code{dependent data} is a univariate response, and
+  \code{explanatory data} is a
+  series of variables specified by name, separated by 
+  the separation character '+'. For example, \code{ y1 ~ x1 + x2 }
+  specifies that the bandwidths for the regression of response \code{y1}
+  and 
+  nonparametric regressors \code{x1} and \code{x2} are to be estimated.
+  See below for further examples. 
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
@@ -346,6 +368,14 @@ npregbw(\dots)
   kernel. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  The use of compactly supported kernels or the occurrence of small
+  bandwidths during cross-validation can lead to numerical problems for
+  the local linear estimator when computing the locally weighted least
+  squares solution. To overcome this problem we rely on a form or
+  \sQuote{ridging} proposed by Cheng, Hall, and Titterington (1997),
+  modified so that we solve the problem pointwise rather than globally
+  (i.e. only when it is needed).
 
   The optimizer invoked for search is Powell's conjugate direction
   method which requires the setting of (non-random) initial values and
@@ -363,7 +393,9 @@ npregbw(\dots)
   modifying \code{nmulti}). Further refinement for difficult cases can
   be achieved by modifying these sets of parameters. However, these
   parameters are intended more for the authors of the package to enable
-  \sQuote{tuning} for various methods rather than for the user themselves.
+  \sQuote{tuning} for various methods rather than for the user
+  themselves.
+
 }
 \value{
   \code{npregbw} returns a \code{rbandwidth} object, with the
@@ -389,6 +421,10 @@ npregbw(\dots)
 \references{
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Cheng, M.-Y. and P. Hall and D.M. Titterington (1997), \dQuote{On the
+  shrinkage of local linear curve estimators,} Statistics and Computing,
+  7, 11-17.
 
   Hall, P. and Q. Li and J.S. Racine (2007), \dQuote{Nonparametric
   estimation of regression functions in the presence of irrelevant
@@ -455,6 +491,7 @@ npregbw(\dots)
 }
 \examples{
 \dontrun{
+## Not run in checks: excluded to keep MPI examples stable and check times short.
 ## The following example is adapted for interactive parallel execution
 ## in R. Here we spawn 1 slave so that there will be two compute nodes
 ## (master and slave).  Kindly see the batch examples in the demos
@@ -463,8 +500,11 @@ npregbw(\dots)
 ## vignette for further details on running parallel np programs via
 ## vignette("npRmpi",package="npRmpi").
 
-mpi.spawn.Rslaves(nslaves=1)
-mpi.bcast.cmd(np.mpi.initialize(),caller.execute=TRUE)
+## Start npRmpi for interactive execution. If slaves are already running and
+## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
+## reuse the existing pool instead of respawning. To change the number of
+## slaves, call `npRmpi.stop(force=TRUE)` then restart.
+npRmpi.start(nslaves=1)
 
 set.seed(42)
 
@@ -492,7 +532,18 @@ summary(bw)
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
-mpi.close.Rslaves()
+## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
+## tearing down slaves in the same R session can lead to hangs/crashes.
+## npRmpi may therefore keep slave daemons alive by default and
+## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## actually shut down the slaves.
+##
+## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
+## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
+## loading the package.
+
+npRmpi.stop()               ## soft close (may keep slaves alive)
+## npRmpi.stop(force=TRUE)  ## hard close
 
 ## Note that in order to exit npRmpi properly avoid quit(), and instead
 ## use mpi.quit() as follows.

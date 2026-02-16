@@ -1,5 +1,5 @@
 \name{mpi.probe}
-\title{MPI\_Probe and MPI\_Iprobe APIs}
+\title{MPI_Probe and MPI_Iprobe APIs}
 \usage{
 mpi.probe(source, tag, comm = 1, status = 0)
 mpi.iprobe(source, tag, comm = 1, status = 0)
@@ -36,8 +36,8 @@ received; FALSE otherwise.
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
  \code{\link{mpi.send}}, \code{\link{mpi.recv}},

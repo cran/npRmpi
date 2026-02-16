@@ -1,5 +1,5 @@
 \name{mpi.send}
-\title{MPI\_Send, MPI\_Isend, MPI\_Recv, and MPI\_Irecv APIs}
+\title{MPI_Send, MPI_Isend, MPI_Recv, and MPI_Irecv APIs}
 \alias{mpi.send}
 \alias{mpi.isend}
 \alias{mpi.recv}
@@ -73,8 +73,8 @@ used to complete the operations.
 Hao Yu
 }
 \references{
-  \url{http://www.lam-mpi.org/}, 
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/}, 
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \seealso{
   \code{\link{mpi.send.Robj}},
@@ -85,7 +85,9 @@ Hao Yu
   \code{\link{mpi.get.sourcetag}}. 
 } 
 \examples{ 
-\donttest{
+\dontrun{
+# Not run in checks: send/recv calls must be paired across ranks.
+# Running one side without a matching peer can deadlock.
 #on a slave
 mpi.send(1:10,1,0,0)
 
@@ -98,4 +100,3 @@ x
 }
 } 
 \keyword{interface}
-

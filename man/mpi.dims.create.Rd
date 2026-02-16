@@ -1,5 +1,5 @@
 \name{mpi.dims.create}
-\title{MPI\_Dims\_create}
+\title{MPI_Dims_create}
 \alias{mpi.dims.create}
 \description{
  \code{mpi.dims.create} Create a Cartesian dimension used by \code{mpi.cart.create}.
@@ -30,15 +30,17 @@ Hao Yu
 \code{\link{mpi.cart.create}}
 }
 \references{
-  \url{http://www.lam-mpi.org/},
-  \url{http://www-unix.mcs.anl.gov/mpi/www/www3/}
+  \url{https://www.mpich.org/},
+  \url{https://www.mpich.org/static/docs/latest/www3/}
 }
 \examples{
-\donttest{
+\dontrun{
+## Not run in checks when toggled to dontrun: this MPI utility example is
+## intended for manual interactive use.
 #What is the dim numbers of 2 dim Cartersian topology under a grid of 36 nodes
 mpi.dims.create(36,2)	#return c(6,6)
 #Constrained dim numbers
 mpi.dims.create(12,2,c(0,4)) #return c(9,4)
-}
+} % enddontrun
 } 
 \keyword{interface}
