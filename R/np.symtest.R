@@ -11,6 +11,9 @@ npsymtest <- function(data = NULL,
                       boot.method = c("iid", "geom"),
                       random.seed = 42,
                       ...) {
+  .npRmpi_require_active_slave_pool(where = "npsymtest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   if(is.data.frame(data)) stop(" you must enter a data vector (not data frame)")
   if(is.null(data)) stop(" you must enter a data vector")
@@ -22,18 +25,8 @@ npsymtest <- function(data = NULL,
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
-
-  set.seed(random.seed)
-
-  console <- newLineConsole()
-  console <- printPush(paste(sep="", "Working..."), console = console)
-  console <- printPop(console)
+  seed.state <- .np_seed_enter(random.seed)
+  .np_progress_note("Computing bandwidths")
 
   ## If of type ts convert to numeric to handle time series data
 
@@ -71,6 +64,7 @@ npsymtest <- function(data = NULL,
     if(is.null(bw)) {
       n <- length(data)
       c <- length(unique(data))
+      if(c <= 1) stop("data must contain at least two distinct factor levels")
       xeval <- unique(data)
       p <- fitted(npudens(tdat=data,edat=xeval,bws=0,...))
       sum.Lambda3 <- c/(c-1)*sum(p*(1-p))
@@ -120,7 +114,7 @@ npsymtest <- function(data = NULL,
         ## Inf, and NaN.
         summand <- f.data.rotate/f.data
         if(!all(is.finite(summand))) {
-          warning(" non-finite value in summation-based statistic: integration recommended")
+          .np_warning(" non-finite value in summation-based statistic: integration recommended")
           summand <- summand[is.finite(summand)]
         }
         return(0.5*mean((1-sqrt(summand))**2))
@@ -132,7 +126,7 @@ npsymtest <- function(data = NULL,
           return(0.5*(sqrt(f.data)-sqrt(f.data.rotate))**2)
         }
         return.integrate <- integrate(h,-Inf,Inf,subdivisions=1e+05,stop.on.error=FALSE,data=data,data.rotate=data.rotate)
-        if(return.integrate$message != "OK") warning(return.integrate$message)
+        if(return.integrate$message != "OK") .np_warning(return.integrate$message)
         return(return.integrate$value)
       }
     } else {
@@ -154,16 +148,17 @@ npsymtest <- function(data = NULL,
   ## between boot.fun.boot and boot.fun.tsboot is the order of
   ## arguments.
 
-  B.counter <- 0
+  boot.state <- new.env(parent = emptyenv())
+  boot.state$counter <- 0L
+  boot.state$progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
 
   ## Function to be fed to tsboot - accepts a vector of integers
   ## corresponding to all observations in the sample (1,2,...) that
   ## get permuted/rearranged to define resampled data.
 
 	boot.fun <- function(ii,data.null,bw) {
-    console <<- printClear(console)
-    console <<- printPush(paste(sep="", "Bootstrap replication ",
-                                    B.counter, "/", boot.num, "..."), console = console)
+    boot.state$counter <- boot.state$counter + 1L
+    boot.state$progress <- .np_progress_step(boot.state$progress, done = boot.state$counter)
     null.sample1 <- data.null[ii]
     if(is.numeric(data.null)) {
       null.sample2 <- -(null.sample1-mean(null.sample1))+mean(null.sample1)
@@ -182,12 +177,13 @@ npsymtest <- function(data = NULL,
         null.sample2 <- factor(-(tmp-location)+location,levels=data.levels)
       }
     }
-    B.counter <<- B.counter + 1
     return(Srho.sym(null.sample1,null.sample2,bw,method=method))
 	}
 
   ## Need to bootstrap integers for data.null to accommodate both
   ## numeric and factor/ordered.
+
+  tseries.idx <- seq_len(2L * length(data))
 
   if(boot.method == "iid")  {
 
@@ -197,7 +193,7 @@ npsymtest <- function(data = NULL,
     ## bootstrap with a block length of 1 which is presumed to
     ## generate an iid bootstrap.
 
-    resampled.stat <- tsboot(tseries = 1:(2*length(data)),
+    resampled.stat <- tsboot(tseries = tseries.idx,
                              statistic = boot.fun,
                              R = boot.num,
                              n.sim = length(data),
@@ -215,7 +211,7 @@ npsymtest <- function(data = NULL,
       boot.blocklen <- b.star(as.numeric(data.matrix(data)),round=TRUE)[1,1]
     }
 
-    resampled.stat <- tsboot(tseries = 1:(2*length(data)),
+    resampled.stat <- tsboot(tseries = tseries.idx,
                              statistic = boot.fun,
                              R = boot.num,
                              n.sim = length(data),
@@ -226,14 +222,13 @@ npsymtest <- function(data = NULL,
 
   }
 
-  console <- printClear(console)
-  console <- printPop(console)  
+  boot.state$progress <- .np_progress_end(boot.state$progress)
 
-  p.value <- mean(ifelse(resampled.stat > test.stat, 1, 0))
+  p.value <- mean(resampled.stat > test.stat)
 
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
   
   symtest(Srho = test.stat,
           Srho.bootstrap = resampled.stat,

@@ -57,9 +57,13 @@ npregiv <- function(y,
                     starting.values=NULL,
                     stop.on.increase=TRUE,
                     ...) {
+  .npRmpi_require_active_slave_pool(where = "npregiv()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   ptm.start <- proc.time()
   cl <- match.call()
+  if(!is.null(nmulti)) nmulti <- npValidateNmulti(nmulti)
 
   ## This function was constructed initially by Samuele Centorrino
   ## <samuele.centorrino@univ-tlse1.fr> to reproduce illustrations in
@@ -232,7 +236,7 @@ npregiv <- function(y,
       if(ncol(X.train)!=ncol(X.eval))
           stop("Error: training and evaluation data have unequal number of columns\n")
 
-      X.col.numeric <- sapply(1:ncol(X.train),function(i){is.numeric(X.train[,i])})
+      X.col.numeric <- vapply(seq_len(ncol(X.train)), function(i) is.numeric(X.train[,i]), logical(1))
 
       ## k represents the number of numeric regressors, this will return
       ## zero if there are none
@@ -292,14 +296,14 @@ npregiv <- function(y,
 
           ## Re-use this matrix, shrinking occurs here
 
-          W.z <- W.glp(xdat=X.train.numeric,
+          W.z <- W.lp(xdat=X.train.numeric,
                              degree=rep(p,NCOL(X.train.numeric)))
 
           if(is.null(mydata.eval)) {
               ## Guess we could avoid copy with conditional statement below using either W.z or W.z.eval
               W.z.eval <- W.z
           } else {
-              W.z.eval <- W.glp(xdat=X.train.numeric,
+              W.z.eval <- W.lp(xdat=X.train.numeric,
                                       exdat=as.data.frame(X.eval.numeric),
                                       degree=rep(p,NCOL(X.train.numeric)))
           }
@@ -308,13 +312,15 @@ npregiv <- function(y,
 
           WzkWz.inv <- list()
 
-          for(i in 1:ncol(K.x)) {
+          for(i in seq_len(ncol(K.x))) {
 
-              if(tryCatch(WzkWz.inv[[i]] <- as.matrix(chol2inv(chol(t(W.z)%*%(K.x[,i]*W.z)))),
-                          error = function(e){
-                              return(matrix(FALSE,nc,nc))
-                          })[1,1]!=FALSE) {
+              WzkWz.inv.try <- tryCatch(as.matrix(chol2inv(chol(t(W.z)%*%(K.x[,i]*W.z)))),
+                                        error = function(e){
+                                            return(matrix(FALSE,nc,nc))
+                                        })
 
+              if(WzkWz.inv.try[1,1]!=FALSE) {
+                  WzkWz.inv[[i]] <- WzkWz.inv.try
               } else {
 
                   if(shrink==FALSE) {
@@ -341,7 +347,7 @@ npregiv <- function(y,
 
                       WzkWz.inv[[i]] <- as.matrix(chol2inv(chol(t(W.z)%*%(K.x[,i]*W.z)+diag(rep(ridge,nc)))))
 
-                      warning(paste("Ridging obs. ", i, ", ridge = ", signif(ridge,6),sep=""),
+                      .np_warning(paste("Ridging obs. ", i, ", ridge = ", signif(ridge,6),sep=""),
                               immediate.=warning.immediate,
                               call.=!warning.immediate)
 
@@ -356,18 +362,18 @@ npregiv <- function(y,
 
           if(deriv==0) {
               Kmat <- matrix(NA, n.eval, n.train)
-              for(i in 1:n.eval) {
+              for(i in seq_len(n.eval)) {
                   Kmat[i,] <- W.z.eval[i,,drop=FALSE]%*%WzkWz.inv[[i]]%*%t(W.z)*K.x[,i]
               }
           }
           if(deriv==1) {
-              W.z.deriv.1 <- W.glp(xdat=X.train.numeric,
+              W.z.deriv.1 <- W.lp(xdat=X.train.numeric,
                                          exdat=as.matrix(X.eval.numeric),
                                          degree=rep(p,NCOL(X.train.numeric)),
                                          gradient.vec = 1)
 
               Kmat <- matrix(NA, n.eval, n.train)
-              for(i in 1:n.eval) {
+              for(i in seq_len(n.eval)) {
                   Kmat[i,] <- W.z.deriv.1[i,,drop=FALSE]%*%WzkWz.inv[[i]]%*%t(W.z)*K.x[,i]
               }
           }
@@ -378,7 +384,7 @@ npregiv <- function(y,
 
           Kmat <- matrix(NA, n.eval, n.train)
           if(deriv==0) {
-              for(i in 1:n.eval) {
+              for(i in seq_len(n.eval)) {
                   Kmat[i,] <- W.z.eval[i,,drop=FALSE]%*%WzkWz.inv[[i]]%*%t(W.z)*K.x[,i]
               }
           }
@@ -386,12 +392,12 @@ npregiv <- function(y,
 
           if(deriv==1) {
 
-              W.z.deriv.1 <- W.glp(xdat=X.train.numeric,
+              W.z.deriv.1 <- W.lp(xdat=X.train.numeric,
                                          exdat=as.matrix(X.eval.numeric),
                                          degree=rep(p,NCOL(X.train.numeric)),
                                          gradient.vec = 1)
 
-              for(i in 1:n.eval) {
+              for(i in seq_len(n.eval)) {
                   Kmat[i,] <- W.z.deriv.1[i,,drop=FALSE]%*%WzkWz.inv[[i]]%*%t(W.z)*K.x[,i]
               }
 
@@ -399,12 +405,12 @@ npregiv <- function(y,
 
           if(deriv==2) {
 
-              W.z.deriv.2 <- W.glp(xdat=X.train.numeric,
+              W.z.deriv.2 <- W.lp(xdat=X.train.numeric,
                                          exdat=as.matrix(X.eval.numeric),
                                          degree=rep(p,NCOL(X.train.numeric)),
                                          gradient.vec = 2)
 
-              for(i in 1:n.eval) {
+              for(i in seq_len(n.eval)) {
                   Kmat[i,] <- W.z.deriv.2[i,,drop=FALSE]%*%WzkWz.inv[[i]]%*%t(W.z)*K.x[,i]
               }
 
@@ -429,7 +435,7 @@ npregiv <- function(y,
     if(is.null(tydat)) stop("Error: You must provide y data")
     if(is.null(txdat)) stop("Error: You must provide X data")
     if(is.null(bws)) stop("Error: You must provide a bandwidth object")
-    if(is.null(degree) | any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
+    if(is.null(degree) || any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
     if(p>0 && (any(deriv < 0) || any(deriv > degree)))
       stop("deriv must lie between 0 and degree")
 
@@ -507,14 +513,14 @@ npregiv <- function(y,
 
     } else {
 
-      W <- W.glp(xdat=txdat,
+      W <- W.lp(xdat=txdat,
                        degree=degree)
 
-      W.eval <- W.glp(xdat=txdat,
+      W.eval <- W.lp(xdat=txdat,
                             exdat=exdat,
                             degree=degree)
 
-      W.eval.deriv <- W.glp(xdat=txdat,
+      W.eval.deriv <- W.lp(xdat=txdat,
                                   exdat=exdat,
                                   degree=degree,
                                   gradient.vec=rep(deriv,NCOL(txdat)))
@@ -555,39 +561,43 @@ npregiv <- function(y,
       tyw <- array(tww,dim = c(ncol(W)+1,ncol(W),n.eval))[1,,]
       tww <- array(tww,dim = c(ncol(W)+1,ncol(W),n.eval))[-1,,]
 
-      coef.mat <- matrix(maxPenalty,ncol(W),n.eval)
-      epsilon <- 1.0/n.eval
-      ridge <- double(n.eval)
-      ridge.lc <- double(n.eval)
-      doridge <- !logical(n.eval)
+      coef.mat <- matrix(maxPenalty, ncol(W), n.eval)
+      ridge.grid <- npRidgeSequenceAdditive(n.train = n.eval, cap = 1.0)
+      ridge <- rep.int(ridge.grid[1L], n.eval)
+      ridge.idx <- rep.int(1L, n.eval)
+      ridge.lc.mean <- double(n.eval)
+      doridge <- rep.int(TRUE, n.eval)
 
       nc <- ncol(tww[,,1])
       I.nc <- diag(nc)
 
-      ## Test for singularity of the generalized local polynomial
+      ## Test for singularity of the local polynomial (regtype = "lp")
       ## estimator, shrink the mean towards the local constant mean.
 
-      ridger <- function(i) {
-        doridge[i] <<- FALSE
-        ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-        tryCatch(chol2inv(chol(tww[,,i] + ridge[i]*I.nc))%*%tyw[,i],
-                 error = function(e){
-                   ridge[i] <<- ridge[i]+epsilon
-                   doridge[i] <<- TRUE
-                   return(rep(maxPenalty,nc))
-                 })
-      }
-
       while(any(doridge)){
-        iloo <- (1:n.eval)[doridge]
-        coef.mat[,iloo] <- sapply(iloo, ridger)
+        iloo <- seq_len(n.eval)[doridge]
+        for(i in iloo) {
+          doridge[i] <- FALSE
+          ridge.lc.mean[i] <- tyw[1,i][1]/NZD(tww[,,i][1,1])
+          coef.mat[,i] <- tryCatch(chol2inv(chol(tww[,,i] + ridge[i]*I.nc))%*%tyw[,i],
+                                   error = function(e){
+                                     ridge.idx[i] <- ridge.idx[i] + 1L
+                                     if (ridge.idx[i] <= length(ridge.grid)) {
+                                       ridge[i] <- ridge.grid[ridge.idx[i]]
+                                       doridge[i] <- TRUE
+                                     }
+                                     return(rep(maxPenalty,nc))
+                                   })
+        }
       }
 
-      mhat <- sapply(1:n.eval, function(i) {
-        (1-ridge[i])*W.eval[i,, drop = FALSE] %*% coef.mat[,i] + ridge.lc[i]
+      ridge.alpha <- pmin(1.0, ridge)
+      mhat <- sapply(seq_len(n.eval), function(i) {
+        (1 - ridge.alpha[i]) * W.eval[i,, drop = FALSE] %*% coef.mat[,i] +
+          ridge.alpha[i] * ridge.lc.mean[i]
       })
 
-      grad <- sapply(1:n.eval, function(i) {W.eval.deriv[i,-1, drop = FALSE] %*% coef.mat[-1,i]})
+      grad <- sapply(seq_len(n.eval), function(i) {W.eval.deriv[i,-1, drop = FALSE] %*% coef.mat[-1,i]})
 
       return(list(mean = mhat,
                   grad = grad))
@@ -609,7 +619,7 @@ npregiv <- function(y,
     if(is.null(xdat)) stop("Error: You must provide X data")
     if(is.null(W)) stop("Error: You must provide a weighting matrix W")
     if(is.null(bws)) stop("Error: You must provide a bandwidth object")
-    if(is.null(degree) | any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
+    if(is.null(degree) || any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
 
     xdat <- as.data.frame(xdat)
 
@@ -645,7 +655,7 @@ npregiv <- function(y,
           fv <- maxPenalty
         }
 
-        return(ifelse(is.finite(fv),fv,maxPenalty))
+        return(if (is.finite(fv)) fv else maxPenalty)
 
       } else {
 
@@ -665,31 +675,35 @@ npregiv <- function(y,
         tyw <- array(tww,dim = c(ncol(W)+1,ncol(W),n))[1,,]
         tww <- array(tww,dim = c(ncol(W)+1,ncol(W),n))[-1,,]
 
-        mean.loo <- rep(maxPenalty,n)
-        epsilon <- 1.0/n
-        ridge <- double(n)
-        ridge.lc <- double(n)
-        doridge <- !logical(n)
+        mean.loo <- rep(maxPenalty, n)
+        ridge.grid <- npRidgeSequenceAdditive(n.train = n, cap = 1.0)
+        ridge <- rep.int(ridge.grid[1L], n)
+        ridge.idx <- rep.int(1L, n)
+        ridge.lc.mean <- double(n)
+        doridge <- rep.int(TRUE, n)
 
         nc <- ncol(tww[,,1])
 
-        ## Test for singularity of the generalized local polynomial
+        ## Test for singularity of the local polynomial (regtype = "lp")
         ## estimator, shrink the mean towards the local constant mean.
 
-        ridger <- function(i) {
-          doridge[i] <<- FALSE
-          ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-          W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
-                  error = function(e){
-                    ridge[i] <<- ridge[i]+epsilon
-                    doridge[i] <<- TRUE
-                    return(rep(maxPenalty,nc))
-                  })
-        }
-
         while(any(doridge)){
-          iloo <- (1:n)[doridge]
-          mean.loo[iloo] <- (1-ridge[iloo])*sapply(iloo, ridger) + ridge.lc[iloo]
+          iloo <- seq_len(n)[doridge]
+          for(i in iloo) {
+            doridge[i] <- FALSE
+            ridge.lc.mean[i] <- tyw[1,i][1]/NZD(tww[,,i][1,1])
+            mean.i <- W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
+                                                       error = function(e){
+                                                         ridge.idx[i] <- ridge.idx[i] + 1L
+                                                         if (ridge.idx[i] <= length(ridge.grid)) {
+                                                           ridge[i] <- ridge.grid[ridge.idx[i]]
+                                                           doridge[i] <- TRUE
+                                                         }
+                                                         return(rep(maxPenalty,nc))
+                                                       })
+            alpha.i <- min(1.0, ridge[i])
+            mean.loo[i] <- (1 - alpha.i) * mean.i + alpha.i * ridge.lc.mean[i]
+          }
         }
 
         if (!any(is.nan(mean.loo)) && !any(mean.loo == maxPenalty)){
@@ -698,7 +712,7 @@ npregiv <- function(y,
           fv <- maxPenalty
         }
 
-        return(ifelse(is.finite(fv),fv,maxPenalty))
+        return(if (is.finite(fv)) fv else maxPenalty)
 
       }
 
@@ -719,7 +733,7 @@ npregiv <- function(y,
     if(is.null(xdat)) stop("Error: You must provide X data")
     if(!all(degree==0)) if(is.null(W)) stop("Error: You must provide a weighting matrix W")
     if(is.null(bws)) stop("Error: You must provide a bandwidth object")
-    if(is.null(degree) | any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
+    if(is.null(degree) || any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
 
     xdat <- as.data.frame(xdat)
 
@@ -763,13 +777,13 @@ npregiv <- function(y,
 
         aic.penalty <- (1+trH/n)/(1-(trH+2)/n)
 
-        if (!any(ghat == maxPenalty) & (aic.penalty > 0)){
+        if (!any(ghat == maxPenalty) && (aic.penalty > 0)){
           fv <- log(mean((ydat-ghat)^2)) + aic.penalty
         } else {
           fv <- maxPenalty
         }
 
-        return(ifelse(is.finite(fv),fv,maxPenalty))
+        return(if (is.finite(fv)) fv else maxPenalty)
 
       } else {
 
@@ -788,46 +802,63 @@ npregiv <- function(y,
         tyw <- array(tww,dim = c(ncol(W)+1,ncol(W),n))[1,,]
         tww <- array(tww,dim = c(ncol(W)+1,ncol(W),n))[-1,,]
 
-        ghat <- rep(maxPenalty,n)
-        epsilon <- 1.0/n
-        ridge <- double(n)
-        ridge.lc <- double(n)
-        doridge <- !logical(n)
+        ghat <- rep(maxPenalty, n)
+        ridge.grid <- npRidgeSequenceAdditive(n.train = n, cap = 1.0)
+        ridge <- rep.int(ridge.grid[1L], n)
+        ridge.idx <- rep.int(1L, n)
+        ridge.lc.mean <- double(n)
+        doridge <- rep.int(TRUE, n)
 
         nc <- ncol(tww[,,1])
 
-        ## Test for singularity of the generalized local polynomial
+        ## Test for singularity of the local polynomial (regtype = "lp")
         ## estimator, shrink the mean towards the local constant mean.
 
-        ridger <- function(i) {
-          doridge[i] <<- FALSE
-          ridge.lc[i] <- ridge[i]*tyw[1,i][1]/NZD(tww[,,i][1,1])
-          W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
-                  error = function(e){
-                    ridge[i] <<- ridge[i]+epsilon
-                    doridge[i] <<- TRUE
-                    return(rep(maxPenalty,nc))
-                  })
-        }
-
         while(any(doridge)){
-          ii <- (1:n)[doridge]
-          ghat[ii] <- (1-ridge[ii])*sapply(ii, ridger) + ridge.lc[ii]
+          ii <- seq_len(n)[doridge]
+          for(i in ii) {
+            doridge[i] <- FALSE
+            ridge.lc.mean[i] <- tyw[1,i][1]/NZD(tww[,,i][1,1])
+            ghat.i <- W[i,, drop = FALSE] %*% tryCatch(chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc))))%*%tyw[,i],
+                                                       error = function(e){
+                                                         ridge.idx[i] <- ridge.idx[i] + 1L
+                                                         if (ridge.idx[i] <= length(ridge.grid)) {
+                                                           ridge[i] <- ridge.grid[ridge.idx[i]]
+                                                           doridge[i] <- TRUE
+                                                         }
+                                                         return(rep(maxPenalty,nc))
+                                                       })
+            alpha.i <- min(1.0, ridge[i])
+            ghat[i] <- (1 - alpha.i) * ghat.i + alpha.i * ridge.lc.mean[i]
+          }
         }
 
-        trH <- kernel.i.eq.j*sum(sapply(1:n,function(i){
-          (1-ridge[i])*W[i,, drop = FALSE] %*% chol2inv(chol(tww[,,i]+diag(rep(ridge[i],nc)))) %*% t(W[i,, drop = FALSE]) + ridge[i]/NZD(tww[,,i][1,1])
-        }))
+        if (any(ghat == maxPenalty))
+          return(maxPenalty)
+
+        ridge.alpha <- pmin(1.0, ridge)
+        trH.comp <- sapply(seq_len(n), function(i) {
+          tryCatch(
+            (1 - ridge.alpha[i]) * W[i,, drop = FALSE] %*%
+              chol2inv(chol(tww[,,i] + diag(rep(ridge[i], nc)))) %*%
+              t(W[i,, drop = FALSE]) +
+              ridge.alpha[i] / NZD(tww[,,i][1,1]),
+            error = function(e) maxPenalty
+          )
+        })
+        if (any(trH.comp == maxPenalty))
+          return(maxPenalty)
+        trH <- kernel.i.eq.j * sum(trH.comp)
 
         aic.penalty <- (1+trH/n)/(1-(trH+2)/n)
 
-        if (!any(ghat == maxPenalty) & (aic.penalty > 0)){
+        if (!any(ghat == maxPenalty) && (aic.penalty > 0)){
           fv <- log(mean((ydat-ghat)^2)) + aic.penalty
         } else {
           fv <- maxPenalty
         }
 
-        return(ifelse(is.finite(fv),fv,maxPenalty))
+        return(if (is.finite(fv)) fv else maxPenalty)
 
       }
 
@@ -851,24 +882,23 @@ npregiv <- function(y,
                     ...) {
 
     ## Save seed prior to setting
+    seed.state <- .np_seed_enter(random.seed)
+    on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
 
-    if(exists(".Random.seed", .GlobalEnv)) {
-      save.seed <- get(".Random.seed", .GlobalEnv)
-      exists.seed = TRUE
-    } else {
-      exists.seed = FALSE
+    if(debug) {
+      debug.dir <- tempfile("npregiv_debug_")
+      dir.create(debug.dir, showWarnings = FALSE, recursive = TRUE)
+      debug.file.optim <- file.path(debug.dir, "optim.debug")
+      debug.file.bandwidth <- file.path(debug.dir, "bandwidth.out")
+      debug.file.summary <- file.path(debug.dir, "optim.out")
     }
-
-    set.seed(random.seed)
-
-    if(debug) system("rm optim.debug bandwidth.out optim.out")
 
     ## Don't think this error checking is robust
 
     if(is.null(ydat)) stop("Error: You must provide y data")
     if(is.null(xdat)) stop("Error: You must provide X data")
-    if(is.null(degree) | any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
-    if(!is.null(nmulti) && nmulti < 1) stop(paste("Error: nmulti must be a positive integer (minimum 1)\nnmulti is (", nmulti, ")\n",sep=""))
+    if(is.null(degree) || any(degree < 0)) stop(paste("Error: degree vector must contain non-negative integers\ndegree is (", degree, ")\n",sep=""))
+    if(!is.null(nmulti)) nmulti <- npValidateNmulti(nmulti)
 
     bwmethod = match.arg(bwmethod)
 
@@ -883,24 +913,25 @@ npregiv <- function(y,
 
     num.bw <- ncol(xdat)
 
-    if(is.null(nmulti)) nmulti <- min(5,num.bw)
+    if(is.null(nmulti)) nmulti <- npDefaultNmulti(num.bw)
 
     ## Which variables are categorical, which are discrete...
 
-    xdat.numeric <- sapply(1:ncol(xdat),function(i){is.numeric(xdat[,i])})
+    xdat.numeric <- vapply(seq_len(ncol(xdat)), function(i) is.numeric(xdat[,i]), logical(1))
 
     ## First initialize initial search values of the vector of
     ## bandwidths to lie in [0,1]
 
-    if(debug) write(c("cv",paste(rep("x",num.bw),seq(1:num.bw),sep="")),file="optim.debug",ncolumns=(num.bw+1))
+    if(debug) write(c("cv",paste(rep("x",num.bw),seq_len(num.bw),sep="")),file=debug.file.optim,ncolumns=(num.bw+1))
 
     ## Pass in the local polynomial weight matrix rather than
     ## recomputing with each iteration.
 
-    W <- W.glp(xdat=xdat,
+    W <- W.lp(xdat=xdat,
                      degree=degree)
 
     sum.lscv <- function(bw.gamma,...) {
+      .np_progress_iv_activity_step()
 
       ## Note - we set the kernel for unordered and ordered regressors
       ## to the liracine kernel (0<=lambda<=1) and test for proper
@@ -912,11 +943,12 @@ npregiv <- function(y,
         lscv <- maxPenalty
       }
 
-      if(debug) write(c(lscv,bw.gamma),file="optim.debug",ncolumns=(num.bw+1),append=TRUE)
+      if(debug) write(c(lscv,bw.gamma),file=debug.file.optim,ncolumns=(num.bw+1),append=TRUE)
       return(lscv)
     }
 
     sum.aicc <- function(bw.gamma,...) {
+      .np_progress_iv_activity_step()
 
       ## Note - we set the kernel for unordered and ordered regressors
       ## to the liracine kernel (0<=lambda<=1) and test for proper
@@ -928,7 +960,7 @@ npregiv <- function(y,
         aicc <- maxPenalty
       }
 
-      if(debug) write(c(aicc,bw.gamma),file="optim.debug",ncolumns=(num.bw+1),append=TRUE)
+      if(debug) write(c(aicc,bw.gamma),file=debug.file.optim,ncolumns=(num.bw+1),append=TRUE)
       return(aicc)
     }
 
@@ -938,7 +970,7 @@ npregiv <- function(y,
 
     ## Pass in the W matrix rather than recomputing it each time
 
-    for(iMulti in 1:nmulti) {
+    for(iMulti in seq_len(nmulti)) {
 
       num.numeric <- ncol(as.data.frame(xdat[,xdat.numeric]))
 
@@ -950,7 +982,7 @@ npregiv <- function(y,
 
         init.search.vals <- runif(ncol(xdat),0,1)
 
-        for(i in 1:ncol(xdat)) {
+        for(i in seq_len(ncol(xdat))) {
           if(xdat.numeric[i]==TRUE) {
             init.search.vals[i] <- runif(1,.5,1.5)*EssDee(xdat[,i])*nrow(xdat)^{-1/(4+num.numeric)}
           }
@@ -1024,7 +1056,7 @@ npregiv <- function(y,
         }
       }
 
-      if(optim.return$convergence != 0) warning(" optim failed to converge")
+      if(optim.return$convergence != 0) .np_warning(" optim failed to converge")
 
       fv.vec[iMulti] <- optim.return$value
 
@@ -1035,20 +1067,16 @@ npregiv <- function(y,
         best <- iMulti
         if(debug) {
           if(iMulti==1) {
-            write(cbind(iMulti,t(bw.opt)),"bandwidth.out",ncolumns=(1+length(bw.opt)))
-            write(cbind(iMulti,fv),"optim.out",ncolumns=2)
+            write(cbind(iMulti,t(bw.opt)),debug.file.bandwidth,ncolumns=(1+length(bw.opt)))
+            write(cbind(iMulti,fv),debug.file.summary,ncolumns=2)
           } else {
-            write(cbind(iMulti,t(bw.opt)),"bandwidth.out",ncolumns=(1+length(bw.opt)),append=TRUE)
-            write(cbind(iMulti,fv),"optim.out",ncolumns=2,append=TRUE)
+            write(cbind(iMulti,t(bw.opt)),debug.file.bandwidth,ncolumns=(1+length(bw.opt)),append=TRUE)
+            write(cbind(iMulti,fv),debug.file.summary,ncolumns=2,append=TRUE)
           }
         }
       }
 
     }
-
-    ## Restore seed
-
-    if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
 
     return(list(bw=bw.opt,
                 fv=fv,
@@ -1059,8 +1087,6 @@ npregiv <- function(y,
   }
 
   ## Here is where the function `npregiv' really begins:
-
-  console <- newLineConsole()
 
   ## Basic error checking
 
@@ -1090,8 +1116,25 @@ npregiv <- function(y,
   start.from <- match.arg(start.from)
   method <- match.arg(method)
 
-  nmulti.loop <- if(!is.null(nmulti)) nmulti else 1
-  nmulti <- if(!is.null(nmulti)) nmulti else 5
+  iv_set_stage <- function(label, iteration = NULL) {
+    .np_progress_iv_set_object(label = label, iteration = iteration)
+  }
+
+  iv_start_label <- function() {
+    if (identical(start.from, "Eyz")) "E[y|z]" else "E[E[y|w]|z]"
+  }
+
+  iv_residual_stage_label <- function(smooth.residuals) {
+    if (smooth.residuals) "E[y-phi(z)|w]" else "E[phi(z)|w]"
+  }
+
+  iv_adjoint_stage_label <- function(smooth.residuals) {
+    if (smooth.residuals) {
+      "E[E[y-phi(z)|w]|z]"
+    } else {
+      "E[E[y|w]-E[phi(z)|w]|z]"
+    }
+  }
 
   ## Need to determine how many x, w, z are numeric
 
@@ -1110,12 +1153,16 @@ npregiv <- function(y,
       if(!is.null(zeval)&&!is.null(xeval)) zeval <- data.frame(zeval,xeval)
   }
 
-  z.numeric <- sapply(1:NCOL(z),function(i){is.numeric(z[,i])})
+  nmulti.loop <- if(!is.null(nmulti)) nmulti else 1
+  nmulti <- if(!is.null(nmulti)) nmulti else npDefaultNmulti(max(NCOL(z), NCOL(w)))
+
+  z.numeric <- vapply(seq_len(NCOL(z)), function(i) is.numeric(z[,i]), logical(1))
   num.z.numeric <- NCOL(as.data.frame(z[,z.numeric]))
 
-  w.numeric <- sapply(1:NCOL(w),function(i){is.numeric(w[,i])})
+  w.numeric <- vapply(seq_len(NCOL(w)), function(i) is.numeric(w[,i]), logical(1))
   num.w.numeric <- NCOL(as.data.frame(w[,w.numeric]))
 
+  result <- .np_progress_select_iv(.np_progress_iv_title(), {
   if(method=="Tikhonov") {
 
     ## Now y=phi(z) + u, hence E(y|w)=E(phi(z)|w) so we need two
@@ -1128,41 +1175,30 @@ npregiv <- function(y,
 
     ## convergence <- NULL
 
-    console <- printClear(console)
-    console <- printPop(console)
+    iv_set_stage("E[y|w]")
     if(is.null(bw)) {
-        console <- printPush("Computing bandwidths and E(y|w)...",console)
-    } else {
-        console <- printPush("Computing E(y|w) using supplied bandwidths...",console)
-    }
-
-    if(is.null(bw)) {
-        hyw <- glpcv(ydat=y,
-                     xdat=w,
-                     degree=rep(p, num.w.numeric),
-                     nmulti=nmulti,
-                     random.seed=random.seed,
-                     optim.maxattempts=optim.maxattempts,
-                     optim.method=optim.method,
-                     optim.reltol=optim.reltol,
-                     optim.abstol=optim.abstol,
-                     optim.maxit=optim.maxit,
-                     ...)
+        hyw <- .np_progress_with_legacy_suppressed(glpcv(ydat=y,
+                                                        xdat=w,
+                                                        degree=rep(p, num.w.numeric),
+                                                        nmulti=nmulti,
+                                                        random.seed=random.seed,
+                                                        optim.maxattempts=optim.maxattempts,
+                                                        optim.method=optim.method,
+                                                        optim.reltol=optim.reltol,
+                                                        optim.abstol=optim.abstol,
+                                                        optim.maxit=optim.maxit,
+                                                        ...))
 
         bw.E.y.w <- hyw$bw
     } else {
         bw.E.y.w <- bw$bw.E.y.w
     }
 
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing weight matrix and E(y|w)...", console)
-
-    E.y.w <- glpreg(tydat=y,
-                    txdat=w,
-                    bws=bw.E.y.w,
-                    degree=rep(p, num.w.numeric),
-                    ...)$mean
+    E.y.w <- .np_progress_with_legacy_suppressed(glpreg(tydat=y,
+                                                        txdat=w,
+                                                        bws=bw.E.y.w,
+                                                        degree=rep(p, num.w.numeric),
+                                                        ...))$mean
 
     KYW <- Kmat.lp(mydata.train=data.frame(w),
                    bws=bw.E.y.w,
@@ -1171,41 +1207,30 @@ npregiv <- function(y,
 
     ## We conduct local polynomial kernel regression of E(y|w) on z
 
-    console <- printClear(console)
-    console <- printPop(console)
+    iv_set_stage("E[E[y|w]|z]")
     if(is.null(bw)) {
-        console <- printPush("Computing bandwidths for E(E(y|w)|z)...", console)
-    } else {
-        console <- printPush("Computing E(E(y|w)|z) using supplied bandwidths...", console)
-    }
-
-    if(is.null(bw)) {
-        hywz <- glpcv(ydat=E.y.w,
-                      xdat=z,
-                      degree=rep(p, num.z.numeric),
-                      nmulti=nmulti,
-                      random.seed=random.seed,
-                      optim.maxattempts=optim.maxattempts,
-                      optim.method=optim.method,
-                      optim.reltol=optim.reltol,
-                      optim.abstol=optim.abstol,
-                      optim.maxit=optim.maxit,
-                      ...)
+        hywz <- .np_progress_with_legacy_suppressed(glpcv(ydat=E.y.w,
+                                                         xdat=z,
+                                                         degree=rep(p, num.z.numeric),
+                                                         nmulti=nmulti,
+                                                         random.seed=random.seed,
+                                                         optim.maxattempts=optim.maxattempts,
+                                                         optim.method=optim.method,
+                                                         optim.reltol=optim.reltol,
+                                                         optim.abstol=optim.abstol,
+                                                         optim.maxit=optim.maxit,
+                                                         ...))
 
         bw.E.E.y.w.z <- hywz$bw
     } else {
         bw.E.E.y.w.z <- bw$bw.E.E.y.w.z
     }
 
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing weight matrix and E(E(y|w)|z)...", console)
-
-    E.E.y.w.z <- glpreg(tydat=E.y.w,
-                        txdat=z,
-                        bws=bw.E.E.y.w.z,
-                        degree=rep(p, num.z.numeric),
-                        ...)$mean
+    E.E.y.w.z <- .np_progress_with_legacy_suppressed(glpreg(tydat=E.y.w,
+                                                            txdat=z,
+                                                            bws=bw.E.E.y.w.z,
+                                                            degree=rep(p, num.z.numeric),
+                                                            ...))$mean
 
     KYWZ <- Kmat.lp(mydata.train=data.frame(z),
                     bws=bw.E.E.y.w.z,
@@ -1224,18 +1249,14 @@ npregiv <- function(y,
     if(!is.null(bw)) alpha <- bw$alpha
 
     if(is.null(alpha)&&is.null(bw)) {
-      console <- printClear(console)
-      console <- printPop(console)
-      console <- printPush("Numerically solving for alpha...", console)
+      iv_set_stage("alpha")
       alpha <- optimize(ittik, c(alpha.min, alpha.max), tol = alpha.tol, CZ = KYW, CY = KYWZ, Cr.r = E.E.y.w.z, r = E.y.w)$minimum
     }
 
     ## Finally, we conduct regularized Tikhonov regression using this
     ## optimal alpha.
 
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush("Computing initial phi(z) estimate...", console)
+    iv_set_stage("phi(z)")
     phi <- as.vector(tikh(alpha, CZ = KYW, CY = KYWZ, Cr.r = E.E.y.w.z))
     phi.mat <- phi
     
@@ -1254,101 +1275,68 @@ npregiv <- function(y,
         phi.eval.mat <- cbind(phi.eval.mat,phi.eval)
     }    
 
-    console <- printClear(console)
-    console <- printPop(console)
-    if(is.null(bw)) {
-        console <- printPush("Computing bandwidths for E(phi(z)|w)...", console)
-    } else {
-        console <- printPush("Computing E(phi(z)|w) using supplied bandwidths...", console)
-    }
-
     bw.E.phi.w <- NULL
     bw.E.E.phi.w.z <- NULL
 
     for(i in 1:iterate.Tikhonov.num) {
+      iter.label <- if (iterate.Tikhonov.num > 1) i else NULL
+      iv_set_stage("E[phi(z)|w]", iteration = iter.label)
 
-      if(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num) {
-          console <- printClear(console)
-          console <- printPop(console)
-          console <- printPush(paste("Iteration ",i," of ",iterate.Tikhonov.num,sep=""), console)
-      }
-
+      iv_set_stage("E[E[phi(z)|w]|z]", iteration = iter.label)
       if(is.null(bw)) {
-          hphiw <- glpcv(ydat=phi, ## 23/1/15 phi is sample
-                         xdat=w,
-                         degree=rep(p, num.w.numeric),
-                         nmulti=nmulti.loop,
-                         random.seed=random.seed,
-                         optim.maxattempts=optim.maxattempts,
-                         optim.method=optim.method,
-                         optim.reltol=optim.reltol,
-                         optim.abstol=optim.abstol,
-                         optim.maxit=optim.maxit,
-                         bw.init=bw.E.phi.w,
-                         ...)
+          hphiw <- .np_progress_with_legacy_suppressed(glpcv(ydat=phi, ## 23/1/15 phi is sample
+                                                            xdat=w,
+                                                            degree=rep(p, num.w.numeric),
+                                                            nmulti=nmulti.loop,
+                                                            random.seed=random.seed,
+                                                            optim.maxattempts=optim.maxattempts,
+                                                            optim.method=optim.method,
+                                                            optim.reltol=optim.reltol,
+                                                            optim.abstol=optim.abstol,
+                                                            optim.maxit=optim.maxit,
+                                                            bw.init=bw.E.phi.w,
+                                                            ...))
 
           bw.E.phi.w <- hphiw$bw
       } else {
           bw.E.phi.w <- bw$bw.E.phi.w
       }
 
-      if(!(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num)) {
-          console <- printClear(console)
-          console <- printPop(console)
-          console <- printPush("Computing weight matrix for E(phi(z)|w)...", console)
-      }
-
-      E.phi.w <- glpreg(tydat=phi,
-                        txdat=w,
-                        bws=bw.E.phi.w,
-                        degree=rep(p, num.w.numeric),
-                        ...)$mean
+      E.phi.w <- .np_progress_with_legacy_suppressed(glpreg(tydat=phi,
+                                                            txdat=w,
+                                                            bws=bw.E.phi.w,
+                                                            degree=rep(p, num.w.numeric),
+                                                            ...))$mean
 
       KPHIW <- Kmat.lp(mydata.train=data.frame(w),
                        bws=bw.E.phi.w,
                        p=rep(p, num.w.numeric),
                        ...)
 
-      if(!(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num)) {
-          console <- printClear(console)
-          console <- printPop(console)
-          if(is.null(bw)) {
-              console <- printPush("Computing bandwidths for E(E(phi(z)|w)|z)...", console)
-          } else {
-              console <- printPush("Computing E(E(phi(z)|w)|z) using supplied bandwidths...", console)
-          }
-      }
-
       if(is.null(bw)) {
-          hphiwz <- glpcv(ydat=E.phi.w,
-                          xdat=z,
-                          degree=rep(p, num.z.numeric),
-                          nmulti=nmulti.loop,
-                          random.seed=random.seed,
-                          optim.maxattempts=optim.maxattempts,
-                          optim.method=optim.method,
-                          optim.reltol=optim.reltol,
-                          optim.abstol=optim.abstol,
-                          optim.maxit=optim.maxit,
-                          bw.init=bw.E.E.phi.w.z,
-                          ...)
+          hphiwz <- .np_progress_with_legacy_suppressed(glpcv(ydat=E.phi.w,
+                                                             xdat=z,
+                                                             degree=rep(p, num.z.numeric),
+                                                             nmulti=nmulti.loop,
+                                                             random.seed=random.seed,
+                                                             optim.maxattempts=optim.maxattempts,
+                                                             optim.method=optim.method,
+                                                             optim.reltol=optim.reltol,
+                                                             optim.abstol=optim.abstol,
+                                                             optim.maxit=optim.maxit,
+                                                             bw.init=bw.E.E.phi.w.z,
+                                                             ...))
 
           bw.E.E.phi.w.z <- hphiwz$bw
       } else {
           bw.E.E.phi.w.z <- bw$bw.E.E.phi.w.z
       }
 
-      E.E.phi.w.z <- glpreg(tydat=E.y.w,
-                            txdat=z,
-                            bws=bw.E.E.phi.w.z,
-                            degree=rep(p, num.z.numeric),
-                            ...)$mean
-
-      if(!(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num)) {
-          console <- printClear(console)
-          console <- printPop(console)
-          console <- printPush("Computing weight matrix for E(E(phi(z)|w)|z)...", console)
-      }
+      E.E.phi.w.z <- .np_progress_with_legacy_suppressed(glpreg(tydat=E.y.w,
+                                                                txdat=z,
+                                                                bws=bw.E.E.phi.w.z,
+                                                                degree=rep(p, num.z.numeric),
+                                                                ...))$mean
       
       KPHIW <- Kmat.lp(mydata.train=data.frame(w),
                        bws=bw.E.phi.w,
@@ -1371,26 +1359,17 @@ npregiv <- function(y,
       } else {
 
           if(is.null(alpha.iter)&&is.null(bw)) {
-              if(!(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num)) {
-                  console <- printClear(console)
-                  console <- printPop(console)
-                  console <- printPush(paste("Iterating and recomputing the numerical solution for alpha (iteration ",i," of ",iterate.Tikhonov.num,")",sep=""), console)
-              }
+              iv_set_stage("alpha", iteration = iter.label)
               alpha.iter <- optimize(ittik, c(alpha.min, alpha.max), tol = alpha.tol, CZ = KPHIW, CY = KPHIWZ, Cr.r = E.E.phi.w.z, r = E.y.w)$minimum
           }
       }
 
       ## Finally, we conduct regularized Tikhonov regression using this
       ## optimal alpha and the updated bandwidths.
-      
-      if(!(iterate.Tikhonov.num > 1 && i < iterate.Tikhonov.num)) {
-          console <- printClear(console)
-          console <- printPop(console)
-          console <- printPush("Computing final phi(z) estimate...", console)
-      }
 
+      iv_set_stage("phi(z)", iteration = iter.label)
       phi <- as.vector(tikh.eval(alpha.iter, CZ = KPHIW, CY = KPHIWZ, CY.eval = KPHIWZ, r = E.y.w))
-      phi.mat <- cbind(phi.mat,phi)    
+      phi.mat <- cbind(phi.mat,phi)
 
       H <- NULL
       if(return.weights.phi) {
@@ -1492,12 +1471,9 @@ npregiv <- function(y,
       }
       
     }
-    
-    console <- printClear(console)
-    console <- printPop(console)
 
-    if((alpha.iter-alpha.min)/NZD(alpha.min) < 0.01) warning(paste("Tikhonov parameter alpha (",formatC(alpha.iter,digits=4,format="f"),") is close to the search minimum (",alpha.min,")",sep=""))
-    if((alpha.max-alpha.iter)/NZD(alpha.max) < 0.01) warning(paste("Tikhonov parameter alpha (",formatC(alpha.iter,digits=4,format="f"),") is close to the search maximum (",alpha.max,")",sep=""))
+    if((alpha.iter-alpha.min)/NZD(alpha.min) < 0.01) .np_warning(paste("Tikhonov parameter alpha (",formatC(alpha.iter,digits=4,format="f"),") is close to the search minimum (",alpha.min,")",sep=""))
+    if((alpha.max-alpha.iter)/NZD(alpha.max) < 0.01) .np_warning(paste("Tikhonov parameter alpha (",formatC(alpha.iter,digits=4,format="f"),") is close to the search maximum (",alpha.max,")",sep=""))
 
     ret <- list(phi=phi,
                 phi.eval=phi.eval,
@@ -1531,46 +1507,37 @@ npregiv <- function(y,
                 method=method,
                 ptm=proc.time() - ptm.start)
     class(ret) <- "npregiv"
-    return(ret)
+    ret
 
   } else {
 
     ## Landweber-Fridman
 
-    ## For the stopping rule
-
-    console <- printClear(console)
-    console <- printPop(console)
-    if(is.null(bw)) {
-        console <- printPush(paste("Computing bandwidths and E(y|w) for stopping rule...",sep=""),console)
-    } else {
-        console <- printPush(paste("Computing E(y|w) for stopping rule using supplied bandwidths...",sep=""),console)
-    }
-
     norm.stop <- numeric()
 
+    iv_set_stage("E[y|w]")
     if(is.null(bw)) {
-        h <- glpcv(ydat=y,
-                   xdat=w,
-                   degree=rep(p, num.w.numeric),
-                   nmulti=nmulti,
-                   random.seed=random.seed,
-                   optim.maxattempts=optim.maxattempts,
-                   optim.method=optim.method,
-                   optim.reltol=optim.reltol,
-                   optim.abstol=optim.abstol,
-                   optim.maxit=optim.maxit,
-                   ...)
+        h <- .np_progress_with_legacy_suppressed(glpcv(ydat=y,
+                                                      xdat=w,
+                                                      degree=rep(p, num.w.numeric),
+                                                      nmulti=nmulti,
+                                                      random.seed=random.seed,
+                                                      optim.maxattempts=optim.maxattempts,
+                                                      optim.method=optim.method,
+                                                      optim.reltol=optim.reltol,
+                                                      optim.abstol=optim.abstol,
+                                                      optim.maxit=optim.maxit,
+                                                      ...))
         bw.E.y.w <- h$bw
     } else {
         bw.E.y.w <- bw$bw.E.y.w
     }
 
-    E.y.w <- glpreg(tydat=y,
-                    txdat=w,
-                    bws=bw.E.y.w,
-                    degree=rep(p, num.w.numeric),
-                    ...)$mean
+    E.y.w <- .np_progress_with_legacy_suppressed(glpreg(tydat=y,
+                                                        txdat=w,
+                                                        bws=bw.E.y.w,
+                                                        degree=rep(p, num.w.numeric),
+                                                        ...))$mean
 
     if(return.weights.phi) {
 
@@ -1587,68 +1554,61 @@ npregiv <- function(y,
     ## We begin the iteration computing phi.0 and phi.1 directly, then
     ## iterate.
 
-    console <- printClear(console)
-    console <- printPop(console)
-    if(is.null(bw)) {
-        console <- printPush(paste("Computing bandwidths and E(y|z) for iteration 0...",sep=""),console)
-    } else {
-        console <- printPush(paste("Computing E(y|z) for iteration 0 using supplied bandwidths...",sep=""),console)
-    }
-
     if(is.null(starting.values)) {
+      iv_set_stage(iv_start_label())
 
       if(is.null(bw)) {
-          h <- glpcv(ydat=if(start.from=="Eyz") y else E.y.w,
-                     xdat=z,
-                     degree=rep(p, num.z.numeric),
-                     nmulti=nmulti,
-                     random.seed=random.seed,
-                     optim.maxattempts=optim.maxattempts,
-                     optim.method=optim.method,
-                     optim.reltol=optim.reltol,
-                     optim.abstol=optim.abstol,
-                     optim.maxit=optim.maxit,
-                     ...)
+          h <- .np_progress_with_legacy_suppressed(glpcv(ydat=if(start.from=="Eyz") y else E.y.w,
+                                                        xdat=z,
+                                                        degree=rep(p, num.z.numeric),
+                                                        nmulti=nmulti,
+                                                        random.seed=random.seed,
+                                                        optim.maxattempts=optim.maxattempts,
+                                                        optim.method=optim.method,
+                                                        optim.reltol=optim.reltol,
+                                                        optim.abstol=optim.abstol,
+                                                        optim.maxit=optim.maxit,
+                                                        ...))
           bw.E.y.z <- h$bw
       } else {
           bw.E.y.z <- bw$bw.E.y.z
       }
 
-      g <- glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
-                  txdat=z,
-                  bws=bw.E.y.z,
-                  degree=rep(p, num.z.numeric),
-                  ...)
+      g <- .np_progress_with_legacy_suppressed(glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                                                      txdat=z,
+                                                      bws=bw.E.y.z,
+                                                      degree=rep(p, num.z.numeric),
+                                                      ...))
 
       phi.0 <- g$mean
       phi.0.deriv.1 <- g$grad
       if(p >= 2) {
-          phi.0.deriv.2 <- glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
-                                  txdat=z,
-                                  bws=bw.E.y.z,
-                                  degree=rep(p, num.z.numeric),
-                                  deriv=2,
-                                  ...)$grad
+          phi.0.deriv.2 <- .np_progress_with_legacy_suppressed(glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                                                                      txdat=z,
+                                                                      bws=bw.E.y.z,
+                                                                      degree=rep(p, num.z.numeric),
+                                                                      deriv=2,
+                                                                      ...))$grad
       }
 
       if(!is.null(zeval)) {
-          g <- glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
-                      txdat=z,
-                      exdat=zeval,
-                      bws=bw.E.y.z,
-                      degree=rep(p, num.z.numeric),
-                      ...)
+          g <- .np_progress_with_legacy_suppressed(glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                                                          txdat=z,
+                                                          exdat=zeval,
+                                                          bws=bw.E.y.z,
+                                                          degree=rep(p, num.z.numeric),
+                                                          ...))
 
           phi.eval.0 <- g$mean
           phi.eval.0.deriv.1 <- g$grad
           if(p >= 2) {
-              phi.eval.0.deriv.2 <- glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
-                                           txdat=z,
-                                           exdat=zeval,
-                                           bws=bw.E.y.z,
-                                           degree=rep(p, num.z.numeric),
-                                           deriv=2,
-                                           ...)$grad
+              phi.eval.0.deriv.2 <- .np_progress_with_legacy_suppressed(glpreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                                                                               txdat=z,
+                                                                               exdat=zeval,
+                                                                               bws=bw.E.y.z,
+                                                                               degree=rep(p, num.z.numeric),
+                                                                               deriv=2,
+                                                                               ...))$grad
           }
       } else {
           phi.eval.0 <- NULL
@@ -1747,73 +1707,59 @@ npregiv <- function(y,
 
     starting.values.phi <- phi.0
 
-    console <- printClear(console)
-    console <- printPop(console)
-    if(smooth.residuals) {
-        if(is.null(bw)) {
-            console <- printPush(paste("Computing bandwidths and E[y-phi(z)|w] for iteration 1...",sep=""),console)
-        } else {
-            console <- printPush(paste("Computing E[y-phi(z)|w] for iteration 1 using supplied bandwidths...",sep=""),console)
-        }
-    } else {
-        if(is.null(bw)) {
-            console <- printPush(paste("Computing bandwidths and E[phi(z)|w] for iteration 1...",sep=""),console)
-        } else {
-            console <- printPush(paste("Computing E[phi(z)|w] for iteration 1 using supplied bandwidths...",sep=""),console)
-        }
-    }
+    iv_set_stage(iv_residual_stage_label(smooth.residuals), iteration = 1L)
 
     if(smooth.residuals) {
 
       resid <- y - phi.0
 
       if(is.null(bw)) {
-          h <- glpcv(ydat=resid,
-                     xdat=w,
-                     degree=rep(p, num.w.numeric),
-                     nmulti=nmulti,
-                     random.seed=random.seed,
-                     optim.maxattempts=optim.maxattempts,
-                     optim.method=optim.method,
-                     optim.reltol=optim.reltol,
-                     optim.abstol=optim.abstol,
-                     optim.maxit=optim.maxit,
-                     ...)
+          h <- .np_progress_with_legacy_suppressed(glpcv(ydat=resid,
+                                                        xdat=w,
+                                                        degree=rep(p, num.w.numeric),
+                                                        nmulti=nmulti,
+                                                        random.seed=random.seed,
+                                                        optim.maxattempts=optim.maxattempts,
+                                                        optim.method=optim.method,
+                                                        optim.reltol=optim.reltol,
+                                                        optim.abstol=optim.abstol,
+                                                        optim.maxit=optim.maxit,
+                                                        ...))
           bw.resid.w <- h$bw
       } else {
           bw.resid.w <- bw$bw.resid.w[1,]
       }
 
-      resid.fitted <- glpreg(tydat=resid,
-                             txdat=w,
-                             bws=bw.resid.w,
-                             degree=rep(p, num.w.numeric),
-                             ...)$mean
+      resid.fitted <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid,
+                                                                 txdat=w,
+                                                                 bws=bw.resid.w,
+                                                                 degree=rep(p, num.w.numeric),
+                                                                 ...))$mean
 
     } else {
 
       if(is.null(bw)) {
-          h <- glpcv(ydat=phi.0,
-                     xdat=w,
-                     degree=rep(p, num.w.numeric),
-                     nmulti=nmulti,
-                     random.seed=random.seed,
-                     optim.maxattempts=optim.maxattempts,
-                     optim.method=optim.method,
-                     optim.reltol=optim.reltol,
-                     optim.abstol=optim.abstol,
-                     optim.maxit=optim.maxit,
-                     ...)
+          h <- .np_progress_with_legacy_suppressed(glpcv(ydat=phi.0,
+                                                        xdat=w,
+                                                        degree=rep(p, num.w.numeric),
+                                                        nmulti=nmulti,
+                                                        random.seed=random.seed,
+                                                        optim.maxattempts=optim.maxattempts,
+                                                        optim.method=optim.method,
+                                                        optim.reltol=optim.reltol,
+                                                        optim.abstol=optim.abstol,
+                                                        optim.maxit=optim.maxit,
+                                                        ...))
           bw.resid.w <- h$bw
       } else {
           bw.resid.w <- bw$bw.resid.w[1,]
       }
 
-      resid.fitted <- E.y.w - glpreg(tydat=phi.0,
-                                     txdat=w,
-                                     bws=bw.resid.w,
-                                     degree=rep(p, num.w.numeric),
-                                     ...)$mean
+      resid.fitted <- E.y.w - .np_progress_with_legacy_suppressed(glpreg(tydat=phi.0,
+                                                                         txdat=w,
+                                                                         bws=bw.resid.w,
+                                                                         degree=rep(p, num.w.numeric),
+                                                                         ...))$mean
 
     }
 
@@ -1828,44 +1774,30 @@ npregiv <- function(y,
 
     norm.stop[1] <- sum(resid.fitted^2)/NZD_pos(sum(E.y.w^2))
 
-    console <- printClear(console)
-    console <- printPop(console)
-    if(smooth.residuals) {
-        if(is.null(bw)) {
-            console <- printPush(paste("Computing bandwidths and E[E(y-phi(z)|w)|z] for iteration 1...",sep=""),console)
-        } else {
-            console <- printPush(paste("Computing E[E(y-phi(z)|w)|z] for iteration 1 using supplied bandwidths...",sep=""),console)
-        }
-    } else {
-        if(is.null(bw)) {
-            console <- printPush(paste("Computing bandwidths and E[E(y|w) - E(phi(z)|w)|z] for iteration 1...",sep=""),console)
-        } else {
-            console <- printPush(paste("Computing E[E(y|w) - E(phi(z)|w)|z] for iteration 1 using supplied bandwidths...",sep=""),console)
-        }
-    }
+    iv_set_stage(iv_adjoint_stage_label(smooth.residuals), iteration = 1L)
 
     if(is.null(bw)) {
-        h <- glpcv(ydat=resid.fitted,
-                   xdat=z,
-                   degree=rep(p, num.z.numeric),
-                   nmulti=nmulti,
-                   random.seed=random.seed,
-                   optim.maxattempts=optim.maxattempts,
-                   optim.method=optim.method,
-                   optim.reltol=optim.reltol,
-                   optim.abstol=optim.abstol,
-                   optim.maxit=optim.maxit,
-                   ...)
+        h <- .np_progress_with_legacy_suppressed(glpcv(ydat=resid.fitted,
+                                                      xdat=z,
+                                                      degree=rep(p, num.z.numeric),
+                                                      nmulti=nmulti,
+                                                      random.seed=random.seed,
+                                                      optim.maxattempts=optim.maxattempts,
+                                                      optim.method=optim.method,
+                                                      optim.reltol=optim.reltol,
+                                                      optim.abstol=optim.abstol,
+                                                      optim.maxit=optim.maxit,
+                                                      ...))
         bw.resid.fitted.w.z <- h$bw
     } else {
         bw.resid.fitted.w.z <- bw$bw.resid.fitted.w.z[1,]
     }
 
-    g <- glpreg(tydat=resid.fitted,
-                txdat=z,
-                bws=bw.resid.fitted.w.z,
-                degree=rep(p, num.z.numeric),
-                ...)
+    g <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                    txdat=z,
+                                                    bws=bw.resid.fitted.w.z,
+                                                    degree=rep(p, num.z.numeric),
+                                                    ...))
 
     phi.deriv.1.list <- vector(mode="list", length=iterate.max)
     phi.deriv.eval.1.list <- vector(mode="list", length=iterate.max)
@@ -1883,22 +1815,22 @@ npregiv <- function(y,
     phi.deriv.eval.2 <- NULL
 
     if(p >= 2) {
-        phi.deriv.2 <- phi.0.deriv.2 + constant*glpreg(tydat=resid.fitted,
-                                                       txdat=z,
-                                                       bws=bw.resid.fitted.w.z,
-                                                       degree=rep(p, num.z.numeric),
-                                                       deriv=2,
-                                                       ...)$grad
+        phi.deriv.2 <- phi.0.deriv.2 + constant*.np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                                                            txdat=z,
+                                                                                            bws=bw.resid.fitted.w.z,
+                                                                                            degree=rep(p, num.z.numeric),
+                                                                                            deriv=2,
+                                                                                            ...))$grad
         phi.deriv.2.list[[1]] <- phi.deriv.2
     }
 
     if(!is.null(zeval)) {
-        g <- glpreg(tydat=resid.fitted,
-                    txdat=z,
-                    exdat=zeval,
-                    bws=bw.resid.fitted.w.z,
-                    degree=rep(p, num.z.numeric),
-                    ...)
+        g <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                        txdat=z,
+                                                        exdat=zeval,
+                                                        bws=bw.resid.fitted.w.z,
+                                                        degree=rep(p, num.z.numeric),
+                                                        ...))
         phi.eval <- phi.eval.0 + constant*g$mean
         phi.eval.mat <- matrix(NA, length(phi.eval), iterate.max)
         phi.eval.mat[,1] <- phi.eval
@@ -1907,13 +1839,13 @@ npregiv <- function(y,
         phi.deriv.eval.1.list[[1]] <- phi.deriv.eval.1
 
         if(p >= 2) {
-            phi.deriv.eval.2 <- phi.eval.0.deriv.2 + constant*glpreg(tydat=resid.fitted,
-                                                                     txdat=z,
-                                                                     bws=bw.resid.fitted.w.z,
-                                                                     exdat=zeval,
-                                                                     degree=rep(p, num.z.numeric),
-                                                                     deriv=2,
-                                                                     ...)$grad
+            phi.deriv.eval.2 <- phi.eval.0.deriv.2 + constant*.np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                                                                          txdat=z,
+                                                                                                          bws=bw.resid.fitted.w.z,
+                                                                                                          exdat=zeval,
+                                                                                                          degree=rep(p, num.z.numeric),
+                                                                                                          deriv=2,
+                                                                                                          ...))$grad
             phi.deriv.eval.2.list[[1]] <- phi.deriv.eval.2
         }
 
@@ -2056,78 +1988,62 @@ npregiv <- function(y,
     ## (but above all are named).
 
     for(j in 2:iterate.max) {
-
-      console <- printClear(console)
-      console <- printPop(console)
-
-      if(smooth.residuals) {
-          if(is.null(bw)) {
-              console <- printPush(paste("Computing bandwidths and E[y-phi(z)|w] for iteration ", j,"...",sep=""),console)
-          } else {
-              console <- printPush(paste("Computing E[y-phi(z)|w] for iteration ", j," using supplied bandwidths...",sep=""),console)
-          }
-      } else {
-          if(is.null(bw)) {
-              console <- printPush(paste("Computing bandwidths and E[phi(z)|w] for iteration ", j,"...",sep=""),console)
-          } else {
-              console <- printPush(paste("Computing E[phi(z)|w] for iteration ", j," using supplied bandwidths...",sep=""),console)
-          }
-      }
+      iv_set_stage(iv_residual_stage_label(smooth.residuals), iteration = j)
 
       if(smooth.residuals) {
 
         resid <- y - phi
 
         if(is.null(bw)) {
-            h <- glpcv(ydat=resid,
-                       xdat=w,
-                       degree=rep(p, num.w.numeric),
-                       nmulti=nmulti.loop,
-                       random.seed=random.seed,
-                       optim.maxattempts=optim.maxattempts,
-                       optim.method=optim.method,
-                       optim.reltol=optim.reltol,
-                       optim.abstol=optim.abstol,
-                       optim.maxit=optim.maxit,
-                       bw.init=bw.resid.w.mat[j-1,],
-                       ...)
+            h <- .np_progress_with_legacy_suppressed(glpcv(ydat=resid,
+                                                          xdat=w,
+                                                          degree=rep(p, num.w.numeric),
+                                                          nmulti=nmulti.loop,
+                                                          random.seed=random.seed,
+                                                          optim.maxattempts=optim.maxattempts,
+                                                          optim.method=optim.method,
+                                                          optim.reltol=optim.reltol,
+                                                          optim.abstol=optim.abstol,
+                                                          optim.maxit=optim.maxit,
+                                                          bw.init=bw.resid.w.mat[j-1,],
+                                                          ...))
         } else {
             h <- NULL
             h$bw <- bw$bw.resid.w[j,]
         }
 
-        resid.fitted <- glpreg(tydat=resid,
-                               txdat=w,
-                               bws=h$bw,
-                               degree=rep(p, num.w.numeric),
-                               ...)$mean
+        resid.fitted <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid,
+                                                                   txdat=w,
+                                                                   bws=h$bw,
+                                                                   degree=rep(p, num.w.numeric),
+                                                                   ...))$mean
 
 
       } else {
 
         if(is.null(bw)) {
-            h <- glpcv(ydat=phi,
-                       xdat=w,
-                       degree=rep(p, num.w.numeric),
-                       nmulti=nmulti.loop,
-                       random.seed=random.seed,
-                       optim.maxattempts=optim.maxattempts,
-                       optim.method=optim.method,
-                       optim.reltol=optim.reltol,
-                       optim.abstol=optim.abstol,
-                       optim.maxit=optim.maxit,
-                       bw.init=bw.resid.w.mat[j-1,],
-                       ...)
+            h <- .np_progress_with_legacy_suppressed(glpcv(ydat=phi,
+                                                          xdat=w,
+                                                          degree=rep(p, num.w.numeric),
+                                                          nmulti=nmulti.loop,
+                                                          random.seed=random.seed,
+                                                          optim.maxattempts=optim.maxattempts,
+                                                          optim.method=optim.method,
+                                                          optim.reltol=optim.reltol,
+                                                          optim.abstol=optim.abstol,
+                                                          optim.maxit=optim.maxit,
+                                                          bw.init=bw.resid.w.mat[j-1,],
+                                                          ...))
         } else {
             h <- NULL
             h$bw <- bw$bw.resid.w[j,]
         }
 
-        resid.fitted <- E.y.w - glpreg(tydat=phi,
-                                       txdat=w,
-                                       bws=h$bw,
-                                       degree=rep(p, num.w.numeric),
-                                       ...)$mean
+        resid.fitted <- E.y.w - .np_progress_with_legacy_suppressed(glpreg(tydat=phi,
+                                                                           txdat=w,
+                                                                           bws=h$bw,
+                                                                           degree=rep(p, num.w.numeric),
+                                                                           ...))$mean
 
       }
 
@@ -2142,46 +2058,32 @@ npregiv <- function(y,
 
       }
 
-      norm.stop[j] <- ifelse(penalize.iteration,j*sum(resid.fitted^2)/NZD_pos(sum(E.y.w^2)),sum(resid.fitted^2)/NZD_pos(sum(E.y.w^2)))
+      norm.stop[j] <- if (penalize.iteration) j*sum(resid.fitted^2)/NZD_pos(sum(E.y.w^2)) else sum(resid.fitted^2)/NZD_pos(sum(E.y.w^2))
 
-      console <- printClear(console)
-      console <- printPop(console)
-      if(smooth.residuals) {
-          if(is.null(bw)) {
-              console <- printPush(paste("Computing bandwidths and E[E(y-phi(z)|w)|z] for iteration ", j,"...",sep=""),console)
-          } else {
-              console <- printPush(paste("Computing E[E(y-phi(z)|w)|z] for iteration ", j," using supplied bandwidths...",sep=""),console)
-          }
-      } else {
-          if(is.null(bw)) {
-              console <- printPush(paste("Computing bandwidths and E[E(y|z)-E(phi(z)|w)|z] for iteration ", j,"...",sep=""),console)
-          } else {
-              console <- printPush(paste("Computing E[E(y|z)-E(phi(z)|w)|z] for iteration ", j," using supplied bandwidths...",sep=""),console)
-          }
-      }
+      iv_set_stage(iv_adjoint_stage_label(smooth.residuals), iteration = j)
 
       if(is.null(bw)) {
-          h <- glpcv(ydat=resid.fitted,
-                     xdat=z,
-                     degree=rep(p, num.z.numeric),
-                     nmulti=nmulti.loop,
-                     random.seed=random.seed,
-                     optim.maxattempts=optim.maxattempts,
-                     optim.method=optim.method,
-                     optim.reltol=optim.reltol,
-                     optim.abstol=optim.abstol,
-                     optim.maxit=optim.maxit,
-                     bw.init=bw.resid.fitted.w.z.mat[j-1,],
-                     ...)
+          h <- .np_progress_with_legacy_suppressed(glpcv(ydat=resid.fitted,
+                                                        xdat=z,
+                                                        degree=rep(p, num.z.numeric),
+                                                        nmulti=nmulti.loop,
+                                                        random.seed=random.seed,
+                                                        optim.maxattempts=optim.maxattempts,
+                                                        optim.method=optim.method,
+                                                        optim.reltol=optim.reltol,
+                                                        optim.abstol=optim.abstol,
+                                                        optim.maxit=optim.maxit,
+                                                        bw.init=bw.resid.fitted.w.z.mat[j-1,],
+                                                        ...))
       } else {
           h$bw <- bw$bw.resid.fitted.w.z[j,]
       }
 
-      g <- glpreg(tydat=resid.fitted,
-                  txdat=z,
-                  bws=h$bw,
-                  degree=rep(p, num.z.numeric),
-                  ...)
+      g <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                      txdat=z,
+                                                      bws=h$bw,
+                                                      degree=rep(p, num.z.numeric),
+                                                      ...))
 
       phi <- phi + constant*g$mean
       phi.mat[,j] <- phi
@@ -2189,35 +2091,35 @@ npregiv <- function(y,
       phi.deriv.1.list[[j]] <- phi.deriv.1
 
       if(p >= 2) {
-          phi.deriv.2 <- phi.deriv.2 + constant*glpreg(tydat=resid.fitted,
-                                                       txdat=z,
-                                                       bws=h$bw,
-                                                       degree=rep(p, num.z.numeric),
-                                                       deriv=2,
-                                                       ...)$grad
+          phi.deriv.2 <- phi.deriv.2 + constant*.np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                                                            txdat=z,
+                                                                                            bws=h$bw,
+                                                                                            degree=rep(p, num.z.numeric),
+                                                                                            deriv=2,
+                                                                                            ...))$grad
           phi.deriv.2.list[[j]] <- phi.deriv.2
       }
 
       if(!is.null(zeval)) {
-          g <- glpreg(tydat=resid.fitted,
-                      txdat=z,
-                      exdat=zeval,
-                      bws=h$bw,
-                      degree=rep(p, num.z.numeric),
-                      ...)
+          g <- .np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                          txdat=z,
+                                                          exdat=zeval,
+                                                          bws=h$bw,
+                                                          degree=rep(p, num.z.numeric),
+                                                          ...))
           phi.eval <- phi.eval + constant*g$mean
           phi.eval.mat[,j] <- phi.eval
 
           phi.deriv.eval.1 <- phi.deriv.eval.1 + constant*g$grad
           phi.deriv.eval.1.list[[j]] <- phi.deriv.eval.1
           if(p >= 2) {
-              phi.deriv.eval.2 <- phi.deriv.eval.2 + constant*glpreg(tydat=resid.fitted,
-                                                                     txdat=z,
-                                                                     exdat=zeval,
-                                                                     bws=h$bw,
-                                                                     degree=rep(p, num.z.numeric),
-                                                                     deriv=2,
-                                                                     ...)$grad
+              phi.deriv.eval.2 <- phi.deriv.eval.2 + constant*.np_progress_with_legacy_suppressed(glpreg(tydat=resid.fitted,
+                                                                                                          txdat=z,
+                                                                                                          exdat=zeval,
+                                                                                                          bws=h$bw,
+                                                                                                          degree=rep(p, num.z.numeric),
+                                                                                                          deriv=2,
+                                                                                                          ...))$grad
               phi.deriv.eval.2.list[[j]] <- phi.deriv.eval.2
           }
 
@@ -2332,10 +2234,6 @@ npregiv <- function(y,
 
       }
 
-      console <- printClear(console)
-      console <- printPop(console)
-      if(is.null(bw)) console <- printPush(paste("Computing stopping rule for iteration ", j,"...",sep=""),console)
-
       ## The number of iterations in LF is asymptotically equivalent
       ## to 1/alpha (where alpha is the regularization parameter in
       ## Tikhonov).  Plus the criterion function we use is increasing
@@ -2409,10 +2307,10 @@ npregiv <- function(y,
 
     if(is.null(bw))  {
 
-      norm.value <- norm.stop/(1:length(norm.stop))
+      norm.value <- norm.stop/seq_along(norm.stop)
 
       if(which.min(norm.stop) == 1 && is.monotone.increasing(norm.stop)) {
-          warning("Stopping rule increases monotonically (consult model$norm.stop):\nThis could be the result of an inspired initial value (unlikely)\nNote: we suggest manually choosing phi.0 and restarting (e.g. instead set `starting.values' to E[E(Y|w)|z])")
+          .np_warning("Stopping rule increases monotonically (consult model$norm.stop):\nThis could be the result of an inspired initial value (unlikely)\nNote: we suggest manually choosing phi.0 and restarting (e.g. instead set `starting.values' to E[E(Y|w)|z])")
           convergence <- "FAILURE_MONOTONE_INCREASING"
           phi <- starting.values.phi
           j <- 1
@@ -2453,7 +2351,7 @@ npregiv <- function(y,
               if(p>=2 && return.weights.phi.deriv.2) phi.deriv.eval.2.weights <- phi.deriv.eval.2.weights.list[[j]]    
           }
       }
-      if(j == iterate.max) warning("iterate.max reached: increase iterate.max or inspect norm.stop vector")      
+      if(j == iterate.max) .np_warning("iterate.max reached: increase iterate.max or inspect norm.stop vector")      
     } else {
         ## bw passed in, set j to norm.index, push out weights etc.
         j <- bw$norm.index
@@ -2476,9 +2374,6 @@ npregiv <- function(y,
         convergence <- NULL
     }
     
-    console <- printClear(console)
-    console <- printPop(console)
-
     ret <- list(phi=phi,
                 phi.mat=phi.mat,
                 phi.deriv.1=as.matrix(phi.deriv.1),
@@ -2515,9 +2410,11 @@ npregiv <- function(y,
                 method=method,
                 ptm=proc.time() - ptm.start)
     class(ret) <- "npregiv"
-    return(ret)
+    ret
 
   }
+  })
+  return(result)
 
 }
 
@@ -2590,6 +2487,15 @@ plot.npregiv <- function(x,
                          ...) {
 
   object <- x
+  dots <- list(...)
+  take_arg <- function(name, default = NULL) {
+    if (!is.null(dots[[name]])) {
+      val <- dots[[name]]
+      dots[[name]] <- NULL
+      return(val)
+    }
+    default
+  }
 
   ## We only support univariate endogenous predictor z
   if(NCOL(object$z) > 1) stop(" only univariate z is supported")
@@ -2604,31 +2510,55 @@ plot.npregiv <- function(x,
   if(deriv) {
     phi.prime <- object$phi.deriv.1[,1]
 
-    plot(z[order(z)], phi.prime[order(z)],
-         type="l",
-         xlab=zname,
-         ylab=paste("d", yname, "/d", zname, sep=""),
-         ...)
+    plot.type <- take_arg("type", "l")
+    plot.xlab <- take_arg("xlab", zname)
+    plot.ylab <- take_arg("ylab", paste("d", yname, "/d", zname, sep=""))
+    do.call(plot, c(list(x = z[order(z)],
+                         y = phi.prime[order(z)],
+                         type = plot.type,
+                         xlab = plot.xlab,
+                         ylab = plot.ylab),
+                    dots))
 
   } else {
 
     if(plot.data) {
-      plot(z, y,
-           xlab=zname,
-           ylab=yname,
-           type="p",
-           col="lightgrey",
-           ...)
-      lines(z[order(z)], phi[order(z)],
-            lwd=2,
-            ...)
+      plot.type <- take_arg("type", "p")
+      plot.xlab <- take_arg("xlab", zname)
+      plot.ylab <- take_arg("ylab", yname)
+      user.col <- take_arg("col", NULL)
+      line.lwd <- take_arg("lwd", 2)
+      plot.args <- c(list(x = z,
+                          y = y,
+                          xlab = plot.xlab,
+                          ylab = plot.ylab,
+                          type = plot.type,
+                          col = if (is.null(user.col)) "lightgrey" else user.col),
+                     dots)
+      do.call(plot, plot.args)
+      line.args <- list(x = z[order(z)],
+                        y = phi[order(z)],
+                        lwd = line.lwd)
+      if (!is.null(user.col)) {
+        line.args$col <- user.col
+      }
+      do.call(lines, c(line.args, dots))
     } else {
-      plot(z[order(z)], phi[order(z)],
-           type="l",
-           xlab=zname,
-           ylab=yname,
-           lwd=2,
-           ...)
+      plot.type <- take_arg("type", "l")
+      plot.xlab <- take_arg("xlab", zname)
+      plot.ylab <- take_arg("ylab", yname)
+      user.col <- take_arg("col", NULL)
+      line.lwd <- take_arg("lwd", 2)
+      plot.args <- list(x = z[order(z)],
+                        y = phi[order(z)],
+                        type = plot.type,
+                        xlab = plot.xlab,
+                        ylab = plot.ylab,
+                        lwd = line.lwd)
+      if (!is.null(user.col)) {
+        plot.args$col <- user.col
+      }
+      do.call(plot, c(plot.args, dots))
     }
   }
 

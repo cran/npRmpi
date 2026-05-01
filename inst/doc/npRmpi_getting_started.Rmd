@@ -1,0 +1,188 @@
+---
+title: "Getting Started with npRmpi"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting Started with npRmpi}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+This vignette is intentionally conservative. The goal is to provide a
+package-side overview of the modern `npRmpi` workflow without making routine
+vignette builds depend on live MPI startup.
+
+The full install matrix, platform-specific notes, and longer mode comparisons
+belong on the gallery site rather than in a shipped package vignette:
+
+- <https://jeffreyracine.github.io/gallery/mpi_large_data.html>
+- <https://jeffreyracine.github.io/gallery/quickstarts.html>
+
+The main practical point is simple: on platforms where spawning is supported,
+the recommended interactive route is now `session` mode (the `spawn` code
+path), where the estimator calls look like ordinary `np` code once MPI has been
+initialized with `npRmpi.init(nslaves = ...)`.
+
+## Which mode should I use?
+
+- Use `session` / `spawn` for ordinary interactive work on platforms where
+  spawning is supported.
+- Use `attach` when the MPI world is already launched with `mpiexec` and you
+  still want `npRmpi.init(mode = "attach")` to manage the worker loop.
+- Use `profile` / manual-broadcast mode when startup and broadcast logic need to
+  be explicit, especially on larger or heterogeneous clusters.
+
+For teaching and troubleshooting, it is usually better to be explicit than to
+rely on `mode = "auto"`.
+
+## Recommended starting point: session mode
+
+```{r}
+library(npRmpi)
+
+npRmpi.init(nslaves = 1)
+
+set.seed(1)
+x <- runif(200)
+y <- sin(2 * pi * x) + rnorm(200, sd = 0.2)
+
+bw <- npregbw(y ~ x, regtype = "ll", bwmethod = "cv.ls")
+fit <- npreg(bws = bw)
+summary(fit)
+
+npRmpi.quit()
+```
+
+The same joint polynomial-order and bandwidth selection route is also available
+here for local-polynomial-capable methods via
+`search.engine = "nomad+powell"`, but this package-side vignette stays
+operational rather than methodological.
+
+If you want the recommended route without spelling out all of the LP tuning
+arguments, use `nomad = TRUE`. This is a documented convenience preset, not a
+generic optimizer alias: it fills only missing LP degree-search controls and
+leaves compatible explicit overrides in place. This route uses the optional
+NOMAD backend provided by the suggested package `crs`, so install `crs` first
+if you want to use `nomad = TRUE` or
+`search.engine = "nomad"`/`"nomad+powell"`.
+
+```{r}
+if (requireNamespace("crs", quietly = TRUE) &&
+    utils::packageVersion("crs") >= package_version("0.15-41")) {
+  npRmpi.init(nslaves = 1)
+
+  set.seed(7)
+  n <- 120
+  x <- runif(n, -1, 1)
+  y <- x + 0.4 * x^2 + rnorm(n, sd = 0.18)
+
+  fit_nomad <- npreg(y ~ x, nomad = TRUE, degree.max = 1L, nmulti = 1L)
+  fit_nomad$bws$nomad.shortcut
+
+  bw_nomad_only <- npregbw(
+    y ~ x,
+    nomad = TRUE,
+    search.engine = "nomad",
+    degree.max = 1L,
+    nmulti = 1L
+  )
+  bw_nomad_only$nomad.shortcut
+
+  npRmpi.quit()
+}
+```
+
+The same convenience entry point is available for the other LP-capable families:
+`npcdens`, `npcdist`, `npplreg`, `npscoef`, and `npindex`, together with their
+corresponding `*bw` constructors.
+
+On current package sources, `spawn` is not the Windows entry path. There the
+practical starting point is `attach` mode under `mpiexec`.
+
+## Attach mode
+
+Use attach mode when the MPI world is already launched via `mpiexec` and you
+want `npRmpi.init(mode = "attach")` to be the startup entry point.
+
+```{r}
+library(npRmpi)
+npRmpi.init(mode = "attach")
+
+if (mpi.comm.rank(0L) == 0L) {
+  set.seed(1)
+  x <- runif(200)
+  y <- sin(2 * pi * x) + rnorm(200, sd = 0.2)
+
+  bw <- npregbw(y ~ x, regtype = "ll", bwmethod = "cv.ls")
+  fit <- npreg(bws = bw)
+  summary(fit)
+
+  npRmpi.quit(mode = "attach")
+}
+```
+
+For attach mode, keep `R_PROFILE_USER` and `R_PROFILE` cleared at launch time.
+Profile startup belongs to a different mode and should not be mixed into
+attach launches.
+
+## Profile / manual-broadcast mode
+
+Use profile mode when explicit startup and broadcast control are needed,
+especially on larger or heterogeneous clusters. In this route,
+`npRmpi.init()` is not the startup entry point; instead, ranks are launched
+with `inst/Rprofile` (or `R_PROFILE_USER`) and then initialized explicitly
+inside the script.
+
+```{r}
+mpi.bcast.cmd(np.mpi.initialize(), caller.execute = TRUE)
+
+set.seed(1)
+x <- runif(200)
+y <- sin(2 * pi * x) + rnorm(200, sd = 0.2)
+dat <- data.frame(y, x)
+
+mpi.bcast.Robj2slave(dat)
+mpi.bcast.cmd(
+  bw <- npregbw(y ~ x, regtype = "ll", bwmethod = "cv.ls", data = dat),
+  caller.execute = TRUE
+)
+mpi.bcast.cmd(
+  fit <- npreg(bws = bw, data = dat),
+  caller.execute = TRUE
+)
+
+summary(fit)
+mpi.bcast.cmd(mpi.quit(), caller.execute = TRUE)
+```
+
+For profile mode, use exactly one startup profile source via `R_PROFILE_USER`
+or a local `.Rprofile`, clear `R_PROFILE`, and avoid `--vanilla`.
+
+## Practical guidance
+
+- Start with `session` / `spawn` mode first on macOS and Linux.
+- Start with `attach` mode first on Windows.
+- Treat `attach` and `profile` as standard advanced workflows.
+- Use `attach` when you want `npRmpi.init(mode = "attach")` to manage the
+  worker loop for an already-launched MPI world.
+- Use `profile` when you want startup and broadcasts to be explicit and
+  script-controlled.
+- Keep the attach and profile launch contracts distinct rather than mixing them.
+- Keep the package-side vignette light; use longer website documentation for
+  platform-specific install notes and cluster recipes.
+
+## Where to go next
+
+- `?npRmpi.init` and package README for current install notes
+- demo scripts for `attach` and `profile` workflows
+- <https://jeffreyracine.github.io/gallery/mpi_large_data.html> for the longer
+  install/run guide
+- <https://jeffreyracine.github.io/gallery/np_npRmpi.html> for the serial-to-MPI
+  transition story

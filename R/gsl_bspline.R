@@ -21,14 +21,14 @@ gsl.bs.default <- function(x,
 #  if(!is.null(knots)) nbreak <- length(knots)
   if(!is.null(knots)&&length(knots)!=nbreak) {
     nbreak <- length(knots)
-    warning(paste(" nbreak and knots vector do not agree: resetting nbreak to", nbreak))
+    .np_warning(paste(" nbreak and knots vector do not agree: resetting nbreak to", nbreak))
   }
 
   ## For evaluation (newx) must use min/max for x unless otherwise
   ## specified - check that mix < max
 
 
-  if(!is.null(x.min)&!is.null(x.max)) if(x.min >= x.max) stop(" x.min must be less than x.max")
+  if(!is.null(x.min) && !is.null(x.max)) if(x.min >= x.max) stop(" x.min must be less than x.max")
   if(is.null(x.min)) {
 			x.min <- min(x)
 			ol <- FALSE
@@ -56,7 +56,7 @@ gsl.bs.default <- function(x,
 	outside <- ol | or 
 
 	if(any(outside)){
-			warning("some 'x' values beyond boundary knots may cause ill-conditioned bases")
+			.np_warning("some 'x' values beyond boundary knots may cause ill-conditioned bases")
 			ord <- degree + 1
 			derivs<- deriv:degree
 			if(ord == deriv) 
@@ -87,7 +87,8 @@ gsl.bs.default <- function(x,
 					tt <- bs.des(rep(k.pivot, ord-deriv), degree, nbreak,deriv= derivs, x.min, x.max, knots)
 					B[or, ] <- xr %*% (tt/scalef)
 			}
-			if(any(inside <- !outside))
+			inside <- !outside
+			if(any(inside))
 					B[inside, ] <- bs.des(x[inside], degree, nbreak, rep(deriv, length(x[inside])), x.min, x.max, knots)
 	}
 	else {
@@ -104,7 +105,9 @@ gsl.bs.default <- function(x,
 	attr(B, "x.max") <- x.max
 	attr(B, "intercept") <- intercept
 	attr(B, "knots") <- knots
-	attr(B, "class") <- c("gsl.bs","matrix")
+	# Keep "gsl.bs" as a compatibility superclass while crs remains the
+	# public owner of predict.gsl.bs.
+	attr(B, "class") <- c("npRmpi_gsl.bs","gsl.bs","matrix")
 
 	return(B)
 
@@ -123,55 +126,48 @@ bs.des     <- function(x,
 		n <- length(x)
 		deriv <- as.vector(deriv)
 
-		if(!is.null(x.min)&!is.null(x.max)) if(x.min >= x.max) stop(" x.min must be less than x.max")
+		if(!is.null(x.min) && !is.null(x.max)) if(x.min >= x.max) stop(" x.min must be less than x.max")
 		if(is.null(x.min)) x.min <- min(x)
 		if(is.null(x.max)) x.max <- max(x)
 
 		## 0 == don't use user supplied knots, 1 = use
 
-		knots.int <- ifelse(is.null(knots), 0, 1)
+		knots.int <- if (is.null(knots)) 0 else 1
 
 		ncol <- nbreak+degree-1;
 
 		if(all(deriv==0)) {
 
-				myout <- .C("gsl_bspline",
-										as.double(x),
-										as.integer(n),
-										as.integer(degree),
-										as.integer(nbreak),
-										as.double(x.min),
-										as.double(x.max),
-										as.double(knots),
-										as.integer(knots.int),
-										Bx = double(n*ncol),
-										PACKAGE="npRmpi" )
+				B <- .Call("C_gsl_bspline",
+									 as.double(x),
+									 as.integer(degree),
+									 as.integer(nbreak),
+									 as.double(x.min),
+									 as.double(x.max),
+									 as.double(knots),
+									 as.integer(knots.int),
+									 PACKAGE="npRmpi" )
 
 		} else {
 
-				myout <- .C("gsl_bspline_deriv",
-										as.double(x),
-										as.integer(n),
-										as.integer(degree),
-										as.integer(nbreak),
-										as.integer(deriv),
-										as.integer(max(deriv)), #for setting the size of memory
-										as.double(x.min),
-										as.double(x.max),
-										as.double(knots),                
-										as.integer(knots.int),
-										Bx = double(n*ncol),
-										PACKAGE="npRmpi" )
+				B <- .Call("C_gsl_bspline_deriv",
+									 as.double(x),
+									 as.integer(degree),
+									 as.integer(nbreak),
+									 as.integer(deriv),
+									 as.double(x.min),
+									 as.double(x.max),
+									 as.double(knots),
+									 as.integer(knots.int),
+									 PACKAGE="npRmpi" )
 
 		}
-
-		B <- matrix(data=myout$Bx, nrow = n, ncol = ncol, byrow = TRUE)
 
 		return(B)
 
 }
 
-predict.gsl.bs <- function(object,
+.npRmpi_predict_gsl_bs_impl <- function(object,
 													 newx=NULL,
 													 ...) {
 
@@ -190,7 +186,7 @@ predict.gsl.bs <- function(object,
 				newx <- as.numeric(newx)
 
 #				if(min(newx)<x.min || max(newx)>x.max) {
-#						warning(" evaluation data lies beyond spline support: resetting those values to min/max")
+#						.np_warning(" evaluation data lies beyond spline support: resetting those values to min/max")
 #						newx[newx < x.min] <- x.min
 #						newx[newx > x.max] <- x.max
 #						newx.ind <- sort(c(which(newx < x.min),which(newx > x.max)))
@@ -212,4 +208,16 @@ predict.gsl.bs <- function(object,
 
 		return(B)
 
+}
+
+predict.npRmpi_gsl.bs <- function(object,
+																 newx=NULL,
+																 ...) {
+		.npRmpi_predict_gsl_bs_impl(object = object, newx = newx, ...)
+}
+
+predict.gsl.bs <- function(object,
+													 newx=NULL,
+													 ...) {
+		.npRmpi_predict_gsl_bs_impl(object = object, newx = newx, ...)
 }

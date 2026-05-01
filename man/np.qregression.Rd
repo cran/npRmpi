@@ -1,7 +1,6 @@
-% $ID$
+%
 \name{npqreg}
 \alias{npqreg}
-\alias{npqreg.call}
 \alias{npqreg.condbandwidth}
 \alias{npqreg.default}
 \alias{npqreg.formula}
@@ -20,9 +19,10 @@
 \usage{
 npqreg(bws, \dots)
 
-\method{npqreg}{formula}(bws, data = NULL, newdata = NULL, \dots)
-
-\method{npqreg}{call}(bws, \dots)
+\method{npqreg}{formula}(bws, 
+       data = NULL, 
+       newdata = NULL, 
+       \dots)
 
 \method{npqreg}{condbandwidth}(bws,
        txdat = stop("training data 'txdat' missing"),
@@ -30,25 +30,23 @@ npqreg(bws, \dots)
        exdat,
        tau = 0.5,
        gradients = FALSE,
-       ftol = 1.490116e-07,
        tol = 1.490116e-04,
        small = 1.490116e-05,
        itmax = 10000,
-       lbc.dir = 0.5,
-       dfc.dir = 3,
-       cfac.dir = 2.5*(3.0-sqrt(5)),
-       initc.dir = 1.0,
-       lbd.dir = 0.1,
-       hbd.dir = 1,
-       dfac.dir = 0.25*(3.0-sqrt(5)),
-       initd.dir = 1.0,
        \dots)
 
-\method{npqreg}{default}(bws, txdat, tydat, \dots)
+\method{npqreg}{default}(bws, 
+       txdat, 
+       tydat, 
+       \dots)
 
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{condbandwidth}
     object returned from an invocation of \code{\link{npcdistbw}}, or
@@ -58,21 +56,6 @@ npqreg(bws, \dots)
     necessary to specify the bandwidth type, kernel types, and so on.
   }
 
-  \item{tau}{
-    a numeric value specifying the \eqn{\tau}{tau}th quantile is
-    desired. Defaults to \code{0.5}.
-  }
-
-  \item{\dots}{
-    additional arguments supplied to specify the regression type,
-    bandwidth type, kernel types, training data, and so on.
-    To do this,
-    you may specify any of \code{bwmethod}, \code{bwscaling},
-    \code{bwtype}, \code{cxkertype}, \code{cxkerorder},
-    \code{cykertype}, \code{cykerorder}, \code{uxkertype},
-    \code{uykertype}, \code{oxkertype}, \code{oykertype}, as described
-    in \code{\link{npcdistbw}}. 
-  }
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -82,16 +65,13 @@ npqreg(bws, \dots)
     \code{\link{npcdistbw}} was called.
   }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
-  }
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
     calculate the regression estimators. Defaults to the training data used to
     compute the bandwidth object.
   }
+
 
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
@@ -100,11 +80,17 @@ npqreg(bws, \dots)
     compute the bandwidth object.
   }
 
+
+\subsection{Evaluation Data And Returned Quantities}{
+These arguments control where the quantile regression is evaluated and which fitted quantities are returned.
+}
+
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
     evaluation takes place on the data provided by \code{txdat}.
   }
+
 
   \item{gradients}{
     [currently not supported] a logical value indicating that you want
@@ -112,65 +98,71 @@ npqreg(bws, \dots)
     object. Defaults to \code{FALSE}.
   }
 
-  \item{itmax}{
-    integer number of iterations before failure in the numerical
-    optimization routine. Defaults to \code{10000}.
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
   }
 
-  \item{ftol}{
-    fractional tolerance on the value of the cross-validation function
-    evaluated at located minima (of order the machine precision or
-    perhaps slightly larger so as not to be diddled by
-    roundoff). Defaults to \code{1.490116e-07}
-    (1.0e+01*sqrt(.Machine$double.eps)).
+
+  \item{tau}{
+    a numeric value specifying the \eqn{\tau}{tau}th quantile is
+    desired. Defaults to \code{0.5}.
   }
 
-  \item{tol}{
-    tolerance on the position of located minima of the cross-validation
-    function (tol should generally be no smaller than the square root of
-    your machine's floating point precision). Defaults to \code{
-      1.490116e-04 (1.0e+04*sqrt(.Machine$double.eps))}.
-  }
 
-  \item{small}{
-    a small number used to bracket a minimum (it is hopeless to ask for
-    a bracketing interval of width less than sqrt(epsilon) times its
-    central value, a fractional width of only about 10-04 (single
-    precision) or 3x10-8 (double precision)). Defaults to \code{small
-      = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
-  }
 
-  \item{lbc.dir,dfc.dir,cfac.dir,initc.dir}{ lower bound, chi-square
-    degrees of freedom, stretch factor, and initial non-random values
-    for direction set search for Powell's algorithm for \code{numeric}
-    variables. See Details}
-
-  \item{lbd.dir,hbd.dir,dfac.dir,initd.dir}{ lower bound, upper bound,
-    stretch factor, and initial non-random values for direction set
-    search for Powell's algorithm for categorical variables. See
-    Details}
-
+\subsection{Quantile Solver Controls}{
+These arguments control the one-dimensional numerical quantile extraction step.
 }
 
-\details{
+  \item{itmax}{
+    integer maximum number of iterations allowed in the one-dimensional
+    quantile refinement. Defaults to \code{10000}.
+  }
 
-  The optimizer invoked for search is Powell's conjugate direction
-  method which requires the setting of (non-random) initial values and
-  search directions for bandwidths, and, when restarting, random values
-  for successive invocations. Bandwidths for \code{numeric} variables
-  are scaled by robust measures of spread, the sample size, and the
-  number of \code{numeric} variables where appropriate. Two sets of
-  parameters for bandwidths for \code{numeric} can be modified, those
-  for initial values for the parameters themselves, and those for the
-  directions taken (Powell's algorithm does not involve explicit
-  computation of the function's gradient). The default values are set by
-  considering search performance for a variety of difficult test cases
-  and simulated cases. We highly recommend restarting search a large
-  number of times to avoid the presence of local minima (achieved by
-  modifying \code{nmulti}). Further refinement for difficult cases can
-  be achieved by modifying these sets of parameters. However, these
-  parameters are intended more for the authors of the package to enable
-  \sQuote{tuning} for various methods rather than for the user themselves.
+
+  \item{small}{
+    minimum interval width used by the one-dimensional quantile
+    refinement. Defaults to \code{1.490116e-05}
+    (approximately \code{1000*sqrt(.Machine$double.eps)}).
+  }
+
+
+  \item{tol}{
+    tolerance on the one-dimensional quantile location refinement.
+    Defaults to \code{1.490116e-04}
+    (approximately \code{10000*sqrt(.Machine$double.eps)}).
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the regression estimator or bandwidth interpretation path as needed.
+}
+
+  \item{\dots}{
+    additional arguments supplied to specify the regression type,
+    bandwidth type, kernel types, training data, and so on.
+    To do this,
+    you may specify any of \code{bwmethod}, \code{bwscaling},
+    \code{bwtype}, \code{cxkertype}, \code{cxkerorder},
+    \code{cykertype}, \code{cykerorder}, \code{uxkertype},
+    \code{uykertype}, \code{oxkertype}, \code{oykertype}, as described
+    in \code{\link{npcdistbw}}.
+  }
+}
+\details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
+
+  Given a conditional distribution bandwidth object, \code{npqreg}
+  estimates the conditional distribution at candidate response values
+  and extracts the requested conditional quantile by a one-dimensional
+  numerical refinement over the observed support of the dependent
+  variable. The refinement minimizes the squared residual between the
+  estimated conditional distribution and the requested probability
+  \code{tau}. The arguments \code{tol}, \code{small}, and \code{itmax}
+  control this one-dimensional refinement.
 
 }
 
@@ -190,11 +182,13 @@ npqreg(bws, \dots)
   \item{eval}{ evaluation points }
   \item{quantile}{ estimation of the quantile regression function
     (conditional quantile) at the  evaluation points }
-  \item{quanterr}{ standard errors of the quantile regression estimates } 
+  \item{quanterr}{ asymptotic standard errors of the quantile
+    regression estimates, based on the estimated conditional density at
+    the fitted quantile }
   \item{quantgrad}{ gradients at each evaluation point }
   \item{tau}{ the \eqn{\tau}{tau}th quantile computed }
 
-  
+
 }
 
 \references{
@@ -219,7 +213,7 @@ npqreg(bws, \dots)
   conditional CDF and quantile functions with mixed categorical and
   continuous data,} Journal of Business and Economic Statistics, 26,
   423-434.
-  
+
   Li, Q. and J. Lin and J.S. Racine (2013), \dQuote{Optimal Bandwidth
   Selection for Nonparametric Conditional Distribution and Quantile
   Functions}, Journal of Business and Economic Statistics, 31, 57-65.
@@ -240,7 +234,8 @@ npqreg(bws, \dots)
   type.
 }
 
-\seealso{ \pkg{quantreg} }
+\seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}} \pkg{quantreg} }
 
 \examples{
 \dontrun{
@@ -251,26 +246,34 @@ npqreg(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
 data("Italy")
-mpi.bcast.Robj2slave(Italy)
 
 ## A quantile regression example
 
-mpi.bcast.cmd(bw <- npcdistbw(gdp~ordered(year),data=Italy),
-              caller.execute=TRUE)
+bw <- npcdistbw(gdp~ordered(year),data=Italy)
 
 summary(bw)
 
-mpi.bcast.cmd(model <- npqreg(bws=bw, tau=0.50),
-              caller.execute=TRUE)
+model <- npqreg(bws=bw, tau=0.50)
 
 summary(model)
 
@@ -280,21 +283,18 @@ summary(model)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{nonparametric}

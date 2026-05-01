@@ -7,6 +7,10 @@ npseed(seed)
 }
 
 \arguments{
+\subsection{Seed Input}{
+Seed value used to reset the package C backend random number generator.
+}
+
   \item{seed}{an integer seed for the random number generator.}
 }
 \value{
@@ -18,6 +22,8 @@ npseed(seed)
 }
 
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
   \code{npseed} provides an interface for setting the random seed (and
   resetting the random number generator) used
   by \code{\link{npRmpi}}. The random number generator is used during the
@@ -35,6 +41,7 @@ npseed(seed)
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   \code{\link{set.seed}}
 }
 
@@ -59,26 +66,31 @@ npseed(seed)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(npseed(712),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+npseed(712)
 
 x <- runif(10)
 y <- x + rnorm(10, sd = 0.1)
-mydat <- data.frame(x,y)
-rm(x,y)
 
-mpi.bcast.Robj2slave(mydat)
-
-mpi.bcast.cmd(bw <- npregbw(y~x, data=mydat),
-              caller.execute=TRUE)
+bw <- npregbw(y~x)
 
 summary(bw)
 
@@ -88,21 +100,18 @@ summary(bw)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 \keyword{nonparametric}

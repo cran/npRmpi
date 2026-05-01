@@ -1,11 +1,56 @@
+.np_round_half_to_even <- function(x) {
+  intpart <- trunc(x)
+  fracpart <- x - intpart
+
+  if (fracpart < 0.5) {
+    intpart
+  } else if (fracpart > 0.5) {
+    intpart + 1
+  } else if ((intpart %% 2) != 0) {
+    intpart + 1
+  } else {
+    intpart
+  }
+}
+
+.np_sibandwidth_manual_nn_validate <- function(h, nobs, where = "sibandwidth") {
+  if (!is.finite(h))
+    stop(sprintf("%s: nearest-neighbor bandwidth must be finite", where), call. = FALSE)
+
+  upper <- max(1L, as.integer(nobs) - 1L)
+  tol <- sqrt(.Machine$double.eps)
+  rounded <- .np_round_half_to_even(h)
+  if ((h < 1) || (h > upper) || (abs(h - rounded) > tol)) {
+    stop(
+      sprintf(
+        "%s: nearest-neighbor bandwidth must be an integer in [1, %d]",
+        where,
+        upper
+      ),
+      call. = FALSE
+    )
+  }
+
+  invisible(as.double(rounded))
+}
+
 sibandwidth <-
   function(beta, h,
            method=c("ichimura","kleinspady"),
+           regtype = c("lc", "ll", "lp"),
+           basis = c("glp", "additive", "tensor"),
+           degree = NULL,
+           bernstein.basis = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
            ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            ckerorder = c(2,4,6,8),
+           ckerbound = c("none","range","fixed"),
+           ckerlb = NULL,
+           ckerub = NULL,
            fval = NA,
            ifval = NA,
+           num.feval = NA,
+           num.feval.fast = NA,
            numimp = NA,
            fval.vector = NA,
            nobs = NA,
@@ -20,25 +65,49 @@ sibandwidth <-
            ...){
 
   ndim = length(beta)
-  regtype = "lc"
+  spec <- npCanonicalConditionalRegSpec(
+    regtype = regtype,
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
+    ncon = 1L,
+    where = "sibandwidth"
+  )
+  regtype <- spec$regtype
+  basis <- spec$basis
+  degree <- spec$degree
+  bernstein.basis <- spec$bernstein.basis
   method = match.arg(method)
   ckertype = match.arg(ckertype)
+  ckerbound = match.arg(ckerbound)
   bwtype <- match.arg(bwtype)
   
   if(missing(ckerorder))
     ckerorder = 2
   else if (ckertype == "uniform")
-    warning("ignoring kernel order specified with uniform kernel type")
+    .np_warning("ignoring kernel order specified with uniform kernel type")
   else {
-    kord = eval(formals()$ckerorder) 
+    kord = c(2,4,6,8) 
     if (!any(kord == ckerorder))
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
 
   if (ckertype == "truncated gaussian" && ckerorder != 2)
-    warning("using truncated gaussian of order 2, higher orders not yet implemented")
+    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
+  cbounds <- npKernelBoundsResolve(
+    dati = xdati,
+    varnames = xnames,
+    kerbound = ckerbound,
+    kerlb = ckerlb,
+    kerub = ckerub,
+    argprefix = "cker")
+  bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
+  if (bwtype != "fixed" && cbounds$bound != "none" && !bounded_nonfixed_supported)
+    stop("finite continuous kernel bounds require bwtype = \"fixed\"")
+  if (bwtype != "fixed" && (!bandwidth.compute || h != 0))
+    .np_sibandwidth_manual_nn_validate(h = h, nobs = nobs, where = "sibandwidth")
 
   sumNum <- sfactor
   ##idati <- NA
@@ -52,7 +121,15 @@ sibandwidth <-
     regtype = regtype,
     pregtype = switch(regtype,
       lc = "Local-Constant",
-      ll = "Local-Linear"),
+      ll = "Local-Linear",
+      lp = "Local-Polynomial"),
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
+    regtype.engine = spec$regtype.engine,
+    basis.engine = spec$basis.engine,
+    degree.engine = spec$degree.engine,
+    bernstein.basis.engine = spec$bernstein.basis.engine,
     method = method,
     pmethod = switch( method,
       ichimura = "Ichimura",
@@ -64,9 +141,11 @@ sibandwidth <-
       "CG" = "CG", "NA"),
     fval = fval,
     ifval = ifval,
+    num.feval = num.feval,
+    num.feval.fast = num.feval.fast,
     numimp = numimp,
     fval.vector = fval.vector,
-    pscaling = "Bandwidth(s)",
+    pscaling = npBandwidthSummaryLabel(bwtype = bwtype),
     type = bwtype,
     ptype = switch( bwtype,
       fixed = "Fixed",
@@ -74,11 +153,10 @@ sibandwidth <-
       adaptive_nn = "Adaptive Nearest Neighbour" ),
     ckertype = ckertype,    
     ckerorder = ckerorder,
-    pckertype = switch(ckertype,
-      gaussian = paste(porder,"Gaussian"),
-      epanechnikov =  paste(porder,"Epanechnikov"),
-      uniform = "Uniform",
-      "truncated gaussian" = "Truncated Gaussian"),
+    ckerbound = cbounds$bound,
+    ckerlb = cbounds$lb,
+    ckerub = cbounds$ub,
+    pckertype = cktToPrint(ckertype, order = porder, kerbound = cbounds$bound),
     nobs = nobs,
     ndim = ndim,
     ncon = sum(xdati$icon),
@@ -96,16 +174,19 @@ sibandwidth <-
     vartitle = list(x = "Explanatory", y = "Dependent", index = "Explanatory"),
     vartitleabb = list(x = "Exp.", y = "Dep.", index = "Exp."),
     rows.omit = rows.omit,
-    nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+    nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
     total.time = total.time)
 
   mybw$klist <- list(
     index =
     list(ckertype = ckertype,
+         ckerbound = cbounds$bound,
+         ckerlb = cbounds$lb,
+         ckerub = cbounds$ub,
          pckertype = mybw$pckertype))
 
   if(only.optimize.beta)
-    mybw$pmethod <- ifelse(only.optimize.beta, paste("Pilot (bandwidth) +",mybw$pmethod, "(beta)"), mybw$pmethod)
+    mybw$pmethod <- paste("Pilot (bandwidth) +", mybw$pmethod, "(beta)")
   
   if(!bandwidth.compute)
     mybw$pmethod <- "Manual"
@@ -138,8 +219,7 @@ coef.sibandwidth <- function(object, ...) {
  names(tc) <- object$xnames
  return(tc)
 }
-plot.sibandwidth <- function(...) { npplot(...) }
-predict.sibandwidth <- function(...) { eval(npindex(...), envir = parent.frame()) }
+predict.sibandwidth <- function(...) { do.call(npindex, list(...)) }
 
 summary.sibandwidth <- function(object, ...){
   cat("\nSingle Index Model",
@@ -156,5 +236,3 @@ summary.sibandwidth <- function(object, ...){
   cat(genTimingStr(object))
   cat("\n\n")
 }
-
-

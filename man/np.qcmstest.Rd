@@ -8,6 +8,12 @@ with Mixed Data Types }
   nonlinear) as described in Racine (2006) which extends the work of
   Zheng (1998).
 }
+\details{
+  For MPI startup/performance guidance (including message-passing tradeoffs and the manual-broadcast template), see \code{\link{npRmpi.init}} details and \code{inst/Rprofile}.
+  Documentation guide: see \code{\link{np.kernels}} for kernels,
+  \code{\link{np.options}} for global options, and
+  \code{\link{plot}} for plotting options.
+}
 \usage{
 npqcmstest(formula,
            data = NULL,
@@ -27,11 +33,9 @@ npqcmstest(formula,
 }
 
 \arguments{
-    \item{formula}{
-    a symbolic description of variables on which the test is
-    to be performed. The details of constructing a formula are
-    described below.
-  }
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the model formula/data interface and explicit data inputs.
+}
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -41,9 +45,12 @@ npqcmstest(formula,
     function is called.
   }
 
-  \item{subset}{
-    an optional vector specifying a subset of observations to be used. 
+  \item{formula}{
+    a symbolic description of variables on which the test is
+    to be performed. The details of constructing a formula are
+    described below.
   }
+
 
   \item{model}{
     a model object obtained from a call to \code{\link[quantreg]{rq}}. Important: the
@@ -51,34 +58,28 @@ npqcmstest(formula,
     \code{npqcmstest} will not work.
   }
 
+
+  \item{subset}{
+    an optional vector specifying a subset of observations to be used.
+  }
+
+
   \item{xdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
     calculate the quantile regression estimators.
   }
 
+
   \item{ydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{xdat}. 
+    \code{xdat}.
   }
 
-  \item{tau}{
-    a numeric value specifying the \eqn{\tau}{tau}th quantile is desired
-  }
 
-  \item{distribution}{
-    a character string used to specify the method of estimating the
-    distribution of the statistic to be calculated. \code{bootstrap}
-    will conduct bootstrapping. \code{asymptotic} will use the normal
-    distribution. Defaults to \code{bootstrap}.
-  }
-
-  \item{bwydat}{
-    a character string used to specify the left hand side variable used
-    in bandwidth selection. \code{"varepsilon"} uses
-    \eqn{1-\tau,-\tau}{1-tau,-tau} for \code{ydat} while \code{"y"} will
-    use \eqn{y}. Defaults to \code{"y"}.
-  }
+\subsection{Bootstrap And Test Controls}{
+These arguments control the quantile level, test statistic, bootstrap procedure, and reproducibility settings.
+}
 
   \item{boot.method}{
     a character string used to specify the bootstrap method.
@@ -88,10 +89,34 @@ npqcmstest(formula,
     \code{iid}.
   }
 
+
   \item{boot.num}{
     an integer value specifying the number of bootstrap replications to
     use. Defaults to \code{399}.
   }
+
+
+  \item{bwydat}{
+    a character string used to specify the left hand side variable used
+    in bandwidth selection. \code{"varepsilon"} uses
+    \eqn{1-\tau,-\tau}{1-tau,-tau} for \code{ydat} while \code{"y"} will
+    use \eqn{y}. Defaults to \code{"y"}.
+  }
+
+
+  \item{density.weighted}{
+    a logical value specifying whether the statistic should be
+    weighted by the density of \code{xdat}. Defaults to \code{TRUE}.
+  }
+
+
+  \item{distribution}{
+    a character string used to specify the method of estimating the
+    distribution of the statistic to be calculated. \code{bootstrap}
+    will conduct bootstrapping. \code{asymptotic} will use the normal
+    distribution. Defaults to \code{bootstrap}.
+  }
+
 
   \item{pivot}{
     a logical value specifying whether the statistic should be
@@ -99,15 +124,21 @@ npqcmstest(formula,
     distribution. Defaults to \code{TRUE}.
   }
 
-  \item{density.weighted}{
-    a logical value specifying whether the statistic should be
-    weighted by the density of \code{xdat}. Defaults to \code{TRUE}.
-  }
 
   \item{random.seed}{
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
+
+
+  \item{tau}{
+    a numeric value specifying the \eqn{\tau}{tau}th quantile is desired
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection routines used by the test.
+}
 
   \item{\dots}{
     additional arguments supplied to control bandwidth selection on the
@@ -118,8 +149,8 @@ npqcmstest(formula,
     This is necessary if you specify \code{bws} as a \eqn{p}-vector and not
     a \code{bandwidth} object, and you do not desire the default behaviours.
   }
-}
 
+}
 \value{
   \code{npqcmstest} returns an object of type \code{cmstest} with the
   following components. Components will contain information
@@ -129,7 +160,7 @@ npqcmstest(formula,
   \item{In}{ the statistic \code{In} }
   \item{Omega.hat}{ as described in Racine, J.S. (2006). }
   \item{q.*}{ the various quantiles of the statistic \code{Jn} (or
-    \code{In} if 
+    \code{In} if
     \code{pivot=FALSE})  are in
     components \code{q.90},
     \code{q.95}, \code{q.99} (one-sided 1\%, 5\%, 10\% critical values) }
@@ -138,7 +169,7 @@ npqcmstest(formula,
     replications of \code{Jn} }
   \item{In.bootstrap}{ if \code{pivot=FALSE} contains the bootstrap
     replications of \code{In} }
-  
+
   \code{\link{summary}} supports object of type \code{cmstest}.
 }
 \references{
@@ -182,6 +213,11 @@ npqcmstest(formula,
   type.
 }
 
+\seealso{\code{\link{npRmpi.init}}.
+  \code{\link{np.kernels}}, \code{\link{np.options}},
+  \code{\link{plot}}, \code{\link{npregbw}}.
+}
+
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.
@@ -191,35 +227,39 @@ npqcmstest(formula,
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(library("quantreg"),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
 
-mpi.bcast.cmd(data("cps71"),
-              caller.execute=TRUE)
-mpi.bcast.cmd(attach(cps71),
-              caller.execute=TRUE)
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
 
-mpi.bcast.cmd(model <- rq(logwage~age+I(age^2), tau=0.5, model=TRUE),
-              caller.execute=TRUE)
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
-mpi.bcast.cmd(X <- data.frame(age),
-              caller.execute=TRUE)
+library("quantreg")
+
+data("cps71")
+
+model <- rq(logwage~age+I(age^2), data=cps71, tau=0.5, model=TRUE)
+
+X <- data.frame(age=cps71$age)
 
 # Note - this may take a few minutes depending on the speed of your
 # computer...
 
-mpi.bcast.cmd(output <- npqcmstest(model=model, xdat=X,
-                                   ydat=logwage, tau=0.5,
-                                   boot.num=29),
-              caller.execute=TRUE)
+output <- npqcmstest(model=model, xdat=X,
+                     ydat=cps71$logwage, tau=0.5,
+                     boot.num=29)
 
 summary(output)
 
@@ -229,21 +269,18 @@ summary(output)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{ nonparametric }

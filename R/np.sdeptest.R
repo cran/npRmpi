@@ -9,6 +9,9 @@ npsdeptest <- function(data = NULL,
                        bootstrap = TRUE,
                        boot.num = 399,
                        random.seed = 42) {
+  .npRmpi_require_active_slave_pool(where = "npsdeptest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
   
   ## Trap fatal errors
 
@@ -22,14 +25,9 @@ npsdeptest <- function(data = NULL,
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
-  
-  set.seed(random.seed)
+  seed.state <- .np_seed_enter(random.seed)
+  .np_progress_note("Computing bandwidths")
+
 
   ## If the variable is a time series convert to type numeric
 
@@ -73,7 +71,7 @@ npsdeptest <- function(data = NULL,
       ## Inf, and NaN.
 
       if(!all(is.finite(summand))) {
-        warning(" non-finite value in summation-based statistic: integration recommended")
+        .np_warning(" non-finite value in summation-based statistic: integration recommended")
         summand <- summand[is.finite(summand)]
       }
 
@@ -119,8 +117,6 @@ npsdeptest <- function(data = NULL,
 
   ## Compute the metric entropy for lags 1 through lag.num
 
-  console <- newLineConsole()
-
   Srho.vec <- numeric()
   ## `Portmanteau' cumulant of all lags
   Srho.cumulant.vec <- numeric()
@@ -131,12 +127,9 @@ npsdeptest <- function(data = NULL,
   bw.joint.y.lag <- numeric()      
   
   ## Save the bandwidths for resampling exercise...
+  lag.progress <- .np_progress_begin("Constructing metric entropy by lag", total = lag.num, surface = "lag")
   
-  for(k in 1:lag.num) {
-    
-    console <- printClear(console)
-    console <- printPop(console)  
-    
+  for (k in seq_len(lag.num)) {
     ## Create y and y.lag
     
     tmp <- ts.intersect(as.ts(data),lag(as.ts(data),k))
@@ -147,23 +140,23 @@ npsdeptest <- function(data = NULL,
     ## Compute and save bandwidths (save for bootstrapping if
     ## requested)
 
-    bw.y[k] <- npudensbw(~y)$bw
-    bw.y.lag[k] <- npudensbw(~y.lag)$bw
-    bw.joint <- npudensbw(~y+y.lag)$bw
+    bw.y[k] <- .np_progress_with_legacy_suppressed(npudensbw(~y))$bw
+    bw.y.lag[k] <- .np_progress_with_legacy_suppressed(npudensbw(~y.lag))$bw
+    bw.joint <- .np_progress_with_legacy_suppressed(npudensbw(~y+y.lag))$bw
     bw.joint.y[k] <- bw.joint[1]
     bw.joint.y.lag[k] <- bw.joint[2]
-
-    console <- printClear(console)
-    console <- printPush(paste(sep="", "Constructing metric entropy at lag ", k, "/", lag.num, "..."), console = console)
     
     Srho.vec[k] <- Srho.bivar(y,y.lag,bw.y[k],bw.y.lag[k],bw.joint,method=method)
+    lag.progress <- .np_progress_step(lag.progress, done = k, detail = paste("lag", k))
 
   }
 
-  for(k in 1:lag.num) Srho.cumulant.vec[k] <- sum(Srho.vec[1:k])
+  lag.progress <- .np_progress_end(lag.progress, detail = paste("lag", lag.num))
+
+  for (k in seq_len(lag.num)) Srho.cumulant.vec[k] <- sum(Srho.vec[seq_len(k)])
 
   ## Bootstrap if requested - null is independence so simple iid
-  ## bootstrap (sample(x,replace=TRUE)) will work
+  ## index resampling under replacement is sufficient
 
   if(bootstrap) {
 
@@ -175,49 +168,46 @@ npsdeptest <- function(data = NULL,
 
     Srho.bootstrap.mat <- matrix(NA,boot.num,(lag.num))
 		Srho.cumulant.bootstrap.mat <- matrix(NA,boot.num,(lag.num))
+    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
 
-    for(b in 1:boot.num) {
-
-      console <- printClear(console)
-      console <- printPush(paste(sep="", "Bootstrap replication ",
-                                 b, "/", boot.num, "..."), console)
+    for (b in seq_len(boot.num)) {
 
       ## Resample under the null
 
-      tmp <- as.ts(sample(data,replace=TRUE))
-      tmp <- ts.intersect(tmp,lag(tmp,k))
-      y <- as.numeric(tmp[,1])
-      y.lag <- as.numeric(tmp[,2])
-      rm(tmp)
+      resampled.ts <- as.ts(data[sample.int(length(data), replace = TRUE)])
 
-      for(k in 1:lag.num) {
-        Srho.vec.boot[k] <- Srho.bivar(y,y.lag,bw.y[k],bw.y.lag[k],c(bw.joint.y[k],bw.joint.y.lag[k]),method=method)
+      for (k in seq_len(lag.num)) {
+        tmp <- ts.intersect(resampled.ts, lag(resampled.ts, k))
+        y <- as.numeric(tmp[,1])
+        y.lag <- as.numeric(tmp[,2])
+        Srho.vec.boot[k] <- Srho.bivar(y, y.lag, bw.y[k], bw.y.lag[k], c(bw.joint.y[k], bw.joint.y.lag[k]), method = method)
         Srho.bootstrap.mat[b,k] <- Srho.vec.boot[k]
-				## `Portmanteau' cumulant of all lags
-				Srho.cumulant.vec.boot[k] <- sum(Srho.vec.boot[1:k])
-				Srho.cumulant.bootstrap.mat[b,k] <- Srho.cumulant.vec.boot[k]          
+        ## `Portmanteau' cumulant of all lags
+        Srho.cumulant.vec.boot[k] <- sum(Srho.vec.boot[seq_len(k)])
+        Srho.cumulant.bootstrap.mat[b,k] <- Srho.cumulant.vec.boot[k]
       }
 
+      progress <- .np_progress_step(progress, done = b)
+
     }
+
+    progress <- .np_progress_end(progress)
 
     ## Compute P-values
 
     P.vec <- numeric()
     P.cumulant.vec <- numeric()
     
-    for(k in 1:lag.num) {
-      P.vec[k] <- mean(ifelse(Srho.bootstrap.mat[,k]>Srho.vec[k],1,0))
-      P.cumulant.vec[k] <- mean(ifelse(Srho.cumulant.bootstrap.mat[,k]>Srho.cumulant.vec[k],1,0))
+    for (k in seq_len(lag.num)) {
+      P.vec[k] <- mean(Srho.bootstrap.mat[,k] > Srho.vec[k])
+      P.cumulant.vec[k] <- mean(Srho.cumulant.bootstrap.mat[,k] > Srho.cumulant.vec[k])
     }
 
   }
 
-  console <- printClear(console)
-  console <- printPop(console)
-  
   ## Restore seed
   
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
   
   if(bootstrap) {
     

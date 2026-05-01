@@ -59,13 +59,13 @@ total.
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+npRmpi.init(nslaves=1)
 
 data(Engel95)
 
@@ -77,7 +77,10 @@ mpi.bcast.Robj2slave(Engel95)
 mpi.bcast.cmd(attach(Engel95),
               caller.execute=TRUE)
 
-mpi.bcast.cmd(model.iv <- npregiv(y=food,z=logexp,w=logwages,method="Landweber-Fridman"),
+mpi.bcast.cmd(model.iv <- npregiv(y=food,
+                                  z=logexp,
+                                  w=logwages,
+                                  method="Landweber-Fridman"),
               caller.execute=TRUE)
 phi <- model.iv$phi
 
@@ -119,20 +122,14 @@ legend(quantile(logexp,trim),quantile(food,1-trim),
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
 } % enddontrun
 }

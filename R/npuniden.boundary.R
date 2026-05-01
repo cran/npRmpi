@@ -10,21 +10,24 @@ npuniden.boundary <- function(X=NULL,
                                   "beta1","beta2",
                                   "fb","fbl","fbu",
                                   "rigaussian","gamma"),
-                              nmulti=5,
+                              nmulti=1,
                               proper=FALSE) {
     kertype <- match.arg(kertype)
     cv <- match.arg(cv)
     bwmethod <- match.arg(bwmethod)
-    if(!is.null(grid) && any(grid<=0)) stop(" the grid vector must contain positive values")
+    if(!is.null(grid) && anyNA(grid)) stop("grid must not contain missing values")
+    if(!is.null(grid) && any(grid<=0, na.rm = TRUE)) stop(" the grid vector must contain positive values")
     if(is.null(X)) stop("you must pass a vector X")
+    if(anyNA(X)) stop("X must not contain missing values")
     if(kertype=="gamma" || kertype=="rigaussian") b <- Inf
     if(kertype=="fbl") b <- Inf
     if(kertype=="fbu") a <- -Inf
     if(a>=b) stop("a must be less than b")
-    if(any(X<a)) stop("X must be >= a")
-    if(any(X>b)) stop("X must be <= b")
-    if(!is.null(Y) && any(Y<a)) stop("Y must be >= a")
-    if(!is.null(Y) && any(Y>b)) stop("Y must be <= b")
+    if(any(X<a, na.rm = TRUE)) stop("X must be >= a")
+    if(any(X>b, na.rm = TRUE)) stop("X must be <= b")
+    if(!is.null(Y) && anyNA(Y)) stop("Y must not contain missing values")
+    if(!is.null(Y) && any(Y<a, na.rm = TRUE)) stop("Y must be >= a")
+    if(!is.null(Y) && any(Y>b, na.rm = TRUE)) stop("Y must be <= b")
     if(is.null(Y)) Y <- X
     if(!is.null(h) && h <= 0) stop("bandwidth h must be positive")
     if(nmulti < 1) stop("number of multistarts nmulti must be positive")
@@ -112,16 +115,34 @@ npuniden.boundary <- function(X=NULL,
             t <- (X-x)/h
             if(x < a+h && h < (b-a)) {
                 c <- (a-x)/h
-                ifelse(c <= t & t <= 2+c,.75*(c+1-1.25*(1+2*c)*(t-c)^2)*(t-(c+2))^2,0)/h
+                out <- numeric(length(t))
+                mask <- (c <= t) & (t <= 2 + c)
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- .75 * (c + 1 - 1.25 * (1 + 2 * c) * (tm - c)^2) * (tm - (c + 2))^2
+                }
+                out / h
             } else if((a+h <= x && x <= b-h) || h >= (b-a)) {
                 z.a <- (a-x)/h
                 z.b <- (b-x)/h  
                 rw <- (3*(z.b^5-z.a^5)-10*(z.b^3-z.a^3)+15*(z.b-z.a))/16
                 rw[rw>1] <- 1
-                ifelse(abs(t)<1,(15/16)*(1-t**2)**2/(h*rw),0)
+                out <- numeric(length(t))
+                mask <- abs(t) < 1
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- (15 / 16) * (1 - tm^2)^2 / (h * rw)
+                }
+                out
             } else if(x > b-h && h < (b-a)) {
                 c <- (b-x)/h
-                ifelse(c-2 <= t & t <= c,.75*(1-c+1.25*(-1+2*c)*(t-c)^2)*(t-(c-2))^2,0)/h
+                out <- numeric(length(t))
+                mask <- (c - 2 <= t) & (t <= c)
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- .75 * (1 - c + 1.25 * (-1 + 2 * c) * (tm - c)^2) * (tm - (c - 2))^2
+                }
+                out / h
             }
         }
     } else if(kertype=="fbl") {
@@ -130,9 +151,21 @@ npuniden.boundary <- function(X=NULL,
             t <- (X-x)/h
             if(x < a+h) {
                 c <- (a-x)/h
-                ifelse(c <= t & t <= 2+c,.75*(c+1-1.25*(1+2*c)*(t-c)^2)*(t-(c+2))^2,0)/h
+                out <- numeric(length(t))
+                mask <- (c <= t) & (t <= 2 + c)
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- .75 * (c + 1 - 1.25 * (1 + 2 * c) * (tm - c)^2) * (tm - (c + 2))^2
+                }
+                out / h
             } else {
-                ifelse(abs(t)<1,(15/16)*(1-t**2)**2/h,0)
+                out <- numeric(length(t))
+                mask <- abs(t) < 1
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- (15 / 16) * (1 - tm^2)^2 / h
+                }
+                out
             }
         }
     } else if(kertype=="fbu") {
@@ -140,10 +173,22 @@ npuniden.boundary <- function(X=NULL,
             ## Floating boundary kernel (Scott (1992), Page 46), right bound
             t <- (X-x)/h
             if(x <= b-h) {
-                ifelse(abs(t)<1,(15/16)*(1-t**2)**2/h,0)
+                out <- numeric(length(t))
+                mask <- abs(t) < 1
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- (15 / 16) * (1 - tm^2)^2 / h
+                }
+                out
             } else {
                 c <- (b-x)/h
-                ifelse(c-2 <= t & t <= c,.75*(1-c+1.25*(-1+2*c)*(t-c)^2)*(t-(c-2))^2,0)/h
+                out <- numeric(length(t))
+                mask <- (c - 2 <= t) & (t <= c)
+                if(any(mask)) {
+                    tm <- t[mask]
+                    out[mask] <- .75 * (1 - c + 1.25 * (-1 + 2 * c) * (tm - c)^2) * (tm - (c - 2))^2
+                }
+                out / h
             }
         }
     }
@@ -156,16 +201,16 @@ npuniden.boundary <- function(X=NULL,
         if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
         if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
         if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-        sapply(1:length(X),function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b)**2)[length(X.seq)]})
+        sapply(seq_along(X), function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b)**2)[length(X.seq)]})
     }
     fhat <- function(X,Y,h,a=0,b=1,proper=FALSE) {
-        f <- sapply(1:length(Y),function(i){mean(kernel(Y[i],X,h,a,b))})
+        f <- sapply(seq_along(Y), function(i){mean(kernel(Y[i],X,h,a,b))})
         if(proper) {
             if(is.finite(a) && is.finite(b)) X.seq <- seq(a,b,length=1000)
             if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
             if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
             if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-            f.seq <- sapply(1:length(X.seq),function(i){mean(kernel(X.seq[i],X,h,a,b))})
+            f.seq <- sapply(seq_along(X.seq), function(i){mean(kernel(X.seq[i],X,h,a,b))})
             if(any(f.seq<0)) {
                 f <- f - min(f.seq)
                 f.seq <- f.seq - min(f.seq)
@@ -193,21 +238,29 @@ npuniden.boundary <- function(X=NULL,
         F
     }
     fhat.loo <- function(X,h,a=0,b=1) {
-        sapply(1:length(X),function(i){mean(kernel(X[i],X[-i],h,a,b))})
+        n <- length(X)
+        if (n <= 1L) return(rep(NA_real_, n))
+        sapply(seq_along(X), function(i){
+            kv <- kernel(X[i], X, h, a, b)
+            (sum(kv) - kv[i])/(n - 1L)
+        })
     }
     if(bwmethod=="cv.ml") {
         ## Likelihood cross-validation function (maximizing)
         fnscale <- list(fnscale = -1)
         cv.function <- function(h,X,a=0,b=1) {
             f.loo <- fhat.loo(X,h,a,b)
-            return(sum(log(ifelse(f.loo > 0 & is.finite(f.loo), f.loo, .Machine$double.xmin))))
+            good <- (f.loo > 0) & is.finite(f.loo)
+            f.safe <- f.loo
+            f.safe[!good] <- .Machine$double.xmin
+            return(sum(log(f.safe)))
         }
     } else {
         ## Least-squares cross-validation function (minimizing)
         fnscale <- list(fnscale = 1) 
         cv.function <- function(h,X,a=0,b=1) {
             cv.ls <- (integrate.trapezoidal(X,fhat(X,X,h,a,b)**2)[order(X)])[length(X)]-2*mean(fhat.loo(X,h,a,b))
-            ifelse(is.finite(cv.ls),cv.ls,sqrt(sqrt(.Machine$double.xmax)))
+            if (is.finite(cv.ls)) cv.ls else sqrt(sqrt(.Machine$double.xmax))
         }
     }
     ## Grid search and then numeric optimization search (no
@@ -221,12 +274,14 @@ npuniden.boundary <- function(X=NULL,
             rob.spread <- min(rob.spread[rob.spread>0])
             constant <- rob.spread*length(X)**(-0.2)
             h.vec <- c(seq(0.25,1.75,length=10),2^(1:25))*constant
-            cv.vec <- sapply(1:length(h.vec),function(i){cv.function(h.vec[i],X,a,b)})
-            foo <- optim(h.vec[ifelse(bwmethod=="cv.ml",which.max(cv.vec),which.min(cv.vec))],
+            cv.vec <- sapply(seq_along(h.vec), function(i){cv.function(h.vec[i],X,a,b)})
+            start.idx <- if (bwmethod=="cv.ml") which.max(cv.vec) else which.min(cv.vec)
+            upper.bound <- if (kertype=="beta2") (b-a)/4 else Inf
+            foo <- optim(h.vec[start.idx],
                          cv.function,
                          method="L-BFGS-B",
                          lower=sqrt(.Machine$double.eps),
-                         upper=ifelse(kertype=="beta2",(b-a)/4,Inf),
+                         upper=upper.bound,
                          control = fnscale,
                          X=X,
                          a=a,
@@ -234,12 +289,14 @@ npuniden.boundary <- function(X=NULL,
             h.opt <- foo$par
             cv.opt <- foo$value
         } else {
-            cv.vec <- sapply(1:length(grid),function(i){cv.function(grid[i],X,a,b)})
-            foo <- optim(grid[ifelse(bwmethod=="cv.ml",which.max(cv.vec),which.min(cv.vec))],
+            cv.vec <- sapply(seq_along(grid), function(i){cv.function(grid[i],X,a,b)})
+            start.idx <- if (bwmethod=="cv.ml") which.max(cv.vec) else which.min(cv.vec)
+            upper.bound <- if (kertype=="beta2") (b-a)/4 else Inf
+            foo <- optim(grid[start.idx],
                          cv.function,
                          method="L-BFGS-B",
                          lower=sqrt(.Machine$double.eps),
-                         upper=ifelse(kertype=="beta2",(b-a)/4,Inf),
+                         upper=upper.bound,
                          control = fnscale,
                          X=X,
                          a=a,

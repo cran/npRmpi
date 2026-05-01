@@ -7,6 +7,7 @@
 #include <float.h>
 #include <time.h>
 #include <stdint.h>
+#include <Rinternals.h>
 
 #include "tree.h"
 
@@ -36,7 +37,22 @@ int difftime(time_t t1, time_t t0)
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 /* No zero divide allowing for negative or positive values */
-#define NZD(a) ((a) < 0 ? (MIN(-DBL_EPSILON,a)) : (MAX(DBL_EPSILON,a)))
+static inline double NZD(const double a){
+  return (a < 0.0) ? MIN(-DBL_EPSILON, a) : MAX(DBL_EPSILON, a);
+}
+/* Positive-only no-zero guard for known-positive quantities */
+static inline double NZD_POS(const double a){
+  return (a > DBL_EPSILON) ? a : DBL_EPSILON;
+}
+void np_fastcv_alllarge_hits_reset(void);
+double np_fastcv_alllarge_hits_get(void);
+int np_mpi_local_regression_active(void);
+SEXP C_np_progress_fit_begin(SEXP total);
+SEXP C_np_progress_fit_end(void);
+void np_progress_fit_set_offset(const int offset);
+void np_progress_fit_step(const int done);
+void np_progress_fit_loop_step(const int done, const int natural_total);
+int np_progress_fit_is_active(void);
 
 double **alloc_matd(int nrows, int ncols);
 double **alloc_tmatd(int nrows, int ncols);
@@ -149,6 +165,19 @@ int kernel_estimate_distribution_categorical(int KERNEL_den, int KERNEL_unordere
 
 int kernel_estimate_regression_categorical_leave_one_out(int int_ll, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories, double *mean);
 double np_kernel_estimate_regression_categorical_ls_aic(int int_ll, int bwm, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories);
+int np_glp_cv_prepare_extern(const int int_ll, const int num_obs, const int ncon, double **matrix_X_continuous_train);
+void np_glp_cv_clear_extern(void);
+void np_reg_cv_core_clear_extern(void);
+int np_shadow_cv_con_density_ml(double *vector_scale_factor, double *cv);
+int np_shadow_cv_con_density_ls(double *vector_scale_factor, double *cv);
+int np_shadow_cv_con_distribution_ls(double *vector_scale_factor, double *cv);
+int np_shadow_proof_conditional_x_weight_row_stream(double *vector_scale_factor, int eval_idx, double *row_out);
+int np_regression_lp_apply_matrix(double *vector_scale_factor, double **rhs_cols, int n_rhs, double *fitted_out);
+int np_bounded_cvls_conditional_quad_context_prepare_extern(void);
+void np_bounded_cvls_conditional_quad_context_clear_extern(void);
+void np_bwm_set_deferred_error(const char *msg);
+const char *np_bwm_get_deferred_error(void);
+void np_bwm_clear_deferred_error(void);
 double cv_func_regression_categorical_ls_nn(double *vector_scale_factor);
 
 int kernel_estimate_regression_categorical_no_stderr(int int_compute_gradient, int int_ll, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int int_WEIGHTS, int *var_index_int, int num_var_test_int, double **matrix_weights_K, double ***matrix_weights_K_deriv, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double **matrix_bandwidth, double **matrix_bandwidth_deriv, double *vector_Y, double *lambda, int *num_categories, double *mean, double **gradient);
@@ -174,7 +203,6 @@ void powell(int RESTRICT, int INTEGER, double *p_restrict, double *p, double **x
 
 void sort(int n, double ra[]);
 
-int pgplot_xy_errorbars(int int_GENERATE, char *output, int num_obs, int num_var_unordered, int num_var_continuous, double *x_categorical_vec, double *x_continuous_vec, double *y_vec, double *y_std, char *x_label, char *y_label, char *title);
 
 int compute_continuous_stddev(int int_LARGE, int num_obs, int num_var_continuous, int num_reg_continuous, double **matrix_Y_continuous, double **matrix_X_continuous, double *vector_continuous_stddev);
 
@@ -202,7 +230,7 @@ int simple_unique(int n, double * vector);
 int unique(int num_obs, double *x);
 void spinner(int num);
 
-int kernel_weighted_sum_np(int * KERNEL_reg, int * KERNEL_unordered_reg, int * KERNEL_ordered_reg, const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval, const int num_reg_unordered, const int num_reg_ordered, const int num_reg_continuous, const int leave_one_out, const int leave_one_out_offset, const int kernel_pow, const int bandwidth_divide, const int bandwidth_divide_weights, const int symmetric, const int gather_scatter, const int drop_one_train, const int drop_which_train, const int * const operator, const int permutation_operator, int do_score, int do_ocg, int * bpso, const int suppress_parallel, const int ncol_Y, const int ncol_W, const int int_TREE, const int do_partial_tree, KDT * const kdt, NL * const inl, int * const nld, int * const idx, double ** matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double ** matrix_Y, double ** matrix_W, double * sgn, double *vector_scale_factor,int bandwidth_provided,double ** matrix_bw_train,double ** matrix_bw_eval,double * lambda_pre,int *num_categories,double ** matrix_categorical_vals, int ** matrix_ordered_indices, double * const restrict weighted_sum,  double * const restrict weighted_permutation_sum, double * const restrict kw);
+int kernel_weighted_sum_np(int * KERNEL_reg, int * KERNEL_unordered_reg, int * KERNEL_ordered_reg, const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval, const int num_reg_unordered, const int num_reg_ordered, const int num_reg_continuous, const int leave_one_out, const int leave_one_out_offset, const int kernel_pow, const int bandwidth_divide, const int bandwidth_divide_weights, const int symmetric, const int gather_scatter, const int drop_one_train, const int drop_which_train, const int * const operator, const int permutation_operator, int do_score, int do_ocg, int * bpso, const int suppress_parallel, const int ncol_Y, const int ncol_W, const int int_TREE, const int do_partial_tree, KDT * const kdt, NL * const inl, int * const nld, int * const idx, double ** matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double ** matrix_Y, double ** matrix_W, double * sgn, double *vector_scale_factor,int bandwidth_provided,double ** matrix_bw_train,double ** matrix_bw_eval,double * lambda_pre,int *num_categories,double ** matrix_categorical_vals, int ** matrix_ordered_indices, double * const restrict weighted_sum,  double * const restrict weighted_permutation_sum, double * const restrict kw, double * const restrict pkw);
 
 int kernel_convolution_weighted_sum(int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_Y,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *kernel_sum);
 
@@ -264,8 +292,12 @@ double max_unordered_bw(int num_categories,
 #define IO_MIN_TRUE  1
 #define IO_MIN_FALSE 0
 
+/* Regression type codes: lc (0), ll (1), lp (2). */
 #define LL_LC  0
 #define LL_LL  1
+#define LL_LP  2
+/* Legacy alias retained for internal compatibility. */
+#define LL_GLP LL_LP
 
 #define OCG_UNO 0
 #define OCG_ORD 1
@@ -294,7 +326,7 @@ double max_unordered_bw(int num_categories,
 static const int OP_CFUN_OFFSETS[4] = { 0, 10, 20, 30 };
 #define OP_NCFUN 40
 static const int OP_UFUN_OFFSETS[4] = { 0, 2, 4, 0 };
-static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
+static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 // these defines are to facilitate accessing the continuous kernels in their various arrays
 
 #define CK_GAUSS2 0
@@ -354,6 +386,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define RBW_D_INITD 15
 #define RBW_NCONFD   16
 #define RBW_NCATFD   17
+#define RBW_SFLOORD  18
 
 #define MPI_RANKI 0
 #define MPI_NUMPI 1
@@ -398,6 +431,8 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define BW_D_INITD 15
 #define BW_NCONFD     16
 #define BW_NCATFD     17
+#define BW_MEMFACD    18
+#define BW_SFLOORD    19
 
 // distribution defines
 #define DBW_NOBSI   0
@@ -442,6 +477,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define DBW_NCONFD     16
 #define DBW_NCATFD     17
 #define DBW_MEMORYD     18
+#define DBW_SFLOORD     19
 
 
 #define CBW_NOBSI   0
@@ -466,12 +502,13 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define CBW_UNUNOI 19
 #define CBW_UNORDI 20
 #define CBW_UNCONI 21
-#define CBW_FASTI 22
-#define CBW_OLDI 23
-#define CBW_TREEI 24
-#define CBW_SCATI 25
-#define CBW_DFC_DIRI 26
-#define CBW_TBNDI 27
+#define CBW_OLDI 22
+#define CBW_TREEI 23
+#define CBW_SCATI 24
+#define CBW_DFC_DIRI 25
+#define CBW_TBNDI 26
+#define CBW_CVLS_QUAD_GRIDI 27
+#define CBW_CVLS_QUAD_POINTSI 28
 
 #define CBW_FTOLD  0
 #define CBW_TOLD   1
@@ -492,6 +529,11 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define CBW_D_INITD 16
 #define CBW_NCONFD     17
 #define CBW_NCATFD     18
+#define CBW_SFLOORD    19
+#define CBW_QUAD_EXTD  20
+#define CBW_QUAD_RATIO_UNIFORMD 21
+#define CBW_QUAD_RATIO_SAMPLED 22
+#define CBW_QUAD_RATIO_GLD 23
 
 
 #define CBWM_CVML 0
@@ -550,6 +592,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define CDBW_D_INITD 16
 #define CDBW_NCONFD     17
 #define CDBW_NCATFD     18
+#define CDBW_SFLOORD    19
 
 #define CDBWM_CVLS 0
 
@@ -636,6 +679,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 3, 6, 9 };
 #define KWS_POPI 19
 #define KWS_PSCOREI 20
 #define KWS_POCGI 21
+#define KWS_SPARI 22
 
 #define CQ_TNOBSI 0
 #define CQ_ENOBSI   1

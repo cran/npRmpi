@@ -36,34 +36,69 @@ npuniden.sc(X = NULL,
 }
 %- maybe also 'usage' for other objects documented here.
 \arguments{
-  \item{X}{
-a required numeric vector of training data lying in \eqn{[a,b]}
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify evaluation points, observations, support bounds, and optional bandwidths.
 }
-  \item{Y}{
-an optional numeric vector of evaluation data lying in \eqn{[a,b]}
-}
-  \item{h}{
-a bandwidth (\eqn{>0})
-}
+
   \item{a}{
 an optional lower bound on the support of \code{X} or \code{Y} (defaults to 0)
 }
+
   \item{b}{
 an optional upper bound on the support of \code{X} or \code{Y} (defaults to 1)
 }
+
+
+  \item{h}{
+a bandwidth (\eqn{>0})
+}
+
+  \item{X}{
+a required numeric vector of training data lying in \eqn{[a,b]}
+}
+
+  \item{Y}{
+an optional numeric vector of evaluation data lying in \eqn{[a,b]}
+}
+
+\subsection{Density Bounds}{
+These arguments set optional lower and upper density bounds used with \code{constraint = \"density\"}.
+}
+
 \item{lb}{
   a scalar lower bound (\eqn{\ge 0}) to be used in conjunction with
   \code{constraint="density"}
 }
+
 \item{ub}{
   a scalar upper bound (\eqn{\ge 0} and \eqn{\ge} \code{lb}) to be used
   in conjunction with \code{constraint="density"}
 }
+
+
+\subsection{Grid And Distance Controls}{
+These arguments control grid construction, distance metric, and mass preservation.
+}
+
 \item{extend.range}{
   number specifying the fraction by which the range of the training data
   should be extended for the additional grid points (passed to the
   function \code{extendrange})
 }
+
+\item{function.distance}{
+  a logical value that, if \code{TRUE}, minimizes the squared deviation between
+  the constrained and unconstrained estimates, otherwise, minimizes the
+  squared deviation between the constrained and unconstrained weights
+}
+
+\item{integral.equal}{
+  a logical value, that, if \code{TRUE}, adjusts the constrained estimate
+  to have the same probability mass over the range \code{X}, \code{Y},
+  and the additional grid points
+}
+
+
 \item{num.grid}{
   number of additional grid points (in addition to \code{X} and
   \code{Y}) placed on an equi-spaced grid spanning
@@ -71,16 +106,11 @@ an optional upper bound on the support of \code{X} or \code{Y} (defaults to 1)
   additional grid points will be used regardless of the value of
   \code{extend.range})
 }
-\item{function.distance}{
-  a logical value that, if \code{TRUE}, minimizes the squared deviation between
-  the constrained and unconstrained estimates, otherwise, minimizes the
-  squared deviation between the constrained and unconstrained weights
+
+\subsection{Shape Constraint}{
+This argument chooses the monotonicity, convexity, or log-shape constraint.
 }
-\item{integral.equal}{
-  a logical value, that, if \code{TRUE}, adjusts the constrained estimate
-  to have the same probability mass over the range \code{X}, \code{Y},
-  and the additional grid points
-}
+
 \item{constraint}{
   a character string indicating whether the estimate is to be
   constrained to be monotonically increasing
@@ -90,9 +120,11 @@ an optional upper bound on the support of \code{X} or \code{Y} (defaults to 1)
   (\code{constraint="log-convex"}), or log-concave
   (\code{constraint="log-concave"})
 }
-}
 
+}
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template. For interactive and cluster batch workflows, see \code{\link{npRmpi.init}}.
+
   Typical usages are (see below for a complete list of options and also
   the examples at the end of this help file)
   \preformatted{
@@ -156,6 +188,7 @@ Jeffrey S. Racine \email{racinej@mcmaster.ca}
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   The \pkg{logcondens}, \pkg{LogConDEAD}, and \pkg{scdensity} packages,
   and the function \code{\link{npuniden.boundary}}.
 }
@@ -171,7 +204,7 @@ X <- sort(rnorm(n))
 h <- npuniden.boundary(X,a=-Inf,b=Inf)$h
 foo <- npuniden.sc(X,h=h,constraint="density",a=-Inf,b=Inf,lb=.1,ub=.2)
 ylim <- range(c(foo$f.sc,foo$f))
-plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
+if (interactive()) plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
 lines(X,foo$f,col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained","Unconstrained"),lty=1:2,col=1:2,bty="n")
@@ -185,15 +218,16 @@ h <- npuniden.boundary(X)$h
 foo <- npuniden.sc(X=X,h=h,constraint=c("mono.incr"))
 
 oldpar <- par(no.readonly = TRUE)
+on.exit(par(oldpar), add = TRUE)
 par(mfrow=c(1,2))
 ylim <- range(c(foo$f.sc,foo$f))
-plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
+if (interactive()) plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
 lines(X,foo$f,col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained","Unconstrained"),lty=1:2,col=1:2,bty="n")
 
 ylim <- range(c(foo$f.sc.deriv,foo$f.deriv))
-plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="First Derivative")
+if (interactive()) plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="First Derivative")
 lines(X,foo$f.deriv,col=2,lty=2)
 abline(h=0,lty=2)
 rug(X)
@@ -209,13 +243,13 @@ foo <- npuniden.sc(X=X,h=h,constraint=c("mono.decr"))
 
 par(mfrow=c(1,2))
 ylim <- range(c(foo$f.sc,foo$f))
-plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
+if (interactive()) plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
 lines(X,foo$f,col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained","Unconstrained"),lty=1:2,col=1:2,bty="n")
 
 ylim <- range(c(foo$f.sc.deriv,foo$f.deriv))
-plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="First Derivative")
+if (interactive()) plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="First Derivative")
 lines(X,foo$f.deriv,col=2,lty=2)
 abline(h=0,lty=2)
 rug(X)
@@ -231,13 +265,13 @@ foo <- npuniden.sc(X=X,h=h,a=-Inf,b=Inf,constraint=c("concave"))
 
 par(mfrow=c(1,2))
 ylim <- range(c(foo$f.sc,foo$f))
-plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
+if (interactive()) plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
 lines(X,foo$f,col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained","Unconstrained"),lty=1:2,col=1:2,bty="n")
 ylim <- range(c(foo$f.sc.deriv,foo$f.deriv))
 
-plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="Second Derivative")
+if (interactive()) plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="Second Derivative")
 lines(X,foo$f.deriv,col=2,lty=2)
 abline(h=0,lty=2)
 rug(X)
@@ -252,13 +286,13 @@ foo <- npuniden.sc(X=X,h=h,constraint=c("convex"))
 
 par(mfrow=c(1,2))
 ylim <- range(c(foo$f.sc,foo$f))
-plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
+if (interactive()) plot(X,foo$f.sc,type="l",ylim=ylim,xlab="X",ylab="Density")
 lines(X,foo$f,col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained","Unconstrained"),lty=1:2,col=1:2,bty="n")
 
 ylim <- range(c(foo$f.sc.deriv,foo$f.deriv))
-plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="Second Derivative")
+if (interactive()) plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="Second Derivative")
 lines(X,foo$f.deriv,col=2,lty=2)
 abline(h=0,lty=2)
 rug(X)
@@ -275,18 +309,22 @@ foo <- npuniden.sc(X=X,h=h,a=-Inf,b=Inf,constraint=c("log-concave"))
 par(mfrow=c(1,2))
 
 ylim <- range(c(log(foo$f.sc),log(foo$f)))
-plot(X,log(foo$f.sc),type="l",ylim=ylim,xlab="X",ylab="Log-Density")
+if (interactive()) plot(X,log(foo$f.sc),type="l",ylim=ylim,xlab="X",ylab="Log-Density")
 lines(X,log(foo$f),col=2,lty=2)
 rug(X)
 legend("topleft",c("Constrained-log","Unconstrained-log"),lty=1:2,col=1:2,bty="n")
 
 ylim <- range(c(foo$f.sc.deriv,foo$f.deriv))
-plot(X,foo$f.sc.deriv,type="l",ylim=ylim,xlab="X",ylab="Second Derivative of Log-Density")
+if (interactive()) plot(X,
+                        foo$f.sc.deriv,
+                        type="l",
+                        ylim=ylim,
+                        xlab="X",
+                        ylab="Second Derivative of Log-Density")
 lines(X,foo$f.deriv,col=2,lty=2)
 abline(h=0,lty=2)
 rug(X)
 legend("topleft",c("Constrained-log","Unconstrained-log"),lty=1:2,col=1:2,bty="n")
-par(oldpar)
 } % enddontrun
 }
 \keyword{ nonparametric }

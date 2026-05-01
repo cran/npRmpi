@@ -16,35 +16,55 @@ mpi.bcast.cmd(cmd=NULL,
               caller.execute = FALSE)
 }
 \arguments{
+\subsection{Command Payload}{
+Command sent from the master and optional arguments evaluated on workers.
+}
+
   \item{cmd}{a command to be sent from master.}
+
+\subsection{Communication Controls}{
+Sender rank, communicator, receiver polling, and caller-execution controls.
+}
+
+  \item{rank}{the sender}
+
+  \item{comm}{a communicator number}
+
+  \item{nonblock}{logical. If TRUE, a nonblock procedure is used on all receivers so that
+they will consume none or little CPUs while waiting.}
+
+  \item{sleep}{a sleep interval, used when nonblock=TRUE. The smaller sleep is, the more responsive slaves
+are, the more CPUs consume.}
+
+  \item{caller.execute}{a logical value indicating whether the master
+    node is additionally to execute the command}
+
+\subsection{Additional Command Arguments}{
+Arguments supplied to the transmitted function command.
+}
+
   \item{...}{used as arguments to cmd (function command) for passing their 
   (master) values to R slaves, i.e., if `myfun(x)' will be executed on R slaves 
 with `x' as master variable, use mpi.bcast.cmd(cmd=myfun, x=x).}
-  \item{rank}{the sender}
-  \item{comm}{a communicator number}
-  \item{nonblock}{logical. If TRUE, a nonblock procedure is used on all receivers so that
-they will consume none or little CPUs while waiting.}
-  \item{sleep}{a sleep interval, used when nonblock=TRUE. The smaller sleep is, the more responsive slaves
-are, the more CPUs consume.}
-  \item{caller.execute}{a logical value indicating whether the master
-    node is additionally to execute the command}
 }
 \value{
   \code{mpi.bcast.cmd} returns no value for the sender and an expression of the transmitted command for others.
 } 
 \details{
   \code{mpi.bcast.cmd} is a collective call. This means all members in a communicator must 
-  execute it at the same time. If slaves are spawned (created) by using slavedaemon.R (Rprofile script), 
-  then they are running \code{mpi.bcast.cmd} in infinite loop (idle state). Hence master can execute 
-  \code{mpi.bcast.cmd} alone to start computation. On the master, \code{cmd} and \code{...} are put together 
-  as a list which is then broadcasted (after serialization) to all slaves (using for loop with mpi.send 
-  and mpi.recv pair). All slaves will return an expression which will be evaluated by either slavedaemon.R, 
-  or by whatever an R script based on slavedaemon.R.
+  execute it at the same time. Under \code{npRmpi.init(mode="spawn")} this is
+  handled by spawned slave daemons. Under \code{npRmpi.init(mode="attach")}
+  (batch \code{mpiexec} workflows), worker ranks enter the same idle-loop
+  coordination internally, so no external bootstrap is needed.
+  On the master, \code{cmd} and \code{...} are put together as a list which is
+  then broadcast (after serialization) to all slaves (using a for-loop with
+  \code{mpi.send}/\code{mpi.recv}). All slaves return an expression that is
+  evaluated by the worker loop.
   
   If nonblock=TRUE, then on receiving side, a nonblock procedure is used to check if 
   there is a message. If not, it will sleep for the specied amount and repeat itself.
   
-  Please use \code{\link{mpi.remote.exec}} if you want the executed results returned from R 
+  Please use \code{mpi.remote.exec} if you want the executed results returned from R 
   slaves.
  }
 \section{Warning}{
@@ -56,9 +76,6 @@ are, the more CPUs consume.}
 
 \author{
 Hao Yu (minor modifications by  Jeffrey S. Racine \email{racinej@mcmaster.ca})
-}
-\seealso{
-  \code{\link{mpi.remote.exec}}
 }
 %\examples{
 %}

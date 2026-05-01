@@ -16,35 +16,53 @@ npsymtest(data = NULL,
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the data, statistic variant, and any supplied bandwidth.
+}
+
+  \item{bw}{
+    a numeric (scalar) bandwidth. Defaults to plug-in (see details below).
+  }
+
+
   \item{data}{
     a vector containing the variable.
   }
-  
+
+
   \item{method}{
     a character string used to specify whether to compute the integral
     version or the summation version of the statistic. Can be set as
     \code{integration} or \code{summation} (see below for
     details). Defaults to \code{integration}.
   }
-  
-  \item{boot.num}{
-    an integer value specifying the number of bootstrap
-    replications to use. Defaults to \code{399}.
-  }
-  
-  \item{bw}{
-    a numeric (scalar) bandwidth. Defaults to plug-in (see details below).
-  }
-  
+
+
+\subsection{Bootstrap Controls}{
+These arguments control bootstrap execution and reproducibility settings.
+}
+
   \item{boot.method}{ a character string used to specify the
     bootstrap method. Can be set as \code{iid} or \code{geom} (see below
     for details). Defaults to \code{iid}.
   }
-  
+
+
+  \item{boot.num}{
+    an integer value specifying the number of bootstrap
+    replications to use. Defaults to \code{399}.
+  }
+
+
   \item{random.seed}{
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection routines used by the test.
+}
 
   \item{\dots}{ additional arguments supplied to specify the bandwidth
     type, kernel types, and so on.  This is used since we specify bw as
@@ -53,20 +71,20 @@ npsymtest(data = NULL,
     defaults, you may specify any of \code{bwscaling}, \code{bwtype},
     \code{ckertype}, \code{ckerorder}, \code{ukertype},
     \code{okertype}.}
-  
-}
 
+
+}
 \value{
   \code{npsymtest} returns an object of type \code{symtest} with the
   following components
-  
+
   \item{Srho}{ the statistic \code{Srho} }
   \item{Srho.bootstrap}{ contains the bootstrap replications of \code{Srho} }
   \item{P}{ the P-value of the statistic }
   \item{boot.num}{ number of bootstrap replications }
   \item{data.rotate}{ the rotated data series }
   \item{bw}{ the numeric (scalar) bandwidth }
-    
+
   \code{\link{summary}} supports object of type \code{symtest}.
 }
 \references{
@@ -90,6 +108,8 @@ npsymtest(data = NULL,
 }
 
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
 
   \code{npsymtest} computes the nonparametric metric entropy (normalized
    Hellinger of Granger, Maasoumi and Racine (2004)) for testing
@@ -98,7 +118,7 @@ npsymtest(data = NULL,
    Maasoumi and Racine (2009) for details. Default bandwidths are of the
    plug-in variety (\code{\link{bw.SJ}} for continuous variables and
    direct plug-in for discrete variables).
- 
+
   For bootstrapping the null distribution of the statistic, \code{iid}
   conducts simple random resampling, while \code{geom} conducts Politis
   and Romano's (1994) stationary bootstrap using automatic block length
@@ -111,21 +131,22 @@ npsymtest(data = NULL,
   densities while the integration version involves differences). Warning
   messages are produced should this occur (\sQuote{integration recommended})
   and should be heeded.
- 
+
 }
 
 \section{Usage Issues}{
-  
+
   When using data of type \code{\link{factor}} it is crucial that the
   variable not be an alphabetic character string (i.e. the factor must
   be integer-valued). The rotation is conducted about the median after
   conversion to type \code{\link{numeric}} which is then converted back
   to type \code{\link{factor}}. Failure to do so will have unpredictable
   results. See the example below for proper usage.
-  
+
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   \code{\link{npdeneqtest},\link{npdeptest},\link{npsdeptest},\link{npunitest}}
 }
 
@@ -138,16 +159,26 @@ npsymtest(data = NULL,
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+set.seed(42)
 
 ## A function to create a time series
 
@@ -167,15 +198,12 @@ n <- 250
 
 yt <- ar.series(0.5,rnorm(n))
 
-mpi.bcast.Robj2slave(yt)
-
 ## A simple example of the test for symmetry
 
-mpi.bcast.cmd(output <- npsymtest(yt,
-                                  boot.num=29,
-                                  boot.method="geom",
-                                  method="summation"),
-              caller.execute=TRUE)
+output <- npsymtest(yt,
+                    boot.num=29,
+                    boot.method="geom",
+                    method="summation")
 
 summary(output)
 
@@ -185,22 +213,19 @@ summary(output)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{ univar }
 \keyword{ nonparametric }

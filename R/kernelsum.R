@@ -1,8 +1,8 @@
 npkernelsum = 
-  function(bws, eval, ksum, kw, p.ksum,
+  function(bws, eval, ksum, kw, p.ksum, p.kw = NULL,
            ntrain, trainiseval = FALSE){
 
-    if (missing(bws) | missing(eval) | missing(ksum) | missing(ntrain))
+    if (missing(bws) || missing(eval) || missing(ksum) || missing(ntrain))
       stop("improper invocation of npkernelsum constructor")
 
     d = list(
@@ -26,16 +26,18 @@ npkernelsum =
       trainiseval = trainiseval
       )
 
+    if (!is.null(p.kw))
+      d$p.kw <- p.kw
+
     class(d) = "npkernelsum"
 
     d
   }
 
 print.npkernelsum <- function(x, digits=NULL, ...){
+  eval.points <- if (x$trainiseval) "" else paste0(" and ", x$nobs, " evaluation points,")
   cat("\nKernel Sum data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", " and "),
-      ifelse(x$trainiseval, "", x$nobs),
-      ifelse(x$trainiseval, ""," evaluation points,"),
+      eval.points,
       " in ",x$ndim," variable(s)\n",sep="")
 
   print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),x$data.names)))
@@ -64,4 +66,3 @@ print.npkernelsum <- function(x, digits=NULL, ...){
     print(...,digits=digits)
   invisible(x)
 }
-

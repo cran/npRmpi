@@ -1,7 +1,8 @@
 qregression <- 
-    function(bws, xeval, tau, quantile, quanterr = NA, quantgrad = NA, ntrain, trainiseval = FALSE, gradients = FALSE){
+    function(bws, xeval, tau, quantile, quanterr = NA, quantgrad = NA, ntrain, trainiseval = FALSE, gradients = FALSE,
+             timing = NA, total.time = NA, optim.time = NA, fit.time = NA){
 
-        if (missing(bws) | missing(xeval) | missing(tau) | missing(quantile) | missing(ntrain))
+        if (missing(bws) || missing(xeval) || missing(tau) || missing(quantile) || missing(ntrain))
             stop("improper invocation of qregression constructor")
 
         d <- list(
@@ -34,7 +35,9 @@ qregression <-
             quantgrad = quantgrad,
             ntrain = ntrain,
             trainiseval = trainiseval,
-            gradients = gradients)
+            gradients = gradients,
+            timing = timing, total.time = total.time,
+            optim.time = optim.time, fit.time = fit.time)
 
         class(d) <- "qregression"
 
@@ -43,7 +46,7 @@ qregression <-
 
 print.qregression <- function(x, digits=NULL, ...){
   cat("\nQuantile regression data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", paste(" and ", x$nobs, " evaluation points,\n", sep="")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs, " evaluation points,\n", sep=""),
       " in ", x$xndim + x$yndim, " variable(s)",
       "\n(", x$yndim, " dependent variable(s), and ", x$xndim, " explanatory variable(s))\n\n",
       sep="")
@@ -64,9 +67,8 @@ fitted.qregression <- function(object, ...){
  object$quantile 
 }
 quantile.qregression <- function(x, ...){ x$quantile }
-plot.qregression <- function(x, ...) { npplot(bws = x$bws, ...) }
 predict.qregression <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npqreg(bws = object$bws, ...), envir = parent.frame())
+  tr <- do.call(npqreg, c(list(bws = object$bws), list(...)))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs, residual.scale = NA))
@@ -76,15 +78,17 @@ predict.qregression <- function(object, se.fit = FALSE, ...) {
 
 se.qregression <- function(x) { x$quanterr }
 gradients.qregression <- function(x, errors = FALSE, ...) {
-  if(!errors)
-    return(x$quantgrad)
-  else
-    return(NULL)
+  if (errors)
+    stop("gradient standard errors are not available for qregression")
+  gout <- x$quantgrad
+  if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
+    stop("gradients are not available: fit the model with gradients=TRUE")
+  gout
 }
 
 summary.qregression <- function(object, ...) {
   cat("\nQuantile Regression Data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "", paste(" and ", object$nobs, " evaluation points,\n", sep="")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs, " evaluation points,\n", sep=""),
       " in ", object$xndim + object$yndim, " variable(s)",
       "\n(", object$yndim, " dependent variable(s), and ", object$xndim, " explanatory variable(s))\n\n",
       sep="")
@@ -97,6 +101,7 @@ summary.qregression <- function(object, ...) {
 
   cat(genRegEstStr(object))
   cat(genBwKerStrs(object$bws))
+  cat(genTimingStr(object))
   
   cat("\n\n")
 }

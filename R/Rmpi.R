@@ -1,19 +1,30 @@
 ### Copyright (C) 2002 Hao Yu 
 mpi.finalize <- function(){
-    if(mpi.is.master())
-        print("Exiting Rmpi. Rmpi cannot be used unless relaunching R.")
-    .Call("mpi_finalize",PACKAGE = "npRmpi")
+    if (!isTRUE(getOption("npRmpi.mpi.initialized", TRUE)))
+        return(invisible(FALSE))
+
+    is.master <- tryCatch(mpi.is.master(), error = function(e) NA)
+    if (!is.na(is.master) && isTRUE(is.master))
+        message("Exiting Rmpi. Rmpi cannot be used unless relaunching R.")
+
+    out <- tryCatch(.Call("mpi_finalize",PACKAGE = "npRmpi"), error = function(e) NULL)
+    options(npRmpi.mpi.initialized = FALSE)
+    if (is.null(out))
+        return(invisible(FALSE))
+    out
 }
 
 mpi.exit <- function(){
     if (mpi.is.master())
-    	print("Detaching Rmpi. Rmpi cannot be used unless relaunching R.")
+    	message("Detaching Rmpi. Rmpi cannot be used unless relaunching R.")
     .Call("mpi_finalize",PACKAGE = "npRmpi")
+    options(npRmpi.mpi.initialized = FALSE)
     detach(package:npRmpi)
 }
 
 mpi.quit <- function(save="no"){
     .Call("mpi_finalize",PACKAGE = "npRmpi")
+    options(npRmpi.mpi.initialized = FALSE)
     q(save=save,runLast=FALSE)
 }
 
@@ -59,7 +70,7 @@ mpi.info.set <- function(info=0, key, value){
 
 mpi.info.get <- function(info=0, key, valuelen){
     .Call("mpi_info_get",as.integer(info), as.character(key), 
-	as.integer(valuelen), as.integer(valuelen),PACKAGE = "npRmpi")
+	as.integer(valuelen),PACKAGE = "npRmpi")
 }
 
 mpi.info.free <- function(info=0){
@@ -90,6 +101,10 @@ mpi.universe.size <- function(){
 	#	if (.Platform$OS!="windows")
 	#		out <- out-1
 	out
+}
+
+mpi.get.version <- function(){
+    .Call("mpi_get_version", PACKAGE = "npRmpi")
 }
 
 mpi.get.processor.name <- function(short=TRUE){
@@ -128,13 +143,24 @@ mpi.cartdim.get <- function(comm=3) {
         .Call("mpi_cartdim_get",as.integer(comm), PACKAGE = "npRmpi")
 }
 
+.npRmpi_parse_cart_get <- function(out, maxdims, caller = "mpi.cart.get") {
+        maxdims <- as.integer(maxdims)
+        if (length(maxdims) != 1L || is.na(maxdims) || maxdims < 1L)
+                stop(sprintf("%s: 'maxdims' must be a single positive integer", caller))
+        expected <- 3L * maxdims
+        if (length(out) != expected)
+                stop(sprintf("%s: expected %d values from mpi_cart_get(), got %d",
+                             caller, expected, length(out)))
+        idx <- seq_len(maxdims)
+        list(dims = out[idx],
+             periods = out[maxdims + idx],
+             coords = out[2L * maxdims + idx])
+}
+
 mpi.cart.get <- function(comm=3, maxdims) {
 
         out <- .Call("mpi_cart_get",as.integer(comm), as.integer(maxdims), PACKAGE = "npRmpi")
-        dims <- out[1:maxdims]
-        periods <- out[(maxdims+1):(maxdims*2)]
-        coords <- out[(maxdims*2 + 1):(maxdims*3)]
-        list(dims=dims,periods=periods,coords=coords)
+        .npRmpi_parse_cart_get(out, maxdims, caller = "mpi.cart.get")
 }
 
 mpi.cart.rank <- function(comm=3, coords) {

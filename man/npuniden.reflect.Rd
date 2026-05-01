@@ -24,26 +24,43 @@ npuniden.reflect(X = NULL,
                  ...)
 }
 \arguments{
-  \item{X}{
-a required numeric vector of training data lying in \eqn{[a,b]}
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify evaluation points, observations, support bounds, and optional bandwidths.
 }
-  \item{Y}{
-an optional numeric vector of evaluation data lying in \eqn{[a,b]}
-}
-  \item{h}{
-an optional bandwidth (>0)
-}
+
   \item{a}{
 an optional lower bound (defaults to 0)
 }
+
   \item{b}{
 an optional upper bound (defaults to 1)
 }
+
+
+  \item{h}{
+an optional bandwidth (>0)
+}
+
+  \item{X}{
+a required numeric vector of training data lying in \eqn{[a,b]}
+}
+
+  \item{Y}{
+an optional numeric vector of evaluation data lying in \eqn{[a,b]}
+}
+
+\subsection{Additional Arguments}{
+Further arguments are passed to \code{\link{npudensbw}} and \code{\link{npudens}}.
+}
+
  \item{...}{
 optional arguments passed to \code{npudensbw} and \code{npudens}
 }
+
 }
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
   Typical usages are (see below for a complete list of options and also
   the examples at the end of this help file)
   \preformatted{
@@ -89,6 +106,7 @@ optional arguments passed to \code{npudensbw} and \code{npudens}
 Jeffrey S. Racine \email{racinej@mcmaster.ca}
 }
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
 The \pkg{Ake}, \pkg{bde}, and \pkg{Conake} packages and the function \code{\link{npuniden.boundary}}.
 }
 \examples{
@@ -100,34 +118,40 @@ The \pkg{Ake}, \pkg{bde}, and \pkg{Conake} packages and the function \code{\link
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
 ## Example 1: f(0)=0, f(1)=1, plot boundary corrected density,
 ## unadjusted density, and DGP
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+set.seed(42)
 
 n <- 100
 X <- sort(rbeta(n,5,1))
 dgp <- dbeta(X,5,1)
 
-mpi.bcast.Robj2slave(X)
+model <- npuniden.reflect(X)
 
-mpi.bcast.cmd(model <- npuniden.reflect(X),
-              caller.execute=TRUE)
-
-mpi.bcast.cmd(model.unadjusted <- npuniden.boundary(X,a=-Inf,b=Inf),
-              caller.execute=TRUE)
+model.unadjusted <- npuniden.boundary(X,a=-Inf,b=Inf)
 
 ylim <- c(0,max(c(dgp,model$f,model.unadjusted$f)))
-plot(X,model$f,ylab="Density",ylim=ylim,type="l")
+if (interactive()) plot(X,model$f,ylab="Density",ylim=ylim,type="l")
 lines(X,model.unadjusted$f,lty=2,col=2)
 lines(X,dgp,lty=3,col=3)
 rug(X)
@@ -136,27 +160,24 @@ legend("topleft",c("Data-Reflection","Unadjusted","DGP"),col=1:3,lty=1:3,bty="n"
 ## Example 2: f(0)=0, f(1)=0, plot density, distribution, DGP, and
 ## asymptotic point-wise confidence intervals
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+set.seed(42)
 
 X <- sort(rbeta(100,5,3))
 
-mpi.bcast.Robj2slave(X)
-
-mpi.bcast.cmd(model <- npuniden.reflect(X),
-              caller.execute=TRUE)
+model <- npuniden.reflect(X)
 
 oldpar <- par(no.readonly = TRUE)
+on.exit(par(oldpar), add = TRUE)
 par(mfrow=c(1,2))
 ylim=range(c(model$f,model$f+1.96*model$sd.f,model$f-1.96*model$sd.f,dbeta(X,5,3)))
-plot(X,model$f,ylim=ylim,ylab="Density",type="l",)
+if (interactive()) plot(X,model$f,ylim=ylim,ylab="Density",type="l",)
 lines(X,model$f+1.96*model$sd.f,lty=2)
 lines(X,model$f-1.96*model$sd.f,lty=2)
 lines(X,dbeta(X,5,3),col=2)
 rug(X)
 legend("topleft",c("Density","DGP"),lty=c(1,1),col=1:2,bty="n")
 
-plot(X,model$F,ylab="Distribution",type="l")
+if (interactive()) plot(X,model$F,ylab="Distribution",type="l")
 lines(X,model$F+1.96*model$sd.F,lty=2)
 lines(X,model$F-1.96*model$sd.F,lty=2)
 lines(X,pbeta(X,5,3),col=2)
@@ -167,11 +188,9 @@ legend("topleft",c("Distribution","DGP"),lty=c(1,1),col=1:2,bty="n")
 ## Example 3: Age for working age males in the cps71 data set bounded
 ## below by 21 and above by 65
 
-mpi.bcast.cmd(data(cps71),
-              caller.execute=TRUE)
+data(cps71)
 
-mpi.bcast.cmd(model <- npuniden.reflect(cps71$age,a=21,b=65),
-              caller.execute=TRUE)
+model <- npuniden.reflect(cps71$age,a=21,b=65)
 
 par(mfrow=c(1,1))
 hist(cps71$age,prob=TRUE,main="",ylim=c(0,max(model$f)))
@@ -179,29 +198,24 @@ lines(cps71$age,model$f)
 lines(density(cps71$age,bw=model$h),col=2)
 legend("topright",c("Data-Reflection","Unadjusted"),lty=c(1,1),col=1:2,bty="n")
 
-par(oldpar)
-
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
 
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 \keyword{ nonparametric }

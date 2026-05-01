@@ -1,4 +1,4 @@
-## $Id: ppw.R,v 1.47 2008/12/12 14:52:17 jracine Exp jracine $
+## 
 
 ## Original code in Matlab by A. Patton, R translation and
 ## modifications by C. Parmeter and J. Racine.
@@ -67,7 +67,7 @@ b.star <- function(data,
   ## Now we loop through each variable in data (i.e., column,
   ## data[,i]).
 
-  for(i in 1:k) {
+  for(i in seq_len(k)) {
 
     ## We first obtain the autocorrelations rho(1),...,rho(mmax) (we
     ## need to drop the first autocorrelation as it is rho(0), hence
@@ -91,7 +91,7 @@ b.star <- function(data,
     ## Compute the number of insignificant runs following each rho(k),
     ## k=1,...,mmax.
     
-    num.insignificant <- sapply(1:(mmax-Kn+1),
+    num.insignificant <- sapply(seq_len(max(mmax - Kn + 1L, 0L)),
                                 function(j){
                                   sum((abs(rho.k) < rho.k.crit)[j:(j+Kn-1)])
                                 })
@@ -144,7 +144,7 @@ b.star <- function(data,
 
     ## Compute M (mhat is at least one).
 
-    M <- ifelse(2*mhat > mmax, mmax, 2*mhat)
+    M <- min(2 * mhat, mmax)
 
     ## We compute BstarSB and BstarCB using the formulas in the above
     ## references. Now we require the autocovariance R(k) (hence
@@ -175,13 +175,13 @@ b.star <- function(data,
 
   if(round == FALSE) {
     
-    BstarSB <- ifelse(BstarSB > Bmax, Bmax, BstarSB)
-    BstarCB <- ifelse(BstarCB > Bmax, Bmax, BstarCB)
+    BstarSB <- pmin(BstarSB, Bmax)
+    BstarCB <- pmin(BstarCB, Bmax)
 
   } else {
 
-    BstarSB <- ifelse(BstarSB > Bmax, Bmax, ifelse(BstarSB < 1, 1, round(BstarSB)))
-    BstarCB <- ifelse(BstarCB > Bmax, Bmax, ifelse(BstarCB < 1, 1, max(1,round(BstarCB))))
+    BstarSB <- pmax(1, pmin(Bmax, round(BstarSB)))
+    BstarCB <- pmax(1, pmin(Bmax, round(BstarCB)))
 
   }
   

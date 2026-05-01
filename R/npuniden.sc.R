@@ -80,26 +80,30 @@ npuniden.sc <- function(X=NULL,
         if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
         if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
         if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-        sapply(1:length(X),function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b,deriv=0)^2)[length(X.seq)]})
+        sapply(seq_along(X), function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b,deriv=0)^2)[length(X.seq)]})
     }
 
     W.kernel <- function(x,X,h,a=0,b=1,deriv=0) {
-        sapply(1:length(x),function(i){kernel(x[i],X,h,a,b,deriv)})
+        sapply(seq_along(x), function(i){kernel(x[i],X,h,a,b,deriv)})
     }
     
     if(is.null(X)) stop("you must pass a vector X")
+    if(anyNA(X)) stop("X must not contain missing values")
     if(a>=b) stop("a must be less than b")
-    if(any(X<a)) stop("X must be >= a")
-    if(any(X>b)) stop("X must be <= b")
-    if(!is.null(Y) && any(Y<a)) stop("Y must be >= a")
-    if(!is.null(Y) && any(Y>b)) stop("Y must be <= b")
+    if(any(X<a, na.rm = TRUE)) stop("X must be >= a")
+    if(any(X>b, na.rm = TRUE)) stop("X must be <= b")
+    if(!is.null(Y) && anyNA(Y)) stop("Y must not contain missing values")
+    if(!is.null(Y) && any(Y<a, na.rm = TRUE)) stop("Y must be >= a")
+    if(!is.null(Y) && any(Y>b, na.rm = TRUE)) stop("Y must be <= b")
     if(is.null(h)) stop("you must provide a bandwidth")
     if(h <= 0) stop("bandwidth h must be positive")
     if(num.grid < 0) stop("num.grid must be a non-negative integer")
     if(constraint=="density" && is.null(lb) && is.null(ub)) stop("you must provide lower and/or upper bounds when constraining the density")
-    if(!is.null(lb) && any(lb<0)) stop("lower bound must be non-negative")
-    if(!is.null(ub) && any(ub<0)) stop("upper bound must be non-negative")
-    if(!is.null(lb) && !is.null(ub) && any(ub<lb)) stop("upper bound must be greater than or equal to lower bound")
+    if(!is.null(lb) && anyNA(lb)) stop("lower bound must not contain missing values")
+    if(!is.null(lb) && any(lb<0, na.rm = TRUE)) stop("lower bound must be non-negative")
+    if(!is.null(ub) && anyNA(ub)) stop("upper bound must not contain missing values")
+    if(!is.null(ub) && any(ub<0, na.rm = TRUE)) stop("upper bound must be non-negative")
+    if(!is.null(lb) && !is.null(ub) && any(ub<lb, na.rm = TRUE)) stop("upper bound must be greater than or equal to lower bound")
 
     ## First elements are X if Y=NULL or Y, rest are to make sure
     ## constraints are imposed on the bulk of the support and a bit
@@ -162,7 +166,7 @@ npuniden.sc <- function(X=NULL,
     attempts <- 1
     while((is.null(output.QP) || any(is.na(output.QP$solution))) && attempts <= attempts.max) {
         if(attempts==attempts.max && !function.distance) {
-            warning("solve.QP was unable to find a solution with function.distance=FALSE, restarting with function.distance=TRUE", immediate. = TRUE)
+            .np_warning("solve.QP was unable to find a solution with function.distance=FALSE, restarting with function.distance=TRUE", immediate. = TRUE)
             attempts <- 1
             function.distance <- TRUE
         }
@@ -208,7 +212,7 @@ npuniden.sc <- function(X=NULL,
     ## but return the unconstrained vector
 
     if(is.null(output.QP) || any(is.na(output.QP$solution))) {
-        warning("solve.QP was unable to find a solution, unconstrained estimate returned", immediate. = TRUE)
+        .np_warning("solve.QP was unable to find a solution, unconstrained estimate returned", immediate. = TRUE)
         output.QP$solution <- rep(0,n.train)
         solve.QP.flag <- FALSE
     }
@@ -240,9 +244,9 @@ npuniden.sc <- function(X=NULL,
     ## points Y if Y is specified)
 
     if(is.null(Y)) {
-        index <- 1:n.train
+        index <- seq_len(n.train)
     } else {
-        index <- 1:length(Y)
+        index <- seq_along(Y)
     }
 
     se.f <- sqrt(abs(f*int.kernel.squared(X.grid,h,a,b)/(h*length(f))))[index]

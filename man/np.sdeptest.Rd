@@ -1,4 +1,4 @@
-% $Id: np.cmstest.Rd,v 1.58 2006/11/03 21:17:20 tristen Exp $
+%
 \name{npsdeptest}
 \alias{npsdeptest}
 \title{ Kernel Consistent Serial Dependence Test for Univariate Nonlinear Processes }
@@ -19,15 +19,21 @@ npsdeptest(data = NULL,
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the data series, lag count, and statistic variant.
+}
+
   \item{data}{
     a vector containing the variable that can be of type
     \code{\link{numeric}} or \code{\link{ts}}.
   }
-  
+
+
   \item{lag.num}{
     an integer value specifying the maximum number of lags to
     use. Defaults to \code{1}.
   }
+
 
   \item{method}{
     a character string used to specify whether to compute the integral
@@ -35,37 +41,44 @@ npsdeptest(data = NULL,
     \code{integration} or \code{summation} (see below for
     details). Defaults to \code{integration}.
   }
-  
+
+
+\subsection{Bootstrap Controls}{
+These arguments control bootstrap execution and reproducibility settings.
+}
+
+  \item{boot.num}{
+    an integer value specifying the number of bootstrap
+    replications to use. Defaults to \code{399}.
+  }
+
+
   \item{bootstrap}{
     a logical value which specifies whether to conduct
     the bootstrap test or not. If set to \code{FALSE}, only the
     statistic will be computed. Defaults to \code{TRUE}.
   }
-  
-  \item{boot.num}{
-    an integer value specifying the number of bootstrap
-    replications to use. Defaults to \code{399}.
-  }
-  
+
+
   \item{random.seed}{
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
 
+
 }
-            
 \value{
   \code{npsdeptest} returns an object of type \code{deptest} with the
   following components
-  
+
   \item{Srho}{ the statistic vector \code{Srho} }
-  \item{Srho.cumulant}{ the cumulant statistic vector \code{Srho.cumulant} }            
+  \item{Srho.cumulant}{ the cumulant statistic vector \code{Srho.cumulant} }
   \item{Srho.bootstrap.mat}{ contains the bootstrap replications of
     \code{Srho} }
   \item{Srho.cumulant.bootstrap.mat}{ contains the bootstrap
     replications of \code{Srho.cumulant} }
   \item{P}{ the P-value vector of the Srho statistic vector }
-  \item{P.cumulant}{ the P-value vector of the cumulant Srho statistic vector }  
+  \item{P.cumulant}{ the P-value vector of the cumulant Srho statistic vector }
   \item{bootstrap}{ a logical value indicating whether bootstrapping was
   performed }
   \item{boot.num}{ number of bootstrap replications }
@@ -73,14 +86,14 @@ npsdeptest(data = NULL,
   \item{bw.y}{ the numeric vector of bandwidths for \code{data}
   marginal density at lag \code{num.lag}}
   \item{bw.y.lag}{ the numeric vector of bandwidths for lagged
-    \code{data} marginal density  at lag \code{num.lag}}  
+    \code{data} marginal density  at lag \code{num.lag}}
   \item{bw.joint}{ the numeric matrix of bandwidths for \code{data}
-  and lagged \code{data} joint density  at lag \code{num.lag}}      
+  and lagged \code{data} joint density  at lag \code{num.lag}}
 
 \code{\link{summary}} supports object of type \code{deptest}.
 }
 \references{
-  
+
   Granger, C.W. and E. Maasoumi and J.S. Racine (2004), \dQuote{A
   dependence metric for possibly nonlinear processes}, Journal of Time
   Series Analysis, 25, 649-669.
@@ -92,7 +105,9 @@ npsdeptest(data = NULL,
 }
 
 \details{
-  
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
+
   \code{npsdeptest} computes the nonparametric metric entropy
    (normalized Hellinger of Granger, Maasoumi and Racine (2004)) for
    testing for nonlinear serial dependence, \eqn{D[f(y_t, \hat y_{t-k}),
@@ -108,21 +123,22 @@ npsdeptest(data = NULL,
   densities while the integration version involves differences). Warning
   messages are produced should this occur (\sQuote{integration recommended})
   and should be heeded.
- 
+
 }
 
 \section{Usage Issues}{
-  
+
   The \code{integration} version of the statistic uses multidimensional
   numerical methods from the \pkg{cubature} package. See
   \pkg{adaptIntegrate} for details. The \code{integration}
   version of the statistic will be substantially slower than the
   \code{summation} version, however, it will likely be both more
   accurate and powerful.
-  
+
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   \code{\link{npdeptest},\link{npdeneqtest},\link{npsymtest},\link{npunitest}}
 }
 
@@ -135,16 +151,26 @@ npsdeptest(data = NULL,
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+set.seed(42)
 
 ar.series <- function(phi,epsilon) {
   n <- length(epsilon)
@@ -160,13 +186,10 @@ n <- 100
 
 yt <- ar.series(0.95,rnorm(n))
 
-mpi.bcast.Robj2slave(yt)
-
-mpi.bcast.cmd(output <- npsdeptest(yt,
-                                   lag.num=2,
-                                   boot.num=29,
-                                   method="summation"),
-              caller.execute=TRUE)
+output <- npsdeptest(yt,
+                     lag.num=2,
+                     boot.num=29,
+                     method="summation")
 
 summary(output)
 
@@ -176,22 +199,19 @@ summary(output)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{ univar }
 \keyword{ nonparametric }

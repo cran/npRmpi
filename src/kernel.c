@@ -78,7 +78,9 @@ double kernel(int KERNEL, double z)
 
 /* Second Order Gaussian (Standard Kernel) */
 
-			return_value = one_over_sqrt_two_pi*exp(-0.5*ipow(z,2));
+			z_squared = z*z;
+
+			return_value = one_over_sqrt_two_pi*exp(-0.5*z_squared);
 
 			break;
 
@@ -96,9 +98,9 @@ double kernel(int KERNEL, double z)
 
 /* Sixth Order Gaussian */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
-			return_value = one_over_sqrt_two_pi*(1.875-1.25*z_squared+0.125*ipow(z,4))*exp(-0.5*z_squared);
+			return_value = one_over_sqrt_two_pi*(1.875+z_squared*(-1.25+0.125*z_squared))*exp(-0.5*z_squared);
 
 			break;
 
@@ -106,9 +108,9 @@ double kernel(int KERNEL, double z)
 
 /* Eighth Order Gaussian */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
-			return_value = one_over_sqrt_two_pi*(2.1875-2.1875*z_squared+0.4375*ipow(z,4)-0.02083333333*ipow(z,6))*exp(-0.5*z_squared);
+			return_value = one_over_sqrt_two_pi*(2.1875+z_squared*(-2.1875+z_squared*(0.4375-0.02083333333*z_squared)))*exp(-0.5*z_squared);
 
 			break;
 
@@ -117,7 +119,7 @@ double kernel(int KERNEL, double z)
 /* Second Order Epanechnikov */
 /* Note that return value is preset to 0 so no ifelse necessary */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
 			if (z_squared < 5.0) return_value = (double)(0.33541019662496845446-0.067082039324993690892*z_squared);
 
@@ -127,7 +129,7 @@ double kernel(int KERNEL, double z)
 
 /* Fourth Order Epanechnikov */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
 			if (z_squared < 5.0) return_value = (double)(0.008385254916*(-15.0+7.0*z_squared)*(-5.0+z_squared));
 
@@ -137,7 +139,7 @@ double kernel(int KERNEL, double z)
 
 /* Sixth Order Epanechnikov */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
 			if (z_squared < 5.0) return_value = (double)(0.33541019662496845446*(2.734375+z_squared*(-3.28125+0.721875*z_squared))*(1.0-0.2*z_squared));
 
@@ -147,7 +149,7 @@ double kernel(int KERNEL, double z)
 
 /* Eighth Order Epanechnikov */
 
-      z_squared = ipow(z,2);
+      z_squared = z*z;
 
 			if (z_squared < 5.0) return_value = (double)(0.33541019662496845446*(3.5888671875+z_squared*(-7.8955078125+z_squared*(4.1056640625-0.5865234375*z_squared)))
                                                    *(1.0-0.2*z_squared));
@@ -347,7 +349,7 @@ double kernel_deriv(int KERNEL, double z)
 
 /* Define z_squared used by all kernels */
 
-	double z_squared = ipow(z,2);
+	double z_squared = z*z;
 	double return_value = 0.0;
 
 	double one_over_sqrt_two_pi = 0.39894228040143267794;
@@ -504,28 +506,27 @@ double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2)
 
 				break;
 
-			case 1:
+				case 1:
 
 /* Fourth Order Gaussian */
 
-				return_value = 0.0044077311214668459918*exp(-0.25*z_squared)*(108.0-28.0*z_squared+ipow(z,4));
+				return_value = 0.0044077311214668459918*exp(-0.25*z_squared)*(108.0+z_squared*(-28.0+z_squared));
 
 				break;
 
-			case 2:
+				case 2:
 
 /* Sixth Order Gaussian */
 
-				return_value = 0.00001721769969*exp(-0.25*z_squared)*(36240.0-19360.0*z_squared+2312.0*ipow(z,4)-88.0*ipow(z,6)+ipow(z,8));
+				return_value = 0.00001721769969*exp(-0.25*z_squared)*(36240.0+z_squared*(-19360.0+z_squared*(2312.0+z_squared*(-88.0+z_squared))));
 
 				break;
 
-			case 3:
+				case 3:
 
 /* Eighth Order Gaussian */
 
-				return_value = 0.2989183974E-7*exp(-0.25*z_squared)*(25018560.0-20462400.0*z_squared+4202352.0*
-					ipow(z,4)-331680.0*ipow(z,6)+11604.0*ipow(z,8)-180.0*ipow(z,10)+ipow(z,12));
+				return_value = 0.2989183974E-7*exp(-0.25*z_squared)*(25018560.0+z_squared*(-20462400.0+z_squared*(4202352.0+z_squared*(-331680.0+z_squared*(11604.0+z_squared*(-180.0+z_squared))))));
 
 				break;
 
@@ -1148,6 +1149,23 @@ double kernel_ordered(int KERNEL, double x, double y, double lambda)
 
 			break;
 
+		case 2:
+
+			/* Normalized Li-Racine on infinite integer support */
+			return_value = ipow(lambda,(int)fabs(x-y))*(1.0-lambda)/(1.0+lambda);
+
+			break;
+
+		case 3:
+
+			/*
+			  Racine-Li-Yan requires empirical support for exact normalization.
+			  This fallback is used where support is unavailable in this API.
+			*/
+			return_value = ipow(lambda,(int)fabs(x-y))*(1.0-lambda)/(1.0+lambda);
+
+			break;
+
 	}
 
 	return(return_value);
@@ -1170,11 +1188,27 @@ double cdf_kernel_ordered(int KERNEL, double x, double y, double lambda, int c, 
 /* Now going from -max to max in steps of 1 - Ahmad & Cerrito claim that this must */
 /* integrate to onc from -infty to infty - using sample analog */
 
-	for(l = categorical_vals[0]-fabs(categorical_vals[0]-categorical_vals[c-1]); l <= categorical_vals[c-1]; l++)
+	if(KERNEL == 3)
 	{
-		if(l <= x)
+		double den = 0.0;
+		int i;
+		for(i = 0; i < c; i++)
+			den += ipow(lambda,(int)fabs(y-categorical_vals[i]));
+		if(den > 0.0)
 		{
-			return_value += kernel_ordered(KERNEL, l, y, lambda);
+			for(i = 0; i < c; i++)
+				if(categorical_vals[i] <= x)
+					return_value += ipow(lambda,(int)fabs(y-categorical_vals[i]))/den;
+		}
+	}
+	else
+	{
+		for(l = categorical_vals[0]-fabs(categorical_vals[0]-categorical_vals[c-1]); l <= categorical_vals[c-1]; l++)
+		{
+			if(l <= x)
+			{
+				return_value += kernel_ordered(KERNEL, l, y, lambda);
+			}
 		}
 	}
 
@@ -1193,10 +1227,29 @@ double kernel_ordered_convolution(int KERNEL, double x, double y, double lambda,
 
 	double return_value = 0.0;
 
-	for(i=0; i < c; i++)
+	if(KERNEL == 3)
 	{
-		return_value += kernel_ordered(KERNEL, x, *pc_vals, lambda)*kernel_ordered(KERNEL, y, *pc_vals, lambda);
-		pc_vals++;
+		double denx = 0.0;
+		double deny = 0.0;
+		for(i=0; i < c; i++)
+		{
+			denx += ipow(lambda,(int)fabs(x-c_vals[i]));
+			deny += ipow(lambda,(int)fabs(y-c_vals[i]));
+		}
+		if(denx > 0.0 && deny > 0.0)
+		{
+			for(i=0; i < c; i++)
+				return_value += (ipow(lambda,(int)fabs(x-c_vals[i]))/denx)*
+					(ipow(lambda,(int)fabs(y-c_vals[i]))/deny);
+		}
+	}
+	else
+	{
+		for(i=0; i < c; i++)
+		{
+			return_value += kernel_ordered(KERNEL, x, *pc_vals, lambda)*kernel_ordered(KERNEL, y, *pc_vals, lambda);
+			pc_vals++;
+		}
 	}
 
 	return(return_value);
@@ -1210,6 +1263,10 @@ double kernel_unordered(int KERNEL, double x, double y, double lambda, int c)
 {
 
 	double return_value = 0.0;
+
+	if(c < 2){
+		return (x == y) ? 1.0 : 0.0;
+	}
 
 	switch(KERNEL)
 	{
@@ -1257,6 +1314,10 @@ double kernel_unordered_ratio(int KERNEL, double x, double y, double lambda, int
 
 	double return_value = 1.0;
   const double dc = (double) c;
+
+	if(c < 2){
+		return (x == y) ? 1.0 : 0.0;
+	}
 
 	switch(KERNEL)	{
 

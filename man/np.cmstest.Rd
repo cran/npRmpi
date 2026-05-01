@@ -1,4 +1,4 @@
-% $Id: np.cmstest.Rd,v 1.58 2006/11/03 21:17:20 tristen Exp $
+%
 \name{npcmstest}
 \alias{npcmstest}
 \title{ Kernel Consistent Model Specification Test with Mixed Data Types }
@@ -6,6 +6,12 @@
   \code{npcmstest} implements a consistent test for correct
   specification of parametric regression models (linear or nonlinear) as
   described in Hsiao, Li, and Racine (2007).
+}
+\details{
+  For MPI startup/performance guidance (including message-passing tradeoffs and the manual-broadcast template), see \code{\link{npRmpi.init}} details and \code{inst/Rprofile}.
+  Documentation guide: see \code{\link{np.kernels}} for kernels,
+  \code{\link{np.options}} for global options, and
+  \code{\link{plot}} for plotting options.
 }
 \usage{
 npcmstest(formula,
@@ -24,11 +30,9 @@ npcmstest(formula,
 }
 
 \arguments{
-    \item{formula}{
-    a symbolic description of variables on which the test is
-    to be performed. The details of constructing a formula are
-    described below.
-  }
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the model formula/data interface and explicit data inputs.
+}
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -38,35 +42,45 @@ npcmstest(formula,
     function is called.
   }
 
-  \item{subset}{
-    an optional vector specifying a subset of observations to be used. 
+  \item{formula}{
+    a symbolic description of variables on which the test is
+    to be performed. The details of constructing a formula are
+    described below.
   }
+
 
   \item{model}{
     a model object obtained from a call to \code{\link{lm}} (or
-    \code{\link{glm}}). Important: the 
+    \code{\link{glm}}). Important: the
     call to either \code{\link{glm}} or \code{\link{lm}} must have the arguments
-    \code{x=TRUE} and 
+    \code{x=TRUE} and
     \code{y=TRUE} or \code{npcmstest} will not work. Also, the test is
     based on residual bootstrapping hence the outcome must be continuous
     (which rules out Logit, Probit, and Count models).
   }
 
+
+  \item{subset}{
+    an optional vector specifying a subset of observations to be used.
+  }
+
+
   \item{xdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
     calculate the regression estimators.
   }
+
+
   \item{ydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{xdat}. 
+    \code{xdat}.
   }
-  \item{distribution}{
-    a character string used to specify the method of estimating the
-    distribution of the statistic to be calculated. \code{bootstrap}
-    will conduct bootstrapping. \code{asymptotic} will use the normal
-    distribution. Defaults to \code{bootstrap}.
-  }
+
+
+\subsection{Bootstrap And Test Controls}{
+These arguments control the test statistic, bootstrap procedure, and reproducibility settings.
+}
 
   \item{boot.method}{
     a character string used to specify the bootstrap method.
@@ -76,10 +90,26 @@ npcmstest(formula,
     \code{iid}.
   }
 
+
   \item{boot.num}{
     an integer value specifying the number of bootstrap replications to
     use. Defaults to \code{399}.
   }
+
+
+  \item{density.weighted}{
+    a logical value specifying whether the statistic should be
+    weighted by the density of \code{xdat}. Defaults to \code{TRUE}.
+  }
+
+
+  \item{distribution}{
+    a character string used to specify the method of estimating the
+    distribution of the statistic to be calculated. \code{bootstrap}
+    will conduct bootstrapping. \code{asymptotic} will use the normal
+    distribution. Defaults to \code{bootstrap}.
+  }
+
 
   \item{pivot}{
     a logical value specifying whether the statistic should be
@@ -87,17 +117,17 @@ npcmstest(formula,
     distribution. Defaults to \code{TRUE}.
   }
 
-  \item{density.weighted}{
-    a logical value specifying whether the statistic should be
-    weighted by the density of \code{xdat}. Defaults to \code{TRUE}.
-  }
 
   \item{random.seed}{
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
 
-  
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection routines used by the test.
+}
+
   \item{\dots}{
     additional arguments supplied to control bandwidth selection on the
     residuals. One can specify the bandwidth type,
@@ -108,8 +138,8 @@ npcmstest(formula,
     a \code{bandwidth} object, and you do not desire the default behaviours.
   }
 
-}
 
+}
 \value{
   \code{npcmstest} returns an object of type \code{cmstest} with the
   following components, components will contain information
@@ -119,7 +149,7 @@ npcmstest(formula,
   \item{In}{ the statistic \code{In} }
   \item{Omega.hat}{ as described in Hsiao, C. and Q. Li and J.S. Racine. }
   \item{q.*}{ the various quantiles of the statistic \code{Jn} (or
-    \code{In} if 
+    \code{In} if
     \code{pivot=FALSE})  are in
     components \code{q.90},
     \code{q.95}, \code{q.99} (one-sided 1\%, 5\%, 10\% critical values) }
@@ -128,7 +158,7 @@ npcmstest(formula,
     replications of \code{Jn} }
   \item{In.bootstrap}{ if \code{pivot=FALSE} contains the bootstrap
     replications of \code{In} }
-  
+
   \code{\link{summary}} supports object of type \code{cmstest}.
 }
 \references{
@@ -167,12 +197,17 @@ npcmstest(formula,
   \code{\link{lm}} and uses features specific to objects of type
   \code{\link{lm}} hence if you attempt to pass objects of a different
   type the function cannot be expected to work.
-  
+
   If you are using data of mixed types, then it is advisable to use the
   \code{\link{data.frame}} function to construct your input data and not
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work as
   intended on mixed data types and will coerce the data to the same
   type.
+}
+
+\seealso{\code{\link{npRmpi.init}}.
+  \code{\link{np.kernels}}, \code{\link{np.options}},
+  \code{\link{plot}}, \code{\link{npregbw}}.
 }
 
 \examples{
@@ -184,26 +219,31 @@ npcmstest(formula,
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(data(cps71),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
 
-mpi.bcast.cmd(attach(cps71),
-              caller.execute=TRUE)
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
 
-mpi.bcast.cmd(model <- lm(logwage~age+I(age^2), x=TRUE, y=TRUE),
-              caller.execute=TRUE)
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
-mpi.bcast.cmd(npcmstest(model = model, xdat = age, ydat = logwage,
-                        boot.num = 29),
-              caller.execute=TRUE)
+data(cps71)
+
+model <- lm(logwage~age+I(age^2), data=cps71, x=TRUE, y=TRUE)
+
+npcmstest(model = model, xdat = cps71$age, ydat = cps71$logwage,
+          boot.num=9, nmulti = 1)
 
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
@@ -211,21 +251,18 @@ mpi.bcast.cmd(npcmstest(model = model, xdat = age, ydat = logwage,
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 \keyword{ nonparametric }

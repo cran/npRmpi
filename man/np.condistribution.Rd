@@ -1,6 +1,5 @@
 \name{npcdist}
 \alias{npcdist}
-\alias{npcdist.call}
 \alias{npcdist.condbandwidth}
 \alias{npcdist.default}
 \alias{npcdist.formula}
@@ -18,11 +17,14 @@
 }
 
 \usage{
-npcdist(bws, \dots)
+npcdist(bws, 
+        \dots)
 
-\method{npcdist}{formula}(bws, data = NULL, newdata = NULL, \dots)
+\method{npcdist}{formula}(bws, 
+        data = NULL, 
+        newdata = NULL, 
+        \dots)
 
-\method{npcdist}{call}(bws, \dots)
 
 \method{npcdist}{condbandwidth}(bws,
         txdat = stop("invoked without training data 'txdat'"),
@@ -30,13 +32,24 @@ npcdist(bws, \dots)
         exdat,
         eydat,
         gradients = FALSE,
+        proper = FALSE,
+        proper.method = c("isotonic"),
+        proper.control = list(),
         \dots)
 
-\method{npcdist}{default}(bws, txdat, tydat, \dots)
+\method{npcdist}{default}(bws, 
+        txdat, 
+        tydat, 
+        nomad = FALSE, 
+        \dots)
 
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{condbandwidth}
     object returned from a previous invocation of
@@ -50,22 +63,7 @@ npcdist(bws, \dots)
     data, and so on.
   }
 
-  \item{gradients}{
-    a logical value specifying whether to return estimates of the
-    gradients at the evaluation points. Defaults to \code{FALSE}.
-  }
 
-  \item{\dots}{
-    additional arguments supplied to specify the bandwidth type, kernel
-    types, and so on.  This is necessary if you specify bws as a
-    \eqn{p+q}-vector and not a \code{condbandwidth} object, and you do
-    not desire the default behaviours. To do this, you may specify any
-    of \code{bwmethod}, \code{bwscaling}, \code{bwtype},
-    \code{cxkertype}, \code{cxkerorder}, \code{cykertype},
-    \code{cykerorder}, \code{uxkertype}, \code{oxkertype},
-    \code{oykertype}, as described in \code{\link{npcdistbw}}.
-  }
-  
   \item{data}{
     an optional data frame, list or environment (or object coercible to
     a data frame by \code{\link{as.data.frame}}) containing the
@@ -74,11 +72,6 @@ npcdist(bws, \dots)
     which \code{\link{npcdistbw}} was called.
  }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
-  }
-
 
   \item{txdat}{
     a \eqn{p}-variate data frame of sample realizations of explanatory
@@ -86,11 +79,38 @@ npcdist(bws, \dots)
     compute the bandwidth object.
   }
 
+
   \item{tydat}{
     a \eqn{q}-variate data frame of sample realizations of dependent
     data (training data). Defaults to the training data used to
     compute the bandwidth object.
   }
+
+
+\subsection{Bandwidth Search Shortcut}{
+This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npcdistbw}} when bandwidths are computed inside \code{npcdist}.
+}
+
+  \item{nomad}{
+    logical shortcut passed through to \code{\link{npcdistbw}} when
+    bandwidths are computed inside \code{npcdist}. When \code{TRUE},
+    the bandwidth route fills any missing values among \code{regtype},
+    \code{search.engine}, \code{degree.select},
+    \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
+    \code{degree.verify}, and \code{bwtype} with the recommended
+    automatic LP NOMAD preset documented in \code{\link{npcdistbw}}.
+    Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
+    also be supplied through \code{\dots}; \code{nmulti} remains the
+    outer restart count while \code{nomad.nmulti} controls inner
+    \code{crs::snomadr()} multistarts within each outer restart.
+    After fitting, inspect \code{fit$bws$nomad.shortcut} on the
+    returned object \code{fit} to see the normalized shortcut metadata.
+  }
+
+
+\subsection{Evaluation Data And Returned Quantities}{
+These arguments control where the fitted conditional distribution is evaluated and which estimates are returned.
+}
 
   \item{exdat}{
     a \eqn{p}-variate data frame of explanatory data on
@@ -99,14 +119,93 @@ npcdist(bws, \dots)
     \code{txdat}.
   }
 
+
   \item{eydat}{
     a \eqn{q}-variate data frame of dependent data on which
     cumulative conditional distributions will be evaluated. By default,
     evaluation takes place on the data provided by \code{tydat}.
   }
 
+
+  \item{gradients}{
+    a logical value specifying whether to return estimates of the
+    gradients at the evaluation points. Defaults to \code{FALSE}.
+  }
+
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+
+\subsection{Fit Properization Controls}{
+These arguments control optional post-estimation properization of the fitted conditional distribution.
+}
+
+  \item{proper}{
+    a logical value specifying whether to post-process the estimated
+    conditional distribution so that it is monotone and bounded on the
+    evaluation grid. Defaults to \code{FALSE}.
+  }
+
+
+  \item{proper.control}{
+    a named list of control parameters for properization. Supported
+    entries are \code{tol}, \code{grid.check}, \code{store.raw}, and
+    \code{fail.on.unsupported}.
+  }
+
+
+
+  \item{proper.method}{
+    the properization method. Currently only
+    \code{"isotonic"} is supported.
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are computed internally, or used to interpret a numeric \code{bws} vector.
+}
+
+  \item{\dots}{
+    additional arguments supplied to \code{\link{npcdistbw}} when
+    \code{npcdist} computes bandwidths internally, or arguments needed
+    to interpret a numeric \code{bws} vector. This is where bandwidth
+    selection controls such as \code{bwmethod}, \code{bwtype},
+    kernel/support controls such as \code{cxkertype},
+    \code{cykertype}, \code{cxkerbound}, and \code{cykerbound},
+    search controls such as \code{nmulti},
+    \code{scale.factor.search.lower}, and \code{nomad.nmulti}, and
+    local-polynomial controls such as \code{regtype}, \code{degree},
+    \code{basis}, and \code{bernstein.basis} are supplied. See
+    \code{\link{npcdistbw}} for the complete bandwidth-selection
+    argument surface.
+  }
+
 }
 \details{
+  Documentation guide: see \code{\link{npcdistbw}} for bandwidth selection and search controls, \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
+  When \code{bws} is omitted, the formula and default methods call
+  \code{\link{npcdistbw}} first and pass bandwidth-selection arguments
+  from \code{\dots} to that call. When \code{bws} is already a
+  \code{condbandwidth} object, \code{npcdist} estimates with the stored
+  bandwidth metadata in that object.
+
+  Argument groups for bandwidth selection are documented on
+  \code{\link{npcdistbw}}. The most common workflow is to initialize MPI
+  execution if needed, choose data and bandwidth inputs, then bandwidth
+  criterion and representation, then kernel/support controls, numerical
+  search controls, and finally local-polynomial/NOMAD controls for
+  polynomial-adaptive fits.
+
+  For S3 plotting help, use \code{methods("plot")} and query
+  class-specific help topics such as \code{?plot.npregression} and
+  \code{?plot.rbandwidth}. You can inspect implementations with
+  \code{getS3method("plot","npregression")}.
+
   \code{npcdist} implements a variety of methods for estimating
   multivariate conditional cumulative distributions (\eqn{p+q}-variate)
   defined over a set of possibly continuous and/or discrete (unordered,
@@ -136,6 +235,12 @@ npcdist(bws, \dots)
   kernel. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  For practitioners who want the recommended automatic LP NOMAD route
+  without spelling out all LP tuning arguments,
+  \code{npcdist(..., nomad=TRUE)} and \code{npcdistbw(..., nomad=TRUE)}
+  expand missing settings to the same documented preset. Explicit
+  incompatible settings fail fast rather than being silently rewritten.
 
 }
 \value{
@@ -182,13 +287,13 @@ npcdist(bws, \dots)
   conditional CDF and quantile functions with mixed categorical and
   continuous data,} Journal of Business and Economic Statistics, 26,
   423-434.
-  
+
   Li, Q. and J. Lin and J.S. Racine (2013), \dQuote{Optimal bandwidth
   selection for nonparametric conditional distribution and quantile
   functions}, Journal of Business and Economic Statistics, 31, 57-65.
 
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,} Cambridge
-  University Press. 
+  University Press.
 
   Scott, D.W. (1992), \emph{Multivariate Density Estimation. Theory,
   Practice and Visualization,} New York: Wiley.
@@ -202,7 +307,7 @@ npcdist(bws, \dots)
 }
 \author{
   Tristen Hayfield \email{tristen.hayfield@gmail.com}, Jeffrey S. Racine
-  \email{racinej@mcmaster.ca}    
+  \email{racinej@mcmaster.ca}
 }
 
 \section{Usage Issues}{
@@ -214,6 +319,7 @@ npcdist(bws, \dots)
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{npudens}}
 }
 \examples{
@@ -226,26 +332,117 @@ npcdist(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+npRmpi.init(nslaves=1)
 
 data("Italy")
 
-mpi.bcast.Robj2slave(Italy)
+bw <- npcdistbw(formula=gdp~ordered(year),
+                data=Italy)
 
-mpi.bcast.cmd(bw <- npcdistbw(formula=gdp~ordered(year),
-                              data=Italy),
-              caller.execute=TRUE)
-
-mpi.bcast.cmd(F <- npcdist(bws=bw),
-              caller.execute=TRUE)
+F <- npcdist(bws=bw)
 
 summary(F)
+
+## Variations on local polynomial conditional distribution estimation
+## with proper = TRUE.
+
+Italy2 <- within(Italy, {
+  year <- as.numeric(as.character(year))
+})
+
+## Plot only: make the plotted surface proper on the plot evaluation grid.
+
+Fhat <- npcdist(gdp ~ year, data = Italy2,
+                regtype = "lp", degree = 3, nmulti = 1)
+
+plot(Fhat, proper = TRUE)
+
+## Fit an object whose fitted values are themselves proper.
+
+ctrl_fit <- list(
+  mode = "slice",
+  apply = "fitted",
+  slice.grid.size = 101L,
+  slice.extend.factor = 0.1
+)
+
+Fhat_fit <- npcdist(
+  gdp ~ year,
+  data = Italy2,
+  regtype = "lp",
+  degree = 3,
+  nmulti = 1,
+  proper = TRUE,
+  proper.control = ctrl_fit
+)
+
+fit_proper <- fitted(Fhat_fit)
+fit_raw <- Fhat_fit$condist.raw
+
+## Predict on a common explicit y-grid for several years, and render
+## those predictions proper.
+
+g.grid <- seq(min(Italy2$gdp), max(Italy2$gdp), length.out = 200)
+
+nd_grid <- expand.grid(
+  gdp = g.grid,
+  year = c(1955, 1975, 1995)
+)
+
+pred_grid <- predict(Fhat, newdata = nd_grid, proper = TRUE)
+
+## Predict on paired rows with different gdp grids by year, and still
+## make the predictions proper via slice mode.
+
+g1 <- seq(quantile(Italy2$gdp, 0.10),
+          quantile(Italy2$gdp, 0.60), length.out = 60)
+g2 <- seq(quantile(Italy2$gdp, 0.30),
+          quantile(Italy2$gdp, 0.90), length.out = 35)
+
+nd_slice <- rbind(
+  data.frame(gdp = g1, year = rep(1960, length(g1))),
+  data.frame(gdp = g2, year = rep(1985, length(g2)))
+)
+
+pred_slice <- predict(
+  Fhat,
+  newdata = nd_slice,
+  proper = TRUE,
+  proper.control = list(mode = "slice")
+)
+
+## One object that carries properization for fitted values and for later
+## predict() calls.
+
+ctrl_both <- list(
+  mode = "slice",
+  apply = "both",
+  slice.grid.size = 101L,
+  slice.extend.factor = 0.1
+)
+
+Fhat_both <- npcdist(
+  gdp ~ year,
+  data = Italy2,
+  regtype = "lp",
+  degree = 3,
+  nmulti = 1,
+  proper = TRUE,
+  proper.control = ctrl_both
+)
+
+fit_both <- fitted(Fhat_both)
+pred_both <- predict(
+  Fhat_both,
+  newdata = nd_slice,
+  proper.control = ctrl_both
+)
 
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
@@ -253,21 +450,15 @@ summary(F)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
 } % enddontrun
 }
 \keyword{nonparametric}

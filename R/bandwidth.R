@@ -5,10 +5,15 @@ bandwidth <-
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
            ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            ckerorder = c(2,4,6,8),
+           ckerbound = c("none","range","fixed"),
+           ckerlb = NULL,
+           ckerub = NULL,
            ukertype = c("aitchisonaitken","liracine"),
-           okertype = c("liracine","wangvanryzin"),
+           okertype = c("liracine","wangvanryzin","racineliyan"),
            fval = NA,
            ifval = NA,
+           num.feval = NA,
+           num.feval.fast = NA,
            fval.history = NA,
            eval.history = NA,
            invalid.history = NA,
@@ -27,33 +32,46 @@ bandwidth <-
     bwmethod = match.arg(bwmethod)
     bwtype = match.arg(bwtype)
     ckertype = match.arg(ckertype)
+    ckerbound = match.arg(ckerbound)
 
     if(missing(ckerorder))
       ckerorder = 2
     else if (ckertype == "uniform")
-      warning("ignoring kernel order specified with uniform kernel type")
+      .np_warning("ignoring kernel order specified with uniform kernel type")
     else {
-      kord = eval(formals()$ckerorder) 
+      kord = c(2,4,6,8) 
       if (!any(kord == ckerorder))
         stop("ckerorder must be one of ", paste(kord,collapse=" "))
     }
 
     if (ckertype == "truncated gaussian" && ckerorder != 2)
-      warning("using truncated gaussian of order 2, higher orders not yet implemented")
+      .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
     if (bwmethod == "normal-reference" && (ckertype != "gaussian" || bwtype != "fixed")){    
-      warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+      .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
       bwtype = "fixed"
       ckertype = "gaussian"
     }
 
     ukertype = match.arg(ukertype)
     okertype = match.arg(okertype)
+    cbounds <- npKernelBoundsResolve(
+      dati = xdati,
+      varnames = xnames,
+      kerbound = ckerbound,
+      kerlb = ckerlb,
+      kerub = ckerub,
+      argprefix = "cker")
+    bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
+    if (bwtype != "fixed" &&
+        cbounds$bound != "none" &&
+        !bounded_nonfixed_supported)
+      stop("finite continuous kernel bounds require bwtype = \"fixed\"")
 
     porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
 
     if (!identical(sfactor,NA)){
-      sumNum <- sapply(1:ndim, function(i) {
+      sumNum <- sapply(seq_len(ndim), function(i) {
         if (xdati$icon[i])
           return(sfactor[i])
 
@@ -76,16 +94,21 @@ bandwidth <-
       pmethod = bwmToPrint(bwmethod),
       fval = fval,
       ifval = ifval,
+      num.feval = num.feval,
+      num.feval.fast = num.feval.fast,
       fval.history = fval.history,
       eval.history = eval.history,
       invalid.history = invalid.history,
       scaling = bwscaling,
-      pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
+      pscaling = npBandwidthSummaryLabel(bwtype = bwtype, bwscaling = bwscaling),
       type = bwtype,
       ptype = bwtToPrint(bwtype),
       ckertype = ckertype,    
       ckerorder = ckerorder,
-      pckertype = cktToPrint(ckertype, order = porder),
+      ckerbound = cbounds$bound,
+      ckerlb = cbounds$lb,
+      ckerub = cbounds$ub,
+      pckertype = cktToPrint(ckertype, order = porder, kerbound = cbounds$bound),
       ukertype = ukertype,
       pukertype = uktToPrint(ukertype),
       okertype = okertype,
@@ -112,13 +135,16 @@ bandwidth <-
       vartitle = list(x = ""),
       vartitleabb = list(x = ""),
       rows.omit = rows.omit,
-      nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+      nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
       timing = timing,
       total.time = total.time)
 
     mybw$klist = list(
       x =
       list(ckertype = ckertype,
+           ckerbound = cbounds$bound,
+           ckerlb = cbounds$lb,
+           ckerub = cbounds$ub,
            pckertype = mybw$pckertype,
            ukertype = ukertype,
            pukertype = mybw$pukertype,
@@ -171,6 +197,5 @@ summary.bandwidth <- function(object, ...) {
   cat("\n\n")
 }
 
-plot.bandwidth <- function(...) { npplot(...)  }
 
-predict.bandwidth <- function(...) { eval(npudens(...), envir =parent.frame()) }
+predict.bandwidth <- function(...) { do.call(npudens, list(...)) }

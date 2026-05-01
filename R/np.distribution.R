@@ -30,18 +30,25 @@ npudist.formula <-
     tmf <- bws$call[c(1,m)]
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
-    umf <- tmf <- eval(tmf, envir = environment(tt))
+    mf.args <- as.list(tmf)[-1L]
+    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
 
     tdat <- tmf[, attr(attr(tmf, "terms"),"term.labels"), drop = FALSE]
 
-    if ((has.eval <- !is.null(newdata))) {
-      umf <- emf <- model.frame(tt, data = newdata)
+    has.eval <- !is.null(newdata)
+    if (has.eval) {
+      umf.args <- list(formula = tt, data = newdata)
+      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      emf <- umf
 
       edat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
     }
     
-    ev <- eval(parse(text=paste("npudist(tdat = tdat,",
-                 ifelse(has.eval,"edat = edat,",""), "bws = bws, ...)")))
+    ud.args <- list(tdat = tdat)
+    if (has.eval)
+      ud.args$edat <- edat
+    ud.args$bws <- bws
+    ev <- do.call(npudist, c(ud.args, list(...)))
 
     ev$omit <- attr(umf,"na.action")
     ev$rows.omit <- as.vector(ev$omit)
@@ -55,7 +62,7 @@ npudist.formula <-
 
 npudist.call <-
   function(bws, ...) {
-    npudist(tdat = eval(bws$call[["dat"]], environment(bws$call)),
+    npudist(tdat = .np_eval_bws_call_arg(bws, "dat"),
           bws = bws, ...)
   }
 
@@ -63,6 +70,13 @@ npudist.dbandwidth <-
   function(bws,
            tdat = stop("invoked without training data 'tdat'"),
            edat, ...){
+
+    dots <- list(...)
+    fit.start <- proc.time()[3]
+    fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
+    .npRmpi_require_active_slave_pool(where = "npudist()")
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     no.e = missing(edat)
 
@@ -77,12 +91,12 @@ npudist.dbandwidth <-
     if (length(bws$bw) != length(tdat))
       stop("length of bandwidth vector does not match number of columns of 'tdat'")
 
-    ccon = unlist(lapply(as.data.frame(tdat[,bws$icon]),class))
-    if ((any(bws$icon) && !all((ccon == class(integer(0))) | (ccon == class(numeric(0))))) ||
-        (any(bws$iord) && !all(unlist(lapply(as.data.frame(tdat[,bws$iord]),class)) ==
-                               class(ordered(0)))) ||
-        (any(bws$iuno) && !all(unlist(lapply(as.data.frame(tdat[,bws$iuno]),class)) ==
-                               class(factor(0)))))
+    if ((any(bws$icon) &&
+         !all(vapply(as.data.frame(tdat[, bws$icon]), inherits, logical(1), c("integer", "numeric")))) ||
+        (any(bws$iord) &&
+         !all(vapply(as.data.frame(tdat[, bws$iord]), inherits, logical(1), "ordered"))) ||
+        (any(bws$iuno) &&
+         !all(vapply(as.data.frame(tdat[, bws$iuno]), inherits, logical(1), "factor"))))
       stop("supplied bandwidths do not match 'tdat' in type")
 
     tdat = na.omit(tdat)
@@ -94,7 +108,7 @@ npudist.dbandwidth <-
     }
 
     tnrow = nrow(tdat)
-    enrow = ifelse(no.e,tnrow,nrow(edat))
+    enrow = (if (no.e) tnrow else nrow(edat))
 
     ## re-assign levels in training and evaluation data to ensure correct
     ## conversion to numeric type.
@@ -103,6 +117,9 @@ npudist.dbandwidth <-
     
     if (!no.e)
       edat <- adjustLevels(edat, bws$xdati, allowNewCells = TRUE)
+
+    if (!no.e)
+      npKernelBoundsCheckEval(edat, bws$icon, bws$ckerlb, bws$ckerub, argprefix = "cker")
 
     ## grab the evaluation data before it is converted to numeric
     if(no.e)
@@ -138,12 +155,12 @@ npudist.dbandwidth <-
       num_uno = bws$nuno,
       num_ord = bws$nord,
       num_con = bws$ncon,
-      int_LARGE_SF = ifelse(bws$scaling, SF_NORMAL, SF_ARB),
+      int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
       BANDWIDTH_den_extern = switch(bws$type,
         fixed = BW_FIXED,
         generalized_nn = BW_GEN_NN,
         adaptive_nn = BW_ADAP_NN),
-      int_MINIMIZE_IO=ifelse(options('np.messages'), IO_MIN_FALSE, IO_MIN_TRUE),
+      int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE,
       ckerneval = switch(bws$ckertype,
         gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
@@ -154,33 +171,57 @@ npudist.dbandwidth <-
         liracine = UKER_LR),
       okerneval = switch(bws$okertype,
         wangvanryzin = OKER_WANG,
-        liracine = OKER_NLR),
+        liracine = OKER_NLR,
+        "racineliyan" = OKER_RLY),
       no.e = no.e,
       mcv.numRow = attr(bws$xmcv, "num.row"),
       densOrDist = NP_DO_DIST,
       old.dist = FALSE,
-      int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO))
+      int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO)
+    cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
-    
-    myout=
-      .C("np_density", as.double(tuno), as.double(tord), as.double(tcon),
-         as.double(euno),  as.double(eord),  as.double(econ), 
-         as.double(c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord])),
-         as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-         as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
-         as.integer(myopti),
-         dist = double(enrow),
-         derr = double(enrow),
-         log_likelihood = double(1),
-         PACKAGE="npRmpi" )[c("dist","derr", "log_likelihood")]
+    myout <- .np_with_compiled_fit_progress(
+      label = "Fitting distribution",
+      total = .np_densdist_fit_total(bws = bws, tnrow = tnrow, enrow = enrow),
+      handoff = fit.progress.handoff,
+      handoff.detail = if (fit.progress.handoff) "starting" else NULL,
+      .Call("C_np_density",
+            as.double(tuno), as.double(tord), as.double(tcon),
+            as.double(euno), as.double(eord), as.double(econ),
+            as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+            as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
+            as.integer(myopti),
+            as.integer(enrow),
+            as.double(cker.bounds.c$lb),
+            as.double(cker.bounds.c$ub),
+            PACKAGE = "npRmpi")
+    )
+    names(myout)[1] <- "dist"
+
+    fit.elapsed <- proc.time()[3] - fit.start
+    optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
+    total.time <- fit.elapsed + (if (is.na(optim.time)) 0.0 else optim.time)
 
     ev <- npdistribution(bws=bws, eval=teval, dist = myout$dist,
                          derr = myout$derr, ntrain = tnrow, trainiseval = no.e,
-                         rows.omit = rows.omit)
+                         rows.omit = rows.omit,
+                         timing = bws$timing, total.time = total.time,
+                         optim.time = optim.time, fit.time = fit.elapsed)
     return(ev)
   }
 
 npudist.default <- function(bws, tdat, ...){
+  .npRmpi_require_active_slave_pool(where = "npudist()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+
+  if (!missing(bws) && inherits(bws, "formula")) {
+    dots <- list(...)
+    tbw <- do.call(npudistbw, c(list(formula = bws), dots))
+    return(npudist(bws = tbw, ...))
+  }
+
   sc <- sys.call()
   sc.names <- names(sc)
 
@@ -193,6 +234,7 @@ npudist.default <- function(bws, tdat, ...){
 
   no.bws <- missing(bws)
   no.tdat <- missing(tdat)
+  has.explicit.bws <- (!no.bws) && isa(bws, "dbandwidth")
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
@@ -216,11 +258,25 @@ npudist.default <- function(bws, tdat, ...){
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
     
-  tbw <- eval.parent(sc.bw)
+  tbw <- if (!has.explicit.bws) {
+    .np_progress_select_bandwidth_enhanced(
+      "Selecting distribution bandwidth",
+      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+    )
+  } else {
+    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+  }
 
   ## convention: first argument is always dropped, second, if present, propagated
-  eval(parse(text=paste("npudist(bws = tbw",
-               ifelse(no.tdat, "",
-                      ifelse(tdat.named, ",tdat = tdat",",tdat")),
-               ",...)")))
+  call.args <- list(bws = tbw)
+  if (!no.tdat) {
+    if (tdat.named) {
+      call.args$tdat <- tdat
+    } else {
+      call.args <- c(call.args, list(tdat))
+    }
+  }
+  if (!has.explicit.bws)
+    call.args$.np_fit_progress_handoff <- TRUE
+  do.call(npudist, c(call.args, list(...)))
 }

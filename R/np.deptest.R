@@ -9,6 +9,9 @@ npdeptest <- function(data.x = NULL,
                       bootstrap = TRUE,
                       boot.num = 399,
                       random.seed = 42) {
+  .npRmpi_require_active_slave_pool(where = "npdeptest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
   
   ## Trap fatal errors
 
@@ -23,14 +26,9 @@ npdeptest <- function(data.x = NULL,
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
+  seed.state <- .np_seed_enter(random.seed)
 
-  set.seed(random.seed)
+  .np_progress_note("Computing bandwidths")
 
   ## If the variable is a time series convert to type numeric
 
@@ -75,7 +73,7 @@ npdeptest <- function(data.x = NULL,
       ## Inf, and NaN.  
 
       if(!all(is.finite(summand))) {
-        warning(" non-finite value in summation-based statistic: integration recommended")
+        .np_warning(" non-finite value in summation-based statistic: integration recommended")
         summand <- summand[is.finite(summand)]
       }
 
@@ -118,54 +116,45 @@ npdeptest <- function(data.x = NULL,
 
   } ## end of Srho.bivar function
   
-  console <- newLineConsole()
-  console <- printClear(console)
-  console <- printPop(console)  
-  
   ## Compute and save bandwidths (save for bootstrapping if requested)
 
-  bw.data.x <- npudensbw(~data.x)$bw
-  bw.data.y <- npudensbw(~data.y)$bw
-  bw.joint <- npudensbw(~data.x+data.y)$bw
-  
-  console <- printClear(console)
-  console <- printPush(paste(sep="", "Constructing metric entropy..."), console = console)
+  bw.data.x <- .np_progress_with_legacy_suppressed(npudensbw(~data.x))$bw
+  bw.data.y <- .np_progress_with_legacy_suppressed(npudensbw(~data.y))$bw
+  bw.joint <- .np_progress_with_legacy_suppressed(npudensbw(~data.x+data.y))$bw
+
+  .np_progress_note("Constructing metric entropy")
   
   Srho.vec <- Srho.bivar(data.x,data.y,bw.data.x,bw.data.y,bw.joint,method=method)
 
   ## Bootstrap if requested - null is independence so simple iid
-  ## bootstrap (sample(x,replace=TRUE)) will work
+  ## index resampling under replacement is sufficient
 
   if(bootstrap) {
 
     Srho.vec.boot <- numeric()
+    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
 
-    for(b in 1:boot.num) {
-
-      console <- printClear(console)
-      console <- printPush(paste(sep="", "Bootstrap replication ",
-                                 b, "/", boot.num, "..."), console)
-      
+    for (b in seq_len(boot.num)) {
       ## Break systematic relationship between x and y (null)
       
-      data.x.boot <- sample(data.x,replace=TRUE)
+      data.x.boot <- data.x[sample.int(length(data.x), replace = TRUE)]
       
       Srho.vec.boot[b] <- Srho.bivar(data.x.boot,data.y,bw.data.x,bw.data.y,bw.joint,method=method)
+      progress <- .np_progress_step(progress, done = b)
 
     }
 
+    progress <- .np_progress_end(progress)
+
     ## Compute P-values
 
-    P <- mean(ifelse(Srho.vec.boot>Srho.vec,1,0))
+    P <- mean(Srho.vec.boot > Srho.vec)
 
   }
 
-  console <- printClear(console)
-  console <- printPop(console)
-
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
 
   if(bootstrap) {
 

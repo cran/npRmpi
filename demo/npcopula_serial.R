@@ -15,7 +15,7 @@ require(MASS)
 
 set.seed(42)
 
-n <- 5000
+n <- as.integer(Sys.getenv("NP_DEMO_N", "5000"))
 n.eval <- 25
 rho <- 0.95
 mu <- c(0,0)
@@ -26,7 +26,7 @@ mydat <- data.frame(x=mydat[,1],y=mydat[,2])
 q.minm <- 0.0
 q.max <- 1.0
 grid.seq <- seq(q.minm,q.max,length=n.eval)
-grid.dat <- cbind(grid.seq,grid.seq)
+grid.dat <- data.frame(x = grid.seq, y = grid.seq)
 
 ## Estimate the copula
 

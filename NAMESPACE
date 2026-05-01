@@ -1,13 +1,14 @@
-useDynLib(npRmpi)
+useDynLib(npRmpi, .registration = TRUE)
 import(stats, boot, cubature)
-importFrom("grDevices", "boxplot.stats", "extendrange", "grey", "n2mfrow", "rgb")
-importFrom("graphics", "axis", "lines", "mtext", "par", "persp", "plot", "plot.new", "plot.window", "points", "polygon")
-importFrom("utils", "combn", "flush.console")
+importFrom("grDevices", "boxplot.stats", "extendrange", "grey", "n2mfrow", "rgb", "trans3d")
+importFrom("graphics", "axis", "legend", "lines", "mtext", "par", "persp", "plot", "plot.new", "plot.window", "points", "polygon", "arrows", "barplot", "bxp")
+importFrom("utils", "combn", "flush.console", "object.size", "tail")
 importFrom("methods", "is")
 importFrom("parallel", "nextRNGStream", "detectCores")
 importFrom("quantreg", "rq")
 importFrom("quadprog", "solve.QP")
 export(b.star
+       ,dimBS
        ,.docall
        ,.force.type
        ,.mpi.undefined
@@ -19,136 +20,52 @@ export(b.star
        ,.mpi.worker.apply
        ,.mpi.worker.sim
        ,.mpi.worker.applyLB
-       ,mpi.abort
-       ,mpi.allgather
-       ,mpi.allgather.Robj
-       ,mpi.allgatherv
-       ,mpi.allreduce
-       ,mpi.any.source
-       ,mpi.any.tag
-       ,mpi.apply
-       ,mpi.applyLB
        ,mpi.barrier
        ,mpi.bcast
        ,mpi.bcast.Robj
        ,mpi.bcast.Robj2slave
-       ,mpi.bcast.Rfun2slave
-       ,mpi.bcast.data2slave
        ,mpi.bcast.cmd
-       ,mpi.cancel
-       ,mpi.cart.coords
-       ,mpi.cart.create
-       ,mpi.cart.get
-       ,mpi.cart.rank
-       ,mpi.cart.shift
-       ,mpi.cartdim.get
        ,mpi.close.Rslaves
-       ,mpi.comm.c2f
-       ,mpi.comm.disconnect
        ,mpi.comm.dup
        ,mpi.comm.free
-       ,mpi.comm.get.parent
-       ,mpi.comm.is.null
-       ,mpi.comm.maxsize
        ,mpi.comm.rank
-       ,mpi.comm.remote.size
-       ,mpi.comm.set.errhandler
        ,mpi.comm.size
-       ,mpi.comm.spawn
-       ,mpi.comm.test.inter
-       ,mpi.dims.create
-       ,mpi.exit
-       ,mpi.finalize
-       ,mpi.gather
-       ,mpi.gather.Robj
-       ,mpi.gatherv
-       ,mpi.get.count
+       ,mpi.get.version
        ,mpi.get.processor.name
-       ,mpi.get.sourcetag
        ,mpi.hostinfo
-       ,mpi.iapply
-       ,mpi.iapplyLB
-       ,mpi.info.create
-       ,mpi.info.free
-       ,mpi.info.get
-       ,mpi.info.set
-       ,mpi.intercomm.merge
-       ,mpi.iparApply
-       ,mpi.iparCapply
-       ,mpi.iparLapply
-       ,mpi.iparMM
-       ,mpi.iparRapply
-       ,mpi.iparReplicate
-       ,mpi.iparSapply
-       ,mpi.iprobe
-       ,mpi.irecv
-       ,mpi.is.master
-       ,mpi.isend
-       ,mpi.isend.Robj
-       ,mpi.parApply
-       ,mpi.parCapply
-       ,mpi.parLapply
-       ,mpi.parMM
-       ,mpi.parRapply
-       ,mpi.parReplicate
-       ,mpi.parSapply
-       ,mpi.parSim
-       ,mpi.probe
-       ,mpi.proc.null
        ,mpi.quit
-       ,mpi.realloc.comm
-       ,mpi.realloc.request
-       ,mpi.realloc.status
-       ,mpi.recv
-       ,mpi.recv.Robj
-       ,mpi.reduce
-       ,mpi.remote.exec
-       ,mpi.request.maxsize
-       ,mpi.scatter
-       ,mpi.scatter.Robj
-       ,mpi.scatterv
-       ,mpi.send
-       ,mpi.send.Robj
-       ,mpi.sendrecv
-       ,mpi.sendrecv.replace
-       ,mpi.setup.rngstream
-       ,mpi.spawn.Rslaves
-       ,mpi.status.maxsize
-       ,mpi.test
-       ,mpi.test.cancelled
-       ,mpi.testall
-       ,mpi.testany
-       ,mpi.testsome
-       ,mpi.universe.size
-       ,mpi.wait
-       ,mpi.waitall
-       ,mpi.waitany
-       ,mpi.waitsome
        ,slave.hostinfo
        ,string
        ,tailslave.log
        ,np.mpi.initialize
-       ,npRmpi.start
-       ,npRmpi.stop
+       ,npRmpi.init
+       ,npRmpi.quit
        ,npRmpi.session.info
        ,npudensbw
        ,npudistbw
        ,npudens
+       ,npudenshat
+       ,npudisthat
        ,npudist
        ,npregbw
        ,npreg
+       ,npreghat
+       ,npindexhat
+       ,npplreghat
+       ,npscoefhat
        ,npregiv
        ,npregivderiv       
        ,npplreg
        ,npplregbw
        ,npcdensbw
        ,npcdens
+       ,npcdenshat
        ,npcdist
        ,npcdistbw
+       ,npcdisthat
        ,npcopula
        ,npdeptest       
        ,npsdeptest
-       ,npplot
        ,npksum
        ,npqreg
        ,npquantile
@@ -181,6 +98,7 @@ S3method(print,npdensity)
 S3method(print,npdistribution)
 S3method(print,rbandwidth)
 S3method(print,npregression)
+S3method(print,npreghat)
 S3method(print,plbandwidth)
 S3method(print,plregression)
 S3method(print,conbandwidth)
@@ -189,6 +107,8 @@ S3method(print,condensity)
 S3method(print,condistribution)
 S3method(print,npkernelsum)
 S3method(print,qregression)
+S3method(print,npregiv)
+S3method(print,npregivderiv)
 S3method(print,cmstest)
 S3method(print,conmode)
 S3method(print,deptest)
@@ -216,6 +136,8 @@ S3method(plot, scbandwidth)
 S3method(plot, npdensity)
 S3method(plot, npdistribution)
 S3method(plot, npregression)
+S3method(plot, npregiv)
+S3method(plot, npregivderiv)
 S3method(plot, plregression)
 S3method(plot, condensity)
 S3method(plot, condistribution)
@@ -248,6 +170,7 @@ S3method(vcov, plregression)
 S3method(vcov, singleindex)
 
 S3method(predict, npregression)
+S3method(predict, npreghat)
 S3method(predict, bandwidth)
 S3method(predict, dbandwidth)
 S3method(predict, conbandwidth)
@@ -279,6 +202,8 @@ S3method(summary, npdistribution)
 S3method(summary, condensity)
 S3method(summary, condistribution)
 S3method(summary, npregression)
+S3method(summary, npregiv)
+S3method(summary, npregivderiv)
 S3method(summary, cmstest)
 S3method(summary, conmode)
 S3method(summary, deptest)
@@ -345,6 +270,13 @@ S3method(npreg, call)
 S3method(npreg, default)
 S3method(npreg, rbandwidth)
 
+S3method(npreghat, formula)
+S3method(npreghat, call)
+S3method(npreghat, default)
+S3method(npreghat, rbandwidth)
+S3method(npreghat, npregression)
+S3method(npreghat, NULL)
+
 S3method(npsigtest, formula)
 S3method(npsigtest, call)
 S3method(npsigtest, default)
@@ -380,15 +312,6 @@ S3method(npcdistbw, NULL)
 S3method(npcdistbw, formula)
 S3method(npcdistbw, default)
 S3method(npcdistbw, condbandwidth)
-
-S3method(npplot, rbandwidth)
-S3method(npplot, bandwidth)
-S3method(npplot, dbandwidth)
-S3method(npplot, plbandwidth)
-S3method(npplot, conbandwidth)
-S3method(npplot, condbandwidth)
-S3method(npplot, sibandwidth)
-S3method(npplot, scbandwidth)
 
 S3method(compute.bootstrap.errors, rbandwidth)
 S3method(compute.bootstrap.errors, bandwidth)
@@ -431,3 +354,6 @@ S3method(npscoef, default)
 S3method(npscoef, call)
 S3method(npscoef, formula)
 S3method(npscoef, scbandwidth)
+
+S3method(gsl.bs, default)
+S3method(predict, npRmpi_gsl.bs)

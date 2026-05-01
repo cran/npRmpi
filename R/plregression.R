@@ -1,13 +1,26 @@
+.np_plreg_bws <- function(object, where = "plregression") {
+  if (!is.null(object$bws))
+    return(object$bws)
+
+  if (!is.null(object$bw) && inherits(object$bw, "plbandwidth"))
+    return(object$bw)
+
+  stop(sprintf("%s object does not contain a usable partially linear bandwidth object", where),
+       call. = FALSE)
+}
+
 plregression = 
   function(bws, xcoef, xcoeferr = 0, xcoefvcov, evalx, evalz, mean, resid = NA,
            ntrain, trainiseval = FALSE, residuals = FALSE,
-           xtra = double(6)){
+           xtra = double(6),
+           timing = NA, total.time = NA,
+           optim.time = NA, fit.time = NA){
 
-    if (missing(bws) | missing(evalx) | missing(evalz) | missing(mean) |
-        missing(ntrain) | missing(xcoef))
+    if (missing(bws) || missing(evalx) || missing(evalz) || missing(mean) || missing(ntrain) || missing(xcoef))
       stop("improper invocation of plregression constructor")
 
     d = list(
+      bws = bws,
       bw = bws,
       xcoef = xcoef,
       xcoeferr = xcoeferr,
@@ -36,6 +49,11 @@ plregression =
       MAPE = xtra[4],
       CORR = xtra[5],
       SIGN = xtra[6]
+      ,
+      timing = timing,
+      total.time = total.time,
+      optim.time = optim.time,
+      fit.time = fit.time
       )
 
     names(d$xcoeferr) <- names(d$xcoef) <- d$data.xnames
@@ -47,18 +65,20 @@ plregression =
   }
 
 print.plregression <- function(x, digits=NULL, ...){
+  obj.bws <- .np_plreg_bws(x, where = "print.plregression")
+
   cat("\nPartially Linear Model",
       "\nRegression data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", paste(" and ", x$nobs, " evaluation points,",
-                                      sep = "")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs, " evaluation points,",
+                                      sep = ""),
       " in ",(x$zndim+x$xndim)," variable(s)",
       "\nWith ", x$xndim, " linear parametric regressor(s), ",
       x$zndim, " nonparametric regressor(s)\n\n", sep="")
 
-  bwmat = matrix(data = 0, nrow = x$xndim+1, ncol = x$bw$bw$yzbw$ndim)
+  bwmat = matrix(data = 0, nrow = x$xndim+1, ncol = obj.bws$bw$yzbw$ndim)
   
-  for (i in 1:length(x$bw$bw))
-    bwmat[i,] = x$bw$bw[[i]]$bw
+  for (i in seq_along(obj.bws$bw))
+    bwmat[i,] = obj.bws$bw[[i]]$bw
   
   print(matrix(bwmat[1,], ncol=x$zndim,
                dimnames=list(paste(x$pscaling,":",sep=""),
@@ -73,7 +93,7 @@ print.plregression <- function(x, digits=NULL, ...){
   
   cat(genRegEstStr(x))
 
-  cat(genBwKerStrs(x$bw))
+  cat(genBwKerStrs(obj.bws))
   cat('\n\n')  
 
   if(!missing(...))
@@ -96,22 +116,41 @@ fitted.plregression <- function(object, ...){
  object$mean 
 }
 residuals.plregression <- function(object, ...) {
- if(object$residuals) { return(object$resid) } else { return(npplreg(bws = object$bw, residuals =TRUE)$resid) } 
+ if(object$residuals) {
+   return(object$resid)
+ } else {
+   return(npplreg(bws = .np_plreg_bws(object, where = "residuals.plregression"),
+                  residuals = TRUE)$resid)
+ }
 }
 predict.plregression <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npplreg(bws = object$bw, ...), envir = parent.frame())
-  if(se.fit)
-    return(list(fit = fitted(tr), se.fit = se(tr), 
-                df = tr$nobs, residual.scale = tr$MSE))
-  else
-    return(fitted(tr))
+  if (isTRUE(se.fit))
+    stop("se.fit = TRUE is not implemented for 'plregression' objects", call. = FALSE)
+
+  obj.bws <- .np_plreg_bws(object, where = "predict.plregression")
+  dots <- list(...)
+  has.formula.route <- !is.null(obj.bws$formula)
+
+  if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
+    nd <- toFrame(dots$newdata)
+    need <- c(obj.bws$xnames, obj.bws$znames)
+    if (!all(need %in% names(nd)))
+      stop("'newdata' must include columns: ", paste(need, collapse = ", "))
+    dots$exdat <- nd[, obj.bws$xnames, drop = FALSE]
+    dots$ezdat <- nd[, obj.bws$znames, drop = FALSE]
+    dots$newdata <- NULL
+  }
+
+  tr <- do.call(npplreg, c(list(bws = obj.bws), dots))
+  return(fitted(tr))
 }
-plot.plregression <- function(x, ...) { npplot(bws = x$bw, ...) }
 summary.plregression <- function(object, ...){
+  obj.bws <- .np_plreg_bws(object, where = "summary.plregression")
+
   cat("\nPartially Linear Model",
       "\nRegression data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "", paste(" and ", object$nobs, " evaluation points,",
-                                      sep = "")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs, " evaluation points,",
+                                      sep = ""),
       " in ",(object$zndim+object$xndim)," variable(s)",
       "\nWith ", object$xndim, " linear parametric regressor(s), ",
       object$zndim, " nonparametric regressor(s)\n", sep="")
@@ -119,10 +158,10 @@ summary.plregression <- function(object, ...){
   cat(genOmitStr(object))
   cat("\n")
 
-  bwmat = matrix(data = 0, nrow = object$xndim+1, ncol = object$bw$bw$yzbw$ndim)
+  bwmat = matrix(data = 0, nrow = object$xndim+1, ncol = obj.bws$bw$yzbw$ndim)
   
-  for (i in 1:length(object$bw$bw))
-    bwmat[i,] = object$bw$bw[[i]]$bw
+  for (i in seq_along(obj.bws$bw))
+    bwmat[i,] = obj.bws$bw[[i]]$bw
   
   print(matrix(bwmat[1,], ncol=object$zndim,
                dimnames=list(paste(object$pscaling,":",sep=""),
@@ -140,6 +179,7 @@ summary.plregression <- function(object, ...){
   cat("\n")
   cat(genGofStr(object))
 
-  cat(genBwKerStrs(object$bw))
+  cat(genBwKerStrs(obj.bws))
+  cat(genTimingStr(object))
   cat('\n\n')  
 }  

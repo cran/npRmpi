@@ -715,6 +715,7 @@ double np_cv_func_con_density_categorical_ls_npksum(double *vector_scale_factor)
   }
   /* Compute the cross-validation function */
     start = clock();
+
     if(np_kernel_estimate_con_density_categorical_leave_one_out_ls_cv(KERNEL_den_extern,
                                                                       KERNEL_den_unordered_extern,
                                                                       KERNEL_den_ordered_extern,

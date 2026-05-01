@@ -5,6 +5,10 @@
 se(x)
 }
 \arguments{
+\subsection{Object Input}{
+Object to interrogate for standard errors.
+}
+
   \item{x}{an object for which the extraction of standard errors is
     meaningful.}
 }
@@ -22,7 +26,8 @@ se(x)
 \seealso{
   \code{\link{fitted}}, \code{\link{residuals}}, \code{\link{coef}},
   and \code{\link{gradients}}, for related methods;
-  \code{\link{npRmpi}} for supported objects. 
+  \code{\link{npRmpi}} for supported objects;
+  \code{\link{npRmpi.init}} for MPI session startup.
 }
 
 \author{
@@ -41,24 +46,30 @@ se(x)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
 set.seed(42)
 
 x <- rnorm(10)
-mpi.bcast.Robj2slave(x)
-
-mpi.bcast.cmd(bw <- npudensbw(~x),
-              caller.execute=TRUE)
-
-mpi.bcast.cmd(fhat <- npudens(bw),
-              caller.execute=TRUE)
+bw <- npudensbw(~x)
+fhat <- npudens(bw)
 
 se(fhat)
 
@@ -68,21 +79,18 @@ se(fhat)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 \keyword{nonparametric}

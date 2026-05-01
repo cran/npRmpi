@@ -1,9 +1,11 @@
 npdistribution <- 
     function(bws, eval, dist, derr = NA,
              ntrain, trainiseval = FALSE,
-             rows.omit = NA){
+             rows.omit = NA,
+             timing = NA, total.time = NA,
+             optim.time = NA, fit.time = NA){
 
-        if (missing(bws) | missing(eval) | missing(dist) | missing(ntrain))
+        if (missing(bws) || missing(eval) || missing(dist) || missing(ntrain))
             stop("improper invocation of distribution constructor")
 
         if (length(rows.omit) == 0)
@@ -29,7 +31,9 @@ npdistribution <-
             ntrain = ntrain,
             trainiseval = trainiseval,
             rows.omit = rows.omit,
-            nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)))
+            nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
+            timing = timing, total.time = total.time,
+            optim.time = optim.time, fit.time = fit.time)
 
         class(d) <- "npdistribution"
 
@@ -38,8 +42,8 @@ npdistribution <-
 
 print.npdistribution <- function(x, digits=NULL, ...){
   cat("\nDistribution Data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", paste(" and ", x$nobs,
-                                      " evaluation points,", sep="")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs,
+                                      " evaluation points,", sep=""),
       " in ",x$ndim," variable(s)\n",sep="")
 
   print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),x$xnames)))
@@ -59,10 +63,17 @@ fitted.npdistribution <- function(object, ...){
  object$dist 
 }
 se.npdistribution <- function(x){ x$derr }
-plot.npdistribution <- function(x, ...) { npplot(bws = x$bws, ...) }
 
 predict.npdistribution <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npudist(bws = object$bws, ...), envir = parent.frame())
+  dots <- list(...)
+  has.formula.route <- !is.null(object$bws$formula)
+
+  if (!has.formula.route && is.null(dots$edat) && !is.null(dots$newdata)) {
+    dots$edat <- dots$newdata
+    dots$newdata <- NULL
+  }
+
+  tr <- do.call(npudist, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs))
@@ -72,8 +83,8 @@ predict.npdistribution <- function(object, se.fit = FALSE, ...) {
 
 summary.npdistribution <- function(object, ...) {
   cat("\nDistribution Data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "", paste(" and ", object$nobs,
-                                      " evaluation points,", sep="")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs,
+                                      " evaluation points,", sep=""),
       " in ",object$ndim," variable(s)\n",sep="")
   
   cat(genOmitStr(object))
@@ -83,6 +94,7 @@ summary.npdistribution <- function(object, ...) {
   cat(genDenEstStr(object))
 
   cat(genBwKerStrs(object$bws))
+  cat(genTimingStr(object))
   cat('\n\n')
 
 }

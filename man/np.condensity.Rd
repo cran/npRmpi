@@ -1,7 +1,6 @@
-% $Id: np.condensity.Rd,v 1.67 2006/11/03 21:19:03 tristen Exp $
+%
 \name{npcdens}
 \alias{npcdens}
-\alias{npcdens.call}
 \alias{npcdens.conbandwidth}
 \alias{npcdens.default}
 \alias{npcdens.formula}
@@ -14,7 +13,7 @@
   \code{conbandwidth} object or a bandwidth vector, bandwidth type, and
   kernel type) using the method of Hall, Racine, and Li (2004).
   The data may be continuous, discrete (unordered and ordered
-  factors), or some combination thereof. 
+  factors), or some combination thereof.
 }
 
 \usage{
@@ -22,7 +21,6 @@ npcdens(bws, \dots)
 
 \method{npcdens}{formula}(bws, data = NULL, newdata = NULL, \dots)
 
-\method{npcdens}{call}(bws, \dots)
 
 \method{npcdens}{conbandwidth}(bws,
         txdat = stop("invoked without training data 'txdat'"),
@@ -30,13 +28,20 @@ npcdens(bws, \dots)
         exdat,
         eydat,
         gradients = FALSE,
+        proper = FALSE,
+        proper.method = c("project"),
+        proper.control = list(),
         \dots)
 
-\method{npcdens}{default}(bws, txdat, tydat, \dots)
+\method{npcdens}{default}(bws, txdat, tydat, nomad = FALSE, \dots)
 
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{conbandwidth}
     object returned from a previous invocation of
@@ -50,35 +55,13 @@ npcdens(bws, \dots)
     data, and so on.
   }
 
-  \item{gradients}{
-    a logical value specifying whether to return estimates of the
-    gradients at the evaluation points. Defaults to \code{FALSE}.
-  }
 
-  \item{\dots}{
-    additional arguments supplied to specify the bandwidth type,
-    kernel types, and so on.  This is necessary if you
-    specify bws as a \eqn{p+q}-vector and not a \code{conbandwidth}
-    object, and you do not desire the default behaviours. To do this,
-    you may specify any of \code{bwmethod}, \code{bwscaling},
-    \code{bwtype}, \code{cxkertype}, \code{cxkerorder},
-    \code{cykertype}, \code{cykerorder}, \code{uxkertype},
-    \code{uykertype}, \code{oxkertype}, \code{oykertype}, as described
-    in \code{\link{npcdensbw}}. 
-
-  }
-  
   \item{data}{
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
     \code{environment(bws)}, typically the environment from which
    \code{\link{npcdensbw}} was called.
-  }
-
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
   }
 
 
@@ -88,11 +71,38 @@ npcdens(bws, \dots)
     compute the bandwidth object.
   }
 
+
   \item{tydat}{
     a \eqn{q}-variate data frame of sample realizations of dependent
     data (training data). Defaults to the training data used to
     compute the bandwidth object.
   }
+
+
+\subsection{Bandwidth Search Shortcut}{
+This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npcdensbw}} when bandwidths are computed inside \code{npcdens}.
+}
+
+  \item{nomad}{
+    logical shortcut passed through to \code{\link{npcdensbw}} when
+    bandwidths are computed inside \code{npcdens}. When \code{TRUE},
+    the bandwidth route fills any missing values among \code{regtype},
+    \code{search.engine}, \code{degree.select},
+    \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
+    \code{degree.verify}, and \code{bwtype} with the recommended
+    automatic LP NOMAD preset documented in \code{\link{npcdensbw}}.
+    Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
+    also be supplied through \code{\dots}; \code{nmulti} remains the
+    outer restart count while \code{nomad.nmulti} controls inner
+    \code{crs::snomadr()} multistarts within each outer restart.
+    After fitting, inspect \code{fit$bws$nomad.shortcut} on the
+    returned object \code{fit} to see the normalized shortcut metadata.
+  }
+
+
+\subsection{Evaluation Data And Returned Quantities}{
+These arguments control where the fitted conditional density is evaluated and which estimates are returned.
+}
 
   \item{exdat}{
     a \eqn{p}-variate data frame of explanatory data on which
@@ -100,14 +110,95 @@ npcdens(bws, \dots)
     evaluation takes place on the data provided by \code{txdat}.
   }
 
+
   \item{eydat}{
     a \eqn{q}-variate data frame of dependent data on which conditional
     densities will be evaluated. By default,
     evaluation takes place on the data provided by \code{tydat}.
   }
 
+
+  \item{gradients}{
+    a logical value specifying whether to return estimates of the
+    gradients at the evaluation points. Defaults to \code{FALSE}.
+  }
+
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+
+\subsection{Fit Properization Controls}{
+These arguments control optional post-estimation properization of the fitted conditional density.
+}
+
+  \item{proper}{
+    a logical value specifying whether to post-process the estimated
+    conditional density so that it integrates to one over the
+    evaluation grid. Defaults to \code{FALSE}.
+  }
+
+
+  \item{proper.control}{
+    a named list of control parameters for properization. Supported
+    entries are \code{tol}, \code{grid.check}, \code{store.raw}, and
+    \code{fail.on.unsupported}.
+  }
+
+
+
+  \item{proper.method}{
+    the properization method. Currently only
+    \code{"project"} is supported.
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to \code{\link{npcdensbw}} when bandwidths are computed internally, or used to interpret a numeric \code{bws} vector.
+}
+
+  \item{\dots}{
+    additional arguments supplied to \code{\link{npcdensbw}} when
+    \code{npcdens} computes bandwidths internally, or arguments needed
+    to interpret a numeric \code{bws} vector. This is where bandwidth
+    selection controls such as \code{bwmethod}, \code{bwtype},
+    kernel/support controls such as \code{cxkertype},
+    \code{cykertype}, \code{cxkerbound}, and \code{cykerbound},
+    search controls such as \code{nmulti},
+    \code{scale.factor.search.lower}, and \code{nomad.nmulti}, and
+    local-polynomial controls such as \code{regtype}, \code{degree},
+    \code{basis}, and \code{bernstein.basis} are supplied. See
+    \code{\link{npcdensbw}} for the complete bandwidth-selection
+    argument surface.
+
+  }
+
 }
 \details{
+  Documentation guide: see \code{\link{npcdensbw}} for bandwidth selection and search controls, \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
+  When \code{bws} is omitted, the formula and default methods call
+  \code{\link{npcdensbw}} first and pass bandwidth-selection arguments
+  from \code{\dots} to that call. When \code{bws} is already a
+  \code{conbandwidth} object, \code{npcdens} estimates with the stored
+  bandwidth metadata in that object.
+
+  Argument groups for bandwidth selection are documented on
+  \code{\link{npcdensbw}}. The most common workflow is to initialize MPI
+  execution if needed, choose data and bandwidth inputs, then bandwidth
+  criterion and representation, then kernel/support controls, numerical
+  search controls, bounded \code{cv.ls} quadrature controls if relevant,
+  and finally local-polynomial/NOMAD controls for polynomial-adaptive
+  fits.
+
+  For S3 plotting help, use \code{methods("plot")} and query
+  class-specific help topics such as \code{?plot.npregression} and
+  \code{?plot.rbandwidth}. You can inspect implementations with
+  \code{getS3method("plot","npregression")}.
+
   \code{npcdens} implements a variety of methods for estimating
   multivariate conditional distributions (\eqn{p+q}-variate) defined
   over a set of possibly continuous and/or discrete (unordered, ordered)
@@ -136,6 +227,12 @@ npcdens(bws, \dots)
   kernel. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  For practitioners who want the recommended automatic LP NOMAD route
+  without spelling out all LP tuning arguments,
+  \code{npcdens(..., nomad=TRUE)} and \code{npcdensbw(..., nomad=TRUE)}
+  expand missing settings to the same documented preset. Explicit
+  incompatible settings fail fast rather than being silently rewritten.
 
 }
 \value{
@@ -179,7 +276,7 @@ npcdens(bws, \dots)
   and Practice,} Princeton University Press.
 
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,} Cambridge
-  University Press. 
+  University Press.
 
   Scott, D.W. (1992), \emph{Multivariate Density Estimation. Theory,
   Practice and Visualization,} New York: Wiley.
@@ -193,7 +290,7 @@ npcdens(bws, \dots)
 }
 \author{
   Tristen Hayfield \email{tristen.hayfield@gmail.com}, Jeffrey S. Racine
-  \email{racinej@mcmaster.ca}    
+  \email{racinej@mcmaster.ca}
 }
 
 \section{Usage Issues}{
@@ -205,6 +302,7 @@ npcdens(bws, \dots)
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{npudens}}
 }
 \examples{
@@ -216,26 +314,132 @@ npcdens(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(data("Italy"),
-              caller.execute=TRUE)
-mpi.bcast.cmd(attach(Italy),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
 
-mpi.bcast.cmd(bw <- npcdensbw(formula=gdp~ordered(year)),
-              caller.execute=TRUE)
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
 
-mpi.bcast.cmd(fhat <- npcdens(bws=bw),
-              caller.execute=TRUE)
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+data("Italy")
+
+bw <- npcdensbw(formula=gdp~ordered(year), data=Italy)
+
+fhat <- npcdens(bws=bw)
 
 summary(fhat)
+
+## Variations on local polynomial conditional density estimation with
+## proper = TRUE.
+
+Italy2 <- within(Italy, {
+  year <- as.numeric(as.character(year))
+})
+
+## Plot only: make the plotted surface proper on the plot evaluation grid.
+
+fhat <- npcdens(gdp ~ year, data = Italy2,
+                regtype = "lp", degree = 3, nmulti = 1)
+
+plot(fhat, proper = TRUE)
+
+## Fit an object whose fitted values are themselves proper.
+
+ctrl_fit <- list(
+  mode = "slice",
+  apply = "fitted",
+  slice.grid.size = 101L,
+  slice.extend.factor = 0.1
+)
+
+fhat_fit <- npcdens(
+  gdp ~ year,
+  data = Italy2,
+  regtype = "lp",
+  degree = 3,
+  nmulti = 1,
+  proper = TRUE,
+  proper.control = ctrl_fit
+)
+
+fit_proper <- fitted(fhat_fit)
+fit_raw <- fhat_fit$condens.raw
+
+## Display the repaired and raw fitted values for cases where the raw
+## fitted density is negative.
+
+head(cbind(fit_proper, fit_raw)[which(fit_raw < 0), ])
+
+## Predict on a common explicit y-grid for several years, and render
+## those predictions proper.
+
+g.grid <- seq(min(Italy2$gdp), max(Italy2$gdp), length.out = 200)
+
+nd_grid <- expand.grid(
+  gdp = g.grid,
+  year = c(1955, 1975, 1995)
+)
+
+pred_grid <- predict(fhat, newdata = nd_grid, proper = TRUE)
+
+## Predict on paired rows with different gdp grids by year, and still
+## make the predictions proper via slice mode.
+
+g1 <- seq(quantile(Italy2$gdp, 0.10),
+          quantile(Italy2$gdp, 0.60), length.out = 60)
+g2 <- seq(quantile(Italy2$gdp, 0.30),
+          quantile(Italy2$gdp, 0.90), length.out = 35)
+
+nd_slice <- rbind(
+  data.frame(gdp = g1, year = rep(1960, length(g1))),
+  data.frame(gdp = g2, year = rep(1985, length(g2)))
+)
+
+pred_slice <- predict(
+  fhat,
+  newdata = nd_slice,
+  proper = TRUE,
+  proper.control = list(mode = "slice")
+)
+
+## One object that carries properization for fitted values and for later
+## predict() calls.
+
+ctrl_both <- list(
+  mode = "slice",
+  apply = "both",
+  slice.grid.size = 101L,
+  slice.extend.factor = 0.1
+)
+
+fhat_both <- npcdens(
+  gdp ~ year,
+  data = Italy2,
+  regtype = "lp",
+  degree = 3,
+  nmulti = 1,
+  proper = TRUE,
+  proper.control = ctrl_both
+)
+
+fit_both <- fitted(fhat_both)
+pred_both <- predict(
+  fhat_both,
+  newdata = nd_slice,
+  proper.control = ctrl_both
+)
 
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.
@@ -243,21 +447,18 @@ summary(fhat)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{nonparametric}

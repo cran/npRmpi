@@ -6,14 +6,22 @@ condbandwidth <-
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
            cxkertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            cxkerorder = c(2,4,6,8),
+           cxkerbound = c("none","range","fixed"),
+           cxkerlb = NULL,
+           cxkerub = NULL,
            uxkertype = c("aitchisonaitken","liracine"),
-           oxkertype = c("liracine","wangvanryzin"),
+           oxkertype = c("liracine","wangvanryzin","racineliyan"),
            cykertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            cykerorder = c(2,4,6,8),
+           cykerbound = c("none","range","fixed"),
+           cykerlb = NULL,
+           cykerub = NULL,
            uykertype = c("aitchisonaitken","liracine"),
-           oykertype = c("liracine","wangvanryzin"),
+           oykertype = c("liracine","wangvanryzin","racineliyan"),
            fval = NA,
            ifval = NA,
+           num.feval = NA,
+           num.feval.fast = NA,
            fval.history = NA,
            eval.history = NA,
            invalid.history = NA,
@@ -29,9 +37,18 @@ condbandwidth <-
            bandwidth.compute = TRUE,
            timing = NA,
            total.time = NA,
+           regtype = "lc",
+           pregtype = "Local-Constant",
+           basis = "glp",
+           degree = integer(0),
+           bernstein.basis = FALSE,
+           regtype.engine = "lc",
+           basis.engine = "glp",
+           degree.engine = integer(0),
+           bernstein.basis.engine = FALSE,
            ...){
 
-  if (missing(xbw) | missing(ybw))
+  if (missing(xbw) || missing(ybw))
     stop("improper invocation of condbandwidth constructor: 'bw' or i[cuo]* missing")
   
   xndim = length(xbw)
@@ -42,22 +59,24 @@ condbandwidth <-
 
   cxkertype = match.arg(cxkertype)
   cykertype = match.arg(cykertype)
+  cxkerbound = match.arg(cxkerbound)
+  cykerbound = match.arg(cykerbound)
 
   if(missing(cxkerorder))
     cxkerorder = 2
   else if (cxkertype == "uniform")
-    warning("ignoring kernel order specified with uniform kernel type")
+    .np_warning("ignoring kernel order specified with uniform kernel type")
   else {
-    kord = eval(formals()$cxkerorder) 
+    kord = c(2,4,6,8) 
     if (!any(kord == cxkerorder))
       stop("cxkerorder must be one of ", paste(kord,collapse=" "))
   }
 
   if (cxkertype == "truncated gaussian" && cxkerorder != 2)
-    warning("using truncated gaussian of order 2, higher orders not yet implemented")
+    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   if (bwmethod == "normal-reference" && (cxkertype != "gaussian" || bwtype != "fixed")){    
-    warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+    .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
     bwtype = "fixed"
     cxkertype = "gaussian"
   }
@@ -65,23 +84,23 @@ condbandwidth <-
   if(missing(cykerorder))
     cykerorder = 2
   else if (cykertype == "uniform")
-    warning("ignoring kernel order specified with uniform kernel type")
+    .np_warning("ignoring kernel order specified with uniform kernel type")
   else {
-    kord = eval(formals()$cykerorder) 
+    kord = c(2,4,6,8) 
     if (!any(kord == cykerorder))
       stop("cykerorder must be one of ", paste(kord,collapse=" "))
   }
 
   if (cykertype == "truncated gaussian" && cykerorder != 2)
-    warning("using truncated gaussian of order 2, higher orders not yet implemented")
+    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   if (bwmethod == "normal-reference" && (cykertype != "gaussian" || bwtype != "fixed")){    
-    warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+    .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
     bwtype = "fixed"
     cykertype = "gaussian"
   }
 
-  if (cxkerorder != cykerorder & bwscaling)
+  if (cxkerorder != cykerorder && bwscaling)
     stop("scale factors with different order kernels for dependent and explanatory variables is unsupported")
   
   uxkertype = match.arg(uxkertype)
@@ -89,6 +108,25 @@ condbandwidth <-
   
   oxkertype = match.arg(oxkertype)
   oykertype = match.arg(oykertype)
+  cxbounds <- npKernelBoundsResolve(
+    dati = xdati,
+    varnames = xnames,
+    kerbound = cxkerbound,
+    kerlb = cxkerlb,
+    kerub = cxkerub,
+    argprefix = "cxker")
+  cybounds <- npKernelBoundsResolve(
+    dati = ydati,
+    varnames = ynames,
+    kerbound = cykerbound,
+    kerlb = cykerlb,
+    kerub = cykerub,
+    argprefix = "cyker")
+  bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
+  if (bwtype != "fixed" &&
+      (cxbounds$bound != "none" || cybounds$bound != "none") &&
+      !bounded_nonfixed_supported)
+    stop("finite continuous kernel bounds require bwtype = \"fixed\"")
 
   pxorder = switch( cxkerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
   pyorder = switch( cykerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
@@ -113,8 +151,8 @@ condbandwidth <-
     }
 
     sumNum <- list(x = NA, y = NA)
-    sumNum[] <- lapply(1:length(dati), function(i) {
-      sapply(1:length(dati[[i]]$icon), scaleOrMax, j = i)
+    sumNum[] <- lapply(seq_along(dati), function(i) {
+      sapply(seq_along(dati[[i]]$icon), scaleOrMax, j = i)
     })
   } else {
     sumNum <- NA
@@ -130,19 +168,27 @@ condbandwidth <-
     pmethod = bwmToPrint(bwmethod),
     fval = fval,
     ifval = ifval,
+    num.feval = num.feval,
+    num.feval.fast = num.feval.fast,
     fval.history = fval.history,
     eval.history = eval.history,
     invalid.history = invalid.history,
     scaling = bwscaling,
-    pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
+    pscaling = npBandwidthSummaryLabel(bwtype = bwtype, bwscaling = bwscaling),
     type = bwtype,
     ptype = bwtToPrint(bwtype),
     cxkertype = cxkertype,
     cykertype = cykertype,
     cxkerorder = cxkerorder,
     cykerorder = cykerorder,
-    pcxkertype = cktToPrint(cxkertype, order = pxorder),
-    pcykertype = cktToPrint(cykertype, order = pyorder),
+    cxkerbound = cxbounds$bound,
+    cxkerlb = cxbounds$lb,
+    cxkerub = cxbounds$ub,
+    cykerbound = cybounds$bound,
+    cykerlb = cybounds$lb,
+    cykerub = cybounds$ub,
+    pcxkertype = cktToPrint(cxkertype, order = pxorder, kerbound = cxbounds$bound),
+    pcykertype = cktToPrint(cykertype, order = pyorder, kerbound = cybounds$bound),
     uxkertype = uxkertype,
     uykertype = uykertype,
     puxkertype = uktToPrint(uxkertype),
@@ -185,13 +231,25 @@ condbandwidth <-
     vartitle = list(x = "Explanatory", y = "Dependent"),
     vartitleabb = list(x = "Exp.", y = "Dep."),
     rows.omit = rows.omit,
-    nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+    nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
     timing = timing,
-    total.time = total.time)
+    total.time = total.time,
+    regtype = regtype,
+    pregtype = pregtype,
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
+    regtype.engine = regtype.engine,
+    basis.engine = basis.engine,
+    degree.engine = degree.engine,
+    bernstein.basis.engine = bernstein.basis.engine)
 
   mybw$klist = list(
     x =
     list(ckertype = cxkertype,
+         ckerbound = cxbounds$bound,
+         ckerlb = cxbounds$lb,
+         ckerub = cxbounds$ub,
          pckertype = mybw$pcxkertype,
          ukertype = uxkertype,
          pukertype = mybw$puxkertype,
@@ -199,6 +257,9 @@ condbandwidth <-
          pokertype = mybw$poxkertype),
     y =
     list(ckertype = cykertype,
+         ckerbound = cybounds$bound,
+         ckerlb = cybounds$lb,
+         ckerub = cybounds$ub,
          pckertype = mybw$pcykertype,
          ukertype = uykertype,
          pukertype = mybw$puykertype,
@@ -233,7 +294,6 @@ print.condbandwidth <- function(x, digits=NULL, ...){
   invisible(x)
 }
 
-plot.condbandwidth <- function(...) { npplot(...) }
 
 summary.condbandwidth <- function(object, ...) {
   cat("\nConditional distribution data (",object$nobs," observations, ",
@@ -252,4 +312,4 @@ summary.condbandwidth <- function(object, ...) {
   cat("\n\n")
 }
 
-predict.condbandwidth <- function(...) { eval(npcdist(...), envir = parent.frame()) }
+predict.condbandwidth <- function(...) { do.call(npcdist, list(...)) }

@@ -1,4 +1,227 @@
-Changes from Version 0.60-20 to 0.60-21 [11-Feb-2026]
+Changes from Version 0.70-0 to 0.70-1 [29-Apr-2026]
+
+* Updated the package startup message to point first to the online gallery
+  of MPI examples and guides, while retaining the compact installed
+  `npRmpi_getting_started` vignette as the offline/package-side entry point.
+
+* Reorganized and expanded `.Rd` argument documentation across the package
+  into user-oriented sections with clearer defaults and cross-references,
+  mirroring the serial package where appropriate without changing the public
+  API.
+
+* Added `.Rbuildignore` coverage for local agent/skill guidance files so
+  release tarballs remain clean.
+
+* Mirrored the native bandwidth-selector alias-cleanup hardening from `np`,
+  clearing stale estimator alias pointers after production C routes release
+  borrowed state.
+
+* Made the extended `NP_CHECK_FULL=1` test lane fail honestly when `testthat`
+  reports failures, then reconciled stale installed-check, progress-output,
+  and scale-factor expectation tests so the full lane is green again.
+
+* Removed recently added extinct bounded-kernel convolution scaffolding for
+  the bounded continuous kernel, preserving the live quadrature-based bounded
+  `cv.ls` route and existing bounded-kernel functionality.
+
+* Standardized continuous bandwidth-search control naming around
+  `scale.factor.*` arguments and documented how initialization bounds,
+  deterministic starts, and the hard search lower bound work together.
+
+* Added local-polynomial instability guidance for conditional-density and
+  conditional-distribution search failures, pointing users from canonical
+  raw-basis `regtype="ll"` failures toward the numerically safer
+  Bernstein-basis local-polynomial route.
+
+* Mirrored the `npqreg` canonical quantile-extraction cleanup from `np` by
+  removing the legacy Powell/environment-selected extraction path, retaining
+  the single one-dimensional conditional-CDF residual refinement route, and
+  updating the `npqreg` help page and fit interface to expose only the live
+  quantile-extraction controls.
+
+* Addressed the CRAN-reported MPI unload race by no longer explicitly
+  calling `library.dynam.unload("npRmpi", ...)` from `.onUnload()` after
+  MPI finalization. Validation covered repeated subprocess load/unload,
+  tarball-first `R CMD check --no-manual --ignore-vignettes` with clean
+  package and namespace unload checks, sliced attach-route validation,
+  profile/manual-broadcast validation, and copied demo triplets for
+  `npreglcls`, `npcdensml`, and `npcdensls`.
+
+* Reduced the default multistart cap from `min(5, p)` to `min(2, p)`
+  across the mirrored core bandwidth selectors, with the univariate
+  boundary density helper now defaulting to `nmulti=1`.
+
+* Aligned automatic LP degree-search NOMAD fallbacks with the same
+  `min(2, p)` cap when `nmulti` is not supplied explicitly.
+
+* Added benchmark-study documentation under `benchmarks/validation`
+  noting the source-of-truth empirical `nmulti` default decision from
+  `np-master`.
+
+* Added a documented `nomad=TRUE` convenience preset across the
+  LP-capable front ends, mirroring the serial package defaults and the
+  estimator/bandwidth help-page guidance for the recommended LP/NOMAD
+  route.
+
+* Reactivated the public conditional LP/LL cross-validation routes mirrored
+  from `np` for the remediated families:
+  - `npcdensbw(cv.ml)` fixed and generalized nearest-neighbor
+  - `npcdensbw(cv.ls)` fixed and generalized nearest-neighbor
+  - `npcdistbw(cv.ls)` fixed and generalized nearest-neighbor
+  - adaptive nearest-neighbor remains explicit fail-fast containment for the
+    remediated LP/LL families.
+  Route validation for the generalized-NN mirrors passed in session/spawn,
+  attach, and profile/manual-broadcast mode, with LP generalized-NN wrapper
+  orchestration kept on the master to avoid unsafe full-wrapper autodispatch.
+
+* Mirrored the conditional density/distribution generalized nearest-neighbor
+  LP CV `jksum.c` helper changes from `np`, keeping the canonical extracted
+  LP X-side machinery aligned across repos and validating bounded
+  generalized-NN wrapper behavior in both session and attach MPI modes.
+
+* Mirrored smooth-coefficient LL/LP core remediation from `np`, removing
+  accidental `n x n` weight-matrix construction/full-matrix dependence from
+  ordinary `npscoef` estimation/CV paths while preserving explicit hat/plot
+  helper behavior.
+
+* Added `npscoefbw()` fast-summary accounting (`num.feval.fast`) without
+  adding generic `npksum()` hot-path overhead.
+
+* Fixed attach/session autodispatch scoping in `npscoef` error-path handling
+  (`object 'yW' not found`), restoring the large-`n` attach demo route.
+
+* Mirrored semiparametric LL/LP canonicalization from `np` for the recently
+  generalized core families, including `npscoef*`, `npplreg*`, and
+  `npindex*`.
+
+* Mirrored the `npreg` local-polynomial `cv.ls` repair by landing the
+  canonical GLP objective kernel for the fixed-bandwidth non-tree route
+  across supported GLP degrees, eliminating the degree-1 LL/LP discrepancy.
+
+* Expanded LL/LP degree-1 regression coverage for semiparametric families,
+  including multivariate parity tests for `npscoef`, `npindex`, and
+  `npplreg`.
+
+* Fixed `npplregbw()` to propagate kernel-defining options (continuous kernel,
+  bandwidth type, bounds, and related controls) into child regression
+  bandwidth objects during computed-bandwidth calls, restoring
+  kernel-sensitive plot/helper behavior and metadata fidelity.
+
+* Completed canonical plot-remediation hardening for core S3 families with
+  explicit fail-fast behavior:
+  - no silent bootstrap-method remaps
+  - no hidden fallback branches for unsupported plot/bootstrap configurations
+  - explicit errors for unsupported argument/mode combinations.
+
+* Added broad plot contract coverage for regression/index/smooth-coefficient/
+  density/distribution families:
+  - bootstrap argument contract gates
+  - asymptotic-only contract gates
+  - helper option-forwarding and semantics parity contracts
+  - regression guards for `plot.errors.method` remap regressions.
+
+* Leaned plot bootstrap/mean paths by standardizing canonical helper usage
+  and removing legacy fallback toggles in touched routes.
+
+* Enforced canonical helper-routing policy in MPI contexts:
+  - no internal runtime `np::` or `np:::` bridges in package execution paths
+  - no silent serial fallback when MPI execution is selected.
+
+* Removed superseded legacy/debug toggles and stale compatibility branches in
+  plotting and CV routing paths, including:
+  - residual fastpath-disable scaffolding in plot helpers,
+  - stale `np.groupcv.fast` option footprint,
+  - obsolete conditional-density fast-switch slot.
+
+* Enforced canonical LP behavior and removed silent behavior coercions:
+  - removed transform-bounds auto-remap in regression bandwidth routing,
+  - removed legacy CV aliasing and unsupported cv-iterate remaps,
+  - removed Bernstein OOS alternate fallback routing while preserving
+    canonical LP path behavior.
+
+* Restored and hardened CV path-lock behavior:
+  - centralized CVLS route predicates in one helper path,
+  - added path-lock tests preventing inline predicate drift/regressions,
+  - hardened large-h gate coverage with route-safety contracts.
+
+* Standardized ridge ladders in helper-side optimization/solve paths to
+  additive `1/n.train` sequences for touched helper families.
+
+* Fixed helper/core ridge-base mismatch in ill-posed helper parity:
+  - `npreghat`/`semihat` now default to zero-ridge-first solve semantics
+    (matching core behavior that attempts un-ridged solve first),
+  - retained `ridge=1e-12` defaults for inid/plreg bootstrap helper internals
+    where explicit parity/stability checks favored nonzero base ridge.
+
+* Added/updated reproducible issue-note harnesses for helper parity and
+  closeout validation, including session/attach route checks and artifacts.
+
+* Added Windows toolchain hardening for LAPACK/BLAS linkage and documented
+  win-builder release-check ingestion workflow updates.
+
+Changes from Version 0.60-20 to 0.70-0 [20-Feb-2026]
+
+* Completed migration to modular S3 plot methods coordinated with
+  autodispatch-aware wrappers, while preserving legacy `plot*` internals for
+  numerical/visual parity.
+
+* Added compatibility normalization for legacy S3 plot aliases prior to
+  dispatch (`gradient` -> `gradients`, `persp` -> `perspective`) to avoid
+  ambiguous argument matching during run-mode examples.
+
+* Hardened autodispatch/manual-mode interactions and mixed-mode guardrails:
+  - synchronized options/preflight checks before distributed calls
+  - stabilized automatic object/data broadcasting for high-level `np*`
+    entry points
+  - improved diagnostics for nested/unsupported mixed dispatch contexts.
+
+* Expanded run-mode documentation modernization:
+  - converted core `np*` examples to the simplified `npRmpi.init()` +
+    `options(npRmpi.autodispatch=TRUE)` style where supported
+  - updated helper examples (`gradients`, `se`, etc.) to the same model
+  - refreshed run/dontrun script workflow for check cycles.
+
+* Ported bounded continuous-kernel support from np master across npRmpi
+  interfaces and C pathways with unified bound controls:
+  - bound modes `none`, `range`, and `fixed`
+  - per-variable lower/upper bounds (`*kerlb`, `*kerub`)
+  - fixed-bandwidth enforcement for finite-bound operation.
+
+* Added the ordered kernel option `"racineliyan"` to ordered-kernel
+  interfaces (`okertype`, `oxkertype`, `oykertype`) and synchronized
+  conditional-density/distribution mappings.
+
+* Synchronized bounded-kernel normalization/convolution support in shared
+  kernel-sum code used by conditional-density/distribution LS-CV pathways.
+
+* Fixed internal package registration targets for native setup calls in
+  npRmpi R wrappers:
+  - `.C("np_set_seed", ..., PACKAGE="npRmpi")`
+  - `.C("np_set_tgauss2", ..., PACKAGE="npRmpi")`
+  resolving R CMD check foreign-call NOTEs about cross-package targets.
+
+* Removed stale legacy conditional-density bwmethod aliasing so only
+  canonical least-squares selector semantics remain.
+
+* Synchronized `plot()` bootstrap error-band enhancements/fixes from
+  np master:
+  - replaced fixed quantiles with scalar `plot.errors.alpha` and added
+    bootstrap quantile band types `pointwise`, `bonferroni`,
+    `simultaneous`, and `all` (alongside `standard`)
+  - vendored/attributed rank-based simultaneous set computation (from
+    `MCPAN::SCSrank`) for `plot.errors.type="simultaneous"`
+  - added color-coded overlay + legend for `plot.errors.type="all"`
+    (Pointwise/Simultaneous/Bonferroni)
+  - fixed non-`all` bootstrap overlays not drawing in several paths due to
+    default color handling
+  - fixed mixed/factor plotting branches (including `npreg`) so all
+    bootstrap error types (`standard`, `pointwise`, `bonferroni`,
+    `simultaneous`, `all`) render consistently
+  - fixed single-index (`npindex`) plotting edge cases in gradient mode:
+    corrected sign-aware lower/upper bounds for negative index weights,
+    fixed sorted alignment for `all` bands, fixed `plot.behavior="data"`
+    return-shape errors, and fixed `ylim` handling for user limits and
+    panel-specific error ranges.
 
 * Ported recent core-performance updates from np master (kernel/jksum
   optimizations) and synchronized behavior across serial/MPI variants.
@@ -6,7 +229,7 @@ Changes from Version 0.60-20 to 0.60-21 [11-Feb-2026]
 * Fixed MPI npksum copyback for padded evaluation partitions, eliminating
   a regression affecting repeated-session workflows (e.g. npcmstest).
 
-* Added robust session-management wrappers (npRmpi.start()/npRmpi.stop()) and
+* Added robust session-management wrappers (npRmpi.init()/npRmpi.quit()) and
   slave-reuse controls to improve stability on macOS+MPICH.
 
 * Hardened .Rd example handling for CRAN checks (run/dontrun tooling and MPI
@@ -14,6 +237,57 @@ Changes from Version 0.60-20 to 0.60-21 [11-Feb-2026]
 
 * Guarded fallback kernel-table indexing in jksum.c to avoid GCC/Winbuilder
   array-bounds warnings.
+
+* Synchronized jksum.c with np master to inherit the latest kernel-evaluation
+  shortcut enhancements:
+  - option-driven continuous large-h K(0) shortcut logic
+  - option-driven discrete near-upper-bound (lambda) shortcut logic
+  applied across core continuous/unordered evaluator paths.
+
+* Added package-level defaults for:
+  - options(np.largeh.rel.tol=1e-3)
+  - options(np.disc.upper.rel.tol=1e-2)
+  in .onLoad, including the NP_RMPI_SKIP_INIT initialization path.
+
+* Added new np.options.Rd man page and linked it from np-package and np.plot
+  documentation to expose and document global option controls.
+
+* Synchronized C-level generalized local polynomial regression support from
+  np master into npRmpi:
+  - `regtype="lp"` in shared regression core
+  - per-continuous-variable degree vectors (`degree`)
+  - GLP derivative extraction/plotting control support.
+
+* Refactored/synchronized regression CV setup for `ll`/`glp` by hoisting
+  invariant basis and workspace preparation out of hot objective loops,
+  reducing redundant work in `cv.ls`/`cv.aic` evaluation.
+
+* Synchronized solve-based local-linear matrix workflows (LAPACK/BLAS-oriented
+  backend) from np master, replacing inverse-heavy hot-path operations.
+
+* Expanded all-large (`h`/`lambda`) fast-path accounting/reporting across
+  conditional estimators:
+  - exposed `num.feval.fast` alongside `num.feval`
+    in relevant summaries
+  - synchronized all-large fast branches for conditional density/distribution
+    CV pathways
+  - reduced all-large branch overhead, including tree-list bypass where the
+    all-large regime is already known.
+
+* Updated `plot()` error-type semantics/documentation in sync with master:
+  - renamed bootstrap error type `standard` to `pmzsd`
+  - `pmzsd` now uses plus/minus the `1-alpha/2` normal quantile
+    (`qnorm(alpha/2, lower.tail=FALSE)` semantics).
+
+* Fixed remaining bootstrap `plot.errors.type="all"` rendering gaps across
+  perspective/non-perspective branches for regression, conditional density,
+  and conditional distribution plotting.
+
+* Tightened discrete upper-bound gate handling to strict relative-tolerance
+  semantics for near-upper-bound lambda shortcuts.
+
+* Removed unused legacy sources and prototypes (RuniqueCombs, pgplot
+  placeholder) and restored B-spline error handling in bspline.c.
 
 Changes from Version 0.60-19 to 0.60-20 [06-Feb-2026]
 
@@ -226,7 +500,7 @@ Changes from Version 0.60-9 to 0.60-10 [5-Feb-2020]
 
 Changes from Version 0.60-8 to 0.60-9 [24-Oct-2018]
 
-* Added support for character expansion to npplot() (which is invoked
+* Added support for character expansion to plot() (which is invoked
   by calling plot() on an np object) - will take defaults from the
   environment par() or can be set directly, e.g.,
   plot(foo,cex.main=0.8)
@@ -277,11 +551,11 @@ Changes from Version 0.60-3 to 0.60-4 [03-Dec-2017]
 * Using wrapLines(strwrap(...)) for summary output for model specification
   test to automatically wrap long formula lines
 
-* plot() calls npplot() and npplot() behaves better when most passable
+* plot() calls plot() and plot() behaves better when most passable
   parameters are fed (col =, lty =, xlab =, etc.) but there may still
   be room for improvement
 
-* Added option plot.par.mfrow=TRUE/FALSE to npplot() so that the
+* Added option plot.par.mfrow=TRUE/FALSE to plot() so that the
   automated setting of par(mfrow=c(,)) in plot is disabled and the
   user can do this manually if desired
 
@@ -521,10 +795,10 @@ Changes from Version 0.40-8 to 0.40-9 [30-July-2011]
 
 Changes from Version 0.40-7 to 0.40-8 [29-July-2011]
 
-* Fixed issue where calling npplot resets system seed
+* Fixed issue where calling plot resets system seed
 
 * Updated examples in docs so that plot is recommended throughout (and
-  not npplot that is invoked by plot)
+  not plot that is invoked by plot)
 
 * Fixed regression in npindex when gradients=TRUE and errors=TRUE
 
@@ -611,7 +885,7 @@ Changes from Version 0.30-8 to 0.30-9 [17-May-2010]
 
 * Fixed regression (dating to version 0.30-4) where random.seed=42 was
   not initialized in functions npcmstest, npdeneqtest, npindexbw,
-  npsdeptest, npqcmstest, npsigtest, npsymtest, npunitest, and npplot
+  npsdeptest, npqcmstest, npsigtest, npsymtest, npunitest, and plot
 
 * Fixed issue with saving and restoring random seed in npdeptest
 
@@ -801,7 +1075,7 @@ Changes from Version 0.14-3 to 0.20-0 [28-Jul-2008]
 
 * Fixed some quietness issues
 
-* npplot() now returns data upon request for conditional densities
+* plot() now returns data upon request for conditional densities
 
 * npreg() and npcdens() now take the appropriate limits in some
   pathological cases
@@ -851,7 +1125,7 @@ Changes from Version 0.13-1 to 0.14-1 [18-Dec-2007]
 * Fixed error when plotting asymptotic errors with conditional
   densities
 
-* Fixed a bug in npplot() with partially linear regressions and
+* Fixed a bug in plot() with partially linear regressions and
   plot.behavior='data' or 'plot-data'
 
 * Maximum default number of multistarts is 5
@@ -902,7 +1176,7 @@ Changes from Version 0.12-1 to 0.13-1 [03-May-2007]
 * Predict now accepts the argument 'se.fit', like predict.lm
 
 * Fixed bug where incorrect asymptotic standard errors of gradients
-  for regression objects were being displayed in npplot()
+  for regression objects were being displayed in plot()
 
 * Fixed bug where errors of gradients of regression objects were not
   being returned in matrix form

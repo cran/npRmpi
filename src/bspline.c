@@ -32,6 +32,7 @@
  */
 
 #include "gsl_bspline.h"
+#include <stdint.h>
 
 /*
  * This module contains routines related to calculating B-splines.
@@ -749,7 +750,8 @@ bspline_process_interval_for_eval (const double x, size_t * i, const int flag,
 {
   if (flag == -1)
     {
-      GSL_ERROR ("x outside of knot interval", GSL_EINVAL);
+      /* Allow left-tail extrapolation by anchoring to the first valid interval. */
+      *i = w->k - 1;
     }
   else if (flag == 1)
     {
@@ -759,7 +761,8 @@ bspline_process_interval_for_eval (const double x, size_t * i, const int flag,
 	}
       else
 	{
-	  GSL_ERROR ("x outside of knot interval", GSL_EINVAL);
+	  /* Allow right-tail extrapolation by anchoring to the last valid interval. */
+	  *i = w->k + w->l - 2;
 	}
     }
 
@@ -1078,16 +1081,14 @@ _gsl_vector_view gsl_matrix_column(gsl_matrix *m, const size_t j)
 }
 
 /* ******************************************************** */
-/*  
 void ErrorMessage(char *msg,int fatal)
-{ 
+{
 #ifdef WINDOWS
-  MessageBox(HWND_DESKTOP,msg,"Info!",MB_ICONEXCLAMATION|MB_OK); 
-#else  
-if (fatal) error("%s",msg);else warning("%s",msg);
+  MessageBox(HWND_DESKTOP,msg,"Info!",MB_ICONEXCLAMATION|MB_OK);
+#else
+  if (fatal) error("%s",msg); else warning("%s",msg);
 #endif
 }
-*/
 
 /* *******************vecotr & block************** */
 
@@ -1231,7 +1232,11 @@ gsl_matrix *gsl_matrix_alloc(const size_t n1, const size_t n2)
                         GSL_ENOMEM);
     }
 
-  /* FIXME: n1*n2 could overflow for large dimensions */
+  if (n2 > 0 && n1 > SIZE_MAX / n2)
+    {
+      free(m);
+      GSL_ERROR("matrix dimension overflow", GSL_EINVAL);
+    }
 
   block = gsl_block_alloc (n1 * n2) ;
 
@@ -1342,5 +1347,3 @@ void gsl_matrix_set(gsl_matrix * m, const size_t i, const size_t j, const double
 #endif
   m->data[i * m->tda + j] = x ;
 }
-
-

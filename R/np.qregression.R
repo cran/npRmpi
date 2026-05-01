@@ -20,6 +20,29 @@ npqreg <-
     }
   }
 
+.npqreg.fit.control.names <- c("data", "newdata", "tau", "gradients", "tol", "small", "itmax")
+.npqreg.removed.solver.controls <- c("ftol",
+                                     "lbc.dir", "dfc.dir", "cfac.dir", "initc.dir",
+                                     "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir")
+
+.npqreg_fit_dots <- function(dots, allow.bandwidth.controls = FALSE) {
+  dot.names <- names(dots)
+  if (is.null(dot.names))
+    return(dots)
+
+  stale <- intersect(dot.names[nzchar(dot.names)], .npqreg.removed.solver.controls)
+  if (length(stale) && !allow.bandwidth.controls) {
+    stop(sprintf(
+      "'%s' %s no longer accepted by npqreg; the canonical one-dimensional quantile extractor is controlled by 'tol', 'small', and 'itmax'",
+      paste(stale, collapse = "', '"),
+      if (length(stale) == 1L) "is" else "are"
+    ))
+  }
+
+  keep <- (!nzchar(dot.names)) | (dot.names %in% .npqreg.fit.control.names)
+  dots[keep]
+}
+
 npqreg.formula <-
   function(bws, data = NULL, newdata = NULL, ...){
 
@@ -29,20 +52,26 @@ npqreg.formula <-
     tmf <- bws$call[c(1,m)]
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
-    umf <- tmf <- eval(tmf, envir = environment(tt))
+    mf.args <- as.list(tmf)[-1L]
+    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
 
     tydat <- tmf[, bws$variableNames[["response"]], drop = FALSE]
     txdat <- tmf[, bws$variableNames[["terms"]], drop = FALSE]
 
-    if ((has.eval <- !is.null(newdata))) {
+    has.eval <- !is.null(newdata)
+    if (has.eval) {
       tt <- drop.terms(tt, match(bws$variableNames$response, attr(tt, 'term.labels')))
-      umf <- emf <- model.frame(tt, data = newdata)
+      umf.args <- list(formula = tt, data = newdata)
+      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      emf <- umf
       exdat <- emf[, bws$variableNames[["terms"]], drop = FALSE]
     }
 
-    tbw <-
-    eval(parse(text=paste("npqreg(txdat = txdat, tydat = tydat,",
-                 ifelse(has.eval,"exdat = exdat,",""), "bws = bws, ...)")))
+    q.args <- list(txdat = txdat, tydat = tydat)
+    if (has.eval)
+      q.args$exdat <- exdat
+    q.args$bws <- bws
+    tbw <- do.call(npqreg, c(q.args, .npqreg_fit_dots(list(...))))
 
     tbw$omit <- attr(umf,"na.action")
     tbw$rows.omit <- as.vector(tbw$omit)
@@ -60,8 +89,8 @@ npqreg.formula <-
 
 npqreg.call <-
   function(bws, ...) {
-    npqreg(txdat = eval(bws$call[["xdat"]], environment(bws$call)),
-           tydat = eval(bws$call[["ydat"]], environment(bws$call)),
+    npqreg(txdat = .np_eval_bws_call_arg(bws, "xdat"),
+           tydat = .np_eval_bws_call_arg(bws, "ydat"),
            bws = bws, ...)
   }
 
@@ -70,6 +99,10 @@ npqreg.conbandwidth <-
     stop("incorrect bandwidth type: expected conditional distribution bandwidths instead of conditional density bandwidths")
   }
 
+.npRmpi_npqreg_should_localize <- function(bws) {
+  isa(bws, "condbandwidth")
+}
+
 npqreg.condbandwidth <-
   function(bws,
            txdat = stop("training data 'txdat' missing"),
@@ -77,11 +110,33 @@ npqreg.condbandwidth <-
            exdat,
            tau = 0.5,
            gradients = FALSE,
-           ftol = 1.490116e-07, tol = 1.490116e-04,
+           tol = 1.490116e-04,
            small = 1.490116e-05, itmax = 10000,
-           lbc.dir = 0.5, dfc.dir = 3, cfac.dir = 2.5*(3.0-sqrt(5)),initc.dir = 1.0, 
-           lbd.dir = 0.1, hbd.dir = 1, dfac.dir = 0.25*(3.0-sqrt(5)), initd.dir = 1.0, 
            ...){
+
+    fit.start <- proc.time()[3]
+    fit.dots <- .npqreg_fit_dots(list(...))
+    if (length(fit.dots))
+      stop(sprintf("unused npqreg fit argument '%s'", names(fit.dots)[1L]))
+    gradients <- npValidateScalarLogical(gradients, "gradients")
+    if (!is.numeric(itmax) || length(itmax) != 1L || is.na(itmax) ||
+        !is.finite(itmax) || itmax < 1 || itmax != floor(itmax))
+      stop("'itmax' must be a positive integer")
+    if (!is.numeric(tol) || length(tol) != 1L || is.na(tol) ||
+        !is.finite(tol) || tol <= 0)
+      stop("'tol' must be a positive finite numeric scalar")
+    if (!is.numeric(small) || length(small) != 1L || is.na(small) ||
+        !is.finite(small) || small <= 0)
+      stop("'small' must be a positive finite numeric scalar")
+    itmax <- as.integer(itmax)
+    tol <- as.double(tol)
+    small <- as.double(small)
+    .npRmpi_require_active_slave_pool(where = "npqreg()")
+    if (.npRmpi_npqreg_should_localize(bws) &&
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     no.ex = missing(exdat)
 
@@ -110,33 +165,39 @@ npqreg.condbandwidth <-
     if (length(bws$ybw) != 1)
       stop("length of bandwidth vector does not match number of columns of 'tydat'")
 
-    if (any(bws$iyord) | any(bws$iyuno) | coarseclass(tydat[,1]) != "numeric")
+    if (any(bws$iyord) || any(bws$iyuno) || coarseclass(tydat[,1]) != "numeric")
       stop("'tydat' is not continuous")
-    
-    xccon = unlist(lapply(txdat[,bws$ixcon, drop = FALSE],class))
-    if ((any(bws$ixcon) && !all((xccon == class(integer(0))) | (xccon == class(numeric(0))))) ||
-        (any(bws$ixord) && !all(unlist(lapply(txdat[,bws$ixord, drop = FALSE],class)) ==
-                                class(ordered(0)))) ||
-        (any(bws$ixuno) && !all(unlist(lapply(txdat[,bws$ixuno, drop = FALSE],class)) ==
-                                class(factor(0)))))
+
+    if ((any(bws$ixcon) &&
+         !all(vapply(txdat[, bws$ixcon, drop = FALSE], inherits, logical(1), c("integer", "numeric")))) ||
+        (any(bws$ixord) &&
+         !all(vapply(txdat[, bws$ixord, drop = FALSE], inherits, logical(1), "ordered"))) ||
+        (any(bws$ixuno) &&
+         !all(vapply(txdat[, bws$ixuno, drop = FALSE], inherits, logical(1), "factor"))))
       stop("supplied bandwidths do not match 'txdat' in type")
 
     ## catch and destroy NA's
-    goodrows = 1:dim(txdat)[1]
-    rows.omit = attr(na.omit(data.frame(txdat,tydat)), "na.action")
-    goodrows[rows.omit] = 0
+    keep.rows <- rep_len(TRUE, nrow(txdat))
+    rows.omit <- attr(na.omit(data.frame(txdat, tydat)), "na.action")
+    if (length(rows.omit) > 0L)
+      keep.rows[as.integer(rows.omit)] <- FALSE
 
-    if (all(goodrows==0))
+    if (!any(keep.rows))
       stop("Training data has no rows without NAs")
 
-    txdat = txdat[goodrows,,drop = FALSE]
-    tydat = tydat[goodrows,,drop = FALSE]
+    txdat <- txdat[keep.rows,,drop = FALSE]
+    tydat <- tydat[keep.rows,,drop = FALSE]
 
-    if (!no.ex)
-      exdat = na.omit(exdat)
+    if (!no.ex){
+      keep.eval <- rep_len(TRUE, nrow(exdat))
+      rows.omit <- attr(na.omit(exdat), "na.action")
+      if (length(rows.omit) > 0L)
+        keep.eval[as.integer(rows.omit)] <- FALSE
+      exdat <- exdat[keep.eval,,drop = FALSE]
+    }
     
     tnrow = dim(txdat)[1]
-    enrow = ifelse(no.ex,tnrow,dim(exdat)[1])
+    enrow = (if (no.ex) tnrow else dim(exdat)[1])
 
     ## re-assign levels in training and evaluation data to ensure correct
     ## conversion to numeric type.
@@ -154,6 +215,10 @@ npqreg.condbandwidth <-
     } else {
       txeval <- exdat
     }
+    txdat.df <- txdat
+    tydat.df <- tydat
+    if (!no.ex)
+      exdat.df <- exdat
 
     ## at this stage, data to be sent to the c routines must be converted to
     ## numeric type.
@@ -181,12 +246,12 @@ npqreg.condbandwidth <-
     myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
-      int_LARGE_SF = ifelse(bws$scaling, SF_NORMAL, SF_ARB),
+      int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
       BANDWIDTH_den_extern = switch(bws$type,
         fixed = BW_FIXED,
         generalized_nn = BW_GEN_NN,
         adaptive_nn = BW_ADAP_NN),
-      int_MINIMIZE_IO=ifelse(options('np.messages'), IO_MIN_FALSE, IO_MIN_TRUE),
+      int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE,
       xkerneval = switch(bws$cxkertype,
         gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
@@ -205,10 +270,12 @@ npqreg.condbandwidth <-
         liracine = UKER_LR),
       oxkerneval = switch(bws$oxkertype,
         wangvanryzin = OKER_WANG,
-        liracine = OKER_LR),
+        liracine = OKER_LR,
+        "racineliyan" = OKER_RLY),
       oykerneval = switch(bws$oykertype,
         wangvanryzin = OKER_WANG,
-        liracine = OKER_NLR),
+        liracine = OKER_NLR,
+        "racineliyan" = OKER_RLY),
       num_yuno = bws$ynuno,
       num_yord = bws$ynord,
       num_ycon = bws$yncon,
@@ -220,45 +287,100 @@ npqreg.condbandwidth <-
       itmax = itmax,
       xmcv.numRow = attr(bws$xmcv, "num.row"),
       nmulti = itmax,
-      dfc.dir = dfc.dir)
+      qreg.unused = 0L)
 
-    myoptd = list(
-      ftol = ftol,
+    myoptd = c(
+      qreg.unused = 0.0,
       tol = tol,
       small = small,
-      lbc.dir = lbc.dir, cfac.dir = cfac.dir,initc.dir = initc.dir, 
-      lbd.dir = lbd.dir, hbd.dir = hbd.dir, dfac.dir = dfac.dir, initd.dir = initd.dir)
+      rep(0.0, 7L))
     
-    myout=
-      .C("np_quantile_conditional",
-         as.double(tydat),
-         as.double(txuno), as.double(txord), as.double(txcon),
-         as.double(exuno), as.double(exord), as.double(excon),
-         as.double(tau),
-         as.double(c(bws$xbw[bws$ixcon],bws$ybw[bws$iycon],
-                     bws$ybw[bws$iyuno],bws$ybw[bws$iyord],
-                     bws$xbw[bws$ixuno],bws$xbw[bws$ixord])),
-         as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-         as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
-         as.integer(myopti),
-         as.double(myoptd),
-         yq = double(enrow),
-         yqerr = double(enrow),
-         yqgrad = double(enrow*bws$xndim*gradients),
-         PACKAGE="npRmpi" )[c("yq","yqerr", "yqgrad")]
+    myout <-
+      .Call("C_np_quantile_conditional",
+            as.double(tydat),
+            as.double(txuno), as.double(txord), as.double(txcon),
+            as.double(exuno), as.double(exord), as.double(excon),
+            as.double(tau),
+            as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
+                        bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
+                        bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
+            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+            as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
+            as.integer(myopti),
+            as.double(myoptd),
+            as.integer(enrow),
+            as.integer(bws$xndim),
+            as.logical(gradients),
+            PACKAGE="npRmpi")[c("yq", "yqerr", "yqgrad")]
+
+    if (all(!is.finite(myout$yqerr) | myout$yqerr <= 0.0)) {
+      dens.bw <- tryCatch(
+        conbandwidth(
+          xbw = bws$xbw,
+          ybw = bws$ybw,
+          bwmethod = "manual",
+          bwscaling = bws$scaling,
+          bwtype = bws$type,
+          cxkertype = bws$cxkertype,
+          cxkerorder = bws$cxkerorder,
+          cxkerbound = bws$cxkerbound,
+          cxkerlb = bws$cxkerlb,
+          cxkerub = bws$cxkerub,
+          uxkertype = bws$uxkertype,
+          oxkertype = bws$oxkertype,
+          cykertype = bws$cykertype,
+          cykerorder = bws$cykerorder,
+          cykerbound = bws$cykerbound,
+          cykerlb = bws$cykerlb,
+          cykerub = bws$cykerub,
+          uykertype = bws$uykertype,
+          oykertype = bws$oykertype,
+          nobs = nrow(txdat.df),
+          xdati = bws$xdati,
+          ydati = bws$ydati,
+          xnames = bws$xnames,
+          ynames = bws$ynames,
+          sfactor = bws$sfactor,
+          bandwidth = bws$bw,
+          bandwidth.compute = FALSE
+        ),
+        error = function(e) NULL
+      )
+      dens.obj <- tryCatch(
+        npcdens(
+          txdat = txdat.df,
+          tydat = tydat.df,
+          exdat = if (no.ex) txdat.df else exdat.df,
+          eydat = data.frame(y = as.double(myout$yq)),
+          bws = dens.bw
+        ),
+        error = function(e) NULL
+      )
+      if (!is.null(dens.obj)) {
+        dens.q <- as.double(dens.obj$condens)
+        qvar <- tau * (1.0 - tau) / (tnrow * NZD(dens.q)^2)
+        myout$yqerr <- sqrt(pmax(qvar, 0.0))
+        myout$yqerr[!is.finite(myout$yqerr)] <- NA_real_
+      }
+    }
 
     ##need to untangle yqgrad
 
     if(gradients){
       myout$yqgrad = matrix(data=myout$yqgrad, nrow = enrow, ncol = bws$xndim, byrow = FALSE) 
       rorder = numeric(bws$xndim)
-      rorder[c((1:bws$xndim)[bws$ixcon], (1:bws$xndim)[bws$ixuno], (1:bws$xndim)[bws$ixord])]=1:bws$xndim
+      xidx <- seq_len(bws$xndim)
+      rorder[c(xidx[bws$ixcon], xidx[bws$ixuno], xidx[bws$ixord])] <- xidx
       myout$yqgrad = myout$yqgrad[, rorder, drop = FALSE]
 
     } else {
       myout$yqgrad = NA
     }
 
+
+    fit.elapsed <- proc.time()[3] - fit.start
+    optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
+    total.time <- fit.elapsed + (if (is.na(optim.time)) 0.0 else optim.time)
 
     qregression(bws = bws,
                 xeval = txeval,
@@ -268,11 +390,27 @@ npqreg.condbandwidth <-
                 quantgrad = myout$yqgrad,
                 ntrain = tnrow,
                 trainiseval = no.ex,
-                gradients = gradients)
+                gradients = gradients,
+                timing = bws$timing, total.time = total.time,
+                optim.time = optim.time, fit.time = fit.elapsed)
   }
 
 
 npqreg.default <- function(bws, txdat, tydat, ...){
+  .npRmpi_require_active_slave_pool(where = "npqreg()")
+  if (!missing(bws) &&
+      .npRmpi_npqreg_should_localize(bws) &&
+      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+    return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+
+  if (!missing(bws) && inherits(bws, "formula")) {
+    dots <- list(...)
+    tbw <- do.call(npcdistbw, c(list(formula = bws), dots))
+    return(npqreg(bws = tbw, ...))
+  }
+
   sc <- sys.call()
   sc.names <- names(sc)
 
@@ -287,6 +425,7 @@ npqreg.default <- function(bws, txdat, tydat, ...){
   no.bws <- missing(bws)
   no.txdat <- missing(txdat)
   no.tydat <- missing(tydat)
+  has.explicit.bws <- (!no.bws) && isa(bws, "condbandwidth")
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
@@ -313,20 +452,30 @@ npqreg.default <- function(bws, txdat, tydat, ...){
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
     
-  tbw <- eval.parent(sc.bw)
-
-  ## convention: drop 'bws' and up to two unnamed arguments (including bws)
-  if(no.bws){
-    tx.str <- ",txdat = txdat"
-    ty.str <- ",tydat = tydat"
+  tbw <- if (!has.explicit.bws) {
+    .np_progress_select_bandwidth(
+      "Selecting conditional distribution bandwidth",
+      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+    )
   } else {
-    tx.str <- ifelse(txdat.named, ",txdat = txdat","")
-    ty.str <- ifelse(tydat.named, ",tydat = tydat","")    
-    if((!bws.named) && (!txdat.named)){
-      ty.str <- ifelse(tydat.named, ",tydat = tydat",
-                       ifelse(no.tydat,"",",tydat"))
+    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+  }
+
+  call.args <- list(bws = tbw)
+  if (no.bws) {
+    call.args$txdat <- txdat
+    call.args$tydat <- tydat
+  } else {
+    if (txdat.named) call.args$txdat <- txdat
+    if (tydat.named) call.args$tydat <- tydat
+    if ((!bws.named) && (!txdat.named) && (!no.tydat) && (!tydat.named)) {
+      call.args <- c(call.args, list(tydat))
     }
   }
-  
-  eval(parse(text=paste("npqreg(bws = tbw", tx.str, ty.str, ",...)")))
+  dots <- list(...)
+  if (has.explicit.bws)
+    fit.dots <- .npqreg_fit_dots(dots)
+  else
+    fit.dots <- .npqreg_fit_dots(dots, allow.bandwidth.controls = TRUE)
+  do.call(npqreg, c(call.args, fit.dots))
 }

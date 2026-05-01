@@ -5,12 +5,13 @@
 #include <math.h>
 #include <float.h>
 #include <errno.h>
+#include <string.h>
 
 #include <R.h>
 #include <R_ext/Utils.h>
 
 #include "headers.h"
-#include "matrix.h"
+#include "linalg.h"
 
 #ifdef MPI2
 
@@ -105,6 +106,225 @@ extern double y_max_extern;
 // so that quantile stuff gives a more sensible multistart message
 extern int imstot;
 
+#define NP_QREG_GRID_POINTS 33
+
+static inline double np_lp_mhat(
+  MATRIX DELTA,
+  double **matrix_X_fit,
+  int num_reg_continuous,
+  int j)
+{
+  double mhat = DELTA[0][0];
+  int ii;
+  for(ii = 0; ii < num_reg_continuous; ii++)
+    mhat += DELTA[ii+1][0]*matrix_X_fit[ii][j];
+  return mhat;
+}
+
+static double np_qreg_quantile_objective_scalar(double y)
+{
+  double quantile[2];
+
+  quantile[0] = 0.0;
+  quantile[1] = y;
+
+  return func_con_density_quantile(quantile);
+}
+
+static int np_qreg_build_grid_window(
+  double *left,
+  double *right,
+  double *best_x,
+  double *best_f)
+{
+  double grid_x[NP_QREG_GRID_POINTS];
+  double grid_f[NP_QREG_GRID_POINTS];
+  double span;
+  int best_idx;
+  int i;
+
+  span = y_max_extern - y_min_extern;
+  if(span <= 0.0)
+  {
+    *left = y_min_extern;
+    *right = y_min_extern;
+    *best_x = y_min_extern;
+    *best_f = np_qreg_quantile_objective_scalar(y_min_extern);
+    return 1;
+  }
+
+  best_idx = 0;
+  for(i = 0; i < NP_QREG_GRID_POINTS; i++)
+  {
+    grid_x[i] = y_min_extern + span * ((double)i / (double)(NP_QREG_GRID_POINTS - 1));
+    grid_f[i] = np_qreg_quantile_objective_scalar(grid_x[i]);
+    if(grid_f[i] < grid_f[best_idx])
+    {
+      best_idx = i;
+    }
+  }
+
+  *best_x = grid_x[best_idx];
+  *best_f = grid_f[best_idx];
+
+  if((best_idx == 0) || (best_idx == NP_QREG_GRID_POINTS - 1))
+  {
+    if(best_idx == 0)
+    {
+      *left = grid_x[0];
+      *right = grid_x[1];
+    }
+    else
+    {
+      *left = grid_x[NP_QREG_GRID_POINTS-2];
+      *right = grid_x[NP_QREG_GRID_POINTS-1];
+    }
+    return 1;
+  }
+
+  *left = grid_x[best_idx-1];
+  *right = grid_x[best_idx+1];
+  return 1;
+}
+
+static double np_qreg_refine_golden_1d(
+  double left,
+  double right,
+  double tol,
+  double small,
+  int itmax,
+  double *quantile_best)
+{
+  const double phi = 0.6180339887498948482;
+  double a;
+  double b;
+  double c;
+  double d;
+  double fa;
+  double fb;
+  double fc;
+  double fd;
+  int iter;
+  int maxiter;
+
+  a = left;
+  b = right;
+  if(b < a)
+  {
+    double tmp = a;
+    a = b;
+    b = tmp;
+  }
+
+  if((b - a) <= small)
+  {
+    fa = np_qreg_quantile_objective_scalar(a);
+    fb = np_qreg_quantile_objective_scalar(b);
+    if(fa <= fb)
+    {
+      *quantile_best = a;
+      return fa;
+    }
+    *quantile_best = b;
+    return fb;
+  }
+
+  c = b - phi * (b - a);
+  d = a + phi * (b - a);
+  fc = np_qreg_quantile_objective_scalar(c);
+  fd = np_qreg_quantile_objective_scalar(d);
+
+  maxiter = (itmax < 64) ? itmax : 64;
+  for(iter = 0; iter < maxiter; iter++)
+  {
+    if(fabs(b - a) <= tol * (fabs(c) + fabs(d)) + small)
+    {
+      break;
+    }
+
+    if(fc <= fd)
+    {
+      b = d;
+      d = c;
+      fd = fc;
+      c = b - phi * (b - a);
+      fc = np_qreg_quantile_objective_scalar(c);
+    }
+    else
+    {
+      a = c;
+      c = d;
+      fc = fd;
+      d = a + phi * (b - a);
+      fd = np_qreg_quantile_objective_scalar(d);
+    }
+  }
+
+  fa = np_qreg_quantile_objective_scalar(a);
+  fb = np_qreg_quantile_objective_scalar(b);
+
+  *quantile_best = a;
+  if(fc < fa)
+  {
+    *quantile_best = c;
+    fa = fc;
+  }
+  if(fd < fa)
+  {
+    *quantile_best = d;
+    fa = fd;
+  }
+  if(fb < fa)
+  {
+    *quantile_best = b;
+    fa = fb;
+  }
+
+  return fa;
+}
+
+static double np_qreg_extract_quantile_1d(
+  double tol,
+  double small,
+  int itmax,
+  double *quantile_best)
+{
+  double left;
+  double right;
+  double xmin;
+  double fret;
+  double grid_best_x;
+  double grid_best_f;
+  int window_status;
+
+  window_status = np_qreg_build_grid_window(&left, &right, &grid_best_x, &grid_best_f);
+
+  if(window_status == 0)
+  {
+    error("C_np_quantile_conditional: canonical one-dimensional quantile extraction failed to bracket a finite support window");
+  }
+
+  fret = np_qreg_refine_golden_1d(left, right, tol, small, itmax, &xmin);
+
+  if((!R_FINITE(fret)) ||
+     (!R_FINITE(xmin)) ||
+     (xmin < y_min_extern) ||
+     (xmin > y_max_extern))
+  {
+    error("C_np_quantile_conditional: canonical one-dimensional quantile extraction failed to produce a finite in-support candidate");
+  }
+
+  if(grid_best_f < fret)
+  {
+    *quantile_best = grid_best_x;
+    return grid_best_f;
+  }
+
+  *quantile_best = xmin;
+
+  return fret;
+}
+
 int kernel_estimate_density_categorical(
 int KERNEL_den,
 int KERNEL_unordered_den,
@@ -198,11 +418,7 @@ double *log_likelihood)
 		lambda,
 		matrix_bandwidth_deriv) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	/* Initialize constants for various kernels required for asymptotic standard errors */
@@ -2105,11 +2321,7 @@ int itmax)
 		lambda,
 		matrix_bandwidth_deriv) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	/* Conduct the estimation */
@@ -2439,7 +2651,6 @@ double *SIGN)
 	double temp1 = DBL_MAX;
 
 	MATRIX  XTKX;
-	MATRIX  XTKXINV;
 	MATRIX  XTKY;
 	MATRIX  XTKYSQ;
 	MATRIX  DELTA;
@@ -2451,6 +2662,7 @@ double *SIGN)
 	double DIFF_KER_PPM = 0.0;		 /* Difference between int K(z)^p and int K(z-.5)K(z+.5) */
 
 	int num_reg_cat_cont;
+	double **matrix_X_fit;
 
 	#ifdef MPI2
 	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
@@ -2465,6 +2677,8 @@ double *SIGN)
 	{
 		num_reg_cat_cont = num_reg_continuous;
 	}
+
+	matrix_X_fit = matrix_X_continuous_eval;
 
 	/* Initialize constants for various kernels required for asymptotic standard errors */
 
@@ -2519,11 +2733,7 @@ double *SIGN)
 		lambda,
 		matrix_bandwidth_deriv) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	#ifndef MPI2
@@ -2850,7 +3060,6 @@ double *SIGN)
 
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		XTKYSQ = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
@@ -2918,7 +3127,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -2947,7 +3156,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -2984,10 +3193,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -3016,28 +3225,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j] = DELTA[0][0];
+				mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j] = - DELTA[k+1][0];
+					gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -3128,7 +3331,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -3157,7 +3360,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -3194,10 +3397,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -3226,28 +3429,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j] = DELTA[0][0];
+				mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j] = - DELTA[k+1][0];
+					gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -3340,7 +3537,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(l < num_reg_continuous+num_reg_unordered)
@@ -3369,7 +3566,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -3406,10 +3603,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -3438,28 +3635,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j] = DELTA[0][0];
+				mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j] = - DELTA[k+1][0];
+					gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -3491,7 +3682,6 @@ double *SIGN)
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( XTKYSQ );
 		mat_free( DELTA );
@@ -3817,7 +4007,6 @@ double *SIGN)
 
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		XTKYSQ = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
@@ -3884,7 +4073,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -3913,7 +4102,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -3950,10 +4139,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -3982,28 +4171,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] = DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j-my_rank*stride] = - DELTA[k+1][0];
+					gradient[k][j-my_rank*stride] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -4094,7 +4277,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -4123,7 +4306,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -4160,10 +4343,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -4192,28 +4375,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] = DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j-my_rank*stride] = - DELTA[k+1][0];
+					gradient[k][j-my_rank*stride] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -4306,7 +4483,7 @@ double *SIGN)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 								* prod_kernel;
 						}
 						else if(l < num_reg_continuous+num_reg_unordered)
@@ -4335,7 +4512,7 @@ double *SIGN)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -4372,10 +4549,10 @@ double *SIGN)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -4404,28 +4581,22 @@ double *SIGN)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] = DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				for(k = 0; k < num_reg_cat_cont; k++)
 				{
-					gradient[k][j-my_rank*stride] = - DELTA[k+1][0];
+					gradient[k][j-my_rank*stride] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 				}
-
-				/*				DELTA =  mat_mul( XTKXINV, XTKYSQ, DELTA);
-
-				temp_var = DELTA[0][0] - mean[j]*mean[j]; 12/9/03 - local
-				linear E[Y^2|]-(E[Y|X])^2 for conditional variance is
-				flawed. Now using local constant.*/
 
 				temp_var = XTKYSQ[0][0]/XTKX[0][0] - ipow(XTKY[0][0]/XTKX[0][0],2);
 
@@ -4457,7 +4628,6 @@ double *SIGN)
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( XTKYSQ );
 		mat_free( DELTA );
@@ -4467,20 +4637,22 @@ double *SIGN)
 	/* Important - only one gather permitted */
 
 	/* Gather */
-
-	MPI_Gather(mean, stride, MPI_DOUBLE, mean, stride, MPI_DOUBLE, 0, comm[1]);
-	MPI_Bcast(mean, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
-	MPI_Gather(mean_stderr, stride, MPI_DOUBLE, mean_stderr, stride, MPI_DOUBLE, 0, comm[1]);
-	MPI_Bcast(mean_stderr, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
-
-	for(l = 0; l < num_reg_continuous; l++)
+	if(!np_mpi_local_regression_active())
 	{
+		MPI_Gather(mean, stride, MPI_DOUBLE, mean, stride, MPI_DOUBLE, 0, comm[1]);
+		MPI_Bcast(mean, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+		MPI_Gather(mean_stderr, stride, MPI_DOUBLE, mean_stderr, stride, MPI_DOUBLE, 0, comm[1]);
+		MPI_Bcast(mean_stderr, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
 
-		MPI_Gather(&gradient[l][0], stride, MPI_DOUBLE, &gradient[l][0], stride, MPI_DOUBLE, 0, comm[1]);
-		MPI_Bcast(&gradient[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
-		MPI_Gather(&gradient_stderr[l][0], stride, MPI_DOUBLE, &gradient_stderr[l][0], stride, MPI_DOUBLE, 0, comm[1]);
-		MPI_Bcast(&gradient_stderr[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+		for(l = 0; l < num_reg_continuous; l++)
+		{
 
+			MPI_Gather(&gradient[l][0], stride, MPI_DOUBLE, &gradient[l][0], stride, MPI_DOUBLE, 0, comm[1]);
+			MPI_Bcast(&gradient[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+			MPI_Gather(&gradient_stderr[l][0], stride, MPI_DOUBLE, &gradient_stderr[l][0], stride, MPI_DOUBLE, 0, comm[1]);
+			MPI_Bcast(&gradient_stderr[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+
+		}
 	}
 	#endif
 
@@ -4562,7 +4734,6 @@ double *mean)
 	double temp1 = DBL_MAX;
 
 	MATRIX  XTKX;
-	MATRIX  XTKXINV;
 	MATRIX  XTKY;
 	MATRIX  DELTA;
 
@@ -4572,6 +4743,7 @@ double *mean)
 	double *pointer_m;
 #endif
 	int num_reg_cat_cont;
+	double **matrix_X_fit;
 
 	#ifdef MPI2
 	int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
@@ -4586,6 +4758,8 @@ double *mean)
 	{
 		num_reg_cat_cont = num_reg_continuous;
 	}
+
+	matrix_X_fit = matrix_X_continuous;
 
 	/* Allocate memory for objects */
 
@@ -4789,7 +4963,6 @@ double *mean)
 		/* Local Linear */
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -4818,7 +4991,6 @@ double *mean)
 		{
 
 			mat_free( XTKX );
-			mat_free( XTKXINV );
 			mat_free( XTKY );
 			mat_free( DELTA );
 
@@ -4890,7 +5062,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -4918,7 +5090,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -4957,10 +5129,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -4989,16 +5161,16 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -5062,7 +5234,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -5090,7 +5262,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -5129,10 +5301,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -5161,16 +5333,16 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -5234,7 +5406,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -5262,7 +5434,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -5301,10 +5473,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -5333,23 +5505,22 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( DELTA );
 
@@ -5550,7 +5721,6 @@ double *mean)
 		/* Local Linear */
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -5582,7 +5752,6 @@ double *mean)
 		{
 
 			mat_free( XTKX );
-			mat_free( XTKXINV );
 			mat_free( XTKY );
 			mat_free( DELTA );
 
@@ -5653,7 +5822,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -5681,7 +5850,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -5720,10 +5889,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -5753,17 +5922,17 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -5826,7 +5995,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -5854,7 +6023,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -5893,10 +6062,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -5925,17 +6094,17 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -5998,7 +6167,7 @@ double *mean)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 									* prod_kernel;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -6026,7 +6195,7 @@ double *mean)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 										* prod_kernel;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -6065,10 +6234,10 @@ double *mean)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -6097,24 +6266,23 @@ double *mean)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( DELTA );
 
@@ -6218,11 +6386,11 @@ double **gradient)
 	double *pointer_matrix_bandwidth;
 
 	MATRIX  XTKX;
-	MATRIX  XTKXINV;
 	MATRIX  XTKY;
 	MATRIX  DELTA;
 
 	int num_reg_cat_cont;
+	double **matrix_X_fit;
 
 	#ifdef MPI2
 	int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
@@ -6237,6 +6405,8 @@ double **gradient)
 	{
 		num_reg_cat_cont = num_reg_continuous;
 	}
+
+	matrix_X_fit = matrix_X_continuous_eval;
 
 	#ifndef MPI2
 
@@ -6609,7 +6779,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -6675,7 +6844,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -6703,7 +6872,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -6740,10 +6909,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -6772,20 +6941,20 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
               XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-						*pointer_m++ = DELTA[0][0];
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+						*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -6851,7 +7020,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -6879,7 +7048,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -6916,10 +7085,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -6947,20 +7116,20 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
               XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-						*pointer_m++ = DELTA[0][0];
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+						*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -7027,7 +7196,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -7055,7 +7224,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -7092,10 +7261,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -7124,21 +7293,21 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
               XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						*pointer_m++ = DELTA[0][0];
+						*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -7146,7 +7315,6 @@ double **gradient)
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -7386,7 +7554,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -7427,7 +7594,7 @@ double **gradient)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 									* *pointer_matrix_weights_K;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -7455,7 +7622,7 @@ double **gradient)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 										* *pointer_matrix_weights_K;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -7493,10 +7660,10 @@ double **gradient)
 
 					/* Now compute the beast... */
 
-					if(fabs(mat_det(XTKX)) > 0.0 )
+					if(mat_is_nonsingular(XTKX) )
 					{
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 					}
 					else
@@ -7525,27 +7692,26 @@ double **gradient)
 								XTKX[k][k] += epsilon;
 								nepsilon += epsilon;
 							}
-						} while (fabs(mat_det(XTKX)) == 0.0);
+						} while (!mat_is_nonsingular(XTKX));
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 						/* Add epsilon times local constant estimator to first element of XTKY */
             XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 					}
 
-					DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+					if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-					mean[j] = DELTA[0][0];
+					mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					for(k = 0; k < num_reg_cat_cont; k++)
 					{
-						gradient[k][j] = - DELTA[k+1][0];
+						gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 					}
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -7728,7 +7894,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -7792,7 +7957,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -7820,7 +7985,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -7857,10 +8022,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -7890,17 +8055,17 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j] = DELTA[0][0];
+						mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
@@ -7963,7 +8128,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -7991,7 +8156,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -8028,10 +8193,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -8060,17 +8225,17 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j] = DELTA[0][0];
+						mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
@@ -8133,7 +8298,7 @@ double **gradient)
 								/* First lower column of XTKX */
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -8161,7 +8326,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -8198,10 +8363,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -8230,24 +8395,23 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j] = DELTA[0][0];
+						mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -8293,7 +8457,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -8333,7 +8496,7 @@ double **gradient)
 							/* First lower column of XTKX */
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 									* *pointer_matrix_weights_K;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -8361,7 +8524,7 @@ double **gradient)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 										* *pointer_matrix_weights_K;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -8402,10 +8565,10 @@ double **gradient)
 
 					/* Now compute the beast... */
 
-					if(fabs(mat_det(XTKX)) > 0.0 )
+					if(mat_is_nonsingular(XTKX) )
 					{
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 					}
 					else
@@ -8434,22 +8597,21 @@ double **gradient)
 								XTKX[k][k] += epsilon;
 								nepsilon += epsilon;
 							}
-						} while (fabs(mat_det(XTKX)) == 0.0);
+						} while (!mat_is_nonsingular(XTKX));
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 						/* Add epsilon times local constant estimator to first element of XTKY */
 						XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 					}
 
-					DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+					if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-					mean[j] = DELTA[0][0];
+					mean[j] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -8820,7 +8982,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -8884,7 +9045,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -8912,7 +9073,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -8949,10 +9110,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -8981,20 +9142,20 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-						mean[j-my_rank*stride] = DELTA[0][0];
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -9058,7 +9219,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -9086,7 +9247,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -9123,10 +9284,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -9155,20 +9316,20 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-						mean[j-my_rank*stride] = DELTA[0][0];
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -9233,7 +9394,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -9261,7 +9422,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -9298,10 +9459,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -9330,21 +9491,21 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j-my_rank*stride] = DELTA[0][0];
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 						for(k = 0; k < num_reg_cat_cont; k++)
 						{
-							gradient[k][j] = - DELTA[k+1][0];
+							gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 						}
 
 					}
@@ -9352,7 +9513,6 @@ double **gradient)
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -9571,7 +9731,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -9612,7 +9771,7 @@ double **gradient)
 
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 									* *pointer_matrix_weights_K;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -9640,7 +9799,7 @@ double **gradient)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 										* *pointer_matrix_weights_K;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -9678,10 +9837,10 @@ double **gradient)
 
 					/* Now compute the beast... */
 
-					if(fabs(mat_det(XTKX)) > 0.0 )
+					if(mat_is_nonsingular(XTKX) )
 					{
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 					}
 					else
@@ -9710,27 +9869,26 @@ double **gradient)
 								XTKX[k][k] += epsilon;
 								nepsilon += epsilon;
 							}
-						} while (fabs(mat_det(XTKX)) == 0.0);
+						} while (!mat_is_nonsingular(XTKX));
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 						/* Add epsilon times local constant estimator to first element of XTKY */
 						XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 					}
 
-					DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+					if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-					mean[j-my_rank*stride] = DELTA[0][0];
+					mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					for(k = 0; k < num_reg_cat_cont; k++)
 					{
-						gradient[k][j] = - DELTA[k+1][0];
+						gradient[k][j] = (k < num_reg_continuous) ? DELTA[k+1][0] : -DELTA[k+1][0];
 					}
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -9907,7 +10065,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -9971,7 +10128,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -9999,7 +10156,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -10036,10 +10193,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -10068,17 +10225,17 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j-my_rank*stride] = DELTA[0][0];
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
@@ -10141,7 +10298,7 @@ double **gradient)
 
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -10169,7 +10326,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -10206,10 +10363,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -10238,17 +10395,17 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j-my_rank*stride] = DELTA[0][0];
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
@@ -10311,7 +10468,7 @@ double **gradient)
 								/* First lower column of XTKX */
 								if(k < num_reg_continuous)
 								{
-									XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+									XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 										* prod_kernel;
 								}
 								else if(k < num_reg_continuous+num_reg_unordered)
@@ -10339,7 +10496,7 @@ double **gradient)
 								{
 									if(l < num_reg_continuous)
 									{
-										XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+										XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 											* prod_kernel;
 									}
 									else if(l < num_reg_continuous+num_reg_unordered)
@@ -10376,10 +10533,10 @@ double **gradient)
 
 						/* Now compute the beast... */
 
-						if(fabs(mat_det(XTKX)) > 0.0 )
+						if(mat_is_nonsingular(XTKX) )
 						{
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 						}
 						else
@@ -10408,24 +10565,23 @@ double **gradient)
 									XTKX[k][k] += epsilon;
 									nepsilon += epsilon;
 								}
-							} while (fabs(mat_det(XTKX)) == 0.0);
+							} while (!mat_is_nonsingular(XTKX));
 
-							XTKXINV = mat_inv( XTKX, XTKXINV );
+
 							/* Add epsilon times local constant estimator to first element of XTKY */
 							XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 						}
 
-						DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+						if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-						mean[j-my_rank*stride] = DELTA[0][0];
+						mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 					}
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -10469,7 +10625,6 @@ double **gradient)
 
 
 				XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-				XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 				XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 				DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -10509,7 +10664,7 @@ double **gradient)
 							/* First lower column of XTKX */
 							if(k < num_reg_continuous)
 							{
-								XTKX[k+1][0] += (temp1 = (matrix_X_continuous_eval[k][j] - matrix_X_continuous_train[k][i]))
+								XTKX[k+1][0] += (temp1 = matrix_X_continuous_train[k][i])
 									* *pointer_matrix_weights_K;
 							}
 							else if(k < num_reg_continuous+num_reg_unordered)
@@ -10537,7 +10692,7 @@ double **gradient)
 							{
 								if(l < num_reg_continuous)
 								{
-									XTKX[k+1][l+1] += temp1 * (matrix_X_continuous_eval[l][j] - matrix_X_continuous_train[l][i])
+									XTKX[k+1][l+1] += temp1 * matrix_X_continuous_train[l][i]
 										* *pointer_matrix_weights_K;
 								}
 								else if(l < num_reg_continuous+num_reg_unordered)
@@ -10578,10 +10733,10 @@ double **gradient)
 
 					/* Now compute the beast... */
 
-					if(fabs(mat_det(XTKX)) > 0.0 )
+					if(mat_is_nonsingular(XTKX) )
 					{
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 					}
 					else
@@ -10610,22 +10765,21 @@ double **gradient)
 								XTKX[k][k] += epsilon;
 								nepsilon += epsilon;
 							}
-						} while (fabs(mat_det(XTKX)) == 0.0);
+						} while (!mat_is_nonsingular(XTKX));
 
-						XTKXINV = mat_inv( XTKX, XTKXINV );
+
 						/* Add epsilon times local constant estimator to first element of XTKY */
 						XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 					}
 
-					DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
+					if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical");
 
-					mean[j-my_rank*stride] = DELTA[0][0];
+					mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 				}
 
 				mat_free( XTKX );
-				mat_free( XTKXINV );
 				mat_free( XTKY );
 				mat_free( DELTA );
 
@@ -10636,21 +10790,23 @@ double **gradient)
 	}
 
 	/* Important - only one gather per module */
-
-	MPI_Gather(mean, stride, MPI_DOUBLE, mean, stride, MPI_DOUBLE, 0, comm[1]);
-	MPI_Bcast(mean, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
-
-	if(int_compute_gradient == 1)
+	if(!np_mpi_local_regression_active())
 	{
+		MPI_Gather(mean, stride, MPI_DOUBLE, mean, stride, MPI_DOUBLE, 0, comm[1]);
+		MPI_Bcast(mean, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
 
-		for(l = 0; l < num_reg_continuous; l++)
+		if(int_compute_gradient == 1)
 		{
 
-			MPI_Gather(&gradient[l][0], stride, MPI_DOUBLE, &gradient[l][0], stride, MPI_DOUBLE, 0, comm[1]);
-			MPI_Bcast(&gradient[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+			for(l = 0; l < num_reg_continuous; l++)
+			{
+
+				MPI_Gather(&gradient[l][0], stride, MPI_DOUBLE, &gradient[l][0], stride, MPI_DOUBLE, 0, comm[1]);
+				MPI_Bcast(&gradient[l][0], num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+
+			}
 
 		}
-
 	}
 	#endif
 
@@ -10772,11 +10928,7 @@ double *log_likelihood)
 		matrix_bandwidth_reg,
 		lambda) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	/* Initialize constants for various kernels required for asymptotic standard errors */
@@ -11474,11 +11626,7 @@ int itmax)
 		matrix_bandwidth_reg,
 		lambda) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	#ifndef MPI2
@@ -12705,10 +12853,6 @@ int itmax)
 		matrix_bandwidth_reg,
 		lambda) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
 		error("\n** Error: invalid bandwidth.");
 	}
 
@@ -13050,11 +13194,7 @@ double *log_likelihood)
 		matrix_bandwidth_reg,
 		lambda) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	/* Initialize constants for various kernels required for asymptotic standard errors */
@@ -14530,11 +14670,7 @@ int itmax)
 		matrix_bandwidth_reg,
 		lambda) == 1)
 	{
-#ifdef MPI2
-		MPI_Barrier(comm[1]);
-		MPI_Finalize();
-#endif
-    error("\n** Error: invalid bandwidth.");
+	    error("\n** Error: invalid bandwidth.");
 	}
 
 	/* Initialize constants for various kernels required for asymptotic standard errors */
@@ -17457,13 +17593,7 @@ double  initd_dir)
 	int i;
 	int j;
 	int k;
-	double fret;
-	double fret_best;
 	double quantile[2];
-	double quantile_multistart[2];
-	int iMs_counter;
-	int iter;
-	int iNum_Ms;
 	double **matrix_y;
 
 	double quantile_l;
@@ -17516,13 +17646,9 @@ double  initd_dir)
 			matrix_bandwidth_var,
 			matrix_bandwidth_reg,
 			lambda) == 1)
-		{
-#ifdef MPI2
-			MPI_Barrier(comm[1]);
-			MPI_Finalize();
-#endif
-      error("\n** Error: invalid bandwidth.");
-		}
+			{
+	      error("\n** Error: invalid bandwidth.");
+			}
 
 	}
 
@@ -17567,71 +17693,10 @@ double  initd_dir)
 			matrix_X_continuous_quantile_extern[j][0] = matrix_X_continuous_eval[j][i];
 		}
 
-		quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-    initialize_nr_directions(BANDWIDTH_den,
-                             num_obs_train,
-                             1, 0, 0,
-                             0, 0, 0,
-                             vector_scale_factor,
-                             NULL,
-                             matrix_y,
-                             0, seed, 
-                             lbc_dir, c_dir, dfc_dir, initc_dir, 
-                             lbd_dir, hbd_dir, d_dir, initd_dir,
-                             matrix_X_continuous_train,
-                             matrix_Y_continuous_train);
-
-		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-		if(fret > zero)
-		{
-			fret_best = fret;
-			quantile_multistart[1] = quantile[1];
-
-      imstot = iMax_Num_Multistart;
-			for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-			{
-
-				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-        initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y,
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret < fret_best)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-					if(fret <= zero)
-					{
-						iMs_counter = iMax_Num_Multistart;
-					}
-				}
-
-			}
-
-			fret = fret_best;
-			quantile[1] = quantile_multistart[1];
-
-      if(int_MINIMIZE_IO != IO_MIN_TRUE){
-        REprintf("\r                                                                             ");
-        REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, num_obs_eval, iNum_Ms, zero);
-      }
-
-		}
+			(void) np_qreg_extract_quantile_1d(tol,
+	                                     small,
+	                                     itmax,
+	                                     &quantile[1]);
 
 		quan[i] = quantile[1];
 		quan_stderr[i] = 0.0;
@@ -17653,67 +17718,10 @@ double  initd_dir)
 
 				matrix_X_continuous_quantile_extern[k][0] = matrix_X_continuous_eval[k][i]  - matrix_bandwidth_reg[k][i];
 
-				quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-		    initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y,
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret > zero)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-
-					for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-					{
-
-						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-				    initialize_nr_directions(BANDWIDTH_den,
-                                     num_obs_train,
-                                     1, 0, 0,
-                                     0, 0, 0,
-                                     vector_scale_factor,
-                                     NULL,
-                                     matrix_y,
-                                     0, seed, 
-                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir,
-                                     matrix_X_continuous_train,
-                                     matrix_Y_continuous_train);
-
-						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-						if(fret < fret_best)
-						{
-							fret_best = fret;
-							quantile_multistart[1] = quantile[1];
-							if(fret <= zero)
-							{
-								iMs_counter = iMax_Num_Multistart;
-							}
-						}
-
-					}
-
-					fret = fret_best;
-					quantile[1] = quantile_multistart[1];
-          if(int_MINIMIZE_IO != IO_MIN_TRUE){
-            REprintf("\r                                                                             ");
-            REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, num_obs_eval, iNum_Ms, zero);
-          }
-				}
+					(void) np_qreg_extract_quantile_1d(tol,
+	                                         small,
+	                                         itmax,
+	                                         &quantile[1]);
 
 				quantile_l = quantile[1];
 
@@ -17726,68 +17734,10 @@ double  initd_dir)
 
 				matrix_X_continuous_quantile_extern[k][0] = matrix_X_continuous_eval[k][i] + matrix_bandwidth_reg[k][i]/2.0;
 
-				quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-		    initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y, 
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret > zero)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-
-					for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-					{
-
-						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-				    initialize_nr_directions(BANDWIDTH_den,
-                                     num_obs_train,
-                                     1, 0, 0,
-                                     0, 0, 0,
-                                     vector_scale_factor,
-                                     NULL,
-                                     matrix_y,
-                                     0, seed, 
-                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir,
-                                     matrix_X_continuous_train,
-                                     matrix_Y_continuous_train);
-
-						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-						if(fret < fret_best)
-						{
-							fret_best = fret;
-							quantile_multistart[1] = quantile[1];
-							if(fret <= zero)
-							{
-								iMs_counter = iMax_Num_Multistart;
-							}
-						}
-
-					}
-
-					fret = fret_best;
-					quantile[1] = quantile_multistart[1];
-          if(int_MINIMIZE_IO != IO_MIN_TRUE){
-            REprintf("\r                                                                             ");
-            REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, num_obs_eval, iNum_Ms, zero);
-          }
-
-				}
+					(void) np_qreg_extract_quantile_1d(tol,
+	                                         small,
+	                                         itmax,
+	                                         &quantile[1]);
 
 				quantile_u = quantile[1];
 
@@ -17847,70 +17797,10 @@ double  initd_dir)
 			matrix_X_continuous_quantile_extern[j][0] = matrix_X_continuous_eval[j][i];
 		}
 
-		quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-    initialize_nr_directions(BANDWIDTH_den,
-                             num_obs_train,
-                             1, 0, 0,
-                             0, 0, 0,
-                             vector_scale_factor,
-                             NULL,
-                             matrix_y,
-                             0, seed, 
-                             lbc_dir, c_dir, dfc_dir, initc_dir, 
-                             lbd_dir, hbd_dir, d_dir, initd_dir,
-                             matrix_X_continuous_train,
-                             matrix_Y_continuous_train);
-
-		powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-		if(fret > zero)
-		{
-			fret_best = fret;
-			quantile_multistart[1] = quantile[1];
-
-			for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-			{
-
-				quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-		    initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y,
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret < fret_best)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-					if(fret <= zero)
-					{
-						iMs_counter = iMax_Num_Multistart;
-					}
-				}
-
-			}
-
-			fret = fret_best;
-			quantile[1] = quantile_multistart[1];
-
-			if((my_rank == 0) && (int_MINIMIZE_IO != IO_MIN_TRUE))
-			{
-				REprintf("\r                                                                             ");
-				REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, stride, iNum_Ms, zero);
-			}
-
-		}
+			(void) np_qreg_extract_quantile_1d(tol,
+	                                     small,
+	                                     itmax,
+	                                     &quantile[1]);
 
 		quan[i-my_rank*stride] = quantile[1];
 		quan_stderr[i-my_rank*stride] = 0.0;
@@ -17930,72 +17820,10 @@ double  initd_dir)
 
 				matrix_X_continuous_quantile_extern[k][0] = matrix_X_continuous_eval[k][i]  - matrix_bandwidth_reg[k][i];
 
-				quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-		    initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y,
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret > zero)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-
-					for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-					{
-
-						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-				    initialize_nr_directions(BANDWIDTH_den,
-                                     num_obs_train,
-                                     1, 0, 0,
-                                     0, 0, 0,
-                                     vector_scale_factor,
-                                     NULL,
-                                     matrix_y,
-                                     0, seed, 
-                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir,
-                                     matrix_X_continuous_train,
-                                     matrix_Y_continuous_train);
-
-						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-						if(fret < fret_best)
-						{
-							fret_best = fret;
-							quantile_multistart[1] = quantile[1];
-							if(fret <= zero)
-							{
-								iMs_counter = iMax_Num_Multistart;
-							}
-						}
-
-					}
-
-					fret = fret_best;
-					quantile[1] = quantile_multistart[1];
-
-          if((my_rank == 0) && (int_MINIMIZE_IO != IO_MIN_TRUE))
-					{
-
-						REprintf("\r                                                                             ");
-						REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, num_obs_eval, iNum_Ms, zero);
-
-					}
-
-				}
+					(void) np_qreg_extract_quantile_1d(tol,
+	                                         small,
+	                                         itmax,
+	                                         &quantile[1]);
 
 				quantile_l = quantile[1];
 
@@ -18008,71 +17836,10 @@ double  initd_dir)
 
 				matrix_X_continuous_quantile_extern[k][0] = matrix_X_continuous_eval[k][i] + matrix_bandwidth_reg[k][i]/2.0;
 
-				quantile[1] = (y_max_extern-y_min_extern)/2.0;
-
-		    initialize_nr_directions(BANDWIDTH_den,
-                                 num_obs_train,
-                                 1, 0, 0,
-                                 0, 0, 0,
-                                 vector_scale_factor,
-                                 NULL,
-                                 matrix_y,
-                                 0, seed, 
-                                 lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                 lbd_dir, hbd_dir, d_dir, initd_dir,
-                                 matrix_X_continuous_train,
-                                 matrix_Y_continuous_train);
-
-				powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-				if(fret > zero)
-				{
-					fret_best = fret;
-					quantile_multistart[1] = quantile[1];
-
-					for(iMs_counter = 1, iNum_Ms = 1; iMs_counter < iMax_Num_Multistart; iMs_counter++, iNum_Ms++)
-					{
-
-						quantile[1] = y_min_extern + ran3(&seed)*(y_max_extern-y_min_extern);
-
-				    initialize_nr_directions(BANDWIDTH_den,
-                                     num_obs_train,
-                                     1, 0, 0,
-                                     0, 0, 0,
-                                     vector_scale_factor,
-                                     NULL,
-                                     matrix_y,
-                                     0, seed, 
-                                     lbc_dir, c_dir, dfc_dir, initc_dir, 
-                                     lbd_dir, hbd_dir, d_dir, initd_dir,
-                                     matrix_X_continuous_train,
-                                     matrix_Y_continuous_train);
-
-						powell(0, 0, quantile, quantile, matrix_y, 1, ftol, tol, small, itmax, &iter, &fret, func_con_density_quantile);
-
-						if(fret < fret_best)
-						{
-							fret_best = fret;
-							quantile_multistart[1] = quantile[1];
-							if(fret <= zero)
-							{
-								iMs_counter = iMax_Num_Multistart;
-							}
-						}
-
-					}
-
-					fret = fret_best;
-					quantile[1] = quantile_multistart[1];
-
-          if((my_rank == 0) && (int_MINIMIZE_IO != IO_MIN_TRUE))
-					{
-						REprintf("\r                                                                             ");
-						REprintf("\rWorking... (observation %d/%d required %d restarts to attain %g)", i+1, num_obs_eval, iNum_Ms, zero);
-
-					}
-
-				}
+					(void) np_qreg_extract_quantile_1d(tol,
+	                                         small,
+	                                         itmax,
+	                                         &quantile[1]);
 
 				quantile_u = quantile[1];
 
@@ -18166,7 +17933,6 @@ int *num_categories)
 	double temp1 = DBL_MAX;
 
 	MATRIX  XTKX;
-	MATRIX  XTKXINV;
 	MATRIX  XTKY;
 	MATRIX  DELTA;
 
@@ -18176,6 +17942,7 @@ int *num_categories)
 #endif
 
 	int num_reg_cat_cont;
+	double **matrix_X_fit;
 
 	double *mean;
 	double prod_kernel_i_eq_j = DBL_MAX;
@@ -18201,6 +17968,8 @@ int *num_categories)
 	{
 		num_reg_cat_cont = num_reg_continuous;
 	}
+
+	matrix_X_fit = matrix_X_continuous;
 
 	/* Allocate memory for objects */
 
@@ -18412,7 +18181,6 @@ int *num_categories)
 		/* Local Linear */
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -18441,7 +18209,6 @@ int *num_categories)
 		{
 
 			mat_free( XTKX );
-			mat_free( XTKXINV );
 			mat_free( XTKY );
 			mat_free( DELTA );
 
@@ -18516,7 +18283,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -18544,7 +18311,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -18581,10 +18348,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -18613,17 +18380,17 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H += inv00*prod_kernel_i_eq_j; }
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -18690,7 +18457,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -18718,7 +18485,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -18755,10 +18522,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -18787,17 +18554,17 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H += inv00*prod_kernel_i_eq_j; }
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -18864,7 +18631,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -18892,7 +18659,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -18929,10 +18696,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -18961,24 +18728,23 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				*pointer_m++ = DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H += inv00*prod_kernel_i_eq_j; }
+				*pointer_m++ = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( DELTA );
 
@@ -19189,7 +18955,6 @@ int *num_categories)
 		/* Local Linear */
 
 		XTKX = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
-		XTKXINV = mat_creat( num_reg_cat_cont + 1, num_reg_cat_cont + 1, UNDEFINED );
 		XTKY = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 		DELTA = mat_creat( num_reg_cat_cont + 1, 1, UNDEFINED );
 
@@ -19221,7 +18986,6 @@ int *num_categories)
 		{
 
 			mat_free( XTKX );
-			mat_free( XTKXINV );
 			mat_free( XTKY );
 			mat_free( DELTA );
 
@@ -19294,7 +19058,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -19322,7 +19086,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -19359,10 +19123,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -19391,17 +19155,17 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H_MPI += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H_MPI += inv00*prod_kernel_i_eq_j; }
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -19466,7 +19230,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -19494,7 +19258,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -19531,10 +19295,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -19563,17 +19327,17 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H_MPI += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H_MPI += inv00*prod_kernel_i_eq_j; }
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
@@ -19638,7 +19402,7 @@ int *num_categories)
 
 						if(k < num_reg_continuous)
 						{
-							XTKX[k+1][0] += (temp1 = (matrix_X_continuous[k][j] - matrix_X_continuous[k][i]))
+							XTKX[k+1][0] += (temp1 = matrix_X_continuous[k][i])
 								* prod_kernel;
 						}
 						else if(k < num_reg_continuous+num_reg_unordered)
@@ -19666,7 +19430,7 @@ int *num_categories)
 						{
 							if(l < num_reg_continuous)
 							{
-								XTKX[k+1][l+1] += temp1 * (matrix_X_continuous[l][j] - matrix_X_continuous[l][i])
+								XTKX[k+1][l+1] += temp1 * matrix_X_continuous[l][i]
 									* prod_kernel;
 							}
 							else if(l < num_reg_continuous+num_reg_unordered)
@@ -19703,10 +19467,10 @@ int *num_categories)
 
 				/* Now compute the beast... */
 
-				if(fabs(mat_det(XTKX)) > 0.0 )
+				if(mat_is_nonsingular(XTKX) )
 				{
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 
 				}
 				else
@@ -19735,24 +19499,23 @@ int *num_categories)
 							XTKX[k][k] += epsilon;
 							nepsilon += epsilon;
 						}
-					} while (fabs(mat_det(XTKX)) == 0.0);
+					} while (!mat_is_nonsingular(XTKX));
 
-					XTKXINV = mat_inv( XTKX, XTKXINV );
+
 					/* Add epsilon times local constant estimator to first element of XTKY */
 					XTKY[0][0] += nepsilon*XTKY[0][0]/NZD(XTKX[0][0]);
 
 				}
 
-				DELTA =  mat_mul( XTKXINV, XTKY, DELTA);
-				trace_H_MPI += XTKXINV[0][0]*prod_kernel_i_eq_j;
-				mean[j-my_rank*stride] =  DELTA[0][0];
+				if(mat_solve(XTKX, XTKY, DELTA) == NULL) error("mat_solve failed in kernel_estimate_regression_categorical_aic");
+				{ int ok00 = 0; const double inv00 = mat_inv00(XTKX, &ok00); if(!ok00) error("mat_inv00 failed in kernel_estimate_regression_categorical_aic"); trace_H_MPI += inv00*prod_kernel_i_eq_j; }
+				mean[j-my_rank*stride] = np_lp_mhat(DELTA, matrix_X_fit, num_reg_continuous, j);
 
 			}
 
 		}
 
 		mat_free( XTKX );
-		mat_free( XTKXINV );
 		mat_free( XTKY );
 		mat_free( DELTA );
 

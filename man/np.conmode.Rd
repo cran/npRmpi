@@ -1,7 +1,6 @@
-% $Id: np.conmode.Rd,v 1.38 2006/11/03 21:19:03 tristen Exp $
+%
 \name{npconmode}
 \alias{npconmode}
-\alias{npconmode.call}
 \alias{npconmode.default}
 \alias{npconmode.formula}
 \alias{npconmode.conbandwidth}
@@ -14,15 +13,25 @@
   Automatically computes various in sample and out of sample measures of
   accuracy.
 }
+\details{
+  For MPI startup/performance guidance (including message-passing tradeoffs and the manual-broadcast template), see \code{\link{npRmpi.init}} details and \code{inst/Rprofile}.
+  Documentation guide: see \code{\link{np.kernels}} for kernels,
+  \code{\link{np.options}} for global options, and
+  \code{\link{plot}} for plotting options.
+}
 
 \usage{
 npconmode(bws, \dots)
 
-\method{npconmode}{formula}(bws, data = NULL, newdata = NULL, \dots)
+\method{npconmode}{formula}(bws, 
+          data = NULL, 
+          newdata = NULL, 
+          \dots)
 
-\method{npconmode}{call}(bws, \dots)
-
-\method{npconmode}{default}(bws, txdat, tydat, \dots)
+\method{npconmode}{default}(bws, 
+          txdat, 
+          tydat, 
+          \dots)
 
 \method{npconmode}{conbandwidth}(bws,
           txdat = stop("invoked without training data 'txdat'"),
@@ -34,17 +43,16 @@ npconmode(bws, \dots)
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{conbandwidth}
     object returned from an invocation of \code{\link{npcdensbw}}
   }
 
-  \item{\dots}{
-    additional arguments supplied to specify the bandwidth type,
-    kernel types, and so on, detailed below.
-    This is necessary if you specify bws as a \eqn{p+q}-vector and not
-    a \code{conbandwidth} object, and you do not desire the default behaviours.
-  }
+
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -54,11 +62,6 @@ npconmode(bws, \dots)
     \code{\link{npcdensbw}} was called.
   }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
-  }
-  
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (conditioning data) used to
@@ -66,17 +69,24 @@ npconmode(bws, \dots)
     compute the bandwidth object.
   }
 
+
   \item{tydat}{
     a one (1) dimensional vector of unordered or ordered factors,
     containing the dependent data. Defaults to the training data used to
     compute the bandwidth object.
   }
 
+
+\subsection{Evaluation Data}{
+These arguments control where the conditional mode is evaluated.
+}
+
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
     evaluation takes place on the data provided by \code{txdat}.
   }
+
 
   \item{eydat}{
     a one (1) dimensional numeric or integer vector of the true values
@@ -86,8 +96,25 @@ npconmode(bws, \dots)
 
 
 
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection counterpart when bandwidths are computed internally.
 }
 
+  \item{\dots}{
+    additional arguments supplied to specify the bandwidth type,
+    kernel types, and so on, detailed below.
+    This is necessary if you specify bws as a \eqn{p+q}-vector and not
+    a \code{conbandwidth} object, and you do not desire the default behaviours.
+  }
+
+}
 \value{
   \code{npconmode} returns a \code{conmode} object with the following
   components:
@@ -97,6 +124,8 @@ npconmode(bws, \dots)
     point}
   \item{condens}{ a vector of numeric type containing the modal density
     estimates at each evaluation point}
+  \item{conderr}{ a vector of numeric type containing asymptotic
+    standard errors for the modal density estimates at each evaluation point}
   \item{xeval}{ a data frame of evaluation points }
   \item{yeval}{ a vector of type \code{factor} (or \code{ordered
       factor}) containing the actual outcomes, or \code{NA} if not
@@ -131,7 +160,7 @@ npconmode(bws, \dots)
   McFadden, D. and C. Puig and D. Kerschner (1977), \dQuote{Determinants
     of the long-run demand for electricity,} Proceedings of the
   American Statistical Association (Business and Economics Section),
-  109-117. 
+  109-117.
 
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,}
   Cambridge University Press.
@@ -158,6 +187,11 @@ npconmode(bws, \dots)
   type.
 }
 
+\seealso{\code{\link{npRmpi.init}}.
+  \code{\link{np.kernels}}, \code{\link{np.options}},
+  \code{\link{plot}}, \code{\link{npcdensbw}}.
+}
+
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.
@@ -167,16 +201,27 @@ npconmode(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
-mpi.bcast.cmd(data(birthwt),caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+library(MASS)
+data(birthwt)
 
 birthwt$low <- factor(birthwt$low)
 birthwt$smoke <- factor(birthwt$smoke)
@@ -185,23 +230,19 @@ birthwt$ht <- factor(birthwt$ht)
 birthwt$ui <- factor(birthwt$ui)
 birthwt$ftv <- ordered(birthwt$ftv)
 
-mpi.bcast.Robj2slave(birthwt)
-
-mpi.bcast.cmd(bw <- npcdensbw(low~
-                              smoke+ 
-                              race+ 
-                              ht+ 
-                              ui+    
-                              ftv+  
-                              age+           
-                              lwt,
-                              data=birthwt),
-              caller.execute=TRUE)
+bw <- npcdensbw(low~
+                smoke+
+                race+
+                ht+
+                ui+
+                ftv+
+                age+
+                lwt,
+                data=birthwt)
 
 summary(bw)
 
-mpi.bcast.cmd(model <- npconmode(bws=bw),
-              caller.execute=TRUE)
+model <- npconmode(bws=bw)
 
 summary(model)
 
@@ -211,21 +252,18 @@ summary(model)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{ nonparametric }% at least one, from doc/KEYWORDS

@@ -23,7 +23,7 @@
 ## convergence: a character string indicating whether/why iteration terminated
 
 ## First, a series of functions for local polynomial kernel regression
-## Functions for generalized local polynomial regression
+## (regtype = "lp", with lc/ll as special degree-restricted cases)
 
 ## This function returns the weight matrix for a local polynomial
 
@@ -53,11 +53,12 @@ npregivderiv <- function(y,
                          starting.values=NULL,
                          stop.on.increase=TRUE,
                          ...) {
+  .npRmpi_require_active_slave_pool(where = "npregivderiv()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   ptm.start <- proc.time()
   cl <- match.call()
-
-  console <- newLineConsole()
 
   ## Basic error checking
 
@@ -65,9 +66,6 @@ npregivderiv <- function(y,
   if(!is.logical(smooth.residuals)) stop("smooth.residuals must be logical (TRUE/FALSE)")
 
   start.from <- match.arg(start.from)
-
-  nmulti.loop <- if(!is.null(nmulti)) nmulti else 1
-  nmulti <- if(!is.null(nmulti)) nmulti else 5
 
   if(iterate.max < 2) stop("iterate.max must be at least 2")
   if(constant <= 0 || constant >= 1) stop("constant must lie in the range (0,1)")
@@ -94,10 +92,14 @@ npregivderiv <- function(y,
   if(!is.null(x)) z <- data.frame(z,x)
   if(!is.null(xeval)) zeval <- data.frame(zeval,xeval)
 
-  z.numeric <- sapply(1:NCOL(z),function(i){is.numeric(z[,i])})
+  if(!is.null(nmulti)) nmulti <- npValidateNmulti(nmulti)
+  nmulti.loop <- if(!is.null(nmulti)) nmulti else 1
+  nmulti <- if(!is.null(nmulti)) nmulti else npDefaultNmulti(max(NCOL(z), NCOL(w)))
+
+  z.numeric <- vapply(seq_len(NCOL(z)), function(i) is.numeric(z[,i]), logical(1))
   num.z.numeric <- NCOL(as.data.frame(z[,z.numeric]))
 
-  w.numeric <- sapply(1:NCOL(w),function(i){is.numeric(w[,i])})
+  w.numeric <- vapply(seq_len(NCOL(w)), function(i) is.numeric(w[,i]), logical(1))
   num.w.numeric <- NCOL(as.data.frame(w[,w.numeric]))
 
   ## Landweber-Fridman
@@ -112,35 +114,25 @@ npregivderiv <- function(y,
   ## For all results we need the density function for Z and the
   ## survivor function for Z (1-CDF of Z)
 
-  console <- printClear(console)
-  console <- printPop(console)
-  if(is.null(x)) {
-    console <- printPush(paste("Computing optimal smoothing for f(z) and S(z) for iteration 1...",sep=""),console)
-  } else {
-    console <- printPush(paste("Computing optimal smoothing for f(z) and S(z) for iteration 1...",sep=""),console)
-  }
+  .np_progress_note("Preparing IV derivative regression")
 
   ## Let's compute the bandwidth object for the unconditional
   ## density for the moment. Use the normal-reference rule for speed
   ## considerations, same smoothing for PDF and CDF.
 
-  bw <- npudensbw(dat=z, bwmethod="normal-reference")
-  model.fz <- npudens(tdat=z, bws=bw$bw)
+  bw <- .np_progress_with_legacy_suppressed(npudensbw(dat=z, bwmethod="normal-reference"))
+  model.fz <- .np_progress_with_legacy_suppressed(npudens(tdat=z, bws=bw$bw))
   f.z <- predict(model.fz, newdata=zeval)
-  model.Sz <- npudist(tdat=z, bws=bw$bw)
+  model.Sz <- .np_progress_with_legacy_suppressed(npudist(tdat=z, bws=bw$bw))
   S.z <- 1-predict(model.Sz, newdata=zeval)
-
-  console <- printClear(console)
-  console <- printPop(console)
-  console <- printPush(paste("Computing optimal smoothing for E(y|w) (stopping rule) for iteration 1...",sep=""),console)
 
   ## For stopping rule...
 
-  model.E.y.w <- npreg(tydat=y,
-                       txdat=w,
-                       exdat=weval,
-                       nmulti=nmulti,
-                       ...)
+  model.E.y.w <- .np_progress_with_legacy_suppressed(npreg(tydat=y,
+                                                           txdat=w,
+                                                           exdat=weval,
+                                                           nmulti=nmulti,
+                                                           ...))
   E.y.w <- model.E.y.w$mean
   bw.E.y.w <- model.E.y.w$bws
 
@@ -149,20 +141,12 @@ npregivderiv <- function(y,
 
   if(is.null(starting.values)) {
 
-    console <- printClear(console)
-    console <- printPop(console)
-    if(is.null(x)) {
-      console <- printPush(paste("Computing optimal smoothing for E(y|z) for iteration 1...",sep=""),console)
-    } else {
-      console <- printPush(paste("Computing optimal smoothing for E(y|z,x) for iteration 1...",sep=""),console)
-    }
-
-    model.phi.prime <- npreg(tydat=if(start.from=="Eyz") y else E.y.w,
-                             txdat=z,
-                             exdat=zeval,
-                             gradients=TRUE,
-                             nmulti=nmulti,
-                             ...)
+    model.phi.prime <- .np_progress_with_legacy_suppressed(npreg(tydat=if(start.from=="Eyz") y else E.y.w,
+                                                                 txdat=z,
+                                                                 exdat=zeval,
+                                                                 gradients=TRUE,
+                                                                 nmulti=nmulti,
+                                                                 ...))
     phi.prime <- model.phi.prime$grad[,1]
     bw.E.y.z <- model.phi.prime$bws
 
@@ -217,19 +201,16 @@ npregivderiv <- function(y,
 
   norm.stop <- numeric(iterate.max)
 
-  console <- printClear(console)
-
   ## Now we compute mu.0 (a residual of sorts)
 
   mu <- y - phi
 
   ## Now we repeat this entire process using mu = y = phi.0 rather than y
 
-  if(smooth.residuals) {
+  progress <- .np_progress_begin("Iterating Landweber-Fridman derivative solve", surface = "iv_solve")
 
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush(paste("Computing optimal smoothing for E(mu|w) (stopping rule) for iteration 1...",sep=""),console)
+  if(smooth.residuals) {
+    progress <- .np_progress_step(progress, done = 1, detail = "updating E(mu|w)")
 
     ## Additional smoothing on top of the stopping rule required, but
     ## we have computed the stopping rule so reuse the bandwidth
@@ -238,19 +219,19 @@ npregivderiv <- function(y,
 
     ## Next, we regress require \mu_{0,i} W using bws optimal for phi on w
 
-    model.mu.w <- npreg(tydat=mu,
-                        txdat=w,
-                        exdat=weval,
-                        ...)
+    model.mu.w <- .np_progress_with_legacy_suppressed(npreg(tydat=mu,
+                                                            txdat=w,
+                                                            exdat=weval,
+                                                            ...))
     predicted.E.mu.w <- model.mu.w$mean
     bw.mu.w <- model.mu.w$bws
 
   } else {
 
-    model.phi.w <- npreg(tydat=phi,
-                         txdat=w,
-                         exdat=weval,
-                         ...)
+    model.phi.w <- .np_progress_with_legacy_suppressed(npreg(tydat=phi,
+                                                             txdat=w,
+                                                             exdat=weval,
+                                                             ...))
     E.phi.w <- model.phi.w$mean
     bw.mu.w <- model.phi.w$bws
 
@@ -301,10 +282,7 @@ npregivderiv <- function(y,
   ## This we iterate...
 
   for(j in 2:iterate.max) {
-
-    console <- printClear(console)
-    console <- printPop(console)
-    console <- printPush(paste("Computing optimal smoothing for E(phi|w) for iteration ", j,"...",sep=""),console)
+    progress <- .np_progress_step(progress, done = j, detail = "updating phi")
 
     ## NOTE - this presumes univariate z case... in general this would
     ## be a continuous variable's index
@@ -325,10 +303,7 @@ npregivderiv <- function(y,
     mean.mu <- mean(mu)
 
     if(smooth.residuals) {
-
-      console <- printClear(console)
-      console <- printPop(console)
-      console <- printPush(paste("Computing optimal smoothing for E(mu|w) for iteration ", j,"...",sep=""),console)
+      progress <- .np_progress_step(progress, done = j, detail = "updating E(mu|w)")
 
 
       ## Additional smoothing on top of the stopping rule required, but
@@ -338,25 +313,25 @@ npregivderiv <- function(y,
 
       ## Next, we regress require \mu_{0,i} W using bws optimal for phi on w
 
-      model.mu.w <- npreg(tydat=mu,
-                          txdat=w,
-                          eydat=mu,
-                          exdat=weval,
-                          bws=bw.mu.w,
-                          nmulti=nmulti.loop,
-                          ...)
+      model.mu.w <- .np_progress_with_legacy_suppressed(npreg(tydat=mu,
+                                                              txdat=w,
+                                                              eydat=mu,
+                                                              exdat=weval,
+                                                              bws=bw.mu.w,
+                                                              nmulti=nmulti.loop,
+                                                              ...))
       predicted.E.mu.w <- model.mu.w$mean
       bw.mu.w <- model.mu.w$bws
 
     } else {
 
-      model.phi.w <- npreg(tydat=phi,
-                           txdat=w,
-                           eydat=phi,
-                           exdat=weval,
-                           bws=bw.mu.w,
-                           nmulti=nmulti.loop,
-                           ...)
+      model.phi.w <- .np_progress_with_legacy_suppressed(npreg(tydat=phi,
+                                                               txdat=w,
+                                                               eydat=phi,
+                                                               exdat=weval,
+                                                               bws=bw.mu.w,
+                                                               nmulti=nmulti.loop,
+                                                               ...))
       E.phi.w <- model.phi.w$mean
       bw.mu.w <- model.phi.w$bws
 
@@ -433,7 +408,7 @@ npregivderiv <- function(y,
   ## to the length of norm.stop.
 
   if(is.monotone.increasing(norm.stop)) {
-    warning("Stopping rule increases monotonically (consult model$norm.stop):\nThis could be the result of an inspired initial value (unlikely)\nNote: we suggest manually choosing phi.0 and restarting (e.g., instead set `start.from' to EEywz or provide a vector of starting values")
+    .np_warning("Stopping rule increases monotonically (consult model$norm.stop):\nThis could be the result of an inspired initial value (unlikely)\nNote: we suggest manually choosing phi.0 and restarting (e.g., instead set `start.from' to EEywz or provide a vector of starting values")
     convergence <- "FAILURE_MONOTONE_INCREASING"
     j <- length(norm.stop)
     phi <- phi.mat[,1]
@@ -443,18 +418,17 @@ npregivderiv <- function(y,
     ## right of where the initial inflection point occurs.
     j <- 1
     ## Climb the initial hill...
-    while(norm.stop[j+1] >= norm.stop[j] & j < length(norm.stop)) j <- j + 1
+    while(norm.stop[j+1] >= norm.stop[j] && j < length(norm.stop)) j <- j + 1
     ## Descend into the first valley
-    while(norm.stop[j+1] < norm.stop[j] & j < length(norm.stop)) j <- j + 1
+    while(norm.stop[j+1] < norm.stop[j] && j < length(norm.stop)) j <- j + 1
     ## When you start to climb again, stop, previous location was min
     phi <- phi.mat[,j-1]
     phi.prime <- phi.prime.mat[,j-1]
   }
-  
-  console <- printClear(console)
-  console <- printPop(console)
 
-  if(j == iterate.max) warning(" iterate.max reached: increase iterate.max or inspect norm.stop vector")
+  progress <- .np_progress_end(progress, detail = "updating E(mu|w)")
+
+  if(j == iterate.max) .np_warning(" iterate.max reached: increase iterate.max or inspect norm.stop vector")
 
   ret <- list(phi=phi,
               phi.prime=phi.prime,
@@ -531,6 +505,15 @@ plot.npregivderiv <- function(x,
                               ...) {
 
   object <- x
+  dots <- list(...)
+  take_arg <- function(name, default = NULL) {
+    if (!is.null(dots[[name]])) {
+      val <- dots[[name]]
+      dots[[name]] <- NULL
+      return(val)
+    }
+    default
+  }
 
   ## We only support univariate endogenous predictor z
   if(NCOL(object$z) > 1) stop(" only univariate z is supported")
@@ -556,22 +539,41 @@ plot.npregivderiv <- function(x,
   }
 
   if(plot.data) {
-    plot(z, y,
-         xlab=zname,
-         ylab=yname,
-         type="p",
-         col="lightgrey",
-         ...)
-    lines(z[order(z)], fit[order(z)],
-          lwd=2,
-          ...)
+    plot.type <- take_arg("type", "p")
+    plot.xlab <- take_arg("xlab", zname)
+    plot.ylab <- take_arg("ylab", yname)
+    user.col <- take_arg("col", NULL)
+    line.lwd <- take_arg("lwd", 2)
+    plot.args <- c(list(x = z,
+                        y = y,
+                        xlab = plot.xlab,
+                        ylab = plot.ylab,
+                        type = plot.type,
+                        col = if (is.null(user.col)) "lightgrey" else user.col),
+                   dots)
+    do.call(plot, plot.args)
+    line.args <- list(x = z[order(z)],
+                      y = fit[order(z)],
+                      lwd = line.lwd)
+    if (!is.null(user.col)) {
+      line.args$col <- user.col
+    }
+    do.call(lines, c(line.args, dots))
   } else {
-    plot(z, fit[order(z)],
-         type="l",
-         xlab=zname,
-         ylab=ylab,
-         lwd=2,
-         ...)
+    plot.type <- take_arg("type", "l")
+    plot.xlab <- take_arg("xlab", zname)
+    plot.ylab <- take_arg("ylab", ylab)
+    user.col <- take_arg("col", NULL)
+    line.lwd <- take_arg("lwd", 2)
+    plot.args <- list(x = z[order(z)],
+                      y = fit[order(z)],
+                      type = plot.type,
+                      xlab = plot.xlab,
+                      ylab = plot.ylab,
+                      lwd = line.lwd)
+    if (!is.null(user.col)) {
+      plot.args$col <- user.col
+    }
+    do.call(plot, c(plot.args, dots))
   }
 }
-

@@ -1,7 +1,6 @@
 \name{npudistbw}
 \alias{npudistbw}
 \alias{npudistbw.formula}
-\alias{npudistbw.NULL}
 \alias{npudistbw.default}
 \alias{npudistbw.dbandwidth}
 \title{Kernel Distribution Bandwidth Selection with Mixed Data Types}
@@ -18,129 +17,102 @@
 
 npudistbw(\dots)
 
-\method{npudistbw}{formula}(formula, data, subset, na.action, call, gdata = NULL,\dots)
-
-\method{npudistbw}{NULL}(dat = stop("invoked without input data 'dat'"),
-          bws,
+\method{npudistbw}{formula}(formula, 
+          data, subset, 
+          na.action, 
+          call, 
+          gdata = NULL,
           \dots)
 
 \method{npudistbw}{dbandwidth}(dat = stop("invoked without input data 'dat'"),
           bws,
           gdat = NULL,
           bandwidth.compute = TRUE,
-          nmulti,
-          remin = TRUE,
-          itmax = 10000,
-          do.full.integral = FALSE,
-          ngrid = 100,
-          ftol = 1.490116e-07,
-          tol = 1.490116e-04,
-          small = 1.490116e-05,
-          lbc.dir = 0.5,
-          dfc.dir = 3,
           cfac.dir = 2.5*(3.0-sqrt(5)),
-          initc.dir = 1.0,
-          lbd.dir = 0.1,
-          hbd.dir = 1,
+          scale.factor.init = 0.5,
           dfac.dir = 0.25*(3.0-sqrt(5)),
-          initd.dir = 1.0,
-          lbc.init = 0.1,
-          hbc.init = 2.0,
-          cfac.init = 0.5,
-          lbd.init = 0.1,
+          dfac.init = 0.375,
+          dfc.dir = 3,
+          do.full.integral = FALSE,
+          ftol = 1.490116e-07,
+          scale.factor.init.upper = 2.0,
+          hbd.dir = 1,
           hbd.init = 0.9,
-          dfac.init = 0.375, 
-          scale.init.categorical.sample = FALSE,
-          memfac = 500.0,
-          transform.bounds = FALSE,
+          initc.dir = 1.0,
+          initd.dir = 1.0,
           invalid.penalty = c("baseline","dbmax"),
+          itmax = 10000,
+          lbc.dir = 0.5,
+          scale.factor.init.lower = 0.1,
+          lbd.dir = 0.1,
+          lbd.init = 0.1,
+          memfac = 500.0,
+          ngrid = 100,
+          nmulti,
           penalty.multiplier = 10,
+          remin = TRUE,
+          scale.init.categorical.sample = FALSE,
+          scale.factor.search.lower = NULL,
+          small = 1.490116e-05,
+          tol = 1.490116e-04,
+          transform.bounds = FALSE,
           \dots)
 
 \method{npudistbw}{default}(dat = stop("invoked without input data 'dat'"),
           bws,
           gdat,
           bandwidth.compute = TRUE,
-          nmulti,
-          remin,
-          itmax,
-          do.full.integral,
-          ngrid,
-          ftol,
-          tol,
-          small,
-          lbc.dir,
-          dfc.dir,
-          cfac.dir,
-          initc.dir,
-          lbd.dir,
-          hbd.dir,
-          dfac.dir,
-          initd.dir,
-          lbc.init,
-          hbc.init,
-          cfac.init,
-          lbd.init,
-          hbd.init,
-          dfac.init,
-          scale.init.categorical.sample,
-          memfac,
-          transform.bounds,
-          invalid.penalty,
-          penalty.multiplier,
           bwmethod,
           bwscaling,
           bwtype,
-          ckertype,
+          cfac.dir,
+          scale.factor.init,
+          ckerbound,
+          ckerlb,
           ckerorder,
+          ckertype,
+          ckerub,
+          dfac.dir,
+          dfac.init,
+          dfc.dir,
+          do.full.integral,
+          ftol,
+          scale.factor.init.upper,
+          hbd.dir,
+          hbd.init,
+          initc.dir,
+          initd.dir,
+          invalid.penalty,
+          itmax,
+          lbc.dir,
+          scale.factor.init.lower,
+          lbd.dir,
+          lbd.init,
+          memfac,
+          ngrid,
+          nmulti,
           okertype,
-          \dots) 
+          penalty.multiplier,
+          remin,
+          scale.init.categorical.sample,
+          scale.factor.search.lower = NULL,
+          small,
+          tol,
+          transform.bounds,
+          \dots)
 
 }
 
 \arguments{
-  \item{formula}{
-    a symbolic description of variables on which bandwidth selection is
-    to be performed. The details of constructing a formula are
-    described below.
-  }
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the data, formula interface, optional integration grid, and whether bandwidths are supplied or computed.
+}
 
-  \item{data}{
-    an optional data frame, list or environment (or object coercible to
-    a data frame by \code{\link{as.data.frame}}) containing the
-    variables in the model. If not found in data, the variables are
-    taken from \code{environment(formula)}, typically the environment
-    from which the function is called.
-  }
-
-  \item{subset}{
-    an optional vector specifying a subset of observations to be used in
-    the fitting process. 
-  }
-
-  \item{na.action}{
-    a function which indicates what should happen when the data contain
-   \code{NA}s. The default is set by the \code{\link{na.action}} setting
-   of options, and is \code{\link{na.fail}} if that is unset. The
-   (recommended) default is \code{\link{na.omit}}.
-  }
-  
-  \item{call}{
-    the original function call. This is passed internally by
-    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
-    another function. It is not recommended that the user set this.
-  }
-    
-  \item{gdata}{
-    a grid of data on which the indicator function for
-    least-squares cross-validation is to be computed (can be the sample
-    or a grid of quantiles).
-  }
-
-  \item{dat}{
-    a \eqn{p}-variate data frame on which bandwidth selection will be
-    performed. The data types may be continuous, discrete (ordered
-    factors), or some combination thereof.
+  \item{bandwidth.compute}{
+    a logical value which specifies whether to do a numerical search for
+    bandwidths or not. If set to \code{FALSE}, a \code{bandwidth} object
+    will be returned with bandwidths set to those specified
+    in \code{bws}. Defaults to \code{TRUE}.
   }
 
   \item{bws}{
@@ -154,17 +126,62 @@ npudistbw(\dots)
     kernel types, selection methods, and so on. This can be left unset.
   }
 
+  \item{call}{
+    the original function call. This is passed internally by
+    \code{\link{npRmpi}} when a bandwidth search has been implied by a call to
+    another function. It is not recommended that the user set this.
+  }
+
+  \item{dat}{
+    a \eqn{p}-variate data frame on which bandwidth selection will be
+    performed. The data types may be continuous, discrete (ordered
+    factors), or some combination thereof.
+  }
+
+  \item{data}{
+    an optional data frame, list or environment (or object coercible to
+    a data frame by \code{\link{as.data.frame}}) containing the
+    variables in the model. If not found in data, the variables are
+    taken from \code{environment(formula)}, typically the environment
+    from which the function is called.
+  }
+
+  \item{formula}{
+    a symbolic description of variables on which bandwidth selection is
+    to be performed. The details of constructing a formula are
+    described below.
+  }
+
   \item{gdat}{
     a grid of data on which the indicator function for
     least-squares cross-validation is to be computed (can be the sample
     or a grid of quantiles).
   }
 
-  \item{\dots}{
-    additional arguments supplied to specify the bandwidth type,
-    kernel types, selection methods, and so on, detailed below.
+
+  \item{gdata}{
+    a grid of data on which the indicator function for
+    least-squares cross-validation is to be computed (can be the sample
+    or a grid of quantiles).
   }
-  
+
+  \item{na.action}{
+    a function which indicates what should happen when the data contain
+   \code{NA}s. The default is set by the \code{\link{na.action}} setting
+   of options, and is \code{\link{na.fail}} if that is unset. The
+   (recommended) default is \code{\link{na.omit}}.
+  }
+
+  \item{subset}{
+    an optional vector specifying a subset of observations to be used in
+    the fitting process.
+  }
+
+
+\subsection{Bandwidth Criterion And Representation}{
+These arguments choose the selection criterion and the way continuous bandwidths are represented.
+}
+
   \item{bwmethod}{ a character string specifying the bandwidth selection
     method.  \code{cv.cdf} specifies least-squares cross-validation for
     cumulative distribution functions (Li, Li and Racine (2017)), and
@@ -204,102 +221,27 @@ npudistbw(\dots)
     \code{fixed}: compute fixed bandwidths \cr
     \code{generalized_nn}: compute generalized nearest neighbors \cr
     \code{adaptive_nn}: compute adaptive nearest neighbors
-    
+
   }
 
-  \item{bandwidth.compute}{
-    a logical value which specifies whether to do a numerical search for
-    bandwidths or not. If set to \code{FALSE}, a \code{bandwidth} object
-    will be returned with bandwidths set to those specified
-    in \code{bws}. Defaults to \code{TRUE}.
-  }
-  
 
-  \item{ckertype}{
-    character string used to specify the continuous kernel type.
-    Can be set as \code{gaussian}, \code{epanechnikov}, or
-    \code{uniform}. Defaults to \code{gaussian}.
-  }
+\subsection{Categorical Search Initialization}{
+These controls set categorical search starts and categorical direction-set initialization.
+}
 
-  \item{ckerorder}{
-    numeric value specifying kernel order (one of
-    \code{(2,4,6,8)}). Kernel order specified along with a
-  \code{uniform} continuous kernel type will be ignored. Defaults to
-  \code{2}.
-  }
+  \item{dfac.dir}{stretch factor for direction set search for Powell's algorithm for categorical variables. See Details}
 
-  \item{okertype}{
-    character string used to specify the ordered categorical kernel type.
-    Can be set as \code{wangvanryzin}.
-  }
+  \item{dfac.init}{non-random initial values for scale factors for categorical variables for Powell's algorithm. See Details}
 
-  \item{nmulti}{
-    integer number of times to restart the process of finding extrema of
-    the cross-validation function from different (random) initial points.
-  }
+  \item{hbd.dir}{upper bound for direction set search for Powell's algorithm for categorical variables. See Details}
 
-  \item{remin}{
-    a logical value which when set as \code{TRUE} the search routine
-    restarts from located minima for a minor gain in accuracy. Defaults
-    to \code{TRUE}.
-  }
+  \item{hbd.init}{upper bound for scale factors for categorical variables for Powell's algorithm. See Details}
 
-  \item{itmax}{
-    integer number of iterations before failure in the numerical
-    optimization routine. Defaults to \code{10000}.
-  }
+  \item{initd.dir}{initial non-random values for direction set search for Powell's algorithm for categorical variables. See Details}
 
-  \item{do.full.integral}{
-    a logical value which when set as \code{TRUE} evaluates the
-    moment-based integral on the entire sample. Defaults
-    to \code{FALSE}.
-  }
+  \item{lbd.dir}{lower bound for direction set search for Powell's algorithm for categorical variables. See Details}
 
-  \item{ngrid}{
-    integer number of grid points to use when computing the moment-based
-    integral. Defaults to \code{100}.
-  }
-
-  \item{ftol}{
-    fractional tolerance on the value of the cross-validation function
-    evaluated at located minima (of order the machine precision or
-    perhaps slightly larger so as not to be diddled by
-    roundoff). Defaults to \code{1.490116e-07}
-    (1.0e+01*sqrt(.Machine$double.eps)).
-  }
-
-  \item{tol}{
-    tolerance on the position of located minima of the cross-validation
-    function (tol should generally be no smaller than the square root of
-    your machine's floating point precision). Defaults to \code{
-      1.490116e-04 (1.0e+04*sqrt(.Machine$double.eps))}.
-  }
-
-  \item{small}{
-    a small number used to bracket a minimum (it is hopeless to ask for
-    a bracketing interval of width less than sqrt(epsilon) times its
-    central value, a fractional width of only about 10-04 (single
-    precision) or 3x10-8 (double precision)). Defaults to \code{small
-      = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
-  }
-
-  \item{lbc.dir,dfc.dir,cfac.dir,initc.dir}{ lower bound, chi-square
-    degrees of freedom, stretch factor, and initial non-random values
-    for direction set search for Powell's algorithm for \code{numeric}
-    variables. See Details}
-
-  \item{lbd.dir,hbd.dir,dfac.dir,initd.dir}{ lower bound, upper bound,
-    stretch factor, and initial non-random values for direction set
-    search for Powell's algorithm for categorical variables. See
-    Details}
-
-  \item{lbc.init, hbc.init, cfac.init}{ lower bound, upper bound, and
-    non-random initial values for scale factors for \code{numeric}
-    variables for Powell's algorithm. See Details}
-
-  \item{lbd.init, hbd.init, dfac.init}{ lower bound, upper bound, and
-    non-random initial values for scale factors for categorical
-    variables for Powell's algorithm. See Details}
+  \item{lbd.init}{lower bound for scale factors for categorical variables for Powell's algorithm. See Details}
 
   \item{scale.init.categorical.sample}{ a logical value that when set
     to \code{TRUE} scales \code{lbd.dir}, \code{hbd.dir},
@@ -308,20 +250,91 @@ npudistbw(\dots)
     kernel, and \eqn{l}{l} the number of \code{numeric} variables. See
     Details}
 
-  \item{transform.bounds}{ a logical value that when set to \code{TRUE}
-    applies an internal transformation that maps the unconstrained
-    search to the feasible bandwidth domain. Defaults to
-    \code{FALSE}.}
 
-  \item{invalid.penalty}{ a character string specifying the penalty
-    used when the optimizer encounters invalid bandwidths.
-    \code{"baseline"} returns a finite penalty based on a baseline
-    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
-    \code{"baseline"}.}
+\subsection{Continuous Direction-Set Search Controls}{
+These controls set Powell direction-set initialization for continuous variables.
+}
 
-  \item{penalty.multiplier}{ a numeric multiplier applied to the
-    baseline penalty when \code{invalid.penalty="baseline"}.
-    Defaults to \code{10}.}
+  \item{cfac.dir}{stretch factor for direction set search for Powell's algorithm for \code{numeric} variables. See Details}
+
+  \item{dfc.dir}{chi-square degrees of freedom for direction set search for Powell's algorithm for \code{numeric} variables. See Details}
+
+  \item{initc.dir}{initial non-random values for direction set search for Powell's algorithm for \code{numeric} variables. See Details}
+
+  \item{lbc.dir}{lower bound for direction set search for Powell's algorithm for \code{numeric} variables. See Details}
+
+
+\subsection{Continuous Kernel Support Controls}{
+These controls choose and parameterize bounded support for continuous kernels.
+}
+
+  \item{ckerbound}{
+    character string controlling continuous-kernel support handling.
+    Can be set as \code{none} (default kernel on full support),
+    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{ckerlb}/\code{ckerub}). The bounded-kernel route reuses the selected continuous kernel and renormalizes it on the chosen support; see \code{\link{np.kernels}}.
+  }
+
+  \item{ckerlb}{
+    numeric scalar/vector of lower bounds for continuous variables used
+    when \code{ckerbound="fixed"}. Must satisfy lower-bound validity for
+    each continuous variable (e.g., \code{<= min(variable)}). Use \code{-Inf} for unbounded below. See \code{\link{np.kernels}} for bounded-kernel normalization details.
+  }
+
+  \item{ckerub}{
+    numeric scalar/vector of upper bounds for continuous variables used
+    when \code{ckerbound="fixed"}. Must satisfy upper-bound validity for
+    each continuous variable (e.g., \code{>= max(variable)}). Use \code{Inf} for unbounded above. See \code{\link{np.kernels}} for bounded-kernel normalization details.
+  }
+
+
+\subsection{Continuous Scale-Factor Search Initialization}{
+These controls define deterministic and random continuous scale-factor starts and the lower admissibility floor for fixed-bandwidth search.
+}
+
+  \item{scale.factor.init}{
+    deterministic initial scale factor for continuous fixed-bandwidth
+    search. Defaults to \code{0.5}. The value supplied by the user is
+    not rewritten, but the effective first start passed to the optimizer
+    is \code{max(scale.factor.init, scale.factor.search.lower)}. See
+    Details.
+  }
+  \item{scale.factor.init.lower}{
+    lower endpoint for random continuous scale-factor starts. Defaults
+    to \code{0.1}. The value supplied by the user is not rewritten, but
+    the effective random-start lower endpoint is
+    \code{max(scale.factor.init.lower, scale.factor.search.lower)}. See
+    Details.
+  }
+  \item{scale.factor.init.upper}{
+    upper endpoint for random continuous scale-factor starts. Defaults
+    to \code{2.0}. It must be greater than or equal to the effective
+    lower endpoint,
+    \code{max(scale.factor.init.lower, scale.factor.search.lower)};
+    otherwise bandwidth search errors rather than silently expanding the
+    interval. See Details.
+  }
+  \item{scale.factor.search.lower}{
+    optional nonnegative scalar giving the hard lower admissibility
+    bound for continuous fixed-bandwidth search candidates. Defaults to
+    \code{NULL}. If \code{NULL}, an existing bandwidth object's stored
+    value is inherited when available; otherwise the package default
+    \code{0.1} is used. This floor applies to computed/search bandwidth
+    candidates and to effective search starts only. It does not rewrite
+    explicit bandwidths supplied for storage with
+    \code{bandwidth.compute = FALSE}. Final fixed-bandwidth search
+    candidates must also have a finite valid raw objective value.
+  }
+
+\subsection{Distribution Integral And Grid Controls}{
+These controls tune the distribution-function integral and grid calculations.
+}
+
+  \item{do.full.integral}{
+    a logical value which when set as \code{TRUE} evaluates the
+    moment-based integral on the entire sample. Defaults
+    to \code{FALSE}.
+  }
 
   \item{memfac}{
     The algorithm to compute the least-squares objective function uses
@@ -334,41 +347,189 @@ npudistbw(\dots)
     large data sets (>100k elements) setting memfac to a lower value may
     fix the problem.
   }
+
+  \item{ngrid}{
+    integer number of grid points to use when computing the moment-based
+    integral. Defaults to \code{100}.
+  }
+
+
+\subsection{Kernel Type Controls}{
+These controls choose continuous, unordered, and ordered kernels.
+}
+
+  \item{ckerorder}{
+    numeric value specifying kernel order (one of
+    \code{(2,4,6,8)}). Kernel order specified along with a
+  \code{uniform} continuous kernel type will be ignored. Defaults to
+  \code{2}.
+  }
+
+  \item{ckertype}{
+    character string used to specify the continuous kernel type.
+    Can be set as \code{gaussian}, \code{epanechnikov}, or
+    \code{uniform}. Defaults to \code{gaussian}.
+  }
+
+  \item{okertype}{
+    character string used to specify the ordered categorical kernel type.
+    Can be set as \code{wangvanryzin}, \code{liracine}, or
+    \code{racineliyan}. Defaults to \code{liracine}.
+  }
+
+\subsection{Numerical Search And Tolerance Controls}{
+These controls set optimizer tolerances, restart behavior, invalid-candidate penalties, and bounded search transformations.
+}
+
+  \item{ftol}{
+    fractional tolerance on the value of the cross-validation function
+    evaluated at located minima (of order the machine precision or
+    perhaps slightly larger so as not to be diddled by
+    roundoff). Defaults to \code{1.490116e-07}
+    (1.0e+01*sqrt(.Machine$double.eps)).
+  }
+
+  \item{invalid.penalty}{ a character string specifying the penalty
+    used when the optimizer encounters invalid bandwidths.
+    \code{"baseline"} returns a finite penalty based on a baseline
+    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
+    \code{"baseline"}.}
+
+  \item{itmax}{
+    integer number of iterations before failure in the numerical
+    optimization routine. Defaults to \code{10000}.
+  }
+
+  \item{nmulti}{
+    integer number of times to restart the process of finding extrema of
+    the cross-validation function from different (random) initial points.
+  }
+
+  \item{penalty.multiplier}{ a numeric multiplier applied to the
+    baseline penalty when \code{invalid.penalty="baseline"}.
+    Defaults to \code{10}.}
+
+  \item{remin}{
+    a logical value which when set as \code{TRUE} the search routine
+    restarts from located minima for a minor gain in accuracy. Defaults
+    to \code{TRUE}.
+  }
+
+  \item{small}{
+    a small number used to bracket a minimum (it is hopeless to ask for
+    a bracketing interval of width less than sqrt(epsilon) times its
+    central value, a fractional width of only about 10-04 (single
+    precision) or 3x10-8 (double precision)). Defaults to \code{small
+      = 1.490116e-05 (1.0e+03*sqrt(.Machine$double.eps))}.
+  }
+
+  \item{tol}{
+    tolerance on the position of located minima of the cross-validation
+    function (tol should generally be no smaller than the square root of
+    your machine's floating point precision). Defaults to \code{
+      1.490116e-04 (1.0e+04*sqrt(.Machine$double.eps))}.
+  }
+
+  \item{transform.bounds}{ a logical value that when set to \code{TRUE}
+    applies an internal transformation that maps the unconstrained
+    search to the feasible bandwidth domain. Defaults to
+    \code{FALSE}.}
+
+
+\subsection{Additional Arguments}{
+These arguments collect remaining controls passed through S3 methods.
+}
+
+  \item{\dots}{
+    additional arguments supplied to specify the bandwidth type,
+    kernel types, selection methods, and so on, detailed below.
+  }
+
 }
 
 \details{
 
+The \code{scale.factor.*} controls are dimensionless search
+controls. The package converts scale factors to bandwidths using the
+estimator-specific scaling encoded in the bandwidth object, including
+kernel order and the number of continuous variables relevant for the
+estimator. Users should not pre-multiply these controls by sample-size
+or standard-deviation factors.
+
+  \code{scale.factor.init} controls the deterministic first search
+  start. \code{scale.factor.init.lower} and
+  \code{scale.factor.init.upper} define the random multistart interval.
+  \code{scale.factor.search.lower} is the lower admissibility bound for
+  continuous fixed-bandwidth search candidates. The effective first
+  start is \code{max(scale.factor.init, scale.factor.search.lower)},
+  and the effective random-start lower endpoint is
+  \code{max(scale.factor.init.lower, scale.factor.search.lower)}.
+  \code{scale.factor.init.upper} must be at least that effective lower
+  endpoint; the package errors rather than silently expanding the user's
+  interval.
+
+  When \code{scale.factor.search.lower} is \code{NULL}, an existing
+  bandwidth object's stored floor is inherited when available;
+  otherwise the package default \code{0.1} is used. Explicit bandwidths
+  supplied for storage with \code{bandwidth.compute = FALSE} are not
+  rewritten by the search floor.
+
+  Categorical search-start controls such as \code{dfac.init},
+  \code{lbd.init}, and \code{hbd.init} have separate semantics and are
+  not affected by \code{scale.factor.search.lower}.
+
+  Documentation guide: see \code{\link{np.kernels}} for kernels,
+  \code{\link{np.options}} for global options, \code{\link{plot}} for
+  plotting options, and \code{\link{npRmpi.init}} for
+  interactive/cluster MPI startup. See \code{\link{npRmpi.init}}
+  details for performance tradeoffs (message passing/startup mode) and
+  the \code{inst/Rprofile} manual-broadcast template.
+
+  The bandwidth-selection argument surface is easiest to read by
+  decision group: data, grid, and existing bandwidth inputs; bandwidth
+  criterion and representation; continuous kernel and support controls
+  beginning with \code{cker*}; ordered categorical kernel controls
+  such as \code{okertype}; distribution-specific integral/grid controls
+  such as \code{gdat}, \code{gdata}, \code{do.full.integral}, and
+  \code{ngrid}; and numerical search initialization, tolerances, and
+  feasibility controls. Users who call \code{\link{npudist}} without a
+  bandwidth object can pass these same bandwidth-selection controls
+  through that function's \code{\dots}.
+
+  For S3 plotting help, use \code{methods("plot")} and query
+  class-specific help topics such as \code{?plot.npregression} and
+  \code{?plot.rbandwidth}. You can inspect implementations with
+  \code{getS3method("plot","npregression")}.
+
+
   Typical usages are (see below for a complete list of options and also
   the examples at the end of this help file)
   \preformatted{
-    
+
     Usage 1: compute a bandwidth object using the formula interface:
-    
+
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(bw <- npudistbw(~y),caller.execute=TRUE)
-    npRmpi.stop()
-    
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    bw <- npudistbw(formula = ~y, data = mydat)
+    npRmpi.quit()
+
     Usage 2: compute a bandwidth object using the data frame interface
     and change the default kernel and order:
 
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(Fhat <- npudistbw(tdat = y, ckertype="epanechnikov", ckerorder=4),
-                  caller.execute=TRUE)
-    npRmpi.stop()
-    
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    Fhat <- npudistbw(tdat = y, ckertype="epanechnikov", ckerorder=4)
+    npRmpi.quit()
+
   }
 
-  
+
   \code{npudistbw} implements a variety of methods for choosing
   bandwidths for multivariate (\eqn{p}-variate) distributions defined
   over a set of possibly continuous and/or discrete (ordered) data. The
@@ -447,7 +608,7 @@ npudistbw(\dots)
   bandwidths, of class \code{bandwidth}
   (or scale factors if \code{bwscaling = TRUE}) is returned. If it is set to
   \code{generalized_nn} or \code{adaptive_nn}, then instead the
-  \eqn{k}th nearest 
+  \eqn{k}th nearest
   neighbors are returned for the continuous variables while the discrete
   kernel bandwidths are returned for the discrete variables. Bandwidths
   are stored under the component name \code{bw}, with each
@@ -519,7 +680,7 @@ npudistbw(\dots)
   often be necessary}. This can be frustrating for users possessing
   large datasets. For exploratory purposes, you may wish to override the
   default search tolerances, say, setting ftol=.01 and tol=.01 and
-  conduct multistarting (the default is to restart min(5, ncol(dat))
+  conduct multistarting (the default is to restart min(2, ncol(dat))
   times) as is done for a number of examples. Once the procedure
   terminates, you can restart search with default tolerances using those
   bandwidths obtained from the less rigorous search (i.e., set
@@ -528,10 +689,11 @@ npudistbw(\dots)
   \code{Rmpi} wrapper is under development that allows one to deploy
   this software in a clustered computing environment to facilitate
   computation involving large datasets.
- 
+
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   \code{\link{bw.nrd}}, \code{\link{bw.SJ}},  \code{\link{hist}},
   \code{\link{npudist}}, \code{\link{npudist}} }
 \examples{
@@ -544,21 +706,18 @@ npudistbw(\dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+npRmpi.init(nslaves=1)
 
 data("Italy")
 
-mpi.bcast.Robj2slave(Italy)
-
-mpi.bcast.cmd(bw <- npudistbw(formula=~ordered(year)+gdp,
-                              data=Italy),
-              caller.execute=TRUE)
+bw <- npudistbw(formula=~ordered(year)+gdp,
+                data=Italy)
 
 summary(bw)
 
@@ -568,21 +727,15 @@ summary(bw)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
 } % enddontrun
 }
 \keyword{nonparametric}

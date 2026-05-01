@@ -1,31 +1,49 @@
 npksum <-
   function(...){
-    args = list(...)
-    if (is(args[[1]],"formula"))
-      UseMethod("npksum",args[[1]])
-    else if (!is.null(args$formula))
-      UseMethod("npksum",args$formula)
-    else
-      UseMethod("npksum",args[[which(names(args)=="bws")[1]]])
+    mc <- match.call(expand.dots = FALSE)
+    target <- .np_bw_dispatch_target(dots = mc$..., eval_env = parent.frame())
+    UseMethod("npksum", target)
   }
+
+.npRmpi_npksum_should_localize <- function(bws, dots = list()) {
+  if (inherits(bws, "kbandwidth"))
+    return(identical(bws$type, "adaptive_nn"))
+
+  if (is.list(bws) && !is.null(bws$type))
+    return(identical(bws$type, "adaptive_nn"))
+
+  if (is.list(dots) && !is.null(dots$bwtype))
+    return(identical(as.character(dots$bwtype)[1L], "adaptive_nn"))
+
+  FALSE
+}
 
 npksum.formula <-
   function(formula, data, newdata, subset, na.action, ...){
+    .npRmpi_require_active_slave_pool(where = "npksum()")
+    if (.npRmpi_npksum_should_localize(NULL, list(...)) &&
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
     mf[[1]] <- as.name("model.frame")
-    mf <- eval(mf, parent.frame())
+    mf.args <- as.list(mf[-1L])
+    mf <- do.call(stats::model.frame, mf.args, envir = parent.frame())
     
     tydat <- model.response(mf)
     txdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
 
-    if (!(miss.new <- missing(newdata))){
+    miss.new <- missing(newdata)
+    if (!miss.new){
       tt <- delete.response(attr(mf,"terms"))
-      umf <- emf <- model.frame(tt, data = newdata)
-      exdat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
+      umf.args <- list(formula = tt, data = newdata)
+      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      exdat <- umf[, attr(attr(umf, "terms"),"term.labels"), drop = FALSE]
     }
 
     call_args <- list(txdat = txdat)
@@ -51,9 +69,18 @@ npksum.numeric <-
            tydat,
            exdat,
            weights,
-           leave.one.out, kernel.pow, bandwidth.divide,
-           operator, permutation.operator, compute.score, compute.ocg, return.kernel.weights,
+           bandwidth.divide, compute.ocg, compute.score, kernel.pow,
+           leave.one.out, operator, permutation.operator, return.kernel.weights,
            ...){
+    dots <- list(...)
+    return.derivative.kernel.weights <- isTRUE(dots$return.derivative.kernel.weights)
+    dots$return.derivative.kernel.weights <- NULL
+    .npRmpi_require_active_slave_pool(where = "npksum()")
+    if (.npRmpi_npksum_should_localize(bws, list(...)) &&
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     txdat <- toFrame(txdat)
     if (!missing(exdat)) {
@@ -75,7 +102,7 @@ npksum.numeric <-
     if (!missing(tydat))
       kbw_args$ydati <- untangle(as.data.frame(tydat))
 
-    kbw_args <- c(kbw_args, list(...))
+    kbw_args <- c(kbw_args, dots)
     tbw <- do.call(kbandwidth, kbw_args)
 
     call_args <- list(txdat = txdat, bws = tbw)
@@ -101,6 +128,8 @@ npksum.numeric <-
       call_args$compute.ocg <- compute.ocg
     if (!missing(return.kernel.weights))
       call_args$return.kernel.weights <- return.kernel.weights
+    if (return.derivative.kernel.weights)
+      call_args$return.derivative.kernel.weights <- return.derivative.kernel.weights
 
     do.call(npksum.default, call_args)
   }
@@ -111,15 +140,23 @@ npksum.default <-
            tydat = NULL,
            exdat = NULL,
            weights = NULL,
-           leave.one.out = FALSE,
-           kernel.pow = 1.0,
            bandwidth.divide = FALSE,
+           compute.ocg = FALSE,
+           compute.score = FALSE,
+           kernel.pow = 1.0,
+           leave.one.out = FALSE,
            operator = names(ALL_OPERATORS),
            permutation.operator = names(PERMUTATION_OPERATORS),
-           compute.score = FALSE,
-           compute.ocg = FALSE,
            return.kernel.weights = FALSE,
            ...){
+    dots <- list(...)
+    return.derivative.kernel.weights <- isTRUE(dots$return.derivative.kernel.weights)
+    .npRmpi_require_active_slave_pool(where = "npksum()")
+    if (.npRmpi_npksum_should_localize(bws, list(...)) &&
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     miss.ty <- missing(tydat)
     miss.ex <- missing(exdat)
@@ -167,12 +204,12 @@ npksum.default <-
     operator.num <- ALL_OPERATORS[operator]
     poperator.num <- PERMUTATION_OPERATORS[permutation.operator]
     
-    ccon = unlist(lapply(txdat[,bws$icon,drop=FALSE],class))
-    if ((any(bws$icon) && !all((ccon == class(integer(0))) | (ccon == class(numeric(0))))) ||
-        (any(bws$iord) && !all(unlist(lapply(txdat[,bws$iord, drop=FALSE],class)) ==
-                               class(ordered(0)))) ||
-        (any(bws$iuno) && !all(unlist(lapply(txdat[,bws$iuno, drop=FALSE],class)) ==
-                               class(factor(0)))))
+    if ((any(bws$icon) &&
+         !all(vapply(txdat[, bws$icon, drop = FALSE], inherits, logical(1), c("integer", "numeric")))) ||
+        (any(bws$iord) &&
+         !all(vapply(txdat[, bws$iord, drop = FALSE], inherits, logical(1), "ordered"))) ||
+        (any(bws$iuno) &&
+         !all(vapply(txdat[, bws$iuno, drop = FALSE], inherits, logical(1), "factor"))))
       stop("supplied bandwidths do not match 'txdat' in type")
 
     if (!miss.ty && (nrow(txdat) != nrow(tydat)))
@@ -183,35 +220,36 @@ npksum.default <-
     if(!integer.pow)
       stop("'kernel.pow' is not an integer")
 
-    if (!miss.ex & leave.one.out)
+    if (!miss.ex && leave.one.out)
       stop("you may not specify 'leave.one.out = TRUE' and provide evaluation data")
 
     if (!miss.weights && !(is.matrix(weights) && nrow(weights) == nrow(txdat)))
       stop("improperly specified weight matrix")
     ## catch and destroy NA's
 
-    goodrows = 1:dim(txdat)[1]
-    rows.omit = attr(na.omit(txdat), "na.action")
+    keep.rows <- rep_len(TRUE, nrow(txdat))
+    rows.omit <- attr(na.omit(txdat), "na.action")
 
     if (!miss.ty)
-      rows.omit = union(rows.omit, attr(na.omit(tydat), "na.action"))
+      rows.omit <- union(rows.omit, attr(na.omit(tydat), "na.action"))
 
     if (!miss.weights)
-      rows.omit = union(rows.omit, attr(na.omit(weights), "na.action"))
+      rows.omit <- union(rows.omit, attr(na.omit(weights), "na.action"))
 
     
-    goodrows[rows.omit] = 0
+    if (length(rows.omit) > 0L)
+      keep.rows[as.integer(rows.omit)] <- FALSE
 
-    if (all(goodrows==0))
+    if (!any(keep.rows))
       stop("Data has no rows without NAs")
 
-    txdat = txdat[goodrows,,drop = FALSE]
+    txdat <- txdat[keep.rows,,drop = FALSE]
 
     if (!miss.ty)
-      tydat = tydat[goodrows,, drop = FALSE]
+      tydat <- tydat[keep.rows,, drop = FALSE]
 
     if (!miss.weights)
-      weights = weights[goodrows,, drop = FALSE]
+      weights <- weights[keep.rows,, drop = FALSE]
 
     if (!miss.ex){
       exdat = na.omit(exdat)
@@ -223,18 +261,22 @@ npksum.default <-
     ## end catch and destroy NA's
 
     tnrow = nrow(txdat)
-    enrow = ifelse(miss.ex, tnrow, nrow(exdat))
-    twncol = ifelse(miss.weights, 0, ncol(weights))
-    tyncol = ifelse(miss.ty, 0, ncol(tydat))
+    enrow = (if (miss.ex) tnrow else nrow(exdat))
+    twncol = (if (miss.weights) 0 else ncol(weights))
+    tyncol = (if (miss.ty) 0 else ncol(tydat))
 
     dim.in = c(twncol, tyncol, enrow)
 
-    dim.out = c(max(ncol(weights),0), max(ncol(tydat),0), enrow)
+    dim.out = c(twncol, tyncol, enrow)
     
     length.out = prod(dim.out[which(dim.out > 0)])
 
-    if((permutation.operator != "none") || compute.ocg){
-      npvar <- ifelse((permutation.operator != "none"), bws$ncon, 0) + ifelse(compute.score | compute.ocg, bws$nuno + bws$nord, 0)
+    has.permutation <- permutation.operator != "none"
+    has.pksum <- has.permutation || compute.ocg
+
+    if (has.pksum){
+      npvar <- (if (has.permutation) bws$ncon else 0L) +
+        (if (compute.score || compute.ocg) bws$nuno + bws$nord else 0L)
       p.length.out <- npvar*length.out
       p.dim.out <- c(dim.out, max(npvar, 0))      
     }
@@ -251,6 +293,9 @@ npksum.default <-
     
     if (!miss.ex)
       exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
+
+    if (!miss.ex)
+      npKernelBoundsCheckEval(exdat, bws$icon, bws$ckerlb, bws$ckerub, argprefix = "cker")
 
     ## grab the evaluation data before it is converted to numeric
     if(miss.ex)
@@ -280,11 +325,18 @@ npksum.default <-
       econ = data.frame()
     }
 
-    nkw <- ifelse(return.kernel.weights, tnrow*enrow, 0)
+    nkw <- (if (return.kernel.weights) tnrow*enrow else 0)
 
-    return.names <- c("ksum","kernel.weights","p.ksum")
+    need.pkw <- isTRUE(return.derivative.kernel.weights) &&
+      return.kernel.weights &&
+      has.pksum &&
+      (p.length.out > 0L)
+
+    return.names <- c("ksum", "kernel.weights", "p.ksum")
+    if (need.pkw)
+      return.names <- c(return.names, "p.kernel.weights")
       
-    myopti = list(
+	    myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
       num_uno = bws$nuno,
@@ -295,7 +347,7 @@ npksum.default <-
         fixed = BW_FIXED,
         generalized_nn = BW_GEN_NN,
         adaptive_nn = BW_ADAP_NN),
-      int_MINIMIZE_IO=ifelse(options('np.messages'), IO_MIN_FALSE, IO_MIN_TRUE), 
+      int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE, 
       kerneval = switch(bws$ckertype,
         gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
@@ -307,18 +359,22 @@ npksum.default <-
       okerneval = switch(bws$okertype,
         wangvanryzin = OKER_WANG,
         liracine = OKER_LR,
-        nliracine = OKER_NLR),
+        nliracine = OKER_NLR,
+        "racineliyan" = OKER_RLY),
       miss.ex = miss.ex,
       leave.one.out = leave.one.out, 
       bandwidth.divide = bandwidth.divide,
       mcv.numRow = attr(bws$xmcv, "num.row"),
       wncol = dim.in[1],
       yncol = dim.in[2],
-      int_do_tree = ifelse(options('np.tree'), DO_TREE_YES, DO_TREE_NO),
+      int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO,
       return.kernel.weights = return.kernel.weights,
       permutation.operator = poperator.num,
       compute.score = compute.score,
-      compute.ocg = compute.ocg)
+      compute.ocg = compute.ocg,
+      suppress.parallel = isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+
+	    cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
     
    asDouble <- function(data){
 	   if (is.null(data)){
@@ -330,19 +386,21 @@ npksum.default <-
 	   return(result)
    }
 
-    myout <- 
-      .C("np_kernelsum",
-         asDouble(tuno), asDouble(tord), asDouble(tcon),
-         asDouble(tydat), asDouble(weights),
-         asDouble(euno),  asDouble(eord),  asDouble(econ), 
-         as.double(c(bws$bw[bws$icon],bws$bw[bws$iuno],bws$bw[bws$iord])),
-         as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-         as.integer(c(operator.num[bws$icon],operator.num[bws$iuno],operator.num[bws$iord])),
-         as.integer(myopti), as.double(kernel.pow),
-         ksum = double(length.out),
-         p.ksum = double(p.length.out),
-         kernel.weights = double(nkw),
-         PACKAGE="npRmpi" )[return.names]
+    myout <-
+      .Call("C_np_kernelsum",
+            asDouble(tuno), asDouble(tord), asDouble(tcon),
+            asDouble(tydat), asDouble(weights),
+            asDouble(euno), asDouble(eord), asDouble(econ),
+            as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+            as.integer(c(operator.num[bws$icon], operator.num[bws$iuno], operator.num[bws$iord])),
+            as.integer(myopti), as.double(kernel.pow),
+            as.integer(length.out),
+            as.integer(p.length.out),
+            as.integer(nkw),
+            as.double(cker.bounds.c$lb),
+            as.double(cker.bounds.c$ub),
+            PACKAGE="npRmpi")[return.names]
 
     if (dim.out[1] > 1){
       dim(myout[["ksum"]]) <- dim.out
@@ -360,7 +418,22 @@ npksum.default <-
       kw <- NULL
     }
 
-    if(((permutation.operator != "none") || compute.ocg) && (p.length.out > 0)) {
+    if(need.pkw){
+      raw.pkw <- myout[["p.kernel.weights"]]
+      if(length(raw.pkw) > 0L){
+        if(npvar == 1L){
+          p.kw <- matrix(data = raw.pkw, nrow = tnrow, ncol = enrow)
+        } else {
+          p.kw <- array(data = raw.pkw, dim = c(tnrow, enrow, npvar))
+        }
+      } else {
+        p.kw <- NULL
+      }
+    } else {
+      p.kw <- NULL
+    }
+
+    if(has.pksum && (p.length.out > 0)) {
       dim.p <- p.dim.out[which(p.dim.out > 1)]
       if(length(dim.p) == 0) dim.p <- 1
 
@@ -368,7 +441,7 @@ npksum.default <-
 
       ip <- integer(0)
 
-      if((permutation.operator != "none") && (bws$ncon > 0))
+      if(has.permutation && (bws$ncon > 0))
         ip <- which(bws$icon)
 
       if(compute.ocg || compute.score){
@@ -390,6 +463,7 @@ npksum.default <-
                         ksum = myout[["ksum"]],
                         kw = kw,
                         p.ksum = p.myout,
+                        p.kw = p.kw,
                         ntrain = tnrow, trainiseval = miss.ex) )
 
   }

@@ -18,7 +18,7 @@
 \usage{
 mpi.comm.is.null(comm)
 string(length)
-.docall(fun, args)
+.docall(fun, args, envir = parent.frame())
 .force.type(x, type)
 .mpi.undefined()
 .mpi.worker.apply(n, tag)
@@ -30,10 +30,15 @@ string(length)
 .typeindex(x)
 }
 \arguments{
+\subsection{MPI And Dispatch Inputs}{
+Internal communicator, dispatch, worker, and result-simplification inputs.
+}
+
   \item{comm}{a communicator number.}
   \item{length}{length of a string.}
   \item{fun}{a function or name of a function.}
   \item{args}{a list of arguments.}
+  \item{envir}{environment used for function-name lookup prior to \code{.GlobalEnv} fallback.}
   \item{x}{an object.}
   \item{type}{a type indicator.}
   \item{n}{number of tasks.}

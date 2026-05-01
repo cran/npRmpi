@@ -11,20 +11,35 @@ np.pairs(y_vars, y_dat, ...)
 np.pairs.plot(pair_list)
 }
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the variables, data, and pair specifications to plot.
+}
+
+  \item{pair_list}{
+    list returned by \code{np.pairs}.
+  }
+
+
+  \item{y_dat}{
+    data frame containing the variables listed in \code{y_vars}.
+  }
+
+
   \item{y_vars}{
     character vector of column names in \code{y_dat}. If \code{y_vars}
     is named, the names are used as plot labels.
   }
-  \item{y_dat}{
-    data frame containing the variables listed in \code{y_vars}.
-  }
+
+
+\subsection{Additional Arguments}{
+Further graphical arguments are passed through to plotting methods.
+}
+
   \item{...}{
     additional arguments passed to \code{\link{npudens}} and
     \code{\link{npreg}}.
   }
-  \item{pair_list}{
-    list returned by \code{np.pairs}.
-  }
+
 }
 \value{
   \code{np.pairs} returns a list with components
@@ -32,6 +47,8 @@ np.pairs.plot(pair_list)
   \code{np.pairs.plot} returns \code{NULL} (invisibly).
 }
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
 On the diagonal, \code{npudens} is used to compute kernel density
 estimates. Off-diagonal panels use \code{npreg} with residuals to draw
 scatterplots and smoothers.
@@ -45,25 +62,32 @@ scatterplots and smoothers.
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
 data("USArrests")
 y_vars <- c("Murder", "UrbanPop")
 names(y_vars) <- c("Murder Arrests per 100K", "Pop. Percent Urban")
 
-mpi.bcast.Robj2slave(USArrests)
-mpi.bcast.Robj2slave(y_vars)
-
-mpi.bcast.cmd(pair_list <- np.pairs(y_vars = y_vars, y_dat = USArrests,
-                                    ckertype = "epanechnikov", 
-                                    bwscaling = TRUE),
-              caller.execute=TRUE)
+pair_list <- np.pairs(y_vars = y_vars, y_dat = USArrests,
+                      ckertype = "epanechnikov",
+                      bwscaling = TRUE)
 
 np.pairs.plot(pair_list)
 
@@ -73,22 +97,20 @@ np.pairs.plot(pair_list)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
-\seealso{\code{\link{npudens}}, \code{\link{npreg}}}
+\seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}\code{\link{npudens}}, \code{\link{npreg}}}
 \keyword{hplot}

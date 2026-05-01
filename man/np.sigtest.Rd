@@ -1,8 +1,7 @@
-% $Id: np.sigtest.Rd,v 1.31 2006/10/24 20:43:29 tristen Exp $
+%
 
 \name{npsigtest}
 \alias{npsigtest}
-\alias{npsigtest.call}
 \alias{npsigtest.default}
 \alias{npsigtest.formula}
 \alias{npsigtest.rbandwidth}
@@ -17,15 +16,20 @@
   and Racine (1997).
 }
 \usage{
-npsigtest(bws, \dots)
+npsigtest(bws, 
+          \dots)
 
-\method{npsigtest}{formula}(bws, data = NULL, \dots)
+\method{npsigtest}{formula}(bws, 
+          data = NULL, 
+          \dots)
 
-\method{npsigtest}{call}(bws, \dots)
+\method{npsigtest}{npregression}(bws, 
+          \dots)
 
-\method{npsigtest}{npregression}(bws, \dots)
-
-\method{npsigtest}{default}(bws, xdat, ydat, \dots)
+\method{npsigtest}{default}(bws, 
+          xdat, 
+          ydat, 
+          \dots)
 
 \method{npsigtest}{rbandwidth}(bws,
           xdat = stop("data xdat missing"),
@@ -35,13 +39,17 @@ npsigtest(bws, \dots)
           boot.type = c("I","II"),
           pivot=TRUE,
           joint=FALSE,
-          index = seq(1,ncol(xdat)),
+          index = seq_len(ncol(xdat)),
           random.seed = 42,
           \dots)
 
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth object, formula/data interface, and explicit data inputs.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{rbandwidth}
     object returned from a previous invocation, or as a vector of
@@ -54,6 +62,7 @@ npsigtest(bws, \dots)
     methods, and so on.
   }
 
+
   \item{data}{
     an optional data frame, list or environment (or object coercible to
     a data frame by \code{\link{as.data.frame}}) containing the
@@ -62,16 +71,23 @@ npsigtest(bws, \dots)
     which \code{\link{npregbw}} was called.
   }
 
+
   \item{xdat}{
     a \eqn{p}-variate data frame of explanatory data (training data)
     used to calculate the regression estimators.
   }
+
 
   \item{ydat}{
     a one (1) dimensional numeric or integer vector of dependent data,
     each element \eqn{i} corresponding to each observation (row) \eqn{i}
     of \code{xdat}.
   }
+
+
+\subsection{Bootstrap And Test Controls}{
+These arguments control bootstrap execution, tested effects, and reproducibility settings.
+}
 
   \item{boot.method}{
     a character string used to specify the bootstrap method for
@@ -83,10 +99,12 @@ npsigtest(bws, \dots)
     Rademacher variables. Defaults to \code{iid}.
   }
 
+
   \item{boot.num}{
     an integer value specifying the number of bootstrap replications to
     use. Defaults to \code{399}.
   }
+
 
   \item{boot.type}{
     a character string specifying whether to use a \sQuote{Bootstrap I} or
@@ -97,12 +115,14 @@ npsigtest(bws, \dots)
     remaining variables. Defaults to \code{boot.type="I"}.
   }
 
-  \item{pivot}{
-    a logical value which specifies whether to bootstrap a pivotal
-    statistic or not (pivoting is achieved by dividing gradient
-    estimates by their asymptotic standard errors). Defaults to
-    \code{TRUE}.
+
+  \item{index}{
+    a vector of indices for the columns of \code{xdat} for which the
+    test of significance is to be conducted. Defaults to
+    (1,2,\dots,\eqn{p}) where \eqn{p} is the number of columns in
+    \code{xdat}.
   }
+
 
   \item{joint}{
     a logical value which specifies whether to conduct a joint test or
@@ -114,25 +134,35 @@ npsigtest(bws, \dots)
     \code{npreg}/\code{npregbw}. Defaults to \code{FALSE}.
   }
 
-  \item{index}{
-    a vector of indices for the columns of \code{xdat} for which the
-    test of significance is to be conducted. Defaults to
-    (1,2,\dots,\eqn{p}) where \eqn{p} is the number of columns in
-    \code{xdat}.
+
+  \item{pivot}{
+    a logical value which specifies whether to bootstrap a pivotal
+    statistic or not (pivoting is achieved by dividing gradient
+    estimates by their asymptotic standard errors). Defaults to
+    \code{TRUE}.
   }
+
 
   \item{random.seed}{
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
 
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection routines used by the test.
+}
+
   \item{\dots}{
     additional arguments supplied to specify the bandwidth type,
     kernel types, selection methods, and so on, detailed below.
   }
 
+
 }
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
 
   \code{npsigtest} implements a variety of methods for computing the
   null distribution of the test statistic and allows the user to
@@ -157,8 +187,13 @@ npsigtest(bws, \dots)
   also that \code{boot.method="pairwise"} is not recommended for the
   multivariate local linear estimator due to substantial size
   distortions that may arise in certain cases.
-  
-}  
+
+  For \code{npRmpi}, \code{npsigtest} supports direct execution when
+  autodispatch is enabled (default via \code{npRmpi.init()}). In that mode,
+  users can call \code{npregbw}, \code{npreg}, and \code{npsigtest}
+  directly without wrapping calls in \code{mpi.bcast.cmd(...)}.
+
+}
 
 \value{
   \code{npsigtest} returns an object of type
@@ -220,6 +255,7 @@ npsigtest(bws, \dots)
 
 }
 
+\seealso{\code{\link{npRmpi.init}}}
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.
@@ -229,16 +265,26 @@ npsigtest(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+set.seed(42)
 
 ## Significance testing with z irrelevant
 
@@ -248,19 +294,12 @@ z <- factor(rbinom(n,1,.5))
 x1 <- rnorm(n)
 x2 <- runif(n,-2,2)
 y <- x1 + x2 + rnorm(n)
-mydat <- data.frame(z,x1,x2,y)
-rm(z,x1,x2,y)
 
-mpi.bcast.Robj2slave(mydat)
+model <- npreg(y~z+x1+x2,
+               regtype="ll",
+               bwmethod="cv.aic")
 
-mpi.bcast.cmd(model <- npreg(y~z+x1+x2,
-                             regtype="ll",
-                             bwmethod="cv.aic",
-                             data=mydat),
-              caller.execute=TRUE)
-
-mpi.bcast.cmd(output <- npsigtest(model,boot.num=29),
-              caller.execute=TRUE)
+output <- npsigtest(model,boot.num=29)
 
 summary(output)
 
@@ -270,21 +309,18 @@ summary(output)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{ nonparametric }

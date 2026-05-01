@@ -13,6 +13,9 @@ npqcmstest <- function(formula,
                        density.weighted = TRUE,
                        random.seed = 42,
                        ...) {
+  .npRmpi_require_active_slave_pool(where = "npqcmstest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   pcall = paste(deparse(model$call),collapse="")
   if(length(grep("model = TRUE", pcall)) == 0)
@@ -24,7 +27,7 @@ npqcmstest <- function(formula,
                ".\nSee help for further info.",
                sep=""))
 
-  if(tau <=0 | tau >=1) stop("tau must lie in (0,1)")
+  if(tau <=0 || tau >=1) stop("tau must lie in (0,1)")
 
   if(boot.num < 9) stop("number of bootstrap replications must be >= 9")
 
@@ -37,9 +40,10 @@ npqcmstest <- function(formula,
   else if(all(miss.xy) & miss.f)
     stop("xdat, and ydat, are missing, and no formula is specified.")
   else if(all(miss.xy) & !miss.f){
-    mf <- eval(parse(text=paste("model.frame(formula = formula, data = data,",
-                       ifelse(missing(subset),"","subset = subset,"),
-                       "na.action = na.omit)")))
+    mf.args <- list(formula = formula, data = data, na.action = na.omit)
+    if (!missing(subset))
+      mf.args$subset <- subset
+    mf <- do.call(model.frame, mf.args)
     ydat <- model.response(mf)
     xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
 
@@ -51,33 +55,37 @@ npqcmstest <- function(formula,
     xdat = toFrame(xdat)
     
     ## catch and destroy NA's
-    goodrows = 1:dim(xdat)[1]
-    rows.omit = attr(na.omit(data.frame(xdat,ydat)), "na.action")
-    goodrows[rows.omit] = 0
+    keep.rows <- rep_len(TRUE, nrow(xdat))
+    rows.omit <- attr(na.omit(data.frame(xdat, ydat)), "na.action")
+    if (length(rows.omit) > 0L)
+      keep.rows[as.integer(rows.omit)] <- FALSE
 
-    if (all(goodrows==0))
+    if (!any(keep.rows))
       stop("Data has no rows without NAs")
 
-    xdat = xdat[goodrows,,drop = FALSE]
-    ydat = ydat[goodrows]
+    xdat <- xdat[keep.rows,,drop = FALSE]
+    ydat <- ydat[keep.rows]
 
-    na.index = which(goodrows==0)
+    na.index <- which(!keep.rows)
   }
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
+  seed.state <- .np_seed_enter(random.seed)
 
-  set.seed(random.seed)
 
   distribution = match.arg(distribution)
   boot.method = match.arg(boot.method)
   bwydat = match.arg(bwydat)  
+
+  qresidual <- function(resid, tau) {
+    n.obs <- length(resid)
+    out <- rep.int(-tau, n.obs)
+    nonmissing <- !is.na(resid)
+    out[nonmissing & resid <= 0] <- 1 - tau
+    out[!nonmissing] <- NA_real_
+    out
+  }
 
   ## Here we go...
 
@@ -87,21 +95,18 @@ npqcmstest <- function(formula,
 
   ## ydat is model's residuals, xdat all regressors with types
 
-  console <- newLineConsole()
-  console <- printPush("Bandwidth selection", console)
+  .np_progress_note("Computing bandwidths")
 
   ## What are the optimal bandwidths? We could proceed to use those
   ## for the conditional expectation with raw y, or along the lines of
   ## Zheng (1998) does GCV where the dep var is varepsilon...
 
   if(bwydat == "y") {
-    bw <- npregbw(xdat=xdat, ydat=model$y, ...)
+    bw <- .np_progress_with_legacy_suppressed(npregbw(xdat=xdat, ydat=model$y, ...))
   } else if(bwydat == "varepsilon"){
-    varepsilon <- ifelse(model.resid<=0,1-tau,-tau)
-    bw <- npregbw(xdat=xdat, ydat=varepsilon, ...)
+    varepsilon <- qresidual(model.resid, tau)
+    bw <- .np_progress_with_legacy_suppressed(npregbw(xdat=xdat, ydat=varepsilon, ...))
   }
-
-  console <- printPop(console)
 
   ## Now define the Jn test statistic that takes arguments xdat, the
   ## residual vector, the bandwidth object, and the number of bootstrap
@@ -131,7 +136,7 @@ npqcmstest <- function(formula,
     ## Compute In (equation 2.10, Hsiao/Li/racine 2005)
     ## Residuals in cms test replaced with varepsilon
     
-    varepsilon <- ifelse(model.resid<=0,1-tau,-tau)
+    varepsilon <- qresidual(model.resid, tau)
 
     return( sum(varepsilon*npksum(txdat=xdat,
                                   tydat=varepsilon,
@@ -147,7 +152,7 @@ npqcmstest <- function(formula,
 
     ## Residuals in cms test replaced with varepsilon
     
-    varepsilon <- ifelse(model.resid<=0,1-tau,-tau)
+    varepsilon <- qresidual(model.resid, tau)
 
     return( 2*prod(bw$bw[bw$icon])*
            sum(varepsilon^2*
@@ -173,6 +178,13 @@ npqcmstest <- function(formula,
 
   ## data is y,xdat for the rq model...
 
+  draw.wild.mult <- function(n.obs, a, b, p.a) {
+    u <- stats::runif(n.obs)
+    mult <- rep.int(b, n.obs)
+    mult[u <= p.a] <- a
+    mult
+  }
+
   boot.wild <- function(model.resid) {
 
     a <- -0.6180339887499 # (1-sqrt(5))/2
@@ -185,9 +197,10 @@ npqcmstest <- function(formula,
     ## non-zero, first render mean zero, apply the wild bootstrap,
     ## then add back in the mean
 
-    y.star <- yhat + (model.resid-mean(model.resid))*
-      ifelse(rbinom(length(model.resid),1,P.a)==1,a,b)+
-        mean(model.resid)
+    resid.mean <- mean(model.resid)
+    y.star <- yhat + (model.resid - resid.mean) *
+      draw.wild.mult(length(model.resid), a, b, P.a) +
+      resid.mean
 
     suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
 
@@ -204,9 +217,10 @@ npqcmstest <- function(formula,
     ## Use the wild bootstrap to get a bootstrap vector for y under
     ## the null that the model is correct, using Rademacher variables
 
-    y.star <- yhat + (model.resid-mean(model.resid))*
-      ifelse(rbinom(length(model.resid),1,P.a)==1,a,b)+
-        mean(model.resid)
+    resid.mean <- mean(model.resid)
+    y.star <- yhat + (model.resid - resid.mean) *
+      draw.wild.mult(length(model.resid), a, b, P.a) +
+      resid.mean
 
     suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
 
@@ -218,7 +232,7 @@ npqcmstest <- function(formula,
 
     ## Simple iid resampling
 
-    y.star <- yhat + sample(model.resid, replace=TRUE)
+    y.star <- yhat + model.resid[sample.int(length(model.resid), replace = TRUE)]
 
     suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
 
@@ -228,9 +242,8 @@ npqcmstest <- function(formula,
 
   if(distribution == "bootstrap"){
     Sn.bootstrap <- numeric(boot.num)
-    for(ii in 1:boot.num) {
-      console <- printPush(paste(sep="", "Bootstrap replication ",
-                                 ii, "/", boot.num, "..."), console)
+    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
+    for (ii in seq_len(boot.num)) {
       if(boot.method == "iid"){
         Sn.bootstrap[ii] <- boot.iid(model.resid)
       } else if(boot.method == "wild"){
@@ -238,10 +251,10 @@ npqcmstest <- function(formula,
       } else if(boot.method == "wild-rademacher"){
         Sn.bootstrap[ii] <- boot.wild.rademacher(model.resid)
       }
-      console <- printPop(console)
+      progress <- .np_progress_step(progress, done = ii)
     }
+    progress <- .np_progress_end(progress)
     Sn.bootstrap <- sort(Sn.bootstrap)
-    cat("\n")
   }
 
   ##  Return a list containing the test statistic etc.
@@ -287,14 +300,14 @@ npqcmstest <- function(formula,
 
     Sn = if (pivot) tJn$Jn else tIn
 
-    tJn$P <- mean(ifelse(Sn.bootstrap > Sn, 1, 0))
+    tJn$P <- mean(Sn.bootstrap > Sn)
 
     
   }
   
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
   
   cmstest(Jn = tJn$Jn,
           In = tJn$In,
@@ -314,4 +327,3 @@ npqcmstest <- function(formula,
           boot.num = boot.num,
           na.index = na.index)
 }
-

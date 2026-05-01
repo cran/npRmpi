@@ -11,6 +11,10 @@ nptgauss(b)
 }
 
 \arguments{
+\subsection{Kernel Truncation}{
+Truncation radius for the truncated Gaussian kernel helper.
+}
+
   \item{b}{
     Truncation radius of the kernel.
   }
@@ -21,6 +25,8 @@ No return value, called for side effects (sets kernel constants in the
 }
 
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template. For interactive and cluster batch workflows, see \code{\link{npRmpi.init}}.
+
   \code{nptgauss} allows one to set the truncation radius of the truncated Gaussian kernel used by \pkg{npRmpi}, which defaults to 3. It automatically computes the constants describing the truncated gaussian kernel for the user.
   
 We define the truncated gaussion kernel on the interval \eqn{[-b,b]} as:
@@ -50,6 +56,7 @@ where \eqn{a_0}{a0} is determined by the normalisation condition on H,
     \email{racinej@mcmaster.ca}
 }
 
+\seealso{\code{\link{npRmpi.init}} for MPI startup and workflow guidance.}
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.

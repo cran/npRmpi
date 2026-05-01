@@ -1,7 +1,6 @@
-% $ID$
+%
 \name{npscoef}
 \alias{npscoef}
-\alias{npscoef.call}
 \alias{npscoef.default}
 \alias{npscoef.formula}
 \alias{npscoef.scbandwidth}
@@ -22,12 +21,19 @@
 \usage{
 npscoef(bws, \dots)
 
-\method{npscoef}{formula}(bws, data = NULL, newdata = NULL, y.eval =
-FALSE, \dots)
+\method{npscoef}{formula}(bws, 
+        data = NULL, 
+        newdata = NULL, 
+        y.eval = FALSE, 
+        \dots)
 
-\method{npscoef}{call}(bws, \dots)
 
-\method{npscoef}{default}(bws, txdat, tydat, tzdat, \dots)
+\method{npscoef}{default}(bws, 
+        txdat, 
+        tydat, 
+        tzdat, 
+        nomad = FALSE, 
+        \dots)
 
 \method{npscoef}{scbandwidth}(bws,
         txdat = stop("training data 'txdat' missing"),
@@ -36,17 +42,21 @@ FALSE, \dots)
         exdat,
         eydat,
         ezdat,
-        residuals = FALSE,
+        betas = FALSE,
         errors = TRUE,
         iterate = TRUE,
-        maxiter = 100,
-        tol = .Machine$double.eps,
         leave.one.out = FALSE,
-        betas = FALSE,
+        maxiter = 100,
+        residuals = FALSE,
+        tol = .Machine$double.eps,
         \dots)
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and smooth-coefficient training data.
+}
+
   \item{bws}{
   a bandwidth specification. This can be set as a \code{scbandwidth}
   object returned from an invocation of \code{\link{npscoefbw}}, or
@@ -58,62 +68,73 @@ FALSE, \dots)
 
   }
 
-  \item{\dots}{
-    additional arguments supplied to specify the regression type,
-    bandwidth type, kernel types, selection methods, and so on.
-    To do this, you may specify any of \code{bwscaling}, \code{bwtype}
-    (one of \code{fixed}, \code{generalized_nn}, \code{adaptive_nn}),
-    \code{ckertype}, \code{ckerorder}, as described in
-    \code{\link{npscoefbw}}. 
-    
-  }
+
 
   \item{data}{
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing
-    the variables 
+    the variables
     in the model. If not found in data, the variables are taken from
     \code{environment(bws)}, typically the environment from which
    \code{\link{npscoefbw}} was called.
   }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
-  }
-
-  \item{y.eval}{
-    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
-    \code{\link{npRmpi}} will compute goodness of fit statistics on these
-    data and return them. Defaults to \code{FALSE}.
-  }
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (training data),
     which, by default, populates the columns \eqn{2} through \eqn{p+1}
-    of \eqn{W} in the model equation, and in the 
-    absence of \code{zdat}, will also correspond to 
+    of \eqn{W} in the model equation, and in the
+    absence of \code{zdat}, will also correspond to
     \eqn{Z} from the model equation. Defaults to
-    the training data used to 
+    the training data used to
     compute the bandwidth object.
   }
+
 
 
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
     \code{txdat}. Defaults to
-    the training data used to 
+    the training data used to
     compute the bandwidth object.
   }
+
 
   \item{tzdat}{
     an optionally specified \eqn{q}-variate data frame of explanatory data
     (training data), which corresponds to \eqn{Z} in the model
-    equation. Defaults to 
-    the training data used to 
+    equation. Defaults to
+    the training data used to
     compute the bandwidth object.
   }
+
+
+\subsection{Bandwidth Search Shortcut}{
+This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npscoefbw}} when bandwidths are computed inside \code{npscoef}.
+}
+
+  \item{nomad}{
+    logical shortcut passed through to \code{\link{npscoefbw}} when
+    bandwidths are computed inside \code{npscoef}. When \code{TRUE},
+    the smooth-coefficient bandwidth route fills any missing values
+    among \code{regtype}, \code{search.engine},
+    \code{degree.select}, \code{bernstein.basis},
+    \code{degree.min}, \code{degree.max}, \code{degree.verify}, and
+    \code{bwtype} with the recommended automatic LP NOMAD preset
+    documented in \code{\link{npscoefbw}}. Additional NOMAD tuning
+    arguments such as \code{nomad.nmulti} may also be supplied through
+    \code{\dots}; \code{nmulti} remains the outer restart count while
+    \code{nomad.nmulti} controls inner
+    \code{crs::snomadr()} multistarts within each outer restart. After fitting, inspect
+    \code{fit$bws$nomad.shortcut} on the returned object \code{fit} to
+    see the normalized shortcut metadata.
+  }
+
+
+\subsection{Evaluation Data And Returned Quantities}{
+These arguments control where the smooth-coefficient fit is evaluated and which evaluation quantities are returned.
+}
 
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
@@ -121,11 +142,13 @@ FALSE, \dots)
     evaluation takes place on the data provided by \code{txdat}.
   }
 
+
   \item{eydat}{
     a one (1) dimensional numeric or integer vector of the true values
     of the dependent variable. Optional, and used only to calculate the
-    true errors. 
+    true errors.
   }
+
 
   \item{ezdat}{
     an optionally specified \eqn{q}-variate data frame of points on
@@ -135,16 +158,36 @@ FALSE, \dots)
     in the model equation. Defaults to be the same as \code{txdat}.
   }
 
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+  \item{y.eval}{
+    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
+    \code{\link{npRmpi}} will compute goodness of fit statistics on these
+    data and return them. Defaults to \code{FALSE}.
+  }
+
+
+\subsection{Fitted Quantities And Backfitting}{
+These arguments control returned coefficient estimates, errors, residuals, and iterative backfitting.
+}
+
+  \item{betas}{
+    a logical value indicating whether or not estimates of the
+    components of \eqn{\gamma}{gamma} should be returned in the
+    \code{smoothcoefficient} object along with the regression estimates.
+    Defaults to \code{FALSE}.
+  }
+
+
   \item{errors}{
     a logical value indicating whether or not asymptotic standard errors
     should be computed and returned in the resulting
     \code{smoothcoefficient} object. Defaults to \code{TRUE}.
-  }
-
-  \item{residuals}{
-    a logical value indicating that you want residuals computed and
-    returned in the resulting \code{smoothcoefficient} object. Defaults to
-    \code{FALSE}.
   }
 
 
@@ -153,16 +196,6 @@ FALSE, \dots)
     should be iterated for self-consistency. Defaults to \code{TRUE}.
   }
 
-  \item{maxiter}{
-    integer specifying the maximum number of times to iterate the
-    backfitted estimates while attempting to make the backfitted estimates
-    converge to the desired tolerance. Defaults to \code{100}.
-  }
-
-  \item{tol}{
-    desired tolerance on the relative convergence of backfit
-    estimates. Defaults to \code{.Machine$double.eps}.
-  }
 
   \item{leave.one.out}{
     a logical value to specify whether or not to compute the leave one
@@ -170,15 +203,41 @@ FALSE, \dots)
     \code{FALSE}.
   }
 
-  \item{betas}{
-    a logical value indicating whether or not estimates of the
-    components of \eqn{\gamma}{gamma} should be returned in the
-    \code{smoothcoefficient} object along with the regression estimates.
-    Defaults to \code{FALSE}.
+
+  \item{maxiter}{
+    integer specifying the maximum number of times to iterate the
+    backfitted estimates while attempting to make the backfitted estimates
+    converge to the desired tolerance. Defaults to \code{100}.
   }
-  
+
+
+  \item{residuals}{
+    a logical value indicating that you want residuals computed and
+    returned in the resulting \code{smoothcoefficient} object. Defaults to
+    \code{FALSE}.
+  }
+
+
+  \item{tol}{
+    desired tolerance on the relative convergence of backfit
+    estimates. Defaults to \code{.Machine$double.eps}.
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection counterpart when bandwidths are not supplied.
 }
 
+  \item{\dots}{
+    additional arguments supplied to specify the regression type,
+    bandwidth type, kernel types, selection methods, and so on.
+    To do this, you may specify any of \code{bwscaling}, \code{bwtype}
+    (one of \code{fixed}, \code{generalized_nn}, \code{adaptive_nn}),
+    \code{ckertype}, \code{ckerorder}, as described in
+    \code{\link{npscoefbw}}.
+
+  }
+}
 \value{
   \code{npscoef} returns a \code{smoothcoefficient} object.   The generic
   functions \code{\link{fitted}}, \code{\link{residuals}}, \code{\link{coef}},
@@ -192,12 +251,17 @@ FALSE, \dots)
 
   \item{eval}{ evaluation points }
   \item{mean}{ estimation of the regression function (conditional mean) at the
-    evaluation points } 
-  \item{merr}{ if \code{errors = TRUE}, standard errors of the
-    regression estimates } 
-  \item{beta}{ if \code{betas = TRUE}, estimates of the coefficients
-    \eqn{\gamma}{gamma} at the 
     evaluation points }
+  \item{merr}{ if \code{errors = TRUE}, standard errors of the
+    regression estimates }
+  \item{beta}{ if \code{betas = TRUE}, estimates of the coefficients
+    \eqn{\gamma}{gamma} at the
+    evaluation points }
+  \item{grad}{ estimated derivatives of the conditional mean with
+    respect to the regressors in \code{xdat}; these correspond to the
+    non-intercept smooth coefficient estimates at each evaluation point}
+  \item{gerr}{ if \code{errors = TRUE}, asymptotic standard errors for
+    \code{grad} }
   \item{resid}{ if \code{residuals = TRUE}, in-sample or out-of-sample
     residuals where appropriate (or possible) }
   \item{R2}{ coefficient of determination (Doksum and Samarov (1995))}
@@ -207,7 +271,7 @@ FALSE, \dots)
   \item{CORR}{ absolute value of Pearson's correlation coefficient }
   \item{SIGN}{ fraction of observations where fitted and observed values
   agree in sign }
-  
+
 }
 \references{
 
@@ -255,12 +319,19 @@ FALSE, \dots)
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For practitioners who want the recommended automatic LP NOMAD route
+  without spelling out all LP tuning arguments,
+  \code{npscoef(..., nomad=TRUE)} and \code{npscoefbw(..., nomad=TRUE)}
+  expand missing settings to the same documented preset. Explicit
+  incompatible settings fail fast rather than being silently rewritten.
+
   Support for backfitted bandwidths is experimental and is limited in
   functionality. The code does not support asymptotic standard errors
   or out of sample estimates with backfitting.
 }
 
-\seealso{
+\seealso{\code{\link{npRmpi.init}}.
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{bw.nrd}}, \code{\link{bw.SJ}}, \code{\link{hist}},
   \code{\link{npudens}}, \code{\link{npudist}},
   \code{\link{npudensbw}}, \code{\link{npscoefbw}} }
@@ -274,36 +345,39 @@ FALSE, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+set.seed(42)
 
 n <- 500
 
 x <- runif(n)
 z <- runif(n, min=-2, max=2)
 y <- x*exp(z)*(1.0+rnorm(n,sd = 0.2))
-mydat <- data.frame(x,y,z)
-rm(x,y,z)
-
-mpi.bcast.Robj2slave(mydat)
 
 ## A smooth coefficient model example
 
-mpi.bcast.cmd(bw <- npscoefbw(y~x|z,data=mydat),
-              caller.execute=TRUE)
+bw <- npscoefbw(y~x|z)
 
 summary(bw)
 
-mpi.bcast.cmd(model <- npscoef(bws=bw, gradients=TRUE),
-              caller.execute=TRUE)
+model <- npscoef(bws=bw, gradients=TRUE)
 
 summary(model)
 
@@ -313,21 +387,18 @@ summary(model)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{nonparametric}

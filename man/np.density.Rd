@@ -1,8 +1,7 @@
-% $Id: np.density.Rd,v 1.75 2006/11/03 21:19:03 tristen Exp $
+%
 \name{npudens}
 \alias{npudens}
 \alias{npudens.bandwidth}
-\alias{npudens.call}
 \alias{npudens.default}
 \alias{npudens.formula}
 
@@ -17,21 +16,29 @@
 
 }
 \usage{
-npudens(bws, \dots)
+npudens(bws, 
+        \dots)
 
-\method{npudens}{formula}(bws, data = NULL, newdata = NULL, \dots)
+\method{npudens}{formula}(bws, 
+        data = NULL, 
+        newdata = NULL, 
+        \dots)
 
 \method{npudens}{bandwidth}(bws,
         tdat = stop("invoked without training data 'tdat'"),
         edat,
         \dots)
 
-\method{npudens}{call}(bws, \dots)
-
-\method{npudens}{default}(bws, tdat, \dots)
+\method{npudens}{default}(bws, 
+        tdat, 
+        \dots)
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
+
   \item{bws}{
     a bandwidth specification. This can be set as a \code{bandwidth}
     object returned from an invocation of \code{\link{npudensbw}}, or as a
@@ -42,26 +49,7 @@ npudens(bws, \dots)
     and so on.
   }
 
-  \item{\dots}{
-    additional arguments supplied to specify, the training
-    data, the
-    bandwidth type, kernel types, and so on.
-    This is necessary if you specify bws as a \eqn{p}-vector and not
-    a \code{bandwidth} object, and you do not desire the default
-    behaviours. To do this, you may specify any of \code{bwscaling},
-    \code{bwtype}, \code{ckertype}, \code{ckerorder}, \code{ukertype},
-    \code{okertype}, as described in \code{\link{npudensbw}}.
-  }
 
-  \item{tdat}{
-    a \eqn{p}-variate data frame of sample realizations (training data)
-    used to estimate the density. Defaults to the training data used to
-    compute the bandwidth object.
-  }
-  \item{edat}{
-    a \eqn{p}-variate data frame of density evaluation points. By default,
-    evaluation takes place on the data provided by \code{tdat}.
-  }
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -71,53 +59,109 @@ npudens(bws, \dots)
     \code{\link{npudensbw}} was called.
   }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
+
+  \item{tdat}{
+    a \eqn{p}-variate data frame of sample realizations (training data)
+    used to estimate the density. Defaults to the training data used to
+    compute the bandwidth object.
   }
-  
+
+
+\subsection{Evaluation Data}{
+These arguments control where the fitted density is evaluated.
 }
 
+  \item{edat}{
+    a \eqn{p}-variate data frame of density evaluation points. By default,
+    evaluation takes place on the data provided by \code{tdat}.
+  }
+
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to \code{\link{npudensbw}} when bandwidths are computed internally, or used to interpret a numeric \code{bws} vector.
+}
+
+  \item{\dots}{
+    additional arguments supplied to \code{\link{npudensbw}} when
+    \code{npudens} computes bandwidths internally, or arguments needed
+    to interpret a numeric \code{bws} vector. This is where bandwidth
+    selection controls such as \code{bwmethod}, \code{bwtype},
+    \code{bwscaling}, kernel/support controls such as \code{ckertype},
+    \code{ckerorder}, and \code{ckerbound}, categorical kernel controls
+    such as \code{ukertype} and \code{okertype}, and search controls
+    such as \code{nmulti} and \code{scale.factor.search.lower} are
+    supplied. See \code{\link{npudensbw}} for the complete
+    bandwidth-selection argument surface.
+  }
+}
 \details{
+  Documentation guide: see \code{\link{npudensbw}} for bandwidth
+  selection and search controls, \code{\link{np.kernels}} for kernels,
+  \code{\link{np.options}} for global options, \code{\link{plot}},
+  \code{\link{plot.np}} for plotting options, and
+  \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See
+  \code{\link{npRmpi.init}} details for performance tradeoffs (message
+  passing/startup mode) and the \code{inst/Rprofile} manual-broadcast
+  template.
+
+  When \code{bws} is omitted, the formula and default methods call
+  \code{\link{npudensbw}} first and pass bandwidth-selection arguments
+  from \code{\dots} to that call. When \code{bws} is already a
+  \code{bandwidth} object, \code{npudens} estimates with the stored
+  bandwidth metadata in that object.
+
+  Argument groups for bandwidth selection are documented on
+  \code{\link{npudensbw}}. The most common workflow is to choose data
+  and bandwidth inputs first, then bandwidth criterion and
+  representation, then kernel/support controls and numerical search
+  controls if defaults need to be changed.
+
+  For S3 plotting help, use \code{methods("plot")} and query
+  class-specific help topics such as \code{?plot.npregression} and
+  \code{?plot.rbandwidth}. You can inspect implementations with
+  \code{getS3method("plot","npregression")}.
+
 
   Typical usages are (see below for a complete list of options and also
   the examples at the end of this help file)
   \preformatted{
     Usage 1: first compute the bandwidth object via npudensbw and then
     compute the density:
-    
+
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(bw <- npudensbw(~y),caller.execute=TRUE)
-    mpi.bcast.cmd(fhat <- npudens(bw),caller.execute=TRUE)
-    npRmpi.stop()
-    
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    bw <- npudensbw(formula = ~y, data = mydat)
+    fhat <- npudens(bw)
+    npRmpi.quit()
+
     Usage 2: alternatively, compute the bandwidth object indirectly:
-    
+
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(fhat <- npudens(~y),caller.execute=TRUE)
-    npRmpi.stop()
-    
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    fhat <- npudens(formula = ~y, data = mydat)
+    npRmpi.quit()
+
     Usage 3: modify the default kernel and order:
-    
+
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(fhat <- npudens(~y, ckertype="epanechnikov", ckerorder=4),
-                  caller.execute=TRUE)
-    npRmpi.stop()
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    fhat <- npudens(formula = ~y, data = mydat, ckertype="epanechnikov", ckerorder=4)
+    npRmpi.quit()
 
     Usage 4: use the data frame interface rather than the formula
     interface:
@@ -125,12 +169,10 @@ npudens(bws, \dots)
     ## Start npRmpi for interactive execution. If slaves are already running and
     ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
     ## reuse the existing pool instead of respawning. To change the number of
-    ## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-    npRmpi.start(nslaves=1)
-    mpi.bcast.Robj2slave(y)
-    mpi.bcast.cmd(fhat <- npudens(tdat = y, ckertype="epanechnikov", ckerorder=4),
-                  caller.execute=TRUE)
-    npRmpi.stop()
+    ## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+    npRmpi.init(nslaves=1)
+    fhat <- npudens(tdat = y, ckertype="epanechnikov", ckerorder=4)
+    npRmpi.quit()
   }
 
   \code{npudens} implements a variety of methods for estimating
@@ -165,7 +207,7 @@ npudens(bws, \dots)
 
 }
 \value{
-  
+
   \code{npudens} returns a \code{npdensity} object. The generic accessor
   functions \code{\link{fitted}}, and \code{\link{se}}, extract
   estimated values and asymptotic standard errors on estimates,
@@ -178,7 +220,7 @@ npudens(bws, \dots)
   \item{dens}{ estimation of the density at the evaluation points }
   \item{derr}{ standard errors of the density estimates }
   \item{log_likelihood}{ log likelihood of the density estimates }
-  
+
 }
 \references{
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{ Multivariate binary
@@ -196,7 +238,7 @@ npudens(bws, \dots)
     data,} Journal of Nonparametric Statistics, 18, 69-100.
 
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,} Cambridge
-  University Press. 
+  University Press.
 
   Scott, D.W. (1992), \emph{Multivariate Density Estimation: Theory,
   Practice and Visualization,} New York: Wiley.
@@ -220,7 +262,8 @@ npudens(bws, \dots)
   type.
 }
 
-\seealso{ \code{\link{npudensbw}} , \code{\link{density}} }
+\seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}} \code{\link{npudensbw}} , \code{\link{density}} }
 
 \examples{
 \dontrun{
@@ -231,24 +274,30 @@ npudens(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(data("Italy"),
-              caller.execute=TRUE)
-mpi.bcast.cmd(attach(Italy),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
 
-mpi.bcast.cmd(bw <- npudensbw(formula=~year+gdp),
-              caller.execute=TRUE)
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
 
-mpi.bcast.cmd(fhat <- npudens(bws=bw),
-              caller.execute=TRUE)
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+data("Italy")
+
+bw <- npudensbw(formula=~year+gdp, data=Italy)
+
+fhat <- npudens(bws=bw)
 
 summary(fhat)
 
@@ -258,21 +307,18 @@ summary(fhat)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 \keyword{ nonparametric }% at least one, from doc/KEYWORDS

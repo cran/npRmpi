@@ -29,28 +29,38 @@ npconmode.formula <-
     tmf <- bws$call[c(1,m)]
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
-    umf <- tmf <- eval(tmf, envir = environment(tt))
+    mf.args <- as.list(tmf)[-1L]
+    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
 
     tydat <- tmf[, bws$variableNames[["response"]], drop = FALSE]
     txdat <- tmf[, bws$variableNames[["terms"]], drop = FALSE]
 
-    if ((has.eval <- !is.null(newdata))) {
+    has.eval <- !is.null(newdata)
+    if (has.eval) {
       has.ey <- succeedWithResponse(tt, newdata)
 
       if (has.ey){
-        umf <- emf <- model.frame(tt, data = newdata)
+        umf.args <- list(formula = tt, data = newdata)
+        umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+        emf <- umf
         eydat <- emf[, bws$variableNames[["response"]], drop = FALSE]
       } else {
-        umf <- emf <- model.frame(formula(bws)[-2], data = newdata)
+        umf.args <- list(formula = formula(bws)[-2], data = newdata)
+        umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+        emf <- umf
       }
 
       exdat <- emf[, bws$variableNames[["terms"]], drop = FALSE]
     }
     
-    ev <-
-      eval(parse(text=paste("npconmode(txdat = txdat, tydat = tydat,",
-                   ifelse(has.eval,paste("exdat = exdat,",ifelse(has.ey,"eydat = eydat,","")),""),
-                   "bws = bws, ...)")))
+    cm.args <- list(txdat = txdat, tydat = tydat)
+    if (has.eval) {
+      cm.args$exdat <- exdat
+      if (has.ey)
+        cm.args$eydat <- eydat
+    }
+    cm.args$bws <- bws
+    ev <- do.call(npconmode, c(cm.args, list(...)))
 
     ev$omit <- attr(umf,"na.action")
     ev$rows.omit <- as.vector(ev$omit)
@@ -65,8 +75,8 @@ npconmode.formula <-
 
 npconmode.call <-
   function(bws, ...) {
-    npconmode(txdat = eval(bws$call[["xdat"]], environment(bws$call)),
-              tydat = eval(bws$call[["ydat"]], environment(bws$call)),
+    npconmode(txdat = .np_eval_bws_call_arg(bws, "xdat"),
+              tydat = .np_eval_bws_call_arg(bws, "ydat"),
               bws = bws, ...)
   }
 
@@ -77,6 +87,9 @@ npconmode.conbandwidth <-
             tydat = stop("invoked without training data 'tydat'"),
             exdat, eydat,
             ...){
+    .npRmpi_require_active_slave_pool(where = "npconmode()")
+    if (.npRmpi_autodispatch_active())
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     txdat = toFrame(txdat)
     tydat = toFrame(tydat)
@@ -91,44 +104,49 @@ npconmode.conbandwidth <-
       eydat = toFrame(eydat)
 
     ## catch and destroy NA's
-    goodrows = 1:dim(txdat)[1]
-    rows.omit = attr(na.omit(data.frame(txdat,tydat)), "na.action")
-    goodrows[rows.omit] = 0
+    keep.rows <- rep_len(TRUE, nrow(txdat))
+    rows.omit <- attr(na.omit(data.frame(txdat, tydat)), "na.action")
+    if (length(rows.omit) > 0L)
+      keep.rows[as.integer(rows.omit)] <- FALSE
 
-    if (all(goodrows==0))
+    if (!any(keep.rows))
       stop("Tranining data has no rows without NAs")
 
-    txdat = txdat[goodrows,,drop = FALSE]
-    tydat = tydat[goodrows,,drop = FALSE]
+    txdat <- txdat[keep.rows,,drop = FALSE]
+    tydat <- tydat[keep.rows,,drop = FALSE]
 
     if (!no.ex){
-      goodrows = 1:dim(exdat)[1]
-      rows.omit = eval(parse(text=paste('attr(na.omit(data.frame(exdat',
-                               ifelse(no.ey,"",",eydat"),')), "na.action")')))
+      keep.eval <- rep_len(TRUE, nrow(exdat))
+      eval.df <- data.frame(exdat)
+      if (!no.ey)
+        eval.df <- data.frame(eval.df, eydat)
+      rows.omit <- attr(na.omit(eval.df), "na.action")
+      if (length(rows.omit) > 0L)
+        keep.eval[as.integer(rows.omit)] <- FALSE
 
-      goodrows[rows.omit] = 0
-
-      exdat = exdat[goodrows,,drop = FALSE]
+      exdat <- exdat[keep.eval,,drop = FALSE]
 
       if (!no.ey)
-        eydat = eydat[goodrows,,drop = FALSE]
+        eydat <- eydat[keep.eval,,drop = FALSE]
 
-      if (all(goodrows==0))
+      if (!any(keep.eval))
         stop("Evaluation data has no rows without NAs")
     }
 
 
     tnrow = dim(txdat)[1]
-    enrow = ifelse(no.ex, tnrow, dim(exdat)[1])
+    enrow = if (no.ex) tnrow else dim(exdat)[1]
 
-    if (!no.ey & no.ex)
+    if (!no.ey && no.ex)
       stop("npconmode: invalid invocation: 'eydat' provided but not 'exdat'")
 
-    if (bws$yndim != 1 | bws$yncon > 0)
+    if (bws$yndim != 1 || bws$yncon > 0)
       stop("'tydat' must consist of one (1) discrete variable")
 
     mdens = double(enrow)
+    mderr = rep(NA_real_, enrow)
     tdens = double(enrow)
+    tderr = rep(NA_real_, enrow)
     tf = logical(enrow)
     indices = integer(enrow)
 
@@ -138,29 +156,36 @@ npconmode.conbandwidth <-
       efac <- factor(union(bws$ydati$all.lev[[1]], levels(eydat[,1])),
                      levels = union(bws$ydati$all.lev[[1]], levels(eydat[,1])), ordered = is.ordered(tydat[,1]))
 
-    tdensE <- parse(text = paste("npcdens(txdat = txdat, tydat = tydat,",
-                      "exdat = ", ifelse(no.ex, "txdat", "exdat"), ",",
-                      "eydat = rep(efac[i], enrow),",
-                      "bws = bws)$condens"))
-
-
-    for(i in 1:nlevels(efac)){
-        tdens <- eval(tdensE)
+    for (i in seq_len(nlevels(efac))) {
+        dens.obj <- npcdens(
+          txdat = txdat,
+          tydat = tydat,
+          exdat = if (no.ex) txdat else exdat,
+          eydat = rep(efac[i], enrow),
+          bws = bws
+        )
+        tdens <- dens.obj$condens
+        tderr <- dens.obj$conderr
         tf = tdens >= mdens
         indices[tf] = i
         mdens[tf] = tdens[tf]
+        mderr[tf] = tderr[tf]
     }
 
-    con.mode <- eval(parse(text = paste("conmode(bws = bws,",
-                             "xeval = ", ifelse(no.ex, "txdat", "exdat"), ",",
-                             ifelse(no.ey & !no.ex, "",
-                                    paste("yeval = ", ifelse(no.ey, "tydat",
-                                                             "eydat"), ",")),
-                             "conmode = efac[indices],",
-                             "condens = mdens, ntrain = nrow(txdat),",
-                             "trainiseval = no.ex)")))
+    cm.args <- list(
+      bws = bws,
+      xeval = if (no.ex) txdat else exdat,
+      conmode = efac[indices],
+      condens = mdens,
+      conderr = mderr,
+      ntrain = nrow(txdat),
+      trainiseval = no.ex
+    )
+    if (!(no.ey && !no.ex))
+      cm.args$yeval <- if (no.ey) tydat else eydat
+    con.mode <- do.call(conmode, cm.args)
     
-    if (!(no.ey & !no.ex)){
+    if (!(no.ey && !no.ex)){
       confusion.matrix <- 
         table(factor(if (no.ex) tydat[,1] else eydat[,1], exclude = NULL),
               factor(con.mode$conmode,exclude = NULL), dnn=c("Actual", "Predicted"))
@@ -191,6 +216,10 @@ npconmode.conbandwidth <-
   }
 
 npconmode.default <- function(bws, txdat, tydat, ...){
+  .npRmpi_require_active_slave_pool(where = "npconmode()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+
   sc <- sys.call()
   sc.names <- names(sc)
 
@@ -205,6 +234,7 @@ npconmode.default <- function(bws, txdat, tydat, ...){
   no.bws <- missing(bws)
   no.txdat <- missing(txdat)
   no.tydat <- missing(tydat)
+  has.explicit.bws <- (!no.bws) && isa(bws, "conbandwidth")
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
@@ -218,7 +248,13 @@ npconmode.default <- function(bws, txdat, tydat, ...){
   
   sc.bw[[1]] <- quote(npcdensbw)
 
-  if(bws.named){
+  bws.formula <- (!no.bws) && inherits(bws, "formula")
+  if (bws.formula) {
+    ib <- match("bws", names(sc.bw), nomatch = 0L)
+    if (ib > 0L) names(sc.bw)[ib] <- "formula"
+  }
+
+  if(bws.named && !bws.formula){
     sc.bw$bandwidth.compute <- FALSE
   }
 
@@ -231,20 +267,25 @@ npconmode.default <- function(bws, txdat, tydat, ...){
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
     
-  tbw <- eval.parent(sc.bw)
-
-  ## convention: drop 'bws' and up to two unnamed arguments (including bws)
-  if(no.bws){
-    tx.str <- ",txdat = txdat"
-    ty.str <- ",tydat = tydat"
+  tbw <- if (!has.explicit.bws) {
+    .np_progress_select_bandwidth(
+      "Selecting conditional density bandwidth",
+      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+    )
   } else {
-    tx.str <- ifelse(txdat.named, ",txdat = txdat","")
-    ty.str <- ifelse(tydat.named, ",tydat = tydat","")    
-    if((!bws.named) && (!txdat.named)){
-      ty.str <- ifelse(tydat.named, ",tydat = tydat",
-                       ifelse(no.tydat,"",",tydat"))
+    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+  }
+
+  call.args <- list(bws = tbw)
+  if (no.bws) {
+    call.args$txdat <- txdat
+    call.args$tydat <- tydat
+  } else {
+    if (txdat.named) call.args$txdat <- txdat
+    if (tydat.named) call.args$tydat <- tydat
+    if ((!bws.named) && (!txdat.named) && (!no.tydat) && (!tydat.named)) {
+      call.args <- c(call.args, list(tydat))
     }
   }
-  
-  eval(parse(text=paste("npconmode(bws = tbw", tx.str, ty.str, ",...)")))
+  do.call(npconmode, c(call.args, list(...)))
 }

@@ -2,9 +2,11 @@ npdensity <-
     function(bws, eval, dens,
              derr = NA, ll = NA,
              ntrain, trainiseval = FALSE,
-             rows.omit = NA){
+             rows.omit = NA,
+             timing = NA, total.time = NA,
+             optim.time = NA, fit.time = NA){
 
-        if (missing(bws) | missing(eval) | missing(dens) | missing(ntrain))
+        if (missing(bws) || missing(eval) || missing(dens) || missing(ntrain))
             stop("improper invocation of density constructor")
 
         if (length(rows.omit) == 0)
@@ -32,7 +34,9 @@ npdensity <-
             ntrain = ntrain,
             trainiseval = trainiseval,
             rows.omit = rows.omit,
-            nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)))
+            nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
+            timing = timing, total.time = total.time,
+            optim.time = optim.time, fit.time = fit.time)
 
 
         class(d) <- "npdensity"
@@ -42,8 +46,8 @@ npdensity <-
 
 print.npdensity <- function(x, digits=NULL, ...){
   cat("\nDensity Data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", paste(" and ", x$nobs,
-                                      " evaluation points,", sep="")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs,
+                                      " evaluation points,", sep=""),
       " in ",x$ndim," variable(s)\n",sep="")
 
   print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),x$xnames)))
@@ -62,13 +66,20 @@ fitted.npdensity <- function(object, ...){
  object$dens 
 }
 se.npdensity <- function(x){ x$derr }
-plot.npdensity <- function(x, ...) { npplot(bws = x$bws, ...) }
 
 predict.npdensity <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npudens(bws = object$bws, ...), envir = parent.frame())
+  dots <- list(...)
+  has.formula.route <- !is.null(object$bws$formula)
+
+  if (!has.formula.route && is.null(dots$edat) && !is.null(dots$newdata)) {
+    dots$edat <- dots$newdata
+    dots$newdata <- NULL
+  }
+
+  tr <- do.call(npudens, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
-                df = tr$nobs, log.likelihood = tr$ll))
+                df = tr$nobs, log.likelihood = tr$log_likelihood))
   else
     return(fitted(tr))
 }
@@ -76,8 +87,8 @@ predict.npdensity <- function(object, se.fit = FALSE, ...) {
 
 summary.npdensity <- function(object, ...) {
   cat("\nDensity Data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "", paste(" and ", object$nobs,
-                                      " evaluation points,", sep="")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs,
+                                      " evaluation points,", sep=""),
       " in ",object$ndim," variable(s)\n",sep="")
 
   cat(genOmitStr(object))
@@ -87,6 +98,7 @@ summary.npdensity <- function(object, ...) {
   cat(genDenEstStr(object))
 
   cat(genBwKerStrs(object$bws))
+  cat(genTimingStr(object))
   cat('\n\n')  
 
 }

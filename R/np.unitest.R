@@ -12,29 +12,23 @@ npunitest <- function(data.x = NULL,
                       bw.y = NULL,                         
                       random.seed = 42,
                       ...) {
+  .npRmpi_require_active_slave_pool(where = "npunitest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   if(is.null(data.x) || is.null(data.y)) stop(" you must enter data vectors for x and y")
   if(is.data.frame(data.x) || is.data.frame(data.y)) stop(" you must enter data vectors (not data frames)")
   if(!identical(class(data.x), class(data.y))) stop(" data vectors must be of same data type")
   if((ncol(data.frame(data.x)) != 1) ||( ncol(data.frame(data.y)) != 1)) stop(" data vectors must have one dimension only")
   if(boot.num < 9) stop(" number of bootstrap replications must be >= 9")
-  if(is.numeric(data.x) && (max(data.x) < min(data.y) || max(data.y) < min(data.x))) warning("non-overlapping empirical distributions (see `Details' in ?npunidist)")
+  if(is.numeric(data.x) && (max(data.x) < min(data.y) || max(data.y) < min(data.x))) .np_warning("non-overlapping empirical distributions (see `Details' in ?npunidist)")
 
   method <- match.arg(method)
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
-
-  set.seed(random.seed)
-
-  console <- newLineConsole()
-  console <- printPush("Computing bandwidths...", console = console)
+  seed.state <- .np_seed_enter(random.seed)
+  .np_progress_note("Computing bandwidths")
 
   ## If of type ts convert to numeric to handle time series data
 
@@ -58,6 +52,7 @@ npunitest <- function(data.x = NULL,
     if(is.null(bw.x)) {
       n <- length(data.x)
       c <- length(unique(data.x))
+      if(c <= 1) stop("data.x must contain at least two distinct factor levels")
       xeval <- unique(data.x)
       p <- fitted(npudens(tdat=data.x,edat=xeval,bws=0,...))
       sum.Lambda3 <- c/(c-1)*sum(p*(1-p))
@@ -68,6 +63,7 @@ npunitest <- function(data.x = NULL,
     if(is.null(bw.y)) {
       n <- length(data.y)
       c <- length(unique(data.y))
+      if(c <= 1) stop("data.y must contain at least two distinct factor levels")
       yeval <- unique(data.y)
       p <- fitted(npudens(tdat=data.y,edat=xeval,bws=0,...))
       sum.Lambda3 <- c/(c-1)*sum(p*(1-p))
@@ -102,11 +98,11 @@ npunitest <- function(data.x = NULL,
         ## case, remove offending points, and warn. This traps -Inf,
         ## Inf, and NaN.
         if(!all(is.finite(summand))) {
-          warning(" non-finite value in summation-based statistic: integration recommended")
+          .np_warning(" non-finite value in summation-based statistic: integration recommended")
           summand <- summand[is.finite(summand)]
         }
         Srho <- 0.5*mean((1-sqrt(summand))**2)
-        if(Srho < 0 || Srho > 1) warning(" numerical instability in summation-based statistic: integration recommended")
+        if(Srho < 0 || Srho > 1) .np_warning(" numerical instability in summation-based statistic: integration recommended")
         return(Srho)
       } else {
         ## Integration
@@ -116,7 +112,7 @@ npunitest <- function(data.x = NULL,
           return(0.5*(sqrt(f.data.x)-sqrt(f.data.y))**2)
         }
         return.integrate <- integrate(h,-Inf,Inf,subdivisions=1e+05,stop.on.error=FALSE,data.x=data.x,data.y=data.y)      
-        if(return.integrate$message != "OK") warning(return.integrate$message)
+        if(return.integrate$message != "OK") .np_warning(return.integrate$message)
         return(return.integrate$value)
       }
     } else {
@@ -132,13 +128,9 @@ npunitest <- function(data.x = NULL,
   
   ## Compute the test statistic
 
-  console <- printClear(console)
-  console <- printPush("Computing test statistic...", console = console)
+  .np_progress_note("Computing test statistic")
 
   test.stat <- Srho.univar(data.x,data.y,bw.x,bw.y,method=method)
-
-  console <- printClear(console)
-  console <- printPop(console)  
 
   if(bootstrap) {
     
@@ -167,35 +159,32 @@ npunitest <- function(data.x = NULL,
     }
     
     resampled.stat <- numeric(boot.num)
+    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
 
-    for(b in 1:boot.num) {
-      
-      console <- printClear(console)
-      console <- printPush(paste(sep="", "Bootstrap replication ",
-                                  b, "/", boot.num, "..."), console = console)
+    for (b in seq_len(boot.num)) {
+      progress <- .np_progress_step(progress, done = b)
 
       ## Need to think this through... is the null one density? If so
       ## resample from that density for both x and y?
       
       ## Conduct simple iid bootstrap resamples
       
-      data.null.x <- data.null[sample(1:length(data.null),length(data.x),replace=TRUE)]
-      data.null.y <- data.null[sample(1:length(data.null),length(data.y),replace=TRUE)]
+      data.null.x <- data.null[sample.int(length(data.null), size = length(data.x), replace = TRUE)]
+      data.null.y <- data.null[sample.int(length(data.null), size = length(data.y), replace = TRUE)]
 
       resampled.stat[b] <- Srho.univar(data.null.x,data.null.y,bw.x,bw.y,method=method)
-      
+
     }
+
+    progress <- .np_progress_end(progress)
     
-    p.value <- mean(ifelse(resampled.stat > test.stat, 1, 0))
+    p.value <- mean(resampled.stat > test.stat)
     
   }
-  
-  console <- printClear(console)
-  console <- printPop(console)  
 
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
 
   if(bootstrap) {
     unitest(Srho = test.stat,

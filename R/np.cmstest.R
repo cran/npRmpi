@@ -11,9 +11,12 @@ npcmstest <- function(formula,
                       density.weighted = TRUE,
                       random.seed = 42,
                       ...) {
+  .npRmpi_require_active_slave_pool(where = "npcmstest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
   
   pcall = paste(deparse(model$call),collapse="")
-  if(length(grep("x = (T|TRUE)[ ,)]", pcall)) == 0 | length(grep("y = (T|TRUE)[ ,)]", pcall)) == 0)
+  if(length(grep("x = (T|TRUE)[ ,)]", pcall)) == 0 || length(grep("y = (T|TRUE)[ ,)]", pcall)) == 0)
     stop(paste(sQuote("model")," is missing components ", sQuote("x"), " and ",
                sQuote("y"), ".\nTo fix this please invoke ", sQuote("lm"),
                " or ", sQuote("glm"),
@@ -31,9 +34,10 @@ npcmstest <- function(formula,
   else if(all(miss.xy) & miss.f)
     stop("xdat, and ydat, are missing, and no formula is specified.")
   else if(all(miss.xy) & !miss.f){
-    mf <- eval(parse(text=paste("model.frame(formula = formula, data = data,",
-                       ifelse(missing(subset),"","subset = subset,"),
-                           "na.action = na.omit)")))
+    mf.args <- list(formula = formula, data = data, na.action = na.omit)
+    if (!missing(subset))
+      mf.args$subset <- subset
+    mf <- do.call(model.frame, mf.args)
     
     ydat <- model.response(mf)
     xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
@@ -46,29 +50,24 @@ npcmstest <- function(formula,
     xdat = toFrame(xdat)
 
     ## catch and destroy NA's
-    goodrows = 1:dim(xdat)[1]
-    rows.omit = attr(na.omit(data.frame(xdat,ydat)), "na.action")
-    goodrows[rows.omit] = 0
+    keep.rows <- rep_len(TRUE, nrow(xdat))
+    rows.omit <- attr(na.omit(data.frame(xdat, ydat)), "na.action")
+    if (length(rows.omit) > 0L)
+      keep.rows[as.integer(rows.omit)] <- FALSE
 
-    if (all(goodrows==0))
+    if (!any(keep.rows))
       stop("Data has no rows without NAs")
 
-    xdat = xdat[goodrows,,drop = FALSE]
-    ydat = ydat[goodrows]
+    xdat <- xdat[keep.rows,,drop = FALSE]
+    ydat <- ydat[keep.rows]
 
-    na.index = which(goodrows==0)
+    na.index <- which(!keep.rows)
   }
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
+  seed.state <- .np_seed_enter(random.seed)
 
-  set.seed(random.seed)
 
   distribution = match.arg(distribution)
   boot.method = match.arg(boot.method)
@@ -83,12 +82,9 @@ npcmstest <- function(formula,
 
   ##  bw <- npregbw(xdat=xdat,ydat=model.resid)
 
-  console <- newLineConsole()
-  console <- printPush("Bandwidth selection", console)
+  .np_progress_note("Computing bandwidths")
 
-  bw <- npregbw(xdat=xdat, ydat=model$y, ...)
-
-  console <- printPop(console)
+  bw <- .np_progress_with_legacy_suppressed(npregbw(xdat=xdat, ydat=model$y, ...))
   
   ## Now define the Jn test statistic that takes arguments xdat, the
   ## residual vector, the bandwidth object, and the number of bootstrap
@@ -158,6 +154,13 @@ npcmstest <- function(formula,
   ## jracine March 8, 2006... not using boot() library (problematic I
   ## realized with [indices] hence unnecessary)
 
+  draw.wild.mult <- function(n.obs, a, b, p.a) {
+    u <- stats::runif(n.obs)
+    mult <- rep.int(b, n.obs)
+    mult[u <= p.a] <- a
+    mult
+  }
+
   boot.wild <- function(model.resid) {
 
     a <- -0.6180339887499 # (1-sqrt(5))/2
@@ -170,7 +173,7 @@ npcmstest <- function(formula,
 
     ## jracine removed [indices]
 
-    y.star <- yhat + model.resid*ifelse(rbinom(length(model.resid),1,P.a)==1,a,b)
+    y.star <- yhat + model.resid * draw.wild.mult(length(model.resid), a, b, P.a)
     resid <-
       if(is.null(model$family)) {
         residuals(glm(y.star~ model$x - 1), type = "response")
@@ -193,7 +196,7 @@ npcmstest <- function(formula,
 
     ## jracine removed [indices]
 
-    y.star <- yhat + model.resid*ifelse(rbinom(length(model.resid),1,P.a)==1,a,b)
+    y.star <- yhat + model.resid * draw.wild.mult(length(model.resid), a, b, P.a)
     resid <-
       if(is.null(model$family)) {
         residuals(glm(y.star~ model$x - 1), type = "response")
@@ -207,7 +210,7 @@ npcmstest <- function(formula,
 
   boot.iid <- function(model.resid) {
 
-    y.star <- yhat + sample(model.resid,replace=TRUE)
+    y.star <- yhat + model.resid[sample.int(length(model.resid), replace = TRUE)]
     resid <-
       if(is.null(model$family)) {
         residuals(glm(y.star~ model$x - 1), type = "response")
@@ -221,10 +224,9 @@ npcmstest <- function(formula,
 
   if(distribution == "bootstrap"){
     Sn.bootstrap <- numeric(boot.num)
+    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
 
-    for(ii in 1:boot.num) {
-      console <- printPush(paste(sep="", "Bootstrap replication ",
-                                 ii, "/", boot.num, "..."), console)
+    for (ii in seq_len(boot.num)) {
        if(boot.method == "iid"){
         Sn.bootstrap[ii] <- boot.iid(model.resid)
       } else if(boot.method == "wild"){
@@ -232,8 +234,9 @@ npcmstest <- function(formula,
       } else if(boot.method == "wild-rademacher"){
         Sn.bootstrap[ii] <- boot.wild.rademacher(model.resid)
       }
-      console <- printPop(console)
+      progress <- .np_progress_step(progress, done = ii)
     }
+    progress <- .np_progress_end(progress)
     Sn.bootstrap <- sort(Sn.bootstrap)
     ##cat("\n")
   }
@@ -282,14 +285,14 @@ npcmstest <- function(formula,
 
     Sn = if (pivot) tJn$Jn else tIn
 
-    tJn$P <- mean(ifelse(Sn.bootstrap > Sn, 1, 0))
+    tJn$P <- mean(Sn.bootstrap > Sn)
 
     
   }
   
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
   
   cmstest(Jn = tJn$Jn,
           In = tJn$In,
@@ -309,4 +312,3 @@ npcmstest <- function(formula,
           boot.num = boot.num,
           na.index = na.index)
 }
-

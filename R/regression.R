@@ -2,10 +2,15 @@ npregression <-
     function(bws, eval, mean, merr = NA, grad = NA, gerr = NA,
              resid = NA,
              ntrain, trainiseval = FALSE, gradients = FALSE, residuals = FALSE,
+             gradient.order = NULL,
              xtra = rep(NA, 6),
-             rows.omit = NA){
+             rows.omit = NA,
+             timing = NA,
+             total.time = NA,
+             optim.time = NA,
+             fit.time = NA){
 
-        if (missing(bws) | missing(eval) | missing(ntrain))
+        if (missing(bws) || missing(eval) || missing(ntrain))
             stop("improper invocation of npregression constructor")
 
         if (length(rows.omit) == 0)
@@ -36,6 +41,7 @@ npregression <-
             ntrain = ntrain,
             trainiseval = trainiseval,
             gradients = gradients,
+            gradient.order = gradient.order,
             residuals = residuals,
             R2 = xtra[1],
             MSE = xtra[2],
@@ -44,7 +50,11 @@ npregression <-
             CORR = xtra[5],
             SIGN = xtra[6],
             rows.omit = rows.omit,
-            nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)))
+            nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
+            timing = timing,
+            total.time = total.time,
+            optim.time = optim.time,
+            fit.time = fit.time)
 
         class(d) <- "npregression"
 
@@ -53,8 +63,8 @@ npregression <-
 
 print.npregression <- function(x, digits=NULL, ...){
   cat("\nRegression Data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "", paste(" and ", x$nobs," evaluation points,",
-                                      sep="")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs," evaluation points,",
+                                      sep=""),
       " in ",x$ndim," variable(s)\n",sep="")
 
   print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),x$xnames)))
@@ -72,29 +82,74 @@ fitted.npregression <- function(object, ...){
  object$mean 
 }
 residuals.npregression <- function(object, ...) {
- if(object$residuals) { return(object$resid) } else { return(npreg(bws = object$bws, residuals =TRUE)$resid) } 
+ if(object$residuals) {
+   return(object$resid)
+ } else {
+   call.residuals <- function() npreg(bws = object$bws, residuals = TRUE)$resid
+   if (.npRmpi_has_active_slave_pool(comm = 1L)) {
+     return(call.residuals())
+   }
+   return(.npRmpi_with_local_regression(call.residuals()))
+ }
 }
 se.npregression <- function(x) { x$merr }
-gradients.npregression <- function(x, errors = FALSE, ...) {
-  if(!errors)
-    return(x$grad)
-  else
-    return(x$gerr)
+gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...) {
+  gout <- if (!errors) x$grad else x$gerr
+  if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
+    stop(if (!errors)
+      "gradients are not available: fit the model with gradients=TRUE"
+    else
+      "gradient standard errors are not available: fit the model with gradients=TRUE")
+
+  if (!identical(x$bws$regtype, "lp") || is.null(gradient.order))
+    return(gout)
+
+  if (!is.matrix(gout))
+    return(gout)
+
+  gorder <- npValidateGlpGradientOrder(regtype = x$bws$regtype,
+                                       gradient.order = gradient.order,
+                                       ncon = x$bws$ncon)
+  gout.masked <- gout
+  gout.masked[,] <- NA_real_
+  cont.idx <- which(x$bws$icon)
+  if (length(cont.idx)) {
+    keep.cont <- (gorder <= x$bws$degree)
+    if (any(keep.cont)) {
+      keep.idx <- cont.idx[keep.cont]
+      gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]
+    }
+    if (any(gorder > x$bws$degree))
+      .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
+  }
+  gout.masked
 }
 predict.npregression <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npreg(bws = object$bws, ...), envir = parent.frame())
+  dots <- list(...)
+  has.formula.route <- !is.null(object$bws$formula)
+
+  if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
+    dots$exdat <- dots$newdata
+    dots$newdata <- NULL
+  }
+
+  call.predict <- function() do.call(npreg, c(list(bws = object$bws), dots))
+  tr <- if (.npRmpi_has_active_slave_pool(comm = 1L)) {
+    call.predict()
+  } else {
+    .npRmpi_with_local_regression(call.predict())
+  }
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs, residual.scale = tr$MSE))
   else
     return(fitted(tr))
 }
-plot.npregression <- function(x, ...) { npplot(bws = x$bws, ...) }
 
 summary.npregression <- function(object, ...) {
   cat("\nRegression Data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "", paste(" and ", object$nobs," evaluation points,",
-                                      sep="")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs," evaluation points,",
+                                      sep=""),
       " in ",object$ndim," variable(s)\n",sep="")
 
   cat(genOmitStr(object))
@@ -105,5 +160,6 @@ summary.npregression <- function(object, ...) {
   cat(genGofStr(object))
 
   cat(genBwKerStrs(object$bws))
+  cat(genTimingStr(object))
   cat('\n\n')  
 }

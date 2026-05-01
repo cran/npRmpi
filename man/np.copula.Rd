@@ -16,6 +16,10 @@ npcopula(bws,
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification and source data.
+}
+
   \item{bws}{
     an unconditional joint distribution (\code{npudistbw}) or joint
     density (\code{npudensbw}) bandwidth object (if \code{bws} is
@@ -23,27 +27,36 @@ npcopula(bws,
     while if \code{bws} is delivered via \code{npudensbw} the copula
     density is estimated)
   }
+
   \item{data}{
     a data frame containing variables used to construct \code{bws}
   }
+
+
+\subsection{Copula Evaluation Grid}{
+These arguments control the marginal probability grid and numerical inversion used for copula evaluation.
+}
+
+  \item{er.quasi.inv}{
+    number passed to \code{\link{extendrange}} when \code{u} is provided
+    specifying the fraction by which the data range should be extended when
+    constructing the grid used to compute the quasi-inverse (see details)
+  }
+
+  \item{n.quasi.inv}{
+    number of grid points generated when \code{u} is provided in order to
+    compute the quasi-inverse of each marginal distribution (see
+    details)
+  }
+
   \item{u}{
     an optional matrix of real numbers lying in [0,1], each column of
     which corresponds to the vector of uth quantile values desired for
     each variable in the copula (otherwise the u values returned are
     those corresponding to the sample realizations)
   }
-  \item{n.quasi.inv}{
-    number of grid points generated when \code{u} is provided in order to
-    compute the quasi-inverse of each marginal distribution (see
-    details)
-  }
-  \item{er.quasi.inv}{
-    number passed to \code{\link{extendrange}} when \code{u} is provided
-    specifying the fraction by which the data range should be extended when
-    constructing the grid used to compute the quasi-inverse (see details)
-  }
-}
 
+}
 \value{
 
   \code{npcopula} returns an object of type \code{\link{data.frame}}
@@ -77,6 +90,8 @@ npcopula(bws,
 }
 
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
 
   \code{npcopula} computes the nonparametric copula or copula density
   using inversion (Nelsen (2006), page 51). For the inversion approach,
@@ -127,6 +142,7 @@ npcopula(bws,
 }
 
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
   \link{npudensbw},\link{npudens},\link{npudist}
 }
 
@@ -141,44 +157,51 @@ npcopula(bws,
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+
+library(MASS)
 
 set.seed(42)
 
 ## Simulate correlated Gaussian data (rho(x,y)=0.99)
 
-n <- 1000
-n.eval <- 100
+n <- 300
+n.eval <- 30
 rho <- 0.99
 mu <- c(0,0)
 Sigma <- matrix(c(1,rho,rho,1),2,2)
-mydat <- mvrnorm(n=n, mu, Sigma)
-mydat <- data.frame(x=mydat[,1],
-                    y=ordered(as.integer(cut(mydat[,2],
-                      quantile(mydat[,2],seq(0,1,by=.1)),
-                      include.lowest=TRUE))-1))
+xy <- mvrnorm(n=n, mu, Sigma)
+x <- xy[,1]
+y <- ordered(as.integer(cut(xy[,2],
+                      quantile(xy[,2],seq(0,1,by=.1)),
+                      include.lowest=TRUE))-1)
+mydat <- data.frame(x=x, y=y)
 q.min <- 0.0
 q.max <- 1.0
 grid.seq <- seq(q.min,q.max,length=n.eval)
 grid.dat <- cbind(grid.seq,grid.seq)
 
-mpi.bcast.Robj2slave(mydat)
-mpi.bcast.Robj2slave(grid.dat)
-
 ## Estimate the copula (bw object obtained from npudistbw())
 
-mpi.bcast.cmd(bw.cdf <- npudistbw(~x+y,data=mydat),
-              caller.execute=TRUE)
-mpi.bcast.cmd(copula <- npcopula(bws=bw.cdf,data=mydat,u=grid.dat),
-              caller.execute=TRUE)
+bw.cdf <- npudistbw(~x+y, data=mydat)
+copula <- npcopula(bws=bw.cdf, data=mydat, u=grid.dat)
 
 ## Plot the copula
 
@@ -196,16 +219,18 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),
 
 ## Plot the empirical copula
 
-mpi.bcast.cmd(copula.emp <- npcopula(bws=bw.cdf,data=mydat),
-              caller.execute=TRUE)
-plot(copula.emp$u1,copula.emp$u2,xlab="u1",ylab="u2",cex=.25,main="Empirical Copula")
+copula.emp <- npcopula(bws=bw.cdf, data=mydat)
+if (interactive()) plot(copula.emp$u1,
+                        copula.emp$u2,
+                        xlab="u1",
+                        ylab="u2",
+                        cex=.25,
+                        main="Empirical Copula")
 
 ## Estimate the copula density (bw object obtained from npudensbw())
 
-mpi.bcast.cmd(bw.pdf <- npudensbw(~x+y,data=mydat),
-              caller.execute=TRUE)
-mpi.bcast.cmd(copula <- npcopula(bws=bw.pdf,data=mydat,u=grid.dat),
-              caller.execute=TRUE)
+bw.pdf <- npudensbw(~x+y, data=mydat)
+copula <- npcopula(bws=bw.pdf, data=mydat, u=grid.dat)
 
 ## Plot the copula density
 
@@ -221,21 +246,15 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
 
 ## Example 2: Bivariate Continuous Data
 
@@ -245,42 +264,39 @@ npRmpi.stop()               ## soft close (may keep slaves alive)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+npRmpi.init(nslaves=1)
 
-mpi.bcast.cmd(library(MASS),caller.execute=TRUE)
+library(MASS)
 
 set.seed(42)
 
 ## Simulate correlated Gaussian data (rho(x,y)=0.99)
 
-n <- 1000
-n.eval <- 100
+n <- 300
+n.eval <- 30
 rho <- 0.99
 mu <- c(0,0)
 Sigma <- matrix(c(1,rho,rho,1),2,2)
-mydat <- mvrnorm(n=n, mu, Sigma)
-mydat <- data.frame(x=mydat[,1],y=mydat[,2])
+xy <- mvrnorm(n=n, mu, Sigma)
+x <- xy[,1]
+y <- xy[,2]
+mydat <- data.frame(x=x, y=y)
 
 q.min <- 0.0
 q.max <- 1.0
 grid.seq <- seq(q.min,q.max,length=n.eval)
 grid.dat <- cbind(grid.seq,grid.seq)
 
-mpi.bcast.Robj2slave(mydat)
-mpi.bcast.Robj2slave(grid.dat)
-
 ## Estimate the copula (bw object obtained from npudistbw())
 
-mpi.bcast.cmd(bw.cdf <- npudistbw(~x+y,data=mydat),
-              caller.execute=TRUE)
-mpi.bcast.cmd(copula <- npcopula(bws=bw.cdf,data=mydat,u=grid.dat),
-              caller.execute=TRUE)
+bw.cdf <- npudistbw(~x+y, data=mydat)
+copula <- npcopula(bws=bw.cdf, data=mydat, u=grid.dat)
 
 ## Plot the copula
 
@@ -298,16 +314,18 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),
 
 ## Plot the empirical copula
 
-mpi.bcast.cmd(copula.emp <- npcopula(bws=bw.cdf,data=mydat),
-              caller.execute=TRUE)
-plot(copula.emp$u1,copula.emp$u2,xlab="u1",ylab="u2",cex=.25,main="Empirical Copula")
+copula.emp <- npcopula(bws=bw.cdf, data=mydat)
+if (interactive()) plot(copula.emp$u1,
+                        copula.emp$u2,
+                        xlab="u1",
+                        ylab="u2",
+                        cex=.25,
+                        main="Empirical Copula")
 
 ## Estimate the copula density (bw object obtained from npudensbw())
 
-mpi.bcast.cmd(bw.pdf <- npudensbw(~x+y,data=mydat),
-              caller.execute=TRUE)
-mpi.bcast.cmd(copula <- npcopula(bws=bw.pdf,data=mydat,u=grid.dat),
-              caller.execute=TRUE)
+bw.pdf <- npudensbw(~x+y, data=mydat)
+copula <- npcopula(bws=bw.pdf, data=mydat, u=grid.dat)
 
 ## Plot the copula density
 
@@ -320,21 +338,18 @@ persp(grid.seq,grid.seq,matrix(copula$copula,n.eval,n.eval),ticktype="detailed",
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun
 }
 

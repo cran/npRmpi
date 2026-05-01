@@ -1,14 +1,29 @@
+ .np_scbandwidth_manual_nn_validate <- function(bw, nobs, where = "scbandwidth") {
+  vapply(bw, function(h) {
+    .np_sibandwidth_manual_nn_validate(h = h, nobs = nobs, where = where)
+  }, numeric(1))
+}
+
 scbandwidth <-
   function(bw = stop("scbandwidth:argument 'bw' missing"),
+           regtype = c("lc","ll","lp"),
+           basis = c("glp","additive","tensor"),
+           degree = NULL,
+           bernstein.basis = FALSE,
            bwmethod = c("cv.ls", "manual"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
            ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
            ckerorder = c(2,4,6,8),
+           ckerbound = c("none","range","fixed"),
+           ckerlb = NULL,
+           ckerub = NULL,
            ukertype = c("aitchisonaitken", "liracine"),
-           okertype = c("liracine","wangvanryzin"),
+           okertype = c("liracine","wangvanryzin","racineliyan"),
            fval = NA,
            ifval = NA,
+           num.feval = NA,
+           num.feval.fast = NA,
            nobs = NA,
            numimp = NA,
            fval.vector = NA,
@@ -29,22 +44,26 @@ scbandwidth <-
            ...){
 
   ndim = length(bw)
+  npRejectLegacyLpArgs(names(list(...)), where = "scbandwidth")
+  regtype = match.arg(regtype)
+  basis <- npValidateLpBasis(regtype = regtype, basis = basis)
   bwmethod = match.arg(bwmethod)
   bwtype = match.arg(bwtype)
   ckertype = match.arg(ckertype)
+  ckerbound = match.arg(ckerbound)
 
   if(missing(ckerorder))
     ckerorder = 2
   else if (ckertype == "uniform")
-    warning("ignoring kernel order specified with uniform kernel type")
+    .np_warning("ignoring kernel order specified with uniform kernel type")
   else {
-    kord = eval(formals()$ckerorder) 
+    kord = c(2,4,6,8) 
     if (!any(kord == ckerorder))
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
 
   if (ckertype == "truncated gaussian" && ckerorder != 2)
-    warning("using truncated gaussian of order 2, higher orders not yet implemented")
+    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   ukertype = match.arg(ukertype)
   okertype = match.arg(okertype)
@@ -54,10 +73,39 @@ scbandwidth <-
   if(is.null(zdati))
     tdati <- xdati
 
+  cbounds <- npKernelBoundsResolve(
+    dati = tdati,
+    varnames = if(is.null(znames)) xnames else znames,
+    kerbound = ckerbound,
+    kerlb = ckerlb,
+    kerub = ckerub,
+    argprefix = "cker")
+  bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
+  if (bwtype != "fixed" && cbounds$bound != "none" && !bounded_nonfixed_supported)
+    stop("finite continuous kernel bounds require bwtype = \"fixed\"")
+  if (bwtype != "fixed" && (!bandwidth.compute || any(bw != 0)))
+    bw <- .np_scbandwidth_manual_nn_validate(bw = bw, nobs = nobs, where = "scbandwidth")
+  ncon <- sum(tdati$icon)
+  degree <- npValidateGlpDegree(regtype = regtype,
+                                degree = degree,
+                                ncon = ncon)
+  bernstein.basis <- npValidateGlpBernstein(regtype = regtype,
+                                            bernstein.basis = bernstein.basis)
+  if (identical(regtype, "lp") && ncon > 0L && is.finite(nobs)) {
+    lp.dim <- dim_basis(basis = basis,
+                        kernel = TRUE,
+                        degree = degree,
+                        segments = rep.int(1L, ncon))
+    if (is.finite(lp.dim) && lp.dim > (nobs - 1.0))
+      stop(sprintf("LP basis dimension (%s) exceeds nobs - 1 (%s); reduce degree",
+                   format(lp.dim, trim = TRUE, scientific = FALSE),
+                   format(nobs - 1.0, trim = TRUE, scientific = FALSE)))
+  }
+
   porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
 
   if (!identical(sfactor,NA)){
-    sumNum <- sapply(1:ndim, function(i) {
+    sumNum <- sapply(seq_len(ndim), function(i) {
       if (tdati$icon[i])
         return(sfactor[i])
 
@@ -77,6 +125,14 @@ scbandwidth <-
   
   mybw = list(
     bw=bw,
+    regtype = regtype,
+    pregtype = switch(regtype,
+      lc = "Local-Constant",
+      ll = "Local-Linear",
+      lp = "Local-Polynomial"),
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
     method = bwmethod,
     pmethod = bwmToPrint(bwmethod),
     pomethod = switch(optim.method,
@@ -85,20 +141,25 @@ scbandwidth <-
       "CG" = "CG", "NA"),
     fval = fval,
     ifval = ifval,
+    num.feval = num.feval,
+    num.feval.fast = num.feval.fast,
     scaling = bwscaling,
-    pscaling = ifelse(bwscaling, "Scale Factor(s)", "Bandwidth(s)"),
+    pscaling = npBandwidthSummaryLabel(bwtype = bwtype, bwscaling = bwscaling),
     type = bwtype,
     ptype = bwtToPrint(bwtype),
     ckertype = ckertype,    
     ckerorder = ckerorder,
-    pckertype = cktToPrint(ckertype, order = porder),
+    ckerbound = cbounds$bound,
+    ckerlb = cbounds$lb,
+    ckerub = cbounds$ub,
+    pckertype = cktToPrint(ckertype, order = porder, kerbound = cbounds$bound),
     ukertype = ukertype,
     pukertype = uktToPrint(ukertype),
     okertype = okertype,
     pokertype = oktToPrint(okertype),
     nobs = nobs,
     ndim = ndim,
-    ncon = sum(tdati$icon),
+    ncon = ncon,
     nuno = sum(tdati$iuno),
     nord = sum(tdati$iord),
     icon = tdati$icon,
@@ -119,7 +180,7 @@ scbandwidth <-
     vartitle = list(x = "Explanatory", y = "Dependent", z = "Explanatory"),
     vartitleabb = list(x = "Exp.", y = "Dep.", z = "Exp."),
     rows.omit = rows.omit,
-    nobs.omit = ifelse(identical(rows.omit,NA), 0, length(rows.omit)),
+    nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
     total.time = total.time)
 
   mybw$klist <-
@@ -130,7 +191,7 @@ scbandwidth <-
                 okertype = okertype,
                 pokertype = mybw$pokertype))
 
-  zorx <- ifelse(is.null(zdati), "x", "z")
+  zorx <- if (is.null(zdati)) "x" else "z"
   names(mybw$sfactor) <- zorx
   names(mybw$bandwidth) <- zorx 
   names(mybw$sumNum) <- zorx
@@ -165,8 +226,7 @@ print.scbandwidth <- function(x, digits=NULL, ...){
   invisible(x)
 }
 
-plot.scbandwidth <- function(...) { npplot(...)  }
-predict.scbandwidth <- function(...) { eval(npscoef(...), envir = parent.frame()) }
+predict.scbandwidth <- function(...) { do.call(npscoef, list(...)) }
 
 summary.scbandwidth <- function(object, ...){
   cat("\nSmooth Coefficient Regression",

@@ -1,4 +1,4 @@
-% $Id: np.kernelsum.Rd,v 1.64 2006/11/03 21:17:20 tristen Exp $
+% 
 \name{npksum}
 \alias{npksum}
 \alias{npksum.default}
@@ -14,20 +14,25 @@
 \usage{
 npksum(\dots)
 
-\method{npksum}{formula}(formula, data, newdata, subset, na.action, \dots)
+\method{npksum}{formula}(formula, 
+       data, 
+       newdata, 
+       subset, 
+       na.action, 
+       \dots)
 
 \method{npksum}{default}(bws,
        txdat = stop("training data 'txdat' missing"),
        tydat = NULL,
        exdat = NULL,
        weights = NULL,
-       leave.one.out = FALSE,
-       kernel.pow = 1.0,
        bandwidth.divide = FALSE,
+       compute.ocg = FALSE,
+       compute.score = FALSE,
+       kernel.pow = 1.0,
+       leave.one.out = FALSE,
        operator = names(ALL_OPERATORS),
        permutation.operator = names(PERMUTATION_OPERATORS),
-       compute.score = FALSE,
-       compute.ocg = FALSE,
        return.kernel.weights = FALSE,
        \dots)
 
@@ -36,18 +41,112 @@ npksum(\dots)
        tydat,
        exdat,
        weights,
-       leave.one.out,
-       kernel.pow,
        bandwidth.divide,
+       compute.ocg,
+       compute.score,
+       kernel.pow,
+       leave.one.out,
        operator,
        permutation.operator,
-       compute.score,
-       compute.ocg,
        return.kernel.weights,
        \dots)
 }
 
 \arguments{
+\subsection{Bandwidth And Data Inputs}{
+Core inputs defining the training data, optional weighted response, and
+evaluation points for the generalized product kernel sum.
+}
+
+  \item{bws}{
+    a bandwidth specification. This can be set as any suitable bandwidth
+    object returned from a bandwidth-generating function, or a numeric vector.
+  }
+  
+  \item{txdat}{
+    a \eqn{p}-variate data frame of sample realizations (training data) used to
+    compute the sum.
+  }
+  
+  \item{tydat}{
+    a numeric vector of data to be weighted. The \eqn{i}th kernel weight
+    is applied to the \eqn{i}th element. Defaults to  \code{1}.
+  }
+  
+  \item{exdat}{
+    a \eqn{p}-variate data frame of sum evaluation points (if omitted,
+    defaults to the training data itself).
+  }
+  
+  \item{weights}{
+    a \eqn{n} by \eqn{q}  matrix of weights which can optionally be
+    applied to \code{tydat} in the sum. See details.
+  }
+  
+\subsection{Kernel-Sum Operators And Output}{
+Controls for bandwidth normalization, kernel powers, leave-one-out
+evaluation, operator variants, and returned kernel weights.
+}
+
+  \item{bandwidth.divide}{
+    a logical specifying whether or not to divide continuous kernel
+    weights by their bandwidths. Use this with nearest-neighbor
+    methods. Defaults to \code{FALSE}.
+  }
+
+  \item{compute.ocg}{
+    a logical specifying whether or not to return a separate result for
+    each unordered and ordered dimension, where the product kernel term
+    for that dimension is evaluated at an appropriate reference
+    category. This is used primarily in \code{npRmpi} to compute ordered and
+    unordered categorical gradients. See details.
+  }
+
+  \item{compute.score}{
+    a logical specifying whether or not to return the score
+    (the \sQuote{grad h} terms) for each dimension in addition to the kernel
+    sum. Cannot be \code{TRUE} if a permutation operator other than
+    \code{"none"} is selected. 
+  }
+
+  \item{kernel.pow}{
+    an integer specifying the power to which the kernels will be raised
+    in the sum. Defaults to \code{1}.
+  }
+
+  \item{leave.one.out}{
+    a logical value to specify whether or not to compute the leave one
+    out sums. Will not work if \code{exdat} is specified. Defaults to
+    \code{FALSE}.
+  }
+
+  \item{operator}{
+    a string specifying whether the \code{normal}, \code{convolution},
+    \code{derivative}, or \code{integral} kernels are to be
+    used. Operators scale results by factors of \eqn{h} or \eqn{1/h} where
+    appropriate. Defaults to \code{normal} and applies to all elements in a
+    multivariate object. See details.
+  }
+
+  \item{permutation.operator}{
+    a string which can have a value of \code{none}, \code{normal},
+    \code{derivative}, or \code{integral}. If set to something other
+    than \code{none} (the default), then a separate result will be returned for each
+    term in the product kernel, with the operator applied to that term.
+    Permutation operators scale results by factors of \eqn{h} or \eqn{1/h} where
+    appropriate. This is useful for computing gradients, for example.
+  }
+
+  \item{return.kernel.weights}{
+    a logical specifying whether or not to return the matrix of
+    generalized product kernel weights. Defaults to \code{FALSE}. See
+    details.
+    }
+
+\subsection{Formula Interface}{
+Formula-method arguments for symbolic kernel-sum specifications.
+}
+
   \item{formula}{
     a symbolic description of variables on which the sum is
     to be performed. The details of constructing a formula are
@@ -78,94 +177,19 @@ npksum(\dots)
     \code{\link{na.omit}}.  
   }
 
+
+\subsection{Additional Arguments}{
+Further arguments passed to the default kernel-sum method.
+}
+
   \item{\dots}{
     additional arguments supplied to specify the parameters to the
     \code{default} S3 method, which is called during estimation. 
   }
-
-
-  \item{txdat}{
-    a \eqn{p}-variate data frame of sample realizations (training data) used to
-    compute the sum.
-  }
-  
-  \item{tydat}{
-    a numeric vector of data to be weighted. The \eqn{i}th kernel weight
-    is applied to the \eqn{i}th element. Defaults to  \code{1}.
-  }
-  
-  \item{exdat}{
-    a \eqn{p}-variate data frame of sum evaluation points (if omitted,
-    defaults to the training data itself).
-  }
-  
-  \item{bws}{
-    a bandwidth specification. This can be set as any suitable bandwidth
-    object returned from a bandwidth-generating function, or a numeric vector.
-  }
-  
-  \item{weights}{
-    a \eqn{n} by \eqn{q}  matrix of weights which can optionally be
-    applied to \code{tydat} in the sum. See details.
-  }
-  
-  \item{leave.one.out}{
-    a logical value to specify whether or not to compute the leave one
-    out sums. Will not work if \code{exdat} is specified. Defaults to
-    \code{FALSE}.
-  }
-
-  \item{kernel.pow}{
-    an integer specifying the power to which the kernels will be raised
-    in the sum. Defaults to \code{1}.
-  }
-
-  \item{bandwidth.divide}{
-    a logical specifying whether or not to divide continuous kernel
-    weights by their bandwidths. Use this with nearest-neighbor
-    methods. Defaults to \code{FALSE}.
-  }
-
-  \item{operator}{
-    a string specifying whether the \code{normal}, \code{convolution},
-    \code{derivative}, or \code{integral} kernels are to be
-    used. Operators scale results by factors of \eqn{h} or \eqn{1/h} where
-    appropriate. Defaults to \code{normal} and applies to all elements in a
-    multivariate object. See details.
-  }
-
-  \item{permutation.operator}{
-    a string which can have a value of \code{none}, \code{normal},
-    \code{derivative}, or \code{integral}. If set to something other
-    than \code{none} (the default), then a separate result will be returned for each
-    term in the product kernel, with the operator applied to that term.
-    Permutation operators scale results by factors of \eqn{h} or \eqn{1/h} where
-    appropriate. This is useful for computing gradients, for example.
-  }
-
-  \item{compute.score}{
-    a logical specifying whether or not to return the score
-    (the \sQuote{grad h} terms) for each dimension in addition to the kernel
-    sum. Cannot be \code{TRUE} if a permutation operator other than
-    \code{"none"} is selected. 
-  }
-
-  \item{compute.ocg}{
-    a logical specifying whether or not to return a separate result for
-    each unordered and ordered dimension, where the product kernel term
-    for that dimension is evaluated at an appropriate reference
-    category. This is used primarily in \code{npRmpi} to compute ordered and
-    unordered categorical gradients. See details.
-  }
-
-  \item{return.kernel.weights}{
-    a logical specifying whether or not to return the matrix of
-    generalized product kernel weights. Defaults to \code{FALSE}. See
-    details.
-    }
-
 }
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
   \code{npksum}
   exists so that you can create your own kernel objects with
   or without a variable to be weighted (default \eqn{Y=1}). With the options
@@ -329,6 +353,7 @@ npksum(\dots)
   type.
 }
 
+\seealso{\code{\link{npRmpi.init}} for MPI startup and workflow guidance.}
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.
@@ -338,27 +363,33 @@ npksum(\dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
 
 n <- 100000
 x <- rnorm(n)
 x.eval <- seq(-4, 4, length=50)
 
-mpi.bcast.Robj2slave(x)
-mpi.bcast.Robj2slave(x.eval)
+bw <- npudensbw(dat=x, bwmethod="normal-reference")
 
-mpi.bcast.cmd(bw <- npudensbw(dat=x, bwmethod="normal-reference"),
-              caller.execute=TRUE)
-
-mpi.bcast.cmd(den.ksum <- npksum(txdat=x, exdat=x.eval, bws=bw$bw,
-                   bandwidth.divide=TRUE)$ksum/n,
-              caller.execute=TRUE)
+den.ksum <- npksum(txdat=x, exdat=x.eval, bws=bw$bw,
+                   bandwidth.divide=TRUE)$ksum/n
 
 den.ksum
 
@@ -368,21 +399,18 @@ den.ksum
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
 } % enddontrun     
 }
 \keyword{ nonparametric }

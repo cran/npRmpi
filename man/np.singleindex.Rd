@@ -1,7 +1,6 @@
-% $ID$
+%
 \name{npindex}
 \alias{npindex}
-\alias{npindex.call}
 \alias{npindex.default}
 \alias{npindex.formula}
 \alias{npindex.sibandwidth}
@@ -28,12 +27,11 @@ npindex(bws, \dots)
         y.eval = FALSE,
         \dots)
 
-\method{npindex}{call}(bws,
-        \dots)
 
 \method{npindex}{default}(bws,
         txdat,
         tydat,
+        nomad = FALSE,
         \dots) 
 
 \method{npindex}{sibandwidth}(bws,
@@ -41,14 +39,17 @@ npindex(bws, \dots)
         tydat = stop("training data 'tydat' missing"),
         exdat,
         eydat,
+        boot.num = 399,
+        errors = FALSE,
         gradients = FALSE,
         residuals = FALSE,
-        errors = FALSE,
-        boot.num = 399,
         \dots)
 }
 
 \arguments{
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify the bandwidth specification, formula/data interface, and training data.
+}
 
   \item{bws}{
     a bandwidth specification. This can be set as a
@@ -57,39 +58,9 @@ npindex(bws, \dots)
     as a vector of parameters (beta) with each element \eqn{i}
     corresponding to the coefficient for column \eqn{i} in \code{txdat}
     where the first element is normalized to 1, and a scalar bandwidth
-    (h). 
+    (h).
   }
 
-  \item{gradients}{
-    a logical value indicating that you want gradients and the
-    asymptotic covariance matrix for beta computed and returned in the
-    resulting \code{singleindex} object. Defaults to \code{FALSE}.
-  }
-
-  \item{residuals}{
-    a logical value indicating that you want residuals computed and
-    returned in the resulting \code{singleindex} object. Defaults to
-    \code{FALSE}.
-  }
-
-  \item{errors}{
-    a logical value indicating that you want (bootstrapped)
-    standard errors for the conditional mean, gradients (when
-    \code{gradients=TRUE} is set), and average gradients (when
-    \code{gradients=TRUE} is set), computed and returned in the
-    resulting \code{singleindex} object. Defaults to \code{FALSE}.
-  }
-
-  \item{boot.num}{
-    an integer specifying the number of bootstrap replications to use
-    when performing standard error calculations. Defaults to
-    \code{399}. 
-  }
-
-  \item{\dots}{
-    additional arguments supplied to specify the parameters to the
-    \code{sibandwidth} S3 method, which is called during estimation. 
-  }
 
   \item{data}{
     an optional data frame, list or environment (or object
@@ -99,22 +70,13 @@ npindex(bws, \dots)
     \code{\link{npindexbw}} was called.
   }
 
-  \item{newdata}{
-    An optional data frame in which to look for evaluation data. If
-    omitted, the training data are used.  
-  }
-
-  \item{y.eval}{
-    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
-    \code{\link{npRmpi}} will compute goodness of fit statistics on these
-    data and return them. Defaults to \code{FALSE}.
-  }
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
     calculate the regression estimators. Defaults to the training data used to
     compute the bandwidth object.
   }
+
 
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
@@ -123,24 +85,119 @@ npindex(bws, \dots)
     compute the bandwidth object.
   }
 
+
+\subsection{Bandwidth Search Shortcut}{
+This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npindexbw}} when bandwidths are computed inside \code{npindex}.
+}
+
+  \item{nomad}{
+    logical shortcut passed through to \code{\link{npindexbw}} when
+    bandwidths are computed inside \code{npindex}. When \code{TRUE},
+    the single-index bandwidth route fills any missing values among
+    \code{regtype}, \code{search.engine}, \code{degree.select},
+    \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
+    \code{degree.verify}, and \code{bwtype} with the recommended
+    automatic LP NOMAD preset documented in \code{\link{npindexbw}}.
+    Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
+    also be supplied through \code{\dots}; \code{nmulti} remains the
+    outer restart count while \code{nomad.nmulti} controls inner
+    \code{crs::snomadr()} multistarts within each outer restart.
+    After fitting, inspect \code{fit$bws$nomad.shortcut} on the
+    returned object \code{fit} to see the normalized shortcut metadata.
+  }
+
+
+\subsection{Evaluation Data And Returned Quantities}{
+These arguments control where the single-index fit is evaluated and which evaluation quantities are returned.
+}
+
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
     evaluation takes place on the data provided by \code{txdat}.
   }
 
+
   \item{eydat}{
     a one (1) dimensional numeric or integer vector of the true values
     of the dependent variable. Optional, and used only to calculate the
-    true errors. 
+    true errors.
   }
-  
+
+
+  \item{newdata}{
+    An optional data frame in which to look for evaluation data. If
+    omitted, the training data are used.
+  }
+
+
+  \item{y.eval}{
+    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
+    \code{\link{npRmpi}} will compute goodness of fit statistics on these
+    data and return them. Defaults to \code{FALSE}.
+  }
+
+
+\subsection{Fitted Quantities And Inference}{
+These arguments control residuals, gradients, and bootstrap standard errors.
 }
 
+  \item{boot.num}{
+    an integer specifying the number of bootstrap replications to use
+    when performing standard error calculations. Defaults to
+    \code{399}.
+  }
+
+
+  \item{errors}{
+    a logical value indicating that you want (bootstrapped)
+    standard errors for the conditional mean, gradients (when
+    \code{gradients=TRUE} is set), and average gradients (when
+    \code{gradients=TRUE} is set), computed and returned in the
+    resulting \code{singleindex} object. Defaults to \code{FALSE}.
+  }
+
+
+  \item{gradients}{
+    a logical value indicating that you want gradients and the
+    asymptotic covariance matrix for beta computed and returned in the
+    resulting \code{singleindex} object. Defaults to \code{FALSE}.
+  }
+
+
+  \item{residuals}{
+    a logical value indicating that you want residuals computed and
+    returned in the resulting \code{singleindex} object. Defaults to
+    \code{FALSE}.
+  }
+
+
+\subsection{Additional Arguments}{
+Further arguments are passed to the bandwidth-selection counterpart when bandwidths are not supplied.
+}
+
+  \item{\dots}{
+    additional arguments supplied to specify the parameters to the
+    \code{sibandwidth} S3 method, which is called during estimation.
+  }
+}
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+
+  For S3 plotting help, use \code{methods("plot")} and query
+  class-specific help topics such as \code{?plot.npregression} and
+  \code{?plot.rbandwidth}. You can inspect implementations with
+  \code{getS3method("plot","npregression")}.
+
 
   A matrix of gradients along with average derivatives are computed and
   returned if \code{gradients=TRUE} is used.
+
+  For practitioners who want the recommended automatic LP NOMAD route
+  without spelling out all LP tuning arguments,
+  \code{npindex(..., nomad=TRUE)} and \code{npindexbw(..., nomad=TRUE)}
+  expand missing settings to the same documented preset. Explicit
+  incompatible settings fail fast rather than being silently rewritten.
 
 }
 
@@ -159,10 +216,10 @@ npindex(bws, \dots)
 
   \item{eval}{ evaluation points }
   \item{mean}{ estimates of the regression function (conditional mean) at the
-  evaluation points } 
+  evaluation points }
   \item{beta}{ the model coefficients }
   \item{betavcov}{ the asymptotic covariance matrix for the model coefficients}
-  \item{merr}{ standard errors of the regression function estimates } 
+  \item{merr}{ standard errors of the regression function estimates }
   \item{grad}{ estimates of the gradients at each evaluation point }
   \item{gerr}{ standard errors of the gradient estimates }
   \item{mean.grad}{ mean (average) gradient over the evaluation points}
@@ -210,13 +267,13 @@ npindex(bws, \dots)
   McFadden, D. and C. Puig and D. Kerschner (1977), \dQuote{Determinants
     of the long-run demand for electricity,} Proceedings of the
   American Statistical Association (Business and Economics Section),
-  109-117. 
+  109-117.
 
   Wang, M.C. and J. van Ryzin (1981), \dQuote{A class of smooth
     estimators for discrete distributions,} Biometrika, 68, 301-309.
 }
 
-    
+
 
 \author{
   Tristen Hayfield  \email{tristen.hayfield@gmail.com}, Jeffrey S. Racine \email{racinej@mcmaster.ca}
@@ -232,6 +289,11 @@ npindex(bws, \dots)
   \code{\link{vcov}} requires that \code{gradients=TRUE} be set.
 }
 
+\seealso{
+  \code{\link{npRmpi.init}} for MPI startup and workflow guidance.
+  \code{\link{np.kernels}}, \code{\link{np.options}},
+  \code{\link{plot}}, \code{\link{plot.np}}, \code{\link{npindexbw}}
+}
 \examples{
 \dontrun{
 ## Not run in checks: excluded to keep MPI examples stable and check times short.
@@ -241,38 +303,40 @@ npindex(bws, \dots)
 ## directory (npRmpi/demos) and study them carefully. Also kindly see
 ## the more extensive examples in the np package itself. See the npRmpi
 ## vignette for further details on running parallel np programs via
-## vignette("npRmpi",package="npRmpi").
+## vignette("npRmpi_getting_started", package = "npRmpi").
 
 ## Start npRmpi for interactive execution. If slaves are already running and
 ## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
 ## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.stop(force=TRUE)` then restart.
-npRmpi.start(nslaves=1)
+## slaves, call `npRmpi.quit(force=TRUE)` then restart.
 
-mpi.bcast.cmd(set.seed(42),
-              caller.execute=TRUE)
+force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+
+in.check <- !force.run && (
+            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
+            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
+            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
+            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
+          )
+
+if (!in.check) {
+npRmpi.init(nslaves=1)
+set.seed(42)
 
 n <- 500
 
 x1 <- runif(n, min=-1, max=1)
 x2 <- runif(n, min=-1, max=1)
 y <- x1 - x2 + rnorm(n)
-mydat <- data.frame(x1,x2,y)
-rm(y,x1,x2)
-
-mpi.bcast.Robj2slave(mydat)
 
 ## Ichimura, continuous y
 
-mpi.bcast.cmd(bw <- npindexbw(formula=y~x1+x2,
-                              data=mydat),
-              caller.execute=TRUE)
+bw <- npindexbw(formula=y~x1+x2)
 
 summary(bw)
 
-mpi.bcast.cmd(model <- npindex(bws=bw,
-                               gradients=TRUE),
-              caller.execute=TRUE)
+model <- npindex(bws=bw,
+                 gradients=TRUE)
 
 summary(model)
 
@@ -282,21 +346,18 @@ summary(model)
 ## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
 ## tearing down slaves in the same R session can lead to hangs/crashes.
 ## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.stop()` performs a "soft close". Use `force=TRUE` to
+## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
 ## actually shut down the slaves.
 ##
 ## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
 ## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
 ## loading the package.
 
-npRmpi.stop()               ## soft close (may keep slaves alive)
-## npRmpi.stop(force=TRUE)  ## hard close
-
-## Note that in order to exit npRmpi properly avoid quit(), and instead
-## use mpi.quit() as follows.
-
-## mpi.bcast.cmd(mpi.quit(),
-##               caller.execute=TRUE)
-} % enddontrun     
+npRmpi.quit()               ## soft close (may keep slaves alive)
+## npRmpi.quit(force=TRUE)  ## hard close
+} else {
+  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
+}
+} % enddontrun
 }
 \keyword{nonparametric}

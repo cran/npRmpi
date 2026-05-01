@@ -9,10 +9,9 @@
 	kernel methods that seamlessly handle a mix of continuous, unordered,
 	and ordered factor data types (unordered and ordered factors are often
 	referred to as \sQuote{nominal} and \sQuote{ordinal} categorical
-	variables respectively). A vignette containing many of the examples
-	found in the help files accompanying the \pkg{npRmpi} package that is
-	intended to serve as a gentle introduction to this package can be
-	accessed via \code{vignette("npRmpi", package="npRmpi")}.
+	variables respectively). A getting-started vignette containing a
+	short introduction to the \pkg{npRmpi} package can be accessed via
+	\code{vignette("npRmpi_getting_started", package = "npRmpi")}.
 
   For a listing of all routines in the \pkg{npRmpi} package type:
   \sQuote{library(help="npRmpi")}.  
@@ -26,25 +25,23 @@
   bandwidth objects to other functions, and those functions can grab the
   specifics from the bandwidth object thereby removing potential
   inconsistencies and unnecessary repetition. Furthermore, many
-  functions such as \code{\link{plot}} (which automatically calls
-  \code{npplot}) can work with the bandwidth object directly without
+  functions such as \code{\link{plot}} (via class-specific S3 methods)
+  can work with the bandwidth object directly without
   having to do the subsequent companion function evaluation.
 
-  As of \code{npRmpi} version 0.20-0, we allow the user to combine these
-  steps. When using \code{npRmpi} versions 0.20-0 and higher, if the first
-  step (bandwidth selection) is not performed explicitly then the second
-  step will automatically call the omitted first step bandwidth selector
-  using defaults unless otherwise specified, and the bandwidth object
-  could then be retrieved retroactively if so desired via
-  \code{objectname$bws}. Furthermore, options for bandwidth selection
-  will be passed directly to the bandwidth selector function. Note that
-  the combined approach would not be a wise choice for certain
-  applications such as when bootstrapping (as it would involve
-  unnecessary computation since the bandwidths would properly be those
-  for the original sample and not the bootstrap resamples) or when
-  conducting quantile regression (as it would involve unnecessary
-  computation when different quantiles are computed from the same
-  conditional cumulative distribution estimate).
+  The user may also combine these steps. If the first step (bandwidth
+  selection) is not performed explicitly then the second step will
+  automatically call the omitted first-step bandwidth selector using
+  defaults unless otherwise specified, and the bandwidth object can be
+  retrieved retroactively if so desired via \code{objectname$bws}.
+  Furthermore, options for bandwidth selection will be passed directly
+  to the bandwidth selector function. Note that the combined approach
+  would not be a wise choice for certain applications such as when
+  bootstrapping (as it would involve unnecessary computation since the
+  bandwidths would properly be those for the original sample and not the
+  bootstrap resamples) or when conducting quantile regression (as it
+  would involve unnecessary computation when different quantiles are
+  computed from the same conditional cumulative distribution estimate).
   
   There are two ways in which you can interact with functions in
   \code{npRmpi}, either i) using data frames, or ii) using a formula
@@ -106,11 +103,10 @@
 	implemented, while the user can specify their own bandwidths should
 	they so choose (either a raw bandwidth or scaling factor).
 
-	A flexible plotting utility, \code{\link{npplot}} (which is
-	automatically invoked by \code{\link{plot}}) , facilitates graphing of
-	multivariate objects. An example for creating postscript graphs using
-	the \code{\link{npplot}} utility and pulling this into a LaTeX
-	document is provided.
+	A flexible plotting utility, via class-specific S3
+	\code{\link{plot}} methods, facilitates graphing of multivariate
+	objects. An example for creating postscript graphs and pulling this
+	into a LaTeX document is provided.
 
 	The function \code{\link{npksum}} allows users to create or implement
 	their own kernel estimators or tests should they so desire.
@@ -118,17 +114,20 @@
 	The underlying functions are written in C for computational
 	efficiency. Despite this, due to their nature, data-driven bandwidth
 	selection methods involving multivariate numerical search can be
-	time-consuming, particularly for large datasets. A version of this
-	package using the \code{Rmpi} wrapper is under development that allows
-	one to deploy this software in a clustered computing environment to
-	facilitate computation involving large datasets.
+	time-consuming, particularly for large datasets. The \pkg{npRmpi}
+	package provides the MPI-aware companion to \pkg{np}, extending the
+	same mixed-data kernel methodology to clustered computing environments
+	while preserving the familiar estimator surface after MPI
+	initialization.
 
   To cite the \code{npRmpi} package, type \code{citation("npRmpi")} from within
   \code{R} for details.
 
 }
 
-\details{ The kernel methods in \code{npRmpi} employ the so-called
+\details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template. For interactive and cluster batch workflows, see \code{\link{npRmpi.init}}.
+ The kernel methods in \code{npRmpi} employ the so-called
 	\sQuote{generalized product kernels} found in Hall, Racine,
 	and Li (2004), Li, Lin, and Racine (2013), Li, Ouyang, and
 	Racine (2013), Li and Racine (2003), Li and Racine (2004), Li
@@ -237,6 +236,14 @@
       \eqn{1}.
     }
 
+    \item{Racine, Li, and Yan (\eqn{x} is a (discrete) ordered factor)}{
+      \eqn{l(x_i,x,\lambda)=\lambda^{|x_i-x|}/\sum_{z \in D}\lambda^{|x_i-z|}}{l(x[i],x,lambda)=lambda^|x[i]-x|/sum_{z in D}lambda^|x[i]-z|},
+      where \eqn{D} is the ordered support.
+
+      Note that \eqn{\lambda}{lambda} must lie between \eqn{0} and
+      \eqn{1}.
+    }
+
   }
 
   So, if you had two variables, \eqn{x_{i1}}{x1[i]} and
@@ -253,6 +260,15 @@
   Note that higher order continuous kernels (i.e., fourth, sixth, and
   eighth order) are derived from the second order kernels given above
   (see Li and Racine (2007) for details).
+
+  For continuous kernels, one can optionally enforce finite support
+  normalization via user-supplied bounds. When finite lower/upper bounds
+  are supplied (e.g., \code{ckerbound="fixed"} with \code{ckerlb} and
+  \code{ckerub}), continuous kernels are normalized on
+  \eqn{[a,b]}{[a,b]} using the corresponding kernel CDF in the denominator.
+  Setting infinite bounds recovers the standard unbounded kernel.
+  This boundary-adaptive normalization is especially useful for
+  unconditional density/distribution estimation on bounded supports.
 
   For particulars on any given method, kindly see the references listed
   for the method in question.
@@ -312,6 +328,14 @@
   Racine, J.S. and Q. Li (2004), \dQuote{Nonparametric estimation of
 	regression functions with both categorical and continuous data,}
 	Journal of Econometrics, 119, 99-130.
+
+  Racine, J.S. and Q. Li and Q. Wang (2024), \dQuote{Boundary-Adaptive
+  Kernel Density Estimation: The Case of (Near) Uniform Density,}
+  Journal of Nonparametric Statistics, 36(1), 146-164.
+
+  Racine, J.S., Q. Li, and K.X. Yan (2020), \dQuote{Kernel Smoothed
+  Probability Mass Functions for Ordered Datatypes,} Journal of
+  Nonparametric Statistics, 32(3), 563-586.
   
   Pagan, A. and A. Ullah (1999), \emph{Nonparametric Econometrics,}
   Cambridge University Press.
@@ -325,5 +349,9 @@
   Wang, M.C. and J. van Ryzin (1981), \dQuote{A class of smooth
   estimators for discrete distributions,} Biometrika, 68, 301-309.
 
+}
+\seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
+  \code{\link{np.options}}
 }
 \keyword{package}

@@ -1,4 +1,6 @@
 np.pairs <- function(y_vars, y_dat, ...) {
+  .npRmpi_require_active_slave_pool(where = "np.pairs()")
+
   if (missing(y_vars) || missing(y_dat))
     stop("'y_vars' and 'y_dat' are required")
   if (!is.data.frame(y_dat))
@@ -13,15 +15,20 @@ np.pairs <- function(y_vars, y_dat, ...) {
     y1 <- pair_names[i, 1]
     y2 <- pair_names[i, 2]
     if (y1 == y2) {
-      npudens(tdat = y_dat[, y1], ...)
+      ddat <- data.frame(v = y_dat[, y1])
+      bw <- npudensbw(formula = ~v, dat = ddat, ...)
+      npudens(bws = bw, dat = ddat, ...)
     } else {
-      npreg(tydat = y_dat[, y2], txdat = y_dat[, y1], residuals = TRUE, ...)
+      rdat <- data.frame(y = y_dat[, y2], x = y_dat[, y1])
+      bw <- npregbw(formula = y ~ x, data = rdat, ...)
+      npreg(bws = bw, data = rdat, residuals = TRUE, ...)
     }
   })
   list(y_vars = y_vars, pair_names = pair_names, pair_kerns = pair_kerns)
 }
 
 np.pairs.plot <- function(pair_list) {
+  .npRmpi_require_active_slave_pool(where = "np.pairs.plot()")
   if (length(pair_list) < 3)
     stop("pair_list must be created by np.pairs")
 
@@ -30,8 +37,8 @@ np.pairs.plot <- function(pair_list) {
   y_vars <- pair_list[["y_vars"]]
   y_labels <- names(y_vars)
 
-  oldpar <- par(no.readonly = TRUE)
-  on.exit(par(oldpar), add = TRUE)
+  oldpar <- .np_plot_capture_par(c("mfrow", "mar"))
+  on.exit(.np_plot_restore_par(oldpar), add = TRUE)
   par(mfrow = c(length(y_vars), length(y_vars)), mar = c(4, 4, 2, 0))
   for (i in seq_len(nrow(pair_names))) {
     y1 <- pair_names[i, 1]

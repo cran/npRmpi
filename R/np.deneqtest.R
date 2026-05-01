@@ -11,6 +11,9 @@ npdeneqtest <- function(x = NULL,
                         boot.num = 399,
                         random.seed = 42,
                         ...) {
+  .npRmpi_require_active_slave_pool(where = "npdeneqtest()")
+  if (.npRmpi_autodispatch_active())
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   ## Some testing of input values
 
@@ -19,21 +22,17 @@ npdeneqtest <- function(x = NULL,
   if(!identical(names(data.frame(x)),names(data.frame(y)))) stop(" data frames x and y must have identical variable names")
   if(boot.num < 9) stop(" number of bootstrap replications must be >= 9")
 
+  .np_progress_note("Computing bandwidths")
+
   if(is.null(bw.x) || is.null(bw.y)) {
-    bw.x <- npudensbw(dat=x,...)
-    bw.y <- npudensbw(dat=y,...)     
+    bw.x <- .np_progress_with_legacy_suppressed(npudensbw(dat=x,...))
+    bw.y <- .np_progress_with_legacy_suppressed(npudensbw(dat=y,...))
   }
 
   ## Save seed prior to setting
 
-  if(exists(".Random.seed", .GlobalEnv)) {
-    save.seed <- get(".Random.seed", .GlobalEnv)
-    exists.seed = TRUE
-  } else {
-    exists.seed = FALSE
-  }
+  seed.state <- .np_seed_enter(random.seed)
 
-  set.seed(random.seed)
 
   ## First, define test statistic function. This will return the
   ## standardized and unstandardized test statistic along with its
@@ -108,8 +107,8 @@ npdeneqtest <- function(x = NULL,
     n2 <- nrow(y)
     ## Resample from pooled data
     z <- data.frame(rbind(x,y))
-    x.bootstrap <- data.frame(z[sample(nrow(z),size=n1,replace=TRUE),])      
-    y.bootstrap <- data.frame(z[sample(nrow(z),size=n2,replace=TRUE),])      
+    x.bootstrap <- data.frame(z[sample.int(nrow(z), size = n1, replace = TRUE), ])      
+    y.bootstrap <- data.frame(z[sample.int(nrow(z), size = n2, replace = TRUE), ])      
     output.boot <- teststat(x.bootstrap,y.bootstrap,bw.x,bw.y)
     return(list(Tn=output.boot$Tn,
                 In=output.boot$In))
@@ -117,20 +116,17 @@ npdeneqtest <- function(x = NULL,
   
   Tn.vector <- numeric(boot.num)
   In.vector <- numeric(boot.num)
-  
-  console <- newLineConsole()
 
-  for(i in 1:boot.num) {
-    console <- printClear(console)
-    console <- printPush(paste(sep="", "Bootstrap replication ",
-                               i, "/", boot.num, "..."), console)
+  progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
+
+  for (i in seq_len(boot.num)) {
     output.boot <- teststat.boot(x,y,bw.x,bw.y)
     Tn.vector[i] <- output.boot$Tn
     In.vector[i] <- output.boot$In
+    progress <- .np_progress_step(progress, done = i)
   }
-  
-  console <- printClear(console)
-  console <- printPop(console)  
+
+  progress <- .np_progress_end(progress)
 
   ## Compute the test statistic
   
@@ -139,12 +135,12 @@ npdeneqtest <- function(x = NULL,
   ## Compute empirical P-values - the number of resampled statistics
   ## more extreme than the original statistic
   
-  Tn.P <- mean(ifelse(Tn.vector>output$Tn,1,0))
-  In.P <- mean(ifelse(In.vector>output$In,1,0))
+  Tn.P <- mean(Tn.vector > output$Tn)
+  In.P <- mean(In.vector > output$In)
   
   ## Restore seed
 
-  if(exists.seed) assign(".Random.seed", save.seed, .GlobalEnv)
+  .np_seed_exit(seed.state)
   
   deneqtest(Tn=output$Tn,
             In=output$In,

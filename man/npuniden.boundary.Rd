@@ -33,48 +33,76 @@ npuniden.boundary(X = NULL,
                               "beta1","beta2",
                               "fb","fbl","fbu",
                               "rigaussian","gamma"),
-                  nmulti = 5,
+                  nmulti = 1,
                   proper = FALSE)
 }
 \arguments{
-  \item{X}{
-a required numeric vector of training data lying in \eqn{[a,b]}
+\subsection{Data, Bandwidth Inputs And Formula Interface}{
+These arguments identify evaluation points, observations, support bounds, and optional bandwidths.
 }
-  \item{Y}{
-an optional numeric vector of evaluation data lying in \eqn{[a,b]}
-}
-  \item{h}{
-an optional bandwidth (>0)
-}
+
   \item{a}{
 an optional lower bound (defaults to lower bound of empirical support \eqn{\min(X)})
 }
+
   \item{b}{
 an optional upper bound (defaults to upper bound of empirical support \eqn{\max(X)})
 }
+
+
+  \item{h}{
+an optional bandwidth (>0)
+}
+
+  \item{X}{
+a required numeric vector of training data lying in \eqn{[a,b]}
+}
+
+  \item{Y}{
+an optional numeric vector of evaluation data lying in \eqn{[a,b]}
+}
+
+\subsection{Bandwidth Search Controls}{
+These arguments control the boundary-corrected bandwidth search.
+}
+
   \item{bwmethod}{
 whether to conduct bandwidth search via least squares cross-validation
 (\code{"cv.ls"}) or likelihood cross-validation (\code{"cv.ml"})
 }
+
   \item{cv}{
 an optional argument for search (default is likely more reliable in the
 presence of local maxima)
 }
+
   \item{grid}{
 an optional grid used for the initial grid search when \code{cv="grid-hybrid"}
 }
+
   \item{kertype}{
 an optional kernel specification (defaults to "gaussian1")
 }
+
   \item{nmulti}{
-number of multi-starts used when \code{cv="numeric"} (defaults to 5)
+number of multi-starts used when \code{cv="numeric"} (defaults to 1 for
+the univariate boundary problem)
 }
+
+
+\subsection{Proper Density Control}{
+This argument controls optional proper-density repair.
+}
+
   \item{proper}{
 an optional logical value indicating whether to enforce proper density
 and distribution function estimates over the range \eqn{[a,b]}
 }
+
 }
 \details{
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template. For interactive and cluster batch workflows, see \code{\link{npRmpi.init}}.
+
   Typical usages are (see below for a complete list of options and also
   the examples at the end of this help file)
   \preformatted{
@@ -208,6 +236,7 @@ and distribution function estimates over the range \eqn{[a,b]}
 Jeffrey S. Racine \email{racinej@mcmaster.ca}
 }
 \seealso{
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
 The \pkg{Ake}, \pkg{bde}, and \pkg{Conake} packages and the function \code{\link{npuniden.reflect}}.
 }
 \examples{
@@ -226,21 +255,23 @@ model.b2 <- npuniden.boundary(X,kertype="beta2")
 model.fb <- npuniden.boundary(X,kertype="fb")
 model.unadjusted <- npuniden.boundary(X,a=-Inf,b=Inf)
 ylim <- c(0,max(c(dgp,model.g1$f,model.g2$f,model.b1$f,model.b2$f,model.fb$f)))
-plot(X,dgp,ylab="Density",ylim=ylim,type="l")
-lines(X,model.g1$f,lty=2,col=2)
-lines(X,model.g2$f,lty=3,col=3)
-lines(X,model.b1$f,lty=4,col=4)
-lines(X,model.b2$f,lty=5,col=5)
-lines(X,model.fb$f,lty=6,col=6)
-lines(X,model.unadjusted$f,lty=7,col=7)
-rug(X)
-legend("topleft",c("DGP",
-                   "Boundary Kernel (gaussian1)",
-                   "Boundary Kernel (gaussian2)",
-                   "Boundary Kernel (beta1)",
-                   "Boundary Kernel (beta2)",
-                   "Boundary Kernel (floating boundary)",
-                   "Unadjusted"),col=1:7,lty=1:7,bty="n")
+if (interactive()) {
+  plot(X,dgp,ylab="Density",ylim=ylim,type="l")
+  lines(X,model.g1$f,lty=2,col=2)
+  lines(X,model.g2$f,lty=3,col=3)
+  lines(X,model.b1$f,lty=4,col=4)
+  lines(X,model.b2$f,lty=5,col=5)
+  lines(X,model.fb$f,lty=6,col=6)
+  lines(X,model.unadjusted$f,lty=7,col=7)
+  rug(X)
+  legend("topleft",c("DGP",
+                     "Boundary Kernel (gaussian1)",
+                     "Boundary Kernel (gaussian2)",
+                     "Boundary Kernel (beta1)",
+                     "Boundary Kernel (beta2)",
+                     "Boundary Kernel (floating boundary)",
+                     "Unadjusted"),col=1:7,lty=1:7,bty="n")
+}
 
 ## Example 2: f(0)=0, f(1)=0, plot density, distribution, DGP, and
 ## asymptotic point-wise confidence intervals
@@ -248,21 +279,26 @@ set.seed(42)
 X <- sort(rbeta(100,5,3))
 model <- npuniden.boundary(X)
 oldpar <- par(no.readonly = TRUE)
+on.exit(par(oldpar), add = TRUE)
 par(mfrow=c(1,2))
 ylim=range(c(model$f,model$f+1.96*model$sd.f,model$f-1.96*model$sd.f,dbeta(X,5,3)))
-plot(X,model$f,ylim=ylim,ylab="Density",type="l",)
-lines(X,model$f+1.96*model$sd.f,lty=2)
-lines(X,model$f-1.96*model$sd.f,lty=2)
-lines(X,dbeta(X,5,3),col=2)
-rug(X)
-legend("topleft",c("Density","DGP"),lty=c(1,1),col=1:2,bty="n")
+if (interactive()) {
+  plot(X,model$f,ylim=ylim,ylab="Density",type="l",)
+  lines(X,model$f+1.96*model$sd.f,lty=2)
+  lines(X,model$f-1.96*model$sd.f,lty=2)
+  lines(X,dbeta(X,5,3),col=2)
+  rug(X)
+  legend("topleft",c("Density","DGP"),lty=c(1,1),col=1:2,bty="n")
+}
 
-plot(X,model$F,ylab="Distribution",type="l")
-lines(X,model$F+1.96*model$sd.F,lty=2)
-lines(X,model$F-1.96*model$sd.F,lty=2)
-lines(X,pbeta(X,5,3),col=2)
-rug(X)
-legend("topleft",c("Distribution","DGP"),lty=c(1,1),col=1:2,bty="n")
+if (interactive()) {
+  plot(X,model$F,ylab="Distribution",type="l")
+  lines(X,model$F+1.96*model$sd.F,lty=2)
+  lines(X,model$F-1.96*model$sd.F,lty=2)
+  lines(X,pbeta(X,5,3),col=2)
+  rug(X)
+  legend("topleft",c("Distribution","DGP"),lty=c(1,1),col=1:2,bty="n")
+}
 
 ## Example 3: Age for working age males in the cps71 data set bounded
 ## below by 21 and above by 65
@@ -275,7 +311,6 @@ lines(age,model$f)
 lines(density(age,bw=model$h),col=2)
 legend("topright",c("Boundary Kernel","Unadjusted"),lty=c(1,1),col=1:2,bty="n")
 detach(cps71)
-par(oldpar)
 } % enddontrun
 }
 \keyword{ nonparametric }

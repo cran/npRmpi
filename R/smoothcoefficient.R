@@ -3,9 +3,11 @@ smoothcoefficient <-
            grad = NA, gerr = NA, resid = NA,
            ntrain, trainiseval = FALSE, residuals = FALSE,
            betas = FALSE,
-           xtra = rep(NA, 6)){
+           xtra = rep(NA, 6),
+           timing = NA, total.time = NA,
+           optim.time = NA, fit.time = NA){
 
-    if (missing(bws) | missing(eval) | missing(ntrain))
+    if (missing(bws) || missing(eval) || missing(ntrain))
       stop("improper invocation of smoothcoefficient constructor")
 
     d = list(
@@ -40,7 +42,11 @@ smoothcoefficient <-
       MAE = xtra[3],
       MAPE = xtra[4],
       CORR = xtra[5],
-      SIGN = xtra[6]
+      SIGN = xtra[6],
+      timing = timing,
+      total.time = total.time,
+      optim.time = optim.time,
+      fit.time = fit.time
       )
 
     class(d) = "smoothcoefficient"
@@ -51,8 +57,7 @@ smoothcoefficient <-
 print.smoothcoefficient <- function(x, digits=NULL, ...){
   cat("\nSmooth Coefficient Model",
       "\nRegression data: ", x$ntrain, " training points,",
-      ifelse(x$trainiseval, "",
-             paste(" and ", x$nobs," evaluation points,", sep="")),
+      if (x$trainiseval) "" else paste(" and ", x$nobs," evaluation points,", sep=""),
       " in ",x$ndim," variable(s)\n",sep="")
   print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),
                                   if(is.null(x$znames)) x$xnames else x$znames)))
@@ -79,13 +84,31 @@ coef.smoothcoefficient <- function(object, ...) {
 fitted.smoothcoefficient <- function(object, ...){
  object$mean 
 }
-plot.smoothcoefficient <- function(x, ...) { npplot(bws = x$bws, ...) }
 residuals.smoothcoefficient <- function(object, ...) {
  if(object$residuals) { return(object$resid) } else { return(npscoef(bws = object$bws, residuals =TRUE)$resid) } 
 }
 se.smoothcoefficient <- function(x){ x$merr }
 predict.smoothcoefficient <- function(object, se.fit = FALSE, ...) {
-  tr <- eval(npscoef(bws = object$bws, ...), envir = parent.frame())
+  dots <- list(...)
+  has.formula.route <- !is.null(object$bws$formula)
+
+  if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
+    nd <- toFrame(dots$newdata)
+    if (!is.null(object$bws$znames)) {
+      need <- c(object$bws$xnames, object$bws$znames)
+      if (!all(need %in% names(nd)))
+        stop("'newdata' must include columns: ", paste(need, collapse = ", "))
+      dots$exdat <- nd[, object$bws$xnames, drop = FALSE]
+      dots$ezdat <- nd[, object$bws$znames, drop = FALSE]
+    } else {
+      if (!all(object$bws$xnames %in% names(nd)))
+        stop("'newdata' must include columns: ", paste(object$bws$xnames, collapse = ", "))
+      dots$exdat <- nd[, object$bws$xnames, drop = FALSE]
+    }
+    dots$newdata <- NULL
+  }
+
+  tr <- do.call(npscoef, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs, residual.scale = tr$MSE))
@@ -96,8 +119,7 @@ predict.smoothcoefficient <- function(object, se.fit = FALSE, ...) {
 summary.smoothcoefficient <- function(object, ...){
   cat("\nSmooth Coefficient Model",
       "\nRegression data: ", object$ntrain, " training points,",
-      ifelse(object$trainiseval, "",
-             paste(" and ", object$nobs," evaluation points,", sep="")),
+      if (object$trainiseval) "" else paste(" and ", object$nobs," evaluation points,", sep=""),
       " in ",object$ndim," variable(s)\n",sep="")
 
   cat(genOmitStr(object))
@@ -111,5 +133,6 @@ summary.smoothcoefficient <- function(object, ...){
   cat(genGofStr(object))
 
   cat(genBwKerStrs(object$bws))
+  cat(genTimingStr(object))
   cat('\n\n')  
 }
