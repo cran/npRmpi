@@ -193,7 +193,8 @@
 }
 
 .np_progress_single_line_surfaces <- function() {
-  c("bandwidth", "plot_activity", "plot_bounded", "bootstrap", "lag", "iv_solve")
+  c("bandwidth", "plot_activity", "plot_bounded", "bootstrap", "lag", "iv_solve",
+    "copula")
 }
 
 .np_progress_renderer_for_surface <- function(surface, capability) {
@@ -560,6 +561,7 @@
   if (!grepl("Selecting polynomial degree and bandwidth", line, fixed = TRUE) &&
       !grepl("Selecting polynomial degree and bw", line, fixed = TRUE) &&
       !grepl("Selecting degree and bandwidth", line, fixed = TRUE) &&
+      !grepl("Selecting degree/bandwidth", line, fixed = TRUE) &&
       !grepl("Refining bandwidth", line, fixed = TRUE)) {
     return(line)
   }
@@ -569,6 +571,7 @@
     out <- sub("Selecting polynomial degree and bandwidth", "Degree/bw search", out, fixed = TRUE)
     out <- sub("Selecting polynomial degree and bw", "Degree/bw search", out, fixed = TRUE)
     out <- sub("Selecting degree and bandwidth", "Degree/bw search", out, fixed = TRUE)
+    out <- sub("Selecting degree/bandwidth", "Degree/bw search", out, fixed = TRUE)
     out <- sub("Refining bandwidth", "Refining bw", out, fixed = TRUE)
     out <- gsub("elapsed ", "elap ", out, fixed = TRUE)
     out <- gsub("restart ", "r ", out, fixed = TRUE)
@@ -578,10 +581,61 @@
     out
   }
 
-  candidates <- list(
+  compact_fields <- function(text) {
+    out <- compact(text)
+    out <- gsub("multistart ", "ms ", out, fixed = TRUE)
+    out <- gsub("iteration ", "iter ", out, fixed = TRUE)
+    out
+  }
+
+  field_drop_candidates <- function(text) {
+    if (!endsWith(text, ")")) {
+      return(character(0L))
+    }
+
+    open <- regexpr(" (", text, fixed = TRUE)[1L]
+    if (open <= 0L) {
+      return(character(0L))
+    }
+
+    prefix <- substr(text, 1L, open - 1L)
+    fields <- substr(text, open + 2L, nchar(text, type = "chars") - 1L)
+    parts <- strsplit(fields, ", ", fixed = TRUE)[[1L]]
+    if (!length(parts)) {
+      return(character(0L))
+    }
+
+    render <- function(values) {
+      sprintf("%s (%s)", prefix, paste(values, collapse = ", "))
+    }
+
+    out <- character(0L)
+    drop_sets <- list(
+      grep("^ms ", parts),
+      grep("^best ", parts),
+      grep("^deg ", parts)
+    )
+    keep <- seq_along(parts)
+    for (drop in drop_sets) {
+      if (length(drop)) {
+        keep <- setdiff(keep, drop)
+        if (length(keep)) {
+          out <- c(out, render(parts[keep]))
+        }
+      }
+    }
+
+    out
+  }
+
+  compacted <- compact(line)
+  compacted_fields <- compact_fields(line)
+  candidates <- unlist(list(
     line,
-    compact(line)
-  )
+    compacted,
+    compacted_fields,
+    field_drop_candidates(compacted_fields)
+  ), use.names = FALSE)
 
   for (candidate in candidates) {
     if (nchar(candidate, type = "width") <= max_width) {

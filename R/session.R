@@ -98,6 +98,32 @@
   invisible(TRUE)
 }
 
+.npRmpi_attach_exit_finalizer <- function(e) {
+  tryCatch({
+    state <- as.character(getOption("npRmpi.attach.close.state", "closed"))[1L]
+    if (!identical(state, "open"))
+      return(invisible(FALSE))
+    world <- .npRmpi_safe_int(mpi.comm.size(0L))
+    comm <- .npRmpi_safe_int(mpi.comm.size(1L))
+    rank <- .npRmpi_safe_int(mpi.comm.rank(1L))
+    if (!is.na(world) && world > 1L &&
+        !is.na(comm) && comm > 1L &&
+        !is.na(rank) && rank == 0L) {
+      npRmpi.quit(mode = "attach", comm = 1L)
+    }
+  }, error = function(err) NULL)
+  invisible(TRUE)
+}
+
+.npRmpi_attach_register_exit_finalizer <- function() {
+  if (!is.null(getOption("npRmpi.attach.exit.finalizer", NULL)))
+    return(invisible(FALSE))
+  env <- new.env(parent = emptyenv())
+  reg.finalizer(env, .npRmpi_attach_exit_finalizer, onexit = TRUE)
+  options(npRmpi.attach.exit.finalizer = env)
+  invisible(TRUE)
+}
+
 .npRmpi_attach_next_session_id <- function() {
   sid <- suppressWarnings(as.integer(getOption("npRmpi.attach.session.counter", 0L)))
   if (!is.finite(sid) || sid < 0L)
@@ -415,6 +441,7 @@ npRmpi.init <- function(...,
                          nonblock = TRUE,
                          sleep = 0.1,
                          quiet = FALSE) {
+  .np_reject_unused_dots(list(...), "npRmpi.init")
   .npRmpi_abort_if_rmpi_attached(where = "npRmpi.init()")
 
   nslaves <- npValidateNonNegativeInteger(nslaves, "nslaves")
@@ -485,6 +512,7 @@ npRmpi.init <- function(...,
         where = "npRmpi.init() reused-slave SPMD reset"
       )
       options(npRmpi.master.only = FALSE)
+      options(npRmpi.pool.active = TRUE)
       if (!quiet)
         mpi.hostinfo(comm)
       return(invisible(TRUE))
@@ -492,6 +520,7 @@ npRmpi.init <- function(...,
     mpi.spawn.Rslaves(..., nslaves = nslaves, comm = comm, quiet = quiet, nonblock = nonblock, sleep = sleep)
     mpi.bcast.cmd(np.mpi.initialize(), caller.execute = TRUE, comm = comm)
     options(npRmpi.master.only = FALSE)
+    options(npRmpi.pool.active = TRUE)
     return(invisible(TRUE))
   }
 
@@ -507,6 +536,7 @@ npRmpi.init <- function(...,
   np.mpi.initialize()
   mpi.barrier(0)
   options(npRmpi.master.only = FALSE)
+  options(npRmpi.pool.active = TRUE)
 
   rank <- .npRmpi_safe_int(mpi.comm.rank(comm))
   rank <- if (is.na(rank)) 0L else as.integer(rank)
@@ -520,6 +550,7 @@ npRmpi.init <- function(...,
   options(npRmpi.attach.close.state = "open")
 
   if (rank == 0L) {
+    .npRmpi_attach_register_exit_finalizer()
     if (!quiet) slave.hostinfo(comm)
     return(invisible(TRUE))
   }
@@ -535,6 +566,13 @@ npRmpi.quit <- function(force = FALSE,
   dellog <- npValidateScalarLogical(dellog, "dellog")
   comm <- npValidatePositiveInteger(comm, "comm")
   mode <- match.arg(mode)
+  if (!isTRUE(getOption("npRmpi.mpi.initialized", FALSE))) {
+    .npRmpi_session_reset_spmd_state()
+    .npRmpi_attach_state_reset()
+    options(npRmpi.master.only = FALSE)
+    options(npRmpi.pool.active = FALSE)
+    return(invisible(FALSE))
+  }
   size.comm <- .npRmpi_safe_int(mpi.comm.size(comm))
   size.comm <- if (is.na(size.comm)) 0L else as.integer(size.comm)
   size.world <- .npRmpi_safe_int(mpi.comm.size(0))
@@ -559,6 +597,7 @@ npRmpi.quit <- function(force = FALSE,
     .npRmpi_session_reset_spmd_state()
     .npRmpi_attach_state_reset()
     options(npRmpi.master.only = FALSE)
+    options(npRmpi.pool.active = FALSE)
     return(invisible(FALSE))
   }
 
@@ -569,6 +608,7 @@ npRmpi.quit <- function(force = FALSE,
       .npRmpi_session_reset_spmd_state()
       .npRmpi_attach_state_reset()
       options(npRmpi.master.only = FALSE)
+      options(npRmpi.pool.active = FALSE)
       return(invisible(TRUE))
     }
     if (identical(attach.state, "closing")) {
@@ -646,11 +686,15 @@ npRmpi.quit <- function(force = FALSE,
     return(invisible(TRUE))
   }
 
-  mpi.close.Rslaves(dellog = dellog, comm = comm, force = force)
+  close.status <- mpi.close.Rslaves(dellog = dellog, comm = comm, force = force)
+  soft.kept.pool <- !isTRUE(force) &&
+    isTRUE(getOption("npRmpi.reuse.slaves", FALSE)) &&
+    .npRmpi_session_has_active_pool(comm = comm)
   .npRmpi_session_reset_spmd_state()
   .npRmpi_attach_state_reset()
   options(npRmpi.master.only = FALSE)
-  invisible(TRUE)
+  options(npRmpi.pool.active = isTRUE(soft.kept.pool))
+  invisible(close.status)
 }
 
 npRmpi.session.info <- function(comm=1){
@@ -688,17 +732,19 @@ npRmpi.session.info <- function(comm=1){
     processor = proc
   )
 
-  cat("npRmpi session info\n")
-  cat("  npRmpi:", info$npRmpi, "\n")
-  cat("  Rmpi  :", info$Rmpi, "\n")
-  cat("  OS    :", info$sysname, info$release, "|", info$platform, "\n")
-  cat("  reuse :", info$reuse_slaves, "(NP_RMPI_NO_REUSE_SLAVES=", info$NP_RMPI_NO_REUSE_SLAVES, ")\n", sep="")
-  cat("  comm  :", info$comm, "rank", info$comm_rank, "of", info$comm_size, "(nslaves=", info$nslaves, ")\n", sep=" ")
-  cat("  mode  :", if (isTRUE(info$master_only)) "master-only" else "slave-pool", "\n")
+  message("npRmpi session info")
+  message("  npRmpi: ", info$npRmpi)
+  message("  Rmpi  : ", info$Rmpi)
+  message("  OS    : ", info$sysname, " ", info$release, " | ", info$platform)
+  message("  reuse : ", info$reuse_slaves,
+          "(NP_RMPI_NO_REUSE_SLAVES=", info$NP_RMPI_NO_REUSE_SLAVES, ")")
+  message("  comm  : ", info$comm, " rank ", info$comm_rank, " of ",
+          info$comm_size, " (nslaves=", info$nslaves, ")")
+  message("  mode  : ", if (isTRUE(info$master_only)) "master-only" else "slave-pool")
   if (!is.na(info$processor))
-    cat("  host  :", info$processor, "\n")
+    message("  host  : ", info$processor)
   if (!all(is.na(info$mpi_version)))
-    cat("  mpi   :", paste(info$mpi_version, collapse=" "), "\n")
+    message("  mpi   : ", paste(info$mpi_version, collapse=" "))
 
   invisible(info)
 }

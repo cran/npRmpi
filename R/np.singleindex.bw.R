@@ -49,7 +49,7 @@ npindexbw.formula <-
     ydat <- model.response(mf)
     xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
 
-    tbw <- npindexbw(xdat = xdat, ydat = ydat, ...)
+    tbw <- do.call(npindexbw, c(list(xdat = xdat, ydat = ydat), list(...)))
 
     ## clean up (possible) inconsistencies due to recursion ...
     tbw$call <- match.call(expand.dots = FALSE)
@@ -85,6 +85,13 @@ npindexbw.NULL <-
     }
     automatic.degree.search <- isTRUE(nomad.requested) ||
       !identical(degree.select.value, "manual")
+    method.value <- if ("method" %in% dot.names) {
+      match.arg(as.character(dots$method[[1L]]), c("ichimura", "kleinspady"))
+    } else {
+      "ichimura"
+    }
+    collective.degree.search <- isTRUE(automatic.degree.search) &&
+      identical(method.value, "kleinspady")
     regtype.value <- if ("regtype" %in% dot.names) {
       match.arg(as.character(dots$regtype[[1L]]), c("lc", "ll", "lp"))
     } else if (isTRUE(nomad.requested)) {
@@ -106,7 +113,10 @@ npindexbw.NULL <-
       automatic.degree.search = automatic.degree.search,
       search.engine = search.engine.value
     )
-    if (.npRmpi_autodispatch_active() && !isTRUE(automatic.degree.search))
+    if (.npRmpi_autodispatch_active() &&
+        (!isTRUE(automatic.degree.search) ||
+           isTRUE(collective.degree.search) ||
+           .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
       return(.npRmpi_autodispatch_call(mc, parent.frame()))
 
     xdat <- toFrame(xdat)
@@ -479,12 +489,16 @@ npindexbw.NULL <-
   )
 
   out <- tryCatch(
+    ## This objective is evaluated inside each rank's optimizer loop under
+    ## autodispatch. Keep the inner regression evaluator local so independent
+    ## optimizer paths cannot enter nested MPI collectives in different orders.
     .npregbw_eval_only(
       xdat = leaf$xdat,
       ydat = ydat,
       bws = leaf$bws,
       invalid.penalty = "baseline",
-      penalty.multiplier = 10
+      penalty.multiplier = 10,
+      localize = TRUE
     ),
     error = function(e) NULL
   )
@@ -588,6 +602,64 @@ npindexbw.NULL <-
   }
 
   list(index = idx, fitted = fit.block)
+}
+
+.npindexbw_kleinspady_collective_enabled <- function(comm = 1L) {
+  .npRmpi_has_active_slave_pool(comm = comm) &&
+    isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
+    !isTRUE(getOption("npRmpi.local.regression.mode", FALSE))
+}
+
+.npindexbw_eval_kleinspady_lp_collective <- function(index,
+                                                     ydat,
+                                                     h,
+                                                     bws,
+                                                     spec,
+                                                     floor = sqrt(.Machine$double.eps),
+                                                     comm = 1L) {
+  index <- as.double(index)
+  ydat <- as.double(ydat)
+  n <- length(index)
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm)), error = function(e) 0L)
+  size <- tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) 1L)
+  if (!is.finite(rank) || is.na(rank) || rank < 0L)
+    rank <- 0L
+  if (!is.finite(size) || is.na(size) || size < 1L)
+    size <- 1L
+
+  assignments <- .splitIndices(n, size)
+  local.idx <- if (length(assignments) >= (rank + 1L))
+    as.integer(assignments[[rank + 1L]])
+  else
+    integer(0L)
+
+  local <- tryCatch({
+    piece <- .npindex_lp_loo_fit_block(
+      idx = local.idx,
+      index = index,
+      ydat = ydat,
+      h = h,
+      bws = bws,
+      spec = spec
+    )
+    idx <- as.integer(piece$index)
+    fit <- as.double(piece$fitted)
+    if (length(idx) != length(fit) || any(!is.finite(fit)))
+      stop("invalid local Klein-Spady LP fit", call. = FALSE)
+    fit[fit < floor] <- floor
+    fit[fit > 1.0 - floor] <- 1.0 - floor
+    loss <- -sum(ydat[idx] * log(fit) + (1.0 - ydat[idx]) * log1p(-fit))
+    c(loss, 0.0, as.double(length(idx)))
+  }, error = function(e) {
+    c(0.0, 1.0, 0.0)
+  })
+
+  totals <- mpi.allreduce(as.double(local), type = 2, op = "sum", comm = comm)
+  invalid <- totals[2L] > 0.0 || abs(totals[3L] - n) > 0.5 || totals[3L] <= 0.0
+  list(
+    objective = if (isTRUE(invalid)) sqrt(.Machine$double.xmax) else totals[1L] / totals[3L],
+    invalid = isTRUE(invalid)
+  )
 }
 
 .npindex_lp_loo_fit <- function(index,
@@ -844,6 +916,23 @@ npindexbw.NULL <-
 
     if (!ok.design)
       return(list(objective = invalid.penalty, num.feval.fast = 0L))
+
+    if (identical(bws$method, "kleinspady") &&
+        .npindexbw_kleinspady_collective_enabled(comm = 1L)) {
+      collective <- .npindexbw_eval_kleinspady_lp_collective(
+        index = index,
+        ydat = ydat,
+        h = h,
+        bws = bws,
+        spec = spec,
+        floor = sqrt(.Machine$double.eps),
+        comm = 1L
+      )
+      return(list(
+        objective = if (isTRUE(collective$invalid)) invalid.penalty else as.numeric(collective$objective[1L]),
+        num.feval.fast = if (.npindexbw_fast_eligible(h = h, bws = bws, eval.index = index)) 1L else 0L
+      ))
+    }
 
     if (identical(bws$method, "kleinspady") &&
         .npRmpi_has_active_slave_pool(comm = 1L) &&
@@ -1127,12 +1216,16 @@ npindexbw.NULL <-
       hot.reg.args$regtype.engine <- "lp"
       hot.reg.args$degree.engine <- degree
       hot.reg.args$bernstein.basis.engine <- degree.search$bernstein.basis
-      hot.opt.args <- opt.args
-      hot.opt.args$nmulti <- .np_nomad_powell_hotstart_nmulti("single_iteration")
+      hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
+        opt.args,
+        strategy = "single_iteration",
+        remin = isTRUE(opt.args$powell.remin)
+      )
       powell.start <- proc.time()[3L]
       hot.payload <- .np_nomad_with_powell_progress(
-        degree,
-        .npindexbw_run_fixed_degree(
+        degree = degree,
+        best_record = best_record,
+        expr = .npindexbw_run_fixed_degree(
           xdat = xdat,
           ydat = ydat,
           bws = bw.vec,
@@ -1173,6 +1266,7 @@ npindexbw.NULL <-
     nmulti = nomad.nmulti,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = if (!is.null(opt.args$random.seed)) opt.args$random.seed else 42L,
+    remin = isTRUE(opt.args$nomad.remin),
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -1336,6 +1430,8 @@ npindexbw.default <-
            degree.max.cycles = 20L,
            degree.verify = FALSE,
            nmulti,
+           nomad.remin = FALSE,
+           powell.remin = TRUE,
            only.optimize.beta,
            optim.abstol,
            optim.maxattempts,
@@ -1350,7 +1446,10 @@ npindexbw.default <-
            scale.factor.search.lower = NULL,
            ...){
     .npRmpi_require_active_slave_pool(where = "npindexbw()")
-    search.mc.names <- names(match.call(expand.dots = FALSE))
+    mc <- match.call(expand.dots = FALSE)
+    search.mc.names <- names(mc)
+    dots <- list(...)
+    dot.names <- names(dots)
     degree.select.value <- if (isTRUE(npValidateScalarLogical(nomad, "nomad"))) {
       "coordinate"
     } else if ("degree.select" %in% search.mc.names) {
@@ -1359,8 +1458,18 @@ npindexbw.default <-
       "manual"
     }
     automatic.degree.search <- !identical(match.arg(degree.select.value, c("manual", "coordinate", "exhaustive")), "manual")
-    if (.npRmpi_autodispatch_active() && !isTRUE(automatic.degree.search))
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    method.value <- if ("method" %in% dot.names) {
+      match.arg(as.character(dots$method[[1L]]), c("ichimura", "kleinspady"))
+    } else {
+      "ichimura"
+    }
+    collective.degree.search <- isTRUE(automatic.degree.search) &&
+      identical(method.value, "kleinspady")
+    if (.npRmpi_autodispatch_active() &&
+        (!isTRUE(automatic.degree.search) ||
+           isTRUE(collective.degree.search) ||
+           .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
+      return(.npRmpi_autodispatch_call(mc, parent.frame()))
 
     xdat <- toFrame(xdat)
 
@@ -1380,10 +1489,7 @@ npindexbw.default <-
                  "See documentation for details."))
 
     p <- ncol(xdat)
-    mc <- match.call(expand.dots = FALSE)
     mc.names <- names(mc)
-    dots <- list(...)
-    dot.names <- names(dots)
     nomad.shortcut <- .np_prepare_nomad_shortcut(
       nomad = nomad,
       call_names = unique(c(mc.names, dot.names)),
@@ -1507,7 +1613,7 @@ npindexbw.default <-
     if (tbw$method == "kleinspady" && !setequal(ydat,c(0,1)))
       stop("Klein and Spady's estimator requires binary ydat with 0/1 values only")
 
-    margs <- c("nmulti","random.seed", "optim.method", "optim.maxattempts",
+    margs <- c("nmulti", "nomad.remin", "powell.remin", "random.seed", "optim.method", "optim.maxattempts",
                "optim.reltol", "optim.abstol", "optim.maxit", "only.optimize.beta",
                "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
                "scale.factor.search.lower")
@@ -1763,27 +1869,17 @@ npindexbw.sibandwidth <-
                 )$ksum
                 tww[1,2,]/NZD(tww[2,2,])
               } else {
-                ok.design <- tryCatch({
-                  npCheckRegressionDesignCondition(
-                    reg.code = REGTYPE_LP,
-                    xcon = data.frame(index = index),
-                    basis = spec$basis.engine,
-                    degree = spec$degree.engine,
-                    bernstein.basis = spec$bernstein.basis.engine,
-                    where = "npindexbw"
-                  )
-                  TRUE
-                }, error = function(e) FALSE)
-                if (!ok.design)
-                  return(ichimuraMaxPenalty)
-
-                .npindex_lp_loo_fit(
+                objective <- .npindexbw_eval_ichimura_lp_via_npreg(
                   index = index,
                   ydat = ydat,
                   h = h,
                   bws = bws,
-                  spec = spec
+                  spec = spec,
+                  invalid.penalty = ichimuraMaxPenalty
                 )
+                num.feval.fast.overall <<- num.feval.fast.overall +
+                  as.numeric(objective$num.feval.fast[1L])
+                return(as.numeric(objective$objective[1L]))
               }
 
               t.ret <- mean((ydat-fit.loo)^2)
@@ -1869,6 +1965,24 @@ npindexbw.sibandwidth <-
                 }, error = function(e) FALSE)
                 if (!ok.design)
                   return(sqrt(.Machine$double.xmax))
+
+                if (.npindexbw_kleinspady_collective_enabled(comm = 1L)) {
+                  collective <- .npindexbw_eval_kleinspady_lp_collective(
+                    index = index,
+                    ydat = ydat,
+                    h = h,
+                    bws = bws,
+                    spec = spec,
+                    floor = kleinspadyFloor,
+                    comm = 1L
+                  )
+                  if (isTRUE(collective$invalid))
+                    return(sqrt(.Machine$double.xmax))
+                  if (is.finite(collective$objective) &&
+                      .npindexbw_fast_eligible(h = h, bws = bws, eval.index = index))
+                    num.feval.fast.overall <<- num.feval.fast.overall + 1L
+                  return(as.numeric(collective$objective[1L]))
+                }
 
                 .npindex_lp_loo_fit(
                   index = index,

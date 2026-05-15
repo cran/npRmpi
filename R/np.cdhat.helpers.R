@@ -70,7 +70,36 @@
   )
 }
 
-.npcdhat_make_xhat_matrix <- function(bws, txdat, exdat) {
+.npcdhat_resolve_x_s <- function(bws, txdat, s = NULL, deriv = NULL, where = "npcdhat") {
+  if (is.null(s) && is.null(deriv))
+    return(NULL)
+
+  txdat <- toFrame(txdat)
+  ncon <- sum(bws$ixcon)
+  con.names <- names(txdat)[bws$ixcon]
+  if (!is.null(s) && !is.null(names(s))) {
+    sout <- integer(ncon)
+    names(sout) <- con.names
+    keep <- intersect(names(s), con.names)
+    if (length(keep))
+      sout[keep] <- as.integer(s[keep])
+    s <- sout
+  }
+  .npreghat_resolve_s(s = s, deriv = deriv, ncon = ncon, con.names = con.names)
+}
+
+.npcdhat_has_x_derivative <- function(s) {
+  length(s) > 0L && any(s > 0L)
+}
+
+.npcdhat_use_adaptive_ratio <- function(bws, x.s = NULL) {
+  regtype <- if (is.null(bws$regtype.engine)) bws$regtype else bws$regtype.engine
+  identical(bws$type, "adaptive_nn") &&
+    !.npcdhat_has_x_derivative(x.s) &&
+    identical(as.character(regtype), "lc")
+}
+
+.npcdhat_make_xhat_matrix <- function(bws, txdat, exdat, s = NULL) {
   xbw <- .npcdhat_make_xbw(bws = bws, txdat = txdat)
   spec <- npCanonicalConditionalRegSpec(
     regtype = if (is.null(xbw$regtype)) "lc" else as.character(xbw$regtype),
@@ -94,6 +123,15 @@
   }
 
   if (identical(regtype, "lc")) {
+    if (.npcdhat_has_x_derivative(s)) {
+      return(.npreghat_exact_lc_derivative_matrix_from_npksum_chunked(
+        bws = xbw,
+        txdat = txdat,
+        exdat = exdat,
+        s = s
+      ))
+    }
+
     return(.npreghat_exact_lc_matrix_from_kernel_weights(
       bws = xbw,
       txdat = txdat,
@@ -106,7 +144,7 @@
       bws = xbw,
       txdat = txdat,
       exdat = exdat,
-      s = integer(0)
+      s = s
     ))
   }
 
@@ -117,7 +155,8 @@
         H[i, ] <- .npreghat_exact_matrix_from_core(
           bws = xbw,
           txdat = txdat,
-          exdat = exdat[i, , drop = FALSE]
+          exdat = exdat[i, , drop = FALSE],
+          s = s
         )[1L, ]
       }
       return(H)
@@ -127,7 +166,7 @@
       bws = xbw,
       txdat = txdat,
       exdat = exdat,
-      s = integer(0),
+      s = s,
       basis = basis,
       degree = degree,
       bernstein.basis = bernstein
@@ -137,7 +176,8 @@
   .npreghat_exact_matrix_from_core(
     bws = xbw,
     txdat = txdat,
-    exdat = exdat
+    exdat = exdat,
+    s = s
   )
 }
 
@@ -159,6 +199,143 @@
   }
 
   list(bws = bws, scale = bw.scale, operator = operator)
+}
+
+.npRmpi_hat_operator_row_tasks <- function(neval, workers) {
+  neval <- as.integer(neval)
+  workers <- as.integer(workers)
+  if (is.na(neval) || neval < 1L || is.na(workers) || workers < 1L)
+    return(NULL)
+
+  n.tasks <- min(neval, workers + 1L)
+  if (n.tasks < 2L)
+    return(NULL)
+
+  base <- neval %/% n.tasks
+  extra <- neval %% n.tasks
+  sizes <- rep.int(base, n.tasks)
+  if (extra > 0L)
+    sizes[seq_len(extra)] <- sizes[seq_len(extra)] + 1L
+
+  starts <- cumsum(c(1L, sizes[-length(sizes)]))
+  lapply(seq_along(sizes), function(i) {
+    rows <- seq.int(starts[[i]], length.out = sizes[[i]])
+    list(rows = as.integer(rows), bsz = as.integer(length(rows)))
+  })
+}
+
+.npRmpi_hat_operator_row_fanout <- function(fun.name,
+                                            bws,
+                                            tdat,
+                                            edat,
+                                            y = NULL,
+                                            output = c("matrix", "apply"),
+                                            target.dist = NULL,
+                                            what = fun.name,
+                                            comm = 1L) {
+  output <- match.arg(output)
+
+  if (!fun.name %in% c("npudisthat", "npudenshat") || !identical(output, "apply"))
+    return(NULL)
+
+  if (!isTRUE(getOption("npRmpi.hat.operator.fanout", TRUE)) ||
+      !isTRUE(getOption("npRmpi.mpi.initialized", FALSE)) ||
+      isTRUE(getOption("npRmpi.autodispatch.context", FALSE)) ||
+      isTRUE(getOption("npRmpi.autodispatch.disable", FALSE)) ||
+      isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+    return(NULL)
+
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm = comm)), error = function(e) NA_integer_)
+  if (is.na(rank) || rank != 0L)
+    return(NULL)
+
+  workers <- tryCatch(.npRmpi_bootstrap_worker_count(comm = comm), error = function(e) 0L)
+  if (is.na(workers) || workers < 1L)
+    return(NULL)
+
+  neval <- nrow(edat)
+  if (identical(fun.name, "npudisthat") &&
+      (is.null(target.dist) || length(target.dist) != neval))
+    return(NULL)
+
+  work.size <- as.double(nrow(tdat)) * as.double(neval) *
+    if (is.null(y)) 1.0 else as.double(ncol(as.matrix(y)))
+  min.work <- suppressWarnings(as.numeric(getOption("npRmpi.hat.operator.fanout.min.work", 2e7))[1L])
+  if (!is.finite(min.work) || is.na(min.work) || min.work < 0)
+    min.work <- 2e7
+  if (work.size < min.work)
+    return(NULL)
+
+  tasks <- .npRmpi_hat_operator_row_tasks(neval = neval, workers = workers)
+  if (!length(tasks) || length(tasks) < 2L)
+    return(NULL)
+
+  ncol.out <- if (identical(output, "apply")) {
+    if (is.null(y))
+      return(NULL)
+    ncol(as.matrix(y))
+  } else {
+    nrow(tdat)
+  }
+
+  worker <- function(task) {
+    old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
+    old.ctx <- getOption("npRmpi.autodispatch.context", FALSE)
+    options(npRmpi.autodispatch.disable = TRUE)
+    options(npRmpi.autodispatch.context = TRUE)
+    on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
+    on.exit(options(npRmpi.autodispatch.context = old.ctx), add = TRUE)
+
+    rows <- as.integer(task$rows)
+    out <- if (identical(fun.name, "npudisthat")) {
+      .np_udisthat_local_chunk(
+        bws = bws,
+        tdat = tdat,
+        edat = edat[rows, , drop = FALSE],
+        y = y,
+        output = output,
+        target.dist = target.dist[rows],
+        n.train = nrow(tdat)
+      )
+    } else {
+      .np_udenshat_local_chunk(
+        bws = bws,
+        tdat = tdat,
+        edat = edat[rows, , drop = FALSE],
+        y = y,
+        output = output,
+        n.train = nrow(tdat)
+      )
+    }
+    out <- as.matrix(out)
+    if (!identical(dim(out), c(length(rows), as.integer(ncol.out))))
+      out <- matrix(as.numeric(out), nrow = length(rows), ncol = as.integer(ncol.out))
+    out
+  }
+
+  .npRmpi_bootstrap_run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = ncol.out,
+    what = what,
+    progress.label = sprintf("%s evaluation rows", what),
+    profile.where = what,
+    comm = comm,
+    prefer.local.single_worker = FALSE,
+    master_local_chunk = TRUE,
+    required.bindings = list(
+      fun.name = fun.name,
+      bws = bws,
+      tdat = tdat,
+      edat = edat,
+      y = y,
+      output = output,
+      target.dist = if (is.null(target.dist)) NA_real_ else target.dist,
+      ncol.out = ncol.out,
+      .np_udisthat_local_chunk = .np_udisthat_local_chunk,
+      .np_udenshat_local_chunk = .np_udenshat_local_chunk
+    )
+  )
 }
 
 .np_direct_operator_matrix <- function(kbw, txdat, exdat, operator, where) {
@@ -426,8 +603,8 @@
   sweep((Kx * Ky) / nrow(txdat), 1L, pmax(denom, .Machine$double.eps), "/")
 }
 
-.npcdhat_exact_matrix <- function(bws, txdat, tydat, exdat, eydat, operator) {
-  if (identical(bws$type, "adaptive_nn")) {
+.npcdhat_exact_matrix <- function(bws, txdat, tydat, exdat, eydat, operator, x.s = NULL) {
+  if (.npcdhat_use_adaptive_ratio(bws = bws, x.s = x.s)) {
     return(.npcdhat_ratio_matrix(
       bws = bws,
       txdat = txdat,
@@ -442,7 +619,8 @@
   Hx <- .npcdhat_make_xhat_matrix(
     bws = bws,
     txdat = txdat,
-    exdat = exdat
+    exdat = exdat,
+    s = x.s
   )
   Gy <- .npcdhat_make_kernel_matrix(
     kbw = ybw,
@@ -454,8 +632,8 @@
   Hx * Gy
 }
 
-.npcdhat_exact_apply <- function(bws, txdat, tydat, exdat, eydat, rhs, operator) {
-  if (identical(bws$type, "adaptive_nn")) {
+.npcdhat_exact_apply <- function(bws, txdat, tydat, exdat, eydat, rhs, operator, x.s = NULL) {
+  if (.npcdhat_use_adaptive_ratio(bws = bws, x.s = x.s)) {
     H <- .npcdhat_ratio_matrix(
       bws = bws,
       txdat = txdat,
@@ -471,7 +649,8 @@
   Hx <- .npcdhat_make_xhat_matrix(
     bws = bws,
     txdat = txdat,
-    exdat = exdat
+    exdat = exdat,
+    s = x.s
   )
   Gy <- .npcdhat_make_kernel_matrix(
     kbw = ybw,
@@ -483,6 +662,121 @@
   (Hx * Gy) %*% rhs
 }
 
+.npRmpi_cdhat_apply_row_tasks <- function(neval, workers, ntrain) {
+  neval <- as.integer(neval)
+  workers <- as.integer(workers)
+  ntrain <- as.integer(ntrain)
+  if (is.na(neval) || neval < 1L ||
+      is.na(workers) || workers < 1L ||
+      is.na(ntrain) || ntrain < 1L)
+    return(NULL)
+
+  max.entries <- suppressWarnings(as.numeric(getOption("npRmpi.cdhat.apply.fanout.max.entries", 2.5e7))[1L])
+  if (!is.finite(max.entries) || is.na(max.entries) || max.entries < 1)
+    max.entries <- 2.5e7
+
+  memory.block <- max(1L, as.integer(floor(max.entries / as.double(ntrain))))
+  balance.block <- max(1L, as.integer(ceiling(neval / as.double(workers + 1L))))
+  block.size <- min(memory.block, balance.block)
+  block.size <- min(block.size, neval)
+
+  starts <- seq.int(1L, neval, by = block.size)
+  lapply(starts, function(st) {
+    en <- min(neval, st + block.size - 1L)
+    rows <- seq.int(st, en)
+    list(rows = as.integer(rows), bsz = as.integer(length(rows)))
+  })
+}
+
+.npRmpi_cdhat_apply_fanout <- function(bws,
+                                        txdat,
+                                        tydat,
+                                        exdat,
+                                        eydat,
+                                        rhs,
+                                        operator,
+                                        x.s = NULL,
+                                        what = "conditional hat apply",
+                                        comm = 1L) {
+  if (!isTRUE(getOption("npRmpi.cdhat.apply.fanout", TRUE)) ||
+      !isTRUE(getOption("npRmpi.mpi.initialized", FALSE)) ||
+      isTRUE(getOption("npRmpi.autodispatch.context", FALSE)) ||
+      isTRUE(getOption("npRmpi.autodispatch.disable", FALSE)) ||
+      isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+    return(NULL)
+
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm = comm)), error = function(e) NA_integer_)
+  if (is.na(rank) || rank != 0L)
+    return(NULL)
+
+  workers <- tryCatch(.npRmpi_bootstrap_worker_count(comm = comm), error = function(e) 0L)
+  if (is.na(workers) || workers < 2L)
+    return(NULL)
+
+  neval <- nrow(exdat)
+  ntrain <- nrow(txdat)
+  ncol.out <- ncol(as.matrix(rhs))
+  work.size <- as.double(ntrain) * as.double(neval) * as.double(ncol.out)
+  min.work <- suppressWarnings(as.numeric(getOption("npRmpi.cdhat.apply.fanout.min.work", 5e7))[1L])
+  if (!is.finite(min.work) || is.na(min.work) || min.work < 0)
+    min.work <- 5e7
+  if (work.size < min.work)
+    return(NULL)
+
+  tasks <- .npRmpi_cdhat_apply_row_tasks(neval = neval, workers = workers, ntrain = ntrain)
+  if (!length(tasks) || length(tasks) < 2L)
+    return(NULL)
+
+  worker <- function(task) {
+    old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
+    old.ctx <- getOption("npRmpi.autodispatch.context", FALSE)
+    options(npRmpi.autodispatch.disable = TRUE)
+    options(npRmpi.autodispatch.context = TRUE)
+    on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
+    on.exit(options(npRmpi.autodispatch.context = old.ctx), add = TRUE)
+
+    rows <- as.integer(task$rows)
+    x.s.worker <- if (length(x.s)) x.s else NULL
+    out <- .npcdhat_exact_apply(
+      bws = bws,
+      txdat = txdat,
+      tydat = tydat,
+      exdat = exdat[rows, , drop = FALSE],
+      eydat = eydat[rows, , drop = FALSE],
+      rhs = rhs,
+      operator = operator,
+      x.s = x.s.worker
+    )
+    out <- as.matrix(out)
+    if (!identical(dim(out), c(length(rows), as.integer(ncol.out))))
+      out <- matrix(as.numeric(out), nrow = length(rows), ncol = as.integer(ncol.out))
+    out
+  }
+
+  .npRmpi_bootstrap_run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = ncol.out,
+    what = what,
+    progress.label = sprintf("%s evaluation rows", what),
+    profile.where = paste0("mpi.applyLB:", what),
+    comm = comm,
+    prefer.local.single_worker = FALSE,
+    master_local_chunk = TRUE,
+    required.bindings = list(
+      bws = bws,
+      txdat = txdat,
+      tydat = tydat,
+      exdat = exdat,
+      eydat = eydat,
+      rhs = rhs,
+      operator = operator,
+      x.s = if (is.null(x.s)) integer(0L) else x.s,
+      ncol.out = ncol.out
+    )
+  )
+}
+
 .npcdhat_core <- function(bws,
                           txdat,
                           tydat,
@@ -491,6 +785,8 @@
                           y,
                           output,
                           operator,
+                          x.deriv = NULL,
+                          x.s = NULL,
                           class_name,
                           where) {
   output <- match.arg(output, c("matrix", "apply"))
@@ -557,19 +853,45 @@
     eydat <- tydat
   }
 
+  if (!is.null(x.s) || !is.null(x.deriv)) {
+    x.s <- .npcdhat_resolve_x_s(
+      bws = bws,
+      txdat = txdat,
+      s = x.s,
+      deriv = x.deriv,
+      where = where
+    )
+  } else {
+    x.s <- NULL
+  }
+
   if (identical(output, "apply")) {
     if (is.null(y))
       stop("argument 'y' is required when output='apply'")
 
-    out <- .npcdhat_exact_apply(
+    out <- .npRmpi_cdhat_apply_fanout(
       bws = bws,
       txdat = txdat,
       tydat = tydat,
       exdat = exdat,
       eydat = eydat,
       rhs = y,
-      operator = operator
+      operator = operator,
+      x.s = x.s,
+      what = paste0(where, " apply")
     )
+    if (is.null(out)) {
+      out <- .npcdhat_exact_apply(
+        bws = bws,
+        txdat = txdat,
+        tydat = tydat,
+        exdat = exdat,
+        eydat = eydat,
+        rhs = y,
+        operator = operator,
+        x.s = x.s
+      )
+    }
     if (ncol(out) == 1L)
       return(as.vector(out))
     return(out)
@@ -581,7 +903,8 @@
     tydat = tydat,
     exdat = exdat,
     eydat = eydat,
-    operator = operator
+    operator = operator,
+    x.s = x.s
   )
 
   class(H) <- c(class_name, "matrix")
@@ -592,6 +915,7 @@
   attr(H, "eydat") <- eydat
   attr(H, "trainiseval") <- no.exy
   attr(H, "rows.omit.train") <- rows.omit.train
+  attr(H, "s") <- x.s
   attr(H, "call") <- match.call(expand.dots = FALSE)
 
   if (!is.null(y)) {

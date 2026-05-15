@@ -53,13 +53,15 @@ npscoefbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-          degree.min = NULL,
+            degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
           degree.max.cycles = 20L,
           degree.verify = FALSE,
           nmulti,
+          nomad.remin = FALSE,
+          powell.remin = TRUE,
           okertype,
           optim.abstol,
           optim.maxattempts,
@@ -500,6 +502,15 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     controls inner NOMAD multistarts within each outer restart.
   }
 
+  \item{nomad.remin}{
+    logical flag controlling the optional second NOMAD hot start. When
+    \code{TRUE}, NOMAD is restarted once from the best full candidate found,
+    including both bandwidth and degree coordinates. Defaults to \code{FALSE};
+    current simulation evidence favors the one-pass NOMAD default for routine
+    use, while leaving this switch available for sensitivity checks.
+  }
+
+
   \item{search.engine}{
     character string controlling the automatic local-polynomial search
     backend when \code{regtype="lp"} and
@@ -524,6 +535,15 @@ These controls set search restart behavior.
     integer number of times to restart the process of finding extrema of
     the cross-validation function from different (random) initial
     points. Defaults to \code{min(2,ncol(xdat))}.
+  }
+
+  \item{powell.remin}{
+    logical flag controlling Powell restart-from-minimum behavior. For
+    ordinary fixed-degree Powell-style search, \code{TRUE} restarts the
+    local search from the located minimum. For \code{search.engine="nomad+powell"},
+    this controls only the final Powell bandwidth-polish step. The default
+    is \code{TRUE} for ordinary Powell routes and \code{FALSE} for the
+    Powell polish after NOMAD unless explicitly supplied.
   }
 
 
@@ -627,12 +647,10 @@ or standard-deviation factors.
   \code{lbd.init}, and \code{hbd.init} have separate semantics and are
   not affected by \code{scale.factor.search.lower}.
 
-  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
   \code{npscoefbw} implements a variety of methods for semiparametric
  regression on multivariate (\eqn{p+q}-variate) explanatory data defined
@@ -737,6 +755,18 @@ or standard-deviation factors.
 
 }
 
+\section{Book And Method Pointers}{
+  \code{npscoefbw} selects bandwidths for the smooth-coefficient model
+  \eqn{Y=X^\prime\beta(Z)+\epsilon}. The selected bandwidths control
+  the mixed-data smoothing over \eqn{Z} used to estimate the coefficient
+  functions \eqn{\beta_j(z)}.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 9
+  \emph{Additive and Smooth (Varying) Coefficient Semiparametric Models},
+  especially Sections 9.3-9.3.4, and Racine (2019), Chapter 8
+  \emph{Semiparametric Conditional Mean Function Estimation}.
+}
+
 \references{
 
  Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
@@ -815,7 +845,7 @@ or standard-deviation factors.
 }
 
 \seealso{
-  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{npregbw}}, \code{\link{npreg}} }
 \examples{
 \dontrun{

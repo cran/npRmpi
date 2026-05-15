@@ -60,7 +60,7 @@ test_that("plot option normalization fails fast for bootstrap inside mpi.bcast.c
       common.scale = FALSE,
       ylim = NULL
     ),
-    "cannot run bootstrap plot paths inside mpi\\.bcast\\.cmd context",
+    "cannot run errors=\"bootstrap\" inside mpi\\.bcast\\.cmd context",
     fixed = FALSE
   )
 })
@@ -113,7 +113,7 @@ test_that("plot method entrypoint fails fast for bootstrap inside mpi.bcast.cmd 
       plot.errors.method = "bootstrap",
       where = "plot.rbandwidth()"
     ),
-    "cannot run plot.errors.method='bootstrap' inside mpi\\.bcast\\.cmd",
+    "cannot run errors=\"bootstrap\" inside mpi\\.bcast\\.cmd",
     fixed = FALSE
   )
 })
@@ -193,7 +193,49 @@ test_that("wild fanout does not switch to master-local when workers are active",
   expect_true(any(grepl("master_local=FALSE", start.lines, fixed = TRUE)))
 })
 
-test_that("wild fanout master-assist is remote-only when workers are active", {
+test_that("active single-worker fanout does not collapse to master-local", {
+  run_fanout <- getFromNamespace(".npRmpi_bootstrap_run_fanout", "npRmpi")
+  tf <- tempfile("npRmpi-boot-transport-", fileext = ".tsv")
+  old.trace <- getOption("npRmpi.bootstrap.transport.trace.file")
+  options(npRmpi.bootstrap.transport.trace.file = tf)
+  on.exit(options(npRmpi.bootstrap.transport.trace.file = old.trace), add = TRUE)
+
+  local_mocked_bindings(
+    .npRmpi_has_active_slave_pool = function(comm = 1L) TRUE,
+    .npRmpi_master_only_mode = function(comm = 1L) FALSE,
+    .npRmpi_bootstrap_worker_count = function(comm = 1L) 1L,
+    mpi.applyLB = function(X, FUN, ..., comm = 1L) {
+      lapply(X, function(task) do.call(FUN, c(list(task), list(...))))
+    },
+    .package = "npRmpi"
+  )
+
+  tasks <- list(list(start = 1L, bsz = 2L, seed = 123L))
+  worker <- function(task) {
+    matrix(rep.int(as.integer(task$start), as.integer(task$bsz)),
+           nrow = as.integer(task$bsz), ncol = 1L)
+  }
+
+  out <- run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = 1L,
+    what = "single-worker",
+    profile.where = "unit.test:single-worker",
+    prefer.local.single_worker = TRUE
+  )
+  expect_true(is.matrix(out))
+  expect_identical(dim(out), c(2L, 1L))
+
+  lines <- readLines(tf, warn = FALSE)
+  start.lines <- lines[grepl("event=fanout.start", lines, fixed = TRUE)]
+  expect_true(length(start.lines) >= 1L)
+  expect_true(any(grepl("workers=1", start.lines, fixed = TRUE)))
+  expect_true(any(grepl("master_local=FALSE", start.lines, fixed = TRUE)))
+  expect_true(any(grepl("single_worker_local=FALSE", start.lines, fixed = TRUE)))
+})
+
+test_that("wild fanout master-assist uses master chunk when workers are active", {
   run_fanout <- getFromNamespace(".npRmpi_bootstrap_run_fanout", "npRmpi")
   tf <- tempfile("npRmpi-boot-transport-", fileext = ".tsv")
   old.trace <- getOption("npRmpi.bootstrap.transport.trace.file")
@@ -202,26 +244,43 @@ test_that("wild fanout master-assist is remote-only when workers are active", {
 
   qenv <- new.env(parent = emptyenv())
   qenv$queue <- list()
+  qenv$progress <- integer()
 
   local_mocked_bindings(
     .npRmpi_has_active_slave_pool = function(comm = 1L) TRUE,
     .npRmpi_master_only_mode = function(comm = 1L) FALSE,
     .npRmpi_bootstrap_worker_count = function(comm = 1L) 1L,
+    .np_plot_bootstrap_progress_begin = function(total, label) list(total = as.integer(total)),
+    .np_plot_progress_tick = function(state, done, force = FALSE) {
+      qenv$progress <- c(qenv$progress, as.integer(done))
+      state
+    },
+    .np_plot_progress_end = function(state) invisible(NULL),
     mpi.any.source = function() 0L,
     mpi.any.tag = function() 0L,
     mpi.bcast.cmd = function(...) invisible(NULL),
     mpi.bcast.Robj = function(...) invisible(NULL),
     mpi.send.Robj = function(obj, dest, tag, comm = 1L) {
-      if (is.list(obj) && !is.null(obj$data.arg) && length(obj$data.arg) == 1L) {
-        task <- obj$data.arg[[1L]]
-        qenv$queue[[length(qenv$queue) + 1L]] <<- list(
-          src = as.integer(dest),
-          tag = as.integer(tag),
-          payload = matrix(
+      if (is.list(obj) && !is.null(obj$task_indices) && !is.null(obj$tasks)) {
+        task.parts <- lapply(obj$tasks, function(task) {
+          matrix(
             rep.int(as.integer(task$start), as.integer(task$bsz)),
             nrow = as.integer(task$bsz),
             ncol = 1L
           )
+        })
+        qenv$queue[[length(qenv$queue) + 1L]] <<- list(
+          src = as.integer(dest),
+          tag = as.integer(tag),
+          payload = list(
+            progress_only = TRUE,
+            boot = sum(vapply(obj$tasks, function(task) as.integer(task$bsz), integer(1L)))
+          )
+        )
+        qenv$queue[[length(qenv$queue) + 1L]] <<- list(
+          src = as.integer(dest),
+          tag = as.integer(tag),
+          payload = list(task_indices = obj$task_indices, parts = task.parts)
         )
       }
       invisible(NULL)
@@ -242,25 +301,34 @@ test_that("wild fanout master-assist is remote-only when workers are active", {
 
   tasks <- list(
     list(start = 1L, bsz = 2L, seed = 101L),
-    list(start = 3L, bsz = 2L, seed = 202L)
+    list(start = 3L, bsz = 2L, seed = 202L),
+    list(start = 5L, bsz = 2L, seed = 303L),
+    list(start = 7L, bsz = 2L, seed = 404L)
   )
 
   out <- run_fanout(
     tasks = tasks,
-    worker = function(task) stop("master-local execution must not run"),
+    worker = function(task) {
+      matrix(rep.int(as.integer(task$start), as.integer(task$bsz)),
+             nrow = as.integer(task$bsz), ncol = 1L)
+    },
     ncol.out = 1L,
     what = "wild",
-    profile.where = "unit.test:remote-only"
+    profile.where = "unit.test:master-assist"
   )
 
   expect_true(is.matrix(out))
-  expect_identical(dim(out), c(4L, 1L))
-  expect_equal(out[, 1L], c(1, 1, 3, 3))
+  expect_identical(dim(out), c(8L, 1L))
+  expect_equal(out[, 1L], c(1, 1, 3, 3, 5, 5, 7, 7))
+  expect_true(any(qenv$progress == 6L))
 
   lines <- readLines(tf, warn = FALSE)
   done.lines <- lines[grepl("event=fanout.master_assist.done", lines, fixed = TRUE)]
+  assist.lines <- lines[grepl("event=fanout.master_assist.start", lines, fixed = TRUE)]
+  expect_true(any(grepl("scheduler=static_bundle", assist.lines, fixed = TRUE)))
   expect_true(length(done.lines) >= 1L)
-  expect_true(any(grepl("local_done=0", done.lines, fixed = TRUE)))
+  expect_true(any(grepl("local_done=2", done.lines, fixed = TRUE)))
+  expect_true(any(grepl("event=fanout.master_local_chunk.done", lines, fixed = TRUE)))
 })
 
 test_that("wild fanout fails fast on dispatch timeout when worker replies stall", {

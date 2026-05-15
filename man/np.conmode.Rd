@@ -4,6 +4,8 @@
 \alias{npconmode.default}
 \alias{npconmode.formula}
 \alias{npconmode.conbandwidth}
+\alias{predict.conmode}
+\alias{plot.conmode}
 \title{ Kernel Modal Regression with Mixed Data Types }
 \description{
   \code{npconmode} performs kernel modal regression on mixed data,
@@ -18,6 +20,38 @@
   Documentation guide: see \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, and
   \code{\link{plot}} for plotting options.
+
+  If \code{bws} is not an explicit \code{conbandwidth} object,
+  \code{npconmode} computes conditional density bandwidths by forwarding the
+  call to \code{\link{npcdensbw}}. The resulting \code{conbandwidth} object is
+  stored unchanged in the returned object's \code{bws} component. Regression
+  type, local-polynomial degree, and NOMAD/search metadata are also mirrored on
+  the returned \code{conmode} object for convenient inspection and summary
+  reporting; the bandwidth object remains the canonical source.
+
+  For non-local-constant conditional-mode fits, \code{npconmode} constructs
+  the full set of fitted probabilities over the discrete response support and
+  projects them onto the probability simplex before selecting and reporting
+  the modal outcome. Thus the probabilities used for modal selection are
+  non-negative and sum to one over the discrete support. For binary outcomes
+  this is the complement contract
+  \eqn{\Pr(Y=\ell_2\mid X=x)=1-\Pr(Y=\ell_1\mid X=x)}. Local-constant fits
+  are already proper by construction, so omitted \code{proper} resolves to
+  \code{FALSE} for \code{regtype="lc"} and to \code{TRUE} otherwise.
+
+  The \code{\link{predict}} method follows the usual S3
+  \code{newdata} convention. With no evaluation arguments,
+  \code{predict(fit)} extracts the stored modal class and
+  \code{predict(fit, type="prob")} extracts stored class probabilities
+  when the object was fitted with \code{probabilities=TRUE}. With
+  \code{newdata}, \code{predict} evaluates the conditional mode at the
+  supplied rows using the stored bandwidth object. Use
+  \code{type="prob"} to return the full matrix of fitted class
+  probabilities at the evaluation rows. Use \code{se.fit=TRUE} with
+  \code{type="prob"} to return a list containing the class-probability matrix
+  and the matching asymptotic standard-error matrix. Native evaluator
+  arguments \code{exdat} and \code{eydat} remain available for advanced
+  workflows and take precedence if supplied.
 }
 
 \usage{
@@ -31,6 +65,12 @@ npconmode(bws, \dots)
 \method{npconmode}{default}(bws, 
           txdat, 
           tydat, 
+          nomad = FALSE,
+          proper = NULL,
+          proper.control = list(),
+          probabilities = FALSE,
+          gradients = FALSE,
+          level = NULL,
           \dots)
 
 \method{npconmode}{conbandwidth}(bws,
@@ -38,7 +78,20 @@ npconmode(bws, \dots)
           tydat = stop("invoked without training data 'tydat'"),
           exdat,
           eydat,
+          proper = NULL,
+          proper.control = list(),
+          probabilities = FALSE,
+          gradients = FALSE,
+          level = NULL,
           \dots)
+
+\method{predict}{conmode}(object,
+          newdata = NULL,
+          type = c("class", "prob"),
+          se.fit = FALSE,
+          \dots)
+
+\method{plot}{conmode}(x, \dots)
 
 }
 
@@ -76,6 +129,14 @@ These arguments identify the bandwidth specification, formula/data interface, an
     compute the bandwidth object.
   }
 
+  \item{object}{
+    an object of class \code{"conmode"} returned by \code{npconmode}.
+  }
+
+  \item{x}{
+    an object of class \code{"conmode"} returned by \code{npconmode}.
+  }
+
 
 \subsection{Evaluation Data}{
 These arguments control where the conditional mode is evaluated.
@@ -101,17 +162,147 @@ These arguments control where the conditional mode is evaluated.
     omitted, the training data are used.
   }
 
+  \item{type}{
+    prediction type for \code{predict.conmode}. Use \code{"class"} to
+    return modal class predictions and \code{"prob"} to return the full
+    class-probability matrix. Probability prediction requires either a
+    stored probability matrix or an evaluation path with
+    \code{probabilities=TRUE}.
+  }
 
+  \item{se.fit}{
+    a logical value for \code{predict.conmode}. If \code{TRUE} and
+    \code{type="prob"}, return a list with components \code{fit} and
+    \code{se.fit}, containing the class-probability matrix and matching
+    asymptotic standard-error matrix. Standard errors are for the smooth
+    class-probability target, not for the discrete modal class label.
+  }
+
+
+\subsection{Probability And Gradient Controls}{
+These arguments control stored class probabilities, proper probability
+normalization, and level-specific class-probability effects.
+}
+
+  \item{probabilities}{
+    a logical value. If \code{TRUE}, store the full matrix of fitted
+    probabilities over the discrete response support in the returned object.
+    The default \code{FALSE} keeps returned objects compact. If
+    \code{gradients=TRUE}, probabilities are stored automatically because
+    they are the object-fed target for \code{\link{plot.conmode}}.
+  }
+
+  \item{gradients}{
+    a logical value. If \code{TRUE}, compute and store
+    class-probability gradients/effects with respect to the conditioning
+    variables. These are derivatives for continuous conditioning variables
+    and the corresponding smooth finite-change effects for discrete
+    conditioning variables as produced by the underlying
+    \code{\link{npcdens}} gradient route. The target is the smooth class
+    probability \eqn{\Pr(Y=\ell\mid X=x)}, not the derivative of the
+    discrete modal class label. Gradients are stored for one selected response
+    level at a time.
+  }
+
+  \item{level}{
+    response level for class-probability gradients/effects and
+    \code{plot.conmode} class-probability displays. If omitted, the default is
+    the base/reference response level, \code{levels(y)[1]}, for both factor and
+    ordered-factor responses.
+  }
+
+  \item{proper}{
+    a logical value or \code{NULL}. If \code{TRUE}, fitted probabilities over
+    the discrete response support are projected onto the probability simplex
+    before modal selection. If \code{FALSE}, legacy raw per-level values are
+    used. If \code{NULL}, the default is estimator-aware:
+    \code{FALSE} for \code{regtype="lc"} and \code{TRUE} otherwise.
+  }
+
+  \item{proper.control}{
+    a list of controls for discrete probability properization. Currently
+    \code{tol} may be supplied to set the numerical tolerance for
+    non-negativity and unit-mass checks.
+  }
+
+
+\subsection{Local-Polynomial Degree And Bandwidth Search}{
+This argument controls the recommended automatic local-polynomial NOMAD route, which jointly selects continuous polynomial degree and bandwidths when conditional-density bandwidths are computed inside \code{npconmode}.
+}
+
+  \item{nomad}{
+    logical shortcut passed through to \code{\link{npcdensbw}} when
+    bandwidths are computed inside \code{npconmode}. When \code{TRUE},
+    the conditional-density bandwidth route fills any missing values
+    among \code{regtype}, \code{search.engine}, \code{degree.select},
+    \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
+    \code{degree.verify}, and \code{bwtype} with the recommended
+    automatic local-polynomial degree-and-bandwidth NOMAD preset documented in \code{\link{npcdensbw}}.
+    Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
+    also be supplied through \code{\dots}; \code{nmulti} remains the
+    outer restart count while \code{nomad.nmulti} controls inner
+    \code{crs::snomadr()} multistarts within each outer restart.
+    Automatic NOMAD degree search requires at least one continuous
+    explanatory variable. After fitting, inspect
+    \code{fit$bws$nomad.shortcut} on the returned object \code{fit} to
+    see the normalized shortcut metadata.
+  }
 
 \subsection{Additional Arguments}{
-Further arguments are passed to the bandwidth-selection counterpart when bandwidths are computed internally.
+Further arguments are passed to the bandwidth-selection counterpart,
+prediction/evaluation route, or plot route as appropriate.
 }
 
   \item{\dots}{
-    additional arguments supplied to specify the bandwidth type,
-    kernel types, and so on, detailed below.
-    This is necessary if you specify bws as a \eqn{p+q}-vector and not
-    a \code{conbandwidth} object, and you do not desire the default behaviours.
+    additional arguments supplied to \code{\link{npcdensbw}} when bandwidths
+    are computed internally, or arguments needed to interpret a numeric
+    \code{bws} vector. This is where bandwidth-selection controls such
+    as \code{bwmethod}, \code{bwtype}, and \code{bwscaling},
+    kernel/support controls such as \code{cxkertype}, \code{cykertype},
+    \code{cxkerorder}, \code{cykerorder}, \code{cxkerbound}, and
+    \code{cykerbound}, categorical kernel controls such as
+    \code{uxkertype}, \code{uykertype}, \code{oxkertype}, and
+    \code{oykertype}, search controls such as \code{nmulti} and
+    \code{scale.factor.search.lower}, and local-polynomial/NOMAD
+    controls such as \code{regtype}, \code{degree},
+    \code{bernstein.basis}, \code{degree.select}, and
+    \code{nomad.nmulti} are supplied. In \code{predict.conmode},
+    additional arguments are passed to \code{npconmode} for evaluation
+    with the stored bandwidth object; native \code{exdat} and
+    \code{eydat} take precedence over \code{newdata}. In
+    \code{plot.conmode}, additional arguments control the object-fed
+    probability/effect display; common controls include
+    \code{gradients}, \code{level}, \code{output}, \code{data_rug},
+    \code{layout}, \code{legend}, \code{view}, \code{neval},
+    \code{grid_control}, \code{perspective}, \code{plot.vars},
+    \code{renderer}, and graphics arguments. The default
+    \code{view="sample"} draws the stored fitted probabilities/effects at the
+    fitted evaluation points. The \code{view="fixed"} route constructs
+    one-dimensional object-fed slices over each conditioning variable, holding
+    the remaining variables at their \code{uocquantile} median/mode values;
+    \code{np_grid_control(xtrim=..., xq=...)} may be used to adjust the slice
+    range and holdout quantiles. With \code{perspective=TRUE}, the same
+    fixed-grid route draws a base-graphics probability surface for one selected
+    response level over two continuous conditioning variables; use
+    \code{plot.vars} to name the displayed pair when more than two continuous
+    conditioning variables are present; \code{renderer="rgl"} requests the
+    corresponding interactive surface when \pkg{rgl} is available. The public
+    \code{output="both"} spelling is
+    accepted as an alias for the historical \code{output="plot-data"}
+    behavior. For class-probability plots, \code{errors="asymptotic"}
+    adds probability-level asymptotic standard errors and intervals for the
+    selected response level. These intervals target the smooth probability
+    \eqn{\Pr(Y=\ell\mid X=x)}, not the discrete modal class label. Rows whose
+    probabilities were materially repaired by simplex projection report
+    \code{NA} standard errors rather than treating raw conditional-density
+    standard errors as projected-probability standard errors. Bootstrap
+    intervals are available for one-dimensional \code{view="sample"} and
+    \code{view="fixed"} probability plots and use the stored bandwidth object
+    without recomputing bandwidths. Surface asymptotic intervals are available
+    as \code{output="data"} payload columns; surface band rendering and
+    surface bootstrap intervals are intentionally deferred.
+    See \code{\link{npcdensbw}} and \code{\link{plot.np}} for the complete
+    bandwidth-selection and plotting argument surfaces.
   }
 
 }
@@ -119,13 +310,18 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   \code{npconmode} returns a \code{conmode} object with the following
   components:
 
+  \item{bws}{ the \code{conbandwidth} object used to compute the conditional
+    mode }
   \item{conmode}{ a vector of type \code{factor} (or \code{ordered
       factor}) containing the conditional mode at each evaluation
     point}
   \item{condens}{ a vector of numeric type containing the modal density
     estimates at each evaluation point}
   \item{conderr}{ a vector of numeric type containing asymptotic
-    standard errors for the modal density estimates at each evaluation point}
+    standard errors for the modal density estimates at each evaluation point.
+    If a row is materially properized by probability projection, this value is
+    set to \code{NA} for that row rather than reporting a standard error for
+    the unrepaired raw probability.}
   \item{xeval}{ a data frame of evaluation points }
   \item{yeval}{ a vector of type \code{factor} (or \code{ordered
       factor}) containing the actual outcomes, or \code{NA} if not
@@ -139,13 +335,89 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
     available }
   \item{fit.mcfadden}{ the McFadden-Puig-Kerschner performance measure
     or \code{NA} if outcomes are not available }
+  \item{probabilities}{ if requested, a matrix of fitted probabilities over
+    the discrete response support }
+  \item{probability.levels}{ if \code{probabilities} are stored, the response
+    support corresponding to the probability matrix columns }
+  \item{probability.errors}{ if \code{probabilities} are stored, a matrix of
+    asymptotic standard errors for the raw selected-level conditional
+    probability estimates, with rows set to \code{NA} where simplex projection
+    materially repaired the fitted probability vector }
+  \item{probability.repaired.rows}{ if \code{probabilities} are stored, a
+    logical vector identifying rows whose fitted probability vector was
+    materially repaired by proper probability projection }
+  \item{probability.gradients}{ if \code{gradients=TRUE}, a matrix whose
+    entries are class-probability gradients/effects for one selected response
+    level, indexed by evaluation row and conditioning variable }
+  \item{probability.gradient.level, probability.gradient.names,
+    probability.gradient.info}{ metadata describing the response support,
+    conditioning variables, and interpretation of
+    \code{probability.gradients} }
+  \item{proper.requested, proper.applied, proper.info}{ metadata describing
+    whether discrete probability properization was requested, whether any row
+    was materially projected, and diagnostics for non-negativity and unit-mass
+    checks }
+  \item{regtype, degree, nomad, search.engine}{ metadata mirrored from
+    \code{bws} describing the conditional density regression type,
+    local-polynomial degree, whether NOMAD automatic degree search was used,
+    and the search engine when available }
+  \item{degree.search, nomad.shortcut, nomad.time, powell.time}{ detailed
+    search metadata mirrored from \code{bws} when automatic degree search or
+    NOMAD/Powell refinement was used }
 
-  The functions \code{\link{mode}}, and \code{\link{fitted}} may be used to
-  extract the conditional mode estimates, and the conditional density
-  estimates at the conditional mode, respectively,
-  from the resulting object. Also, \code{\link{summary}} supports
-  \code{conmode} objects.
+  The function \code{\link{predict}} may be used to extract conditional mode
+  class predictions, while \code{\link{fitted}} extracts the conditional
+  density estimates at the conditional mode from the resulting object. The
+  function \code{\link{gradients}} extracts
+  class-probability gradients/effects when \code{gradients=TRUE}. Also,
+  \code{\link{summary}} and \code{\link{plot}} support \code{conmode}
+  objects. For \code{plot.conmode}, first fit with
+  \code{probabilities=TRUE} so the plot can remain object-fed. The default
+  plot displays the fitted probability for the base/reference response level
+  \code{levels(y)[1]}; use \code{plot(fit, level=...)} to display another
+  response level and \code{plot(fit, gradients=TRUE)} to display stored
+  class-probability effects. The default \code{view="sample"} draws stored
+  object-fed probability/effect payloads at the fitted evaluation points. Use
+  \code{view="fixed"} and \code{neval} to draw object-fed one-dimensional
+  slices over each conditioning variable, with other variables held at their
+  median/mode values. Use \code{perspective=TRUE} to draw a base-graphics
+  probability surface for one selected response level over two continuous
+  conditioning variables, and \code{renderer="rgl"} for the corresponding
+  interactive surface. Use \code{errors="asymptotic"} for probability-level
+  standard errors and intervals in one-dimensional plots, or with
+  \code{output="data"} for surface interval payloads. Bootstrap intervals and
+  surface band rendering are not yet implemented for \code{plot.conmode}.
 }
+\section{Book And Method Pointers}{
+  The conditional-mode target is
+  \eqn{\arg\max_y \Pr(Y=y\mid X=x)} for a discrete response. In practice
+  \code{npconmode} estimates the conditional probability of each
+  response support point using \code{\link{npcdensbw}} /
+  \code{\link{npcdens}}, optionally projects non-local-constant fitted
+  probabilities onto the probability simplex, and then reports the
+  modal support point.
+
+  Setting \code{gradients=TRUE} stores class-probability effects for one
+  response level. If \code{level} is omitted, the base/reference response level
+  \code{levels(Y)[1]} is used. For a selected support point \eqn{\ell}, the
+  stored effects target
+  \deqn{
+    \nabla_x \Pr(Y=\ell\mid X=x),
+  }
+  with continuous variables interpreted as derivatives and discrete variables
+  interpreted as the corresponding smooth finite-change effects. These effects
+  are useful for asking how the fitted probability of a class changes with each
+  covariate; they are not gradients of the \code{arg max} classification rule
+  itself.
+
+  For book-length background, see Racine (2019), Chapter 4
+  \emph{Conditional Probability Density and Cumulative Distribution
+  Functions}, especially the binary and multinomial choice material,
+  and Li and Racine (2007), Chapter 5 \emph{Conditional Density
+  Estimation} together with Chapter 4 \emph{Kernel Estimation with Mixed
+  Data}.
+}
+
 \references{
   Aitchison, J. and  C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
@@ -245,6 +517,47 @@ summary(bw)
 model <- npconmode(bws=bw)
 
 summary(model)
+
+## Predict modal classes and fitted class probabilities at selected rows.
+new.birthwt <- birthwt[1:5, c("smoke", "race", "ht", "ui", "ftv", "age", "lwt")]
+predict(model, newdata=new.birthwt)
+predict(npconmode(bws=bw, probabilities=TRUE),
+        newdata=new.birthwt, type="prob")
+
+## Class-probability effects can be requested for interactive inspection.
+## The default plot displays the fitted probability for the base/reference
+## response level; level selects another response level when desired, and
+## gradients=TRUE plots the corresponding class-probability effects.
+
+set.seed(42)
+n <- 100
+x <- seq(-1, 1, length.out=n)
+y <- factor(rbinom(n, 1, plogis(1.5*x)), levels=0:1)
+
+model.effects <- npconmode(y~x,
+                           regtype="ll",
+                           bwmethod="cv.ls",
+                           nmulti=1,
+                           probabilities=TRUE,
+                           gradients=TRUE)
+
+gradients(model.effects)
+plot(model.effects)
+plot(model.effects, view="fixed", neval=25)
+plot(model.effects, gradients=TRUE)
+plot(model.effects, gradients=TRUE, view="fixed", neval=25)
+
+## A two-continuous-predictor fit can be displayed as a probability surface.
+## The default level is the base/reference response level.
+
+z <- runif(n, -1, 1)
+y2 <- factor(rbinom(n, 1, plogis(1.5*x - z)), levels=0:1)
+model.surface <- npconmode(y2~x+z,
+                           regtype="ll",
+                           bwmethod="cv.ls",
+                           nmulti=1,
+                           probabilities=TRUE)
+plot(model.surface, perspective=TRUE, neval=15)
 
 ## For the interactive run only we close the slaves perhaps to proceed
 ## with other examples and so forth. This is redundant in batch mode.

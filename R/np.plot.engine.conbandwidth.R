@@ -9,6 +9,7 @@
            ytrim = 0.0,
            neval = 50,
            gradients = FALSE,
+           gradient.order = 1L,
            common.scale = TRUE,
            perspective = TRUE,
            renderer = c("base", "rgl"),
@@ -61,6 +62,7 @@
     scalar_default <- .np_plot_scalar_default
 
     dots <- list(...)
+    plot.legend <- if (!is.null(dots$legend)) dots$legend else TRUE
     plot.user.args <- .np_plot_user_args(dots, "plot")
     bxp.user.args <- .np_plot_user_args(dots, "bxp")
     rgl.persp3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.persp3d", "rgl.persp3d.")
@@ -69,6 +71,7 @@
     rgl.grid3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.grid3d", "rgl.grid3d.")
     rgl.widget.user.args <- .np_plot_collect_rgl_args(dots, "rgl.widget", "rgl.widget.")
     rgl.legend3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.legend3d", "rgl.legend3d.")
+    rgl.legend3d.user.args <- .np_plot_merge_rgl_legend_control(rgl.legend3d.user.args, plot.legend)
     rgl.surface3d.user.args <- .np_plot_extract_prefixed_args(dots, "rgl.surface3d.")
     bxp.args <- bxp.user.args
     if (!is.null(col)) bxp.args$col <- col
@@ -131,7 +134,7 @@
             !missing(plot.errors.boot.nonfixed),
             !missing(plot.errors.boot.blocklen))){
       stop(
-        "plot.errors.method must be set to 'bootstrap' when bootstrap error arguments are supplied",
+        "errors must be set to \"bootstrap\" when bootstrap controls are supplied",
         call. = FALSE
       )
     }
@@ -163,13 +166,6 @@
     plot.errors.style <- normalized.opts$plot.errors.style
     plot.errors.bar <- normalized.opts$plot.errors.bar
     common.scale <- normalized.opts$common.scale
-
-    if (plot.errors.method == "asymptotic" && quantreg && gradients){
-      stop(
-        "asymptotic errors are unsupported for quantile regression gradients; use bootstrap errors",
-        call. = FALSE
-      )
-    }
 
     plot.errors = (plot.errors.method != "none")
     proper.args <- .np_condens_validate_proper_args(
@@ -537,13 +533,12 @@
               lwd = scalar_default(lwd, par()$lwd)
             )
             if (plot.errors.type == "all" && !is.null(lerr.all) && !is.null(herr.all)) {
-              band.cols <- .np_plot_all_band_colors()
-              legend("topright",
-                     legend = c("Pointwise","Simultaneous","Bonferroni"),
-                     lty = 1,
-                     col = unname(band.cols[c("pointwise", "simultaneous", "bonferroni")]),
-                     lwd = 2.15 * scalar_default(lwd, par()$lwd),
-                     bty = "n")
+              .np_plot_draw_all_band_legend(
+                legend = plot.legend,
+                x = "topright",
+                lty = 1,
+                lwd = 2.15 * scalar_default(lwd, par()$lwd)
+              )
             }
           }
 
@@ -652,7 +647,8 @@
             exdat = subcol(exdat,ei,i)[seq_len(xi.neval),, drop = FALSE],
             eydat = eydat[seq_len(xi.neval),, drop = FALSE],
             cdf = cdf,
-            gradients = gradients
+            gradients = gradients,
+            gradient.order = gradient.order
           )
         }
         if (!quantreg && isTRUE(proper.args$proper.requested)) {
@@ -721,6 +717,7 @@
                         quantreg = quantreg,
                         tau = tau,
                         gradients = gradients,
+                        gradient.order = gradient.order,
                         gradient.index = j,
                         slice.index = plot.index,
                         plot.errors.boot.method = plot.errors.boot.method,
@@ -812,7 +809,8 @@
                   ex = as.numeric(na.omit(ei)),
                   center = na.omit(if (plotOnEstimate) temp.dens else temp.err[,3]),
                   all.err = temp.all.err,
-                  xi.factor = xi.factor)
+                  xi.factor = xi.factor,
+                  legend = plot.legend)
               } else {
                 if (!xi.factor && !plotOnEstimate)
                   lines(na.omit(ei), na.omit(temp.err[,3]), lty = 3)
@@ -881,6 +879,7 @@
               eydat = subcol(eydat,ei,i)[seq_len(xi.neval),, drop = FALSE],
               cdf = cdf,
               gradients = gradients,
+              gradient.order = gradient.order,
               proper = isTRUE(proper.args$proper.requested),
               proper.method = proper.args$proper.method,
               proper.control = proper.args$proper.control
@@ -943,6 +942,7 @@
                           quantreg = quantreg,
                           tau = tau,
                           gradients = gradients,
+                          gradient.order = gradient.order,
                           gradient.index = j,
                           slice.index = plot.index,
                           plot.errors.boot.method = plot.errors.boot.method,
@@ -1037,7 +1037,8 @@
                     ex = as.numeric(na.omit(ei)),
                     center = na.omit(if (plotOnEstimate) temp.dens else temp.err[,3]),
                     all.err = temp.all.err,
-                    xi.factor = xi.factor)
+                    xi.factor = xi.factor,
+                  legend = plot.legend)
                 } else {
                   if (!xi.factor && !plotOnEstimate)
                     lines(na.omit(ei), na.omit(temp.err[,3]), lty = 3)
@@ -1170,7 +1171,8 @@
                   else
                     na.omit(data.err[,3*idx]),
                   all.err = data.err.all[[idx]],
-                  xi.factor = xi.factor)
+                  xi.factor = xi.factor,
+                  legend = plot.legend)
               } else {
                 if (!xi.factor && !plotOnEstimate)
                   lines(na.omit(ei), na.omit(temp.err[,3]), lty = 3)

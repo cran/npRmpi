@@ -36,6 +36,7 @@ npcdist.formula <-
 
     has.eval <- !is.null(newdata)
     if (has.eval) {
+      npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
       umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
       emf <- umf
@@ -82,6 +83,7 @@ npcdist.condbandwidth <-
            txdat = stop("invoked without training data 'txdat'"),
            tydat = stop("invoked without training data 'tydat'"),
            exdat, eydat, gradients = FALSE,
+           gradient.order = 1L,
            proper = FALSE,
            proper.method = c("isotonic"),
            proper.control = list(),
@@ -98,17 +100,12 @@ npcdist.condbandwidth <-
     )
     .npRmpi_require_active_slave_pool(where = "npcdist()")
     .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npcdist()")
-    use.local.compiled.adaptive.cvls <- identical(bws$method, "cv.ls") &&
-      identical(bws$type, "adaptive_nn")
-    keep_local_cvls_nn <- use.local.compiled.adaptive.cvls ||
-      (identical(bws$regtype.engine, "lp") &&
-       identical(bws$type, "generalized_nn"))
     if (.npRmpi_autodispatch_active() &&
         !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
-        identical(.npRmpi_safe_int(mpi.comm.size(0)), 1L)) {
+        !.npRmpi_session_has_active_pool(comm = 1L)) {
       return(.npRmpi_with_local_cdist_eval(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
     }
-    if (.npRmpi_autodispatch_active() && !keep_local_cvls_nn) {
+    if (.npRmpi_autodispatch_active()) {
       out <- .npRmpi_autodispatch_call(match.call(), parent.frame())
       out <- .npRmpi_restore_nomad_fit_bws_metadata(out, bws)
       if (inherits(out, "condistribution") &&
@@ -264,33 +261,22 @@ npcdist.condbandwidth <-
       exord = data.frame()
     }
 
-    reg.engine <- if (is.null(bws$regtype.engine)) {
-      if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
-    } else {
-      as.character(bws$regtype.engine)
-    }
-    basis.engine <- if (is.null(bws$basis.engine)) {
-      if (is.null(bws$basis)) "glp" else bws$basis
-    } else {
-      bws$basis.engine
-    }
-    degree.engine <- if (is.null(bws$degree.engine)) {
-      if (bws$xncon > 0L) {
-        if (identical(reg.engine, "lc")) rep.int(0L, bws$xncon) else npValidateGlpDegree(
-          regtype = "lp",
-          degree = bws$degree,
-          ncon = bws$xncon
-        )
-      } else {
-        integer(0)
-      }
-    } else {
-      as.integer(bws$degree.engine)
-    }
-    bernstein.engine <- if (is.null(bws$bernstein.basis.engine)) {
-      isTRUE(bws$bernstein.basis)
-    } else {
-      isTRUE(bws$bernstein.basis.engine)
+    reg.spec <- npConditionalRegEngineSpec(bws, where = "npcdist")
+    reg.engine <- reg.spec$reg.engine
+    basis.engine <- reg.spec$basis.engine
+    degree.engine <- reg.spec$degree.engine
+    bernstein.engine <- reg.spec$bernstein.engine
+    glp.gradient.order <- npConditionalGradientOrder(
+      bws = bws,
+      reg.engine = reg.engine,
+      gradient.order = gradient.order,
+      where = "npcdist"
+    )
+    if (isTRUE(gradients) &&
+        identical(reg.engine, "lp") &&
+        (bws$xncon > 0L) &&
+        all(degree.engine == 0L)) {
+      stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
 
     reg.c <- npRegtypeToC(
@@ -360,57 +346,29 @@ npcdist.condbandwidth <-
       total = .np_condensdist_fit_total(bws = bws, tnrow = tnrow, enrow = enrow),
       handoff = fit.progress.handoff,
       handoff.detail = if (fit.progress.handoff) "starting" else NULL,
-      if (keep_local_cvls_nn) {
-        .npRmpi_with_local_cdist_eval(
-          .Call("C_np_density_conditional",
-                as.double(tyuno), as.double(tyord), as.double(tycon),
-                as.double(txuno), as.double(txord), as.double(txcon),
-                as.double(eyuno), as.double(eyord), as.double(eycon),
-                as.double(exuno), as.double(exord), as.double(excon),
-                as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
-                            bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
-                            bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
-                as.double(bws$ymcv), as.double(attr(bws$ymcv, "pad.num")),
-                as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-                as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
-                as.integer(myopti),
-                as.integer(enrow),
-                as.integer(bws$xndim),
-                as.double(cxker.bounds.c$lb),
-                as.double(cxker.bounds.c$ub),
-                as.double(cyker.bounds.c$lb),
-                as.double(cyker.bounds.c$ub),
-                as.integer(reg.c$code),
-                as.integer(degree.c),
-                as.integer(bernstein.engine),
-                basis.code,
-                PACKAGE = "npRmpi")
-        )
-      } else {
-        .Call("C_np_density_conditional",
-              as.double(tyuno), as.double(tyord), as.double(tycon),
-              as.double(txuno), as.double(txord), as.double(txcon),
-              as.double(eyuno), as.double(eyord), as.double(eycon),
-              as.double(exuno), as.double(exord), as.double(excon),
-              as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
-                          bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
-                          bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
-              as.double(bws$ymcv), as.double(attr(bws$ymcv, "pad.num")),
-              as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-              as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
-              as.integer(myopti),
-              as.integer(enrow),
-              as.integer(bws$xndim),
-              as.double(cxker.bounds.c$lb),
-              as.double(cxker.bounds.c$ub),
-              as.double(cyker.bounds.c$lb),
-              as.double(cyker.bounds.c$ub),
-              as.integer(reg.c$code),
-              as.integer(degree.c),
-              as.integer(bernstein.engine),
-              basis.code,
-              PACKAGE = "npRmpi")
-      }
+      .Call("C_np_density_conditional",
+            as.double(tyuno), as.double(tyord), as.double(tycon),
+            as.double(txuno), as.double(txord), as.double(txcon),
+            as.double(eyuno), as.double(eyord), as.double(eycon),
+            as.double(exuno), as.double(exord), as.double(excon),
+            as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
+                        bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
+                        bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
+            as.double(bws$ymcv), as.double(attr(bws$ymcv, "pad.num")),
+            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+            as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
+            as.integer(myopti),
+            as.integer(enrow),
+            as.integer(bws$xndim),
+            as.double(cxker.bounds.c$lb),
+            as.double(cxker.bounds.c$ub),
+            as.double(cyker.bounds.c$lb),
+            as.double(cyker.bounds.c$ub),
+            as.integer(reg.c$code),
+            as.integer(degree.c),
+            as.integer(bernstein.engine),
+            basis.code,
+            PACKAGE = "npRmpi")
     )
     names(myout)[1] <- "condist"
 
@@ -423,6 +381,39 @@ npcdist.condbandwidth <-
 
       myout$congerr = matrix(data=myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
       myout$congerr = myout$congerr[, rorder, drop = FALSE]
+
+      if (identical(reg.engine, "lp") && bws$xncon > 0L) {
+        cont.idx <- which(bws$ixcon)
+        invalid.order <- glp.gradient.order > degree.engine
+        if (any(invalid.order)) {
+          myout$congrad[, cont.idx[invalid.order]] <- NA_real_
+          myout$congerr[, cont.idx[invalid.order]] <- NA_real_
+          .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
+        }
+
+        higher.order <- (glp.gradient.order > 1L) & !invalid.order
+        if (any(higher.order)) {
+          rhs <- rep.int(1.0, nrow(proper.slice.context$txdat))
+          for (jj in which(higher.order)) {
+            svec <- integer(bws$xncon)
+            svec[jj] <- glp.gradient.order[jj]
+            hat.args <- list(
+              bws = bws,
+              txdat = proper.slice.context$txdat,
+              tydat = proper.slice.context$tydat,
+              y = rhs,
+              output = "apply",
+              s = svec
+            )
+            if (!no.exy) {
+              hat.args$exdat <- proper.slice.context$exdat
+              hat.args$eydat <- proper.slice.context$eydat
+            }
+            myout$congrad[, cont.idx[jj]] <- as.vector(do.call(npcdisthat, hat.args))
+            myout$congerr[, cont.idx[jj]] <- NA_real_
+          }
+        }
+      }
     } else {
       myout$congrad = NA
       myout$congerr = NA
@@ -439,6 +430,7 @@ npcdist.condbandwidth <-
                            condist = myout$condist, conderr = myout$conderr,
                            congrad = myout$congrad, congerr = myout$congerr,
                            ntrain = tnrow, trainiseval = no.exy, gradients = gradients,
+                           gradient.order = if (identical(reg.engine, "lp")) glp.gradient.order else NULL,
                            rows.omit = rows.omit,
                            timing = bws$timing, total.time = total.time,
                            optim.time = optim.time, fit.time = fit.elapsed)
@@ -518,7 +510,7 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
       .npRmpi_autodispatch_active() &&
       !isTRUE(nomad) &&
       !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
-      identical(.npRmpi_safe_int(mpi.comm.size(0)), 1L)) {
+      !.npRmpi_session_has_active_pool(comm = 1L)) {
     return(.npRmpi_with_local_cdist_eval(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
   }
   keep_local_raw_degree1_cvls <- !has.explicit.bws &&
@@ -570,6 +562,14 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw$newdata <- NULL
+  sc.bw$exdat <- NULL
+  sc.bw$eydat <- NULL
+  sc.bw$gradients <- NULL
+  sc.bw$gradient.order <- NULL
+  sc.bw$proper <- NULL
+  sc.bw$proper.method <- NULL
+  sc.bw$proper.control <- NULL
     
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
     sc.bw,

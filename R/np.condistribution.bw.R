@@ -152,7 +152,7 @@ npcdistbw.condbandwidth <-
            ngrid = 100,
            nmulti,
            penalty.multiplier = 10,
-           remin = TRUE,
+           powell.remin = TRUE,
            scale.init.categorical.sample = FALSE,
            scale.factor.search.lower = NULL,
            small = 1.490116e-05,
@@ -167,7 +167,7 @@ npcdistbw.condbandwidth <-
       nmulti <- npDefaultNmulti(dim(ydat)[2]+dim(xdat)[2])
     }
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute, "bandwidth.compute")
-    remin <- npValidateScalarLogical(remin, "remin")
+    remin <- npValidateScalarLogical(powell.remin, "powell.remin")
     do.full.integral <- npValidateScalarLogical(do.full.integral, "do.full.integral")
     scale.init.categorical.sample <-
       npValidateScalarLogical(scale.init.categorical.sample, "scale.init.categorical.sample")
@@ -245,13 +245,8 @@ npcdistbw.condbandwidth <-
       (use.local.compiled.adaptive.cvls ||
        (identical(spec$regtype.engine, "lp") &&
         identical(bws$type, "generalized_nn")))
-    keep_local_raw_degree1_cvls <- bandwidth.compute &&
-      identical(bws$method, "cv.ls") &&
-      identical(bws$type, "fixed") &&
-      npIsRawDegreeOneConditionalSpec(spec, bws$xncon)
     if (.npRmpi_autodispatch_active() &&
-        !keep_local_cvls_nn &&
-        !keep_local_raw_degree1_cvls)
+        !keep_local_cvls_nn)
       return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     xdat = xdat[goodrows,,drop = FALSE]
@@ -427,7 +422,7 @@ npcdistbw.condbandwidth <-
 
       if (bws$method != "normal-reference"){
         myout <- npWithLocalLinearRawBasisSearchError(
-          if (keep_local_cvls_nn || keep_local_raw_degree1_cvls) {
+          if (keep_local_cvls_nn) {
             .npRmpi_with_local_cdist_eval(
               .Call("C_np_distribution_conditional_bw",
                     as.double(yuno), as.double(yord), as.double(ycon),
@@ -993,17 +988,27 @@ npcdistbw.condbandwidth <-
     rep.int(1, length(x_ord_flat))
   )
 
-  list(
+  setup <- list(
     cont_flat = c(y_cont_flat, x_cont_flat),
-    cont_scale = c(EssDee(ycon), EssDee(xcon)) * nconfac,
+    cont_scale = .npConditionalNomadContScale(
+      ycon = ycon,
+      xcon = xcon,
+      iycon = template$iycon,
+      ixcon = template$ixcon,
+      nconfac = nconfac,
+      where = "npcdistbw"
+    ),
     cat_flat = c(y_uno_flat, y_ord_flat, x_uno_flat, x_ord_flat),
     ncatfac = ncatfac,
     bandwidth.scale.categorical = bandwidth.scale.categorical,
     cat_upper = cat_upper
   )
+  .npAssertConditionalNomadSetup(setup, where = "npcdistbw")
+  setup
 }
 
 .npcdistbw_nomad_point_to_bw <- function(point, template, setup) {
+  .npAssertConditionalNomadSetup(setup, where = "npcdistbw")
   point <- as.numeric(point)
   ncont <- length(setup$cont_flat)
   ncat <- length(setup$cat_flat)
@@ -1025,6 +1030,7 @@ npcdistbw.condbandwidth <-
 }
 
 .npcdistbw_nomad_bw_to_point <- function(bws, template, setup) {
+  .npAssertConditionalNomadSetup(setup, where = "npcdistbw")
   point <- numeric(length(setup$cont_flat) + length(setup$cat_flat))
 
   if (length(setup$cont_flat) > 0L) {
@@ -1162,6 +1168,7 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     manage_progress_lifecycle = is.null(external.progress),
     bind_bandwidth_runtime = !is.null(external.progress),
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
+    remin = isTRUE(opt.args$nomad.remin),
     nomad.opts = list(
       DIRECTION_TYPE = "ORTHO 2N",
       QUAD_MODEL_SEARCH = "no",
@@ -1350,12 +1357,16 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
       hot.reg.args$regtype.engine <- "lp"
       hot.reg.args$degree.engine <- degree
       hot.reg.args$bernstein.basis.engine <- degree.search$bernstein.basis
-      hot.opt.args <- opt.args
-      hot.opt.args$nmulti <- .np_nomad_powell_hotstart_nmulti("disable_multistart")
+      hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
+        opt.args,
+        strategy = "disable_multistart",
+        remin = isTRUE(opt.args$powell.remin)
+      )
       powell.start <- proc.time()[3L]
       hot.payload <- .np_nomad_with_powell_progress(
-        degree,
-        .npcdistbw_run_fixed_degree_collective(
+        degree = degree,
+        best_record = best_record,
+        expr = .npcdistbw_run_fixed_degree_collective(
           xdat = xdat,
           ydat = ydat,
           bws = bw_vec,
@@ -1392,7 +1403,8 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
       cont_scale = setup$cont_scale,
       cat_flat = setup$cat_flat,
       ncatfac = setup$ncatfac,
-      bandwidth.scale.categorical = setup$bandwidth.scale.categorical
+      bandwidth.scale.categorical = setup$bandwidth.scale.categorical,
+      cat_upper = setup$cat_upper
     )
     search.degree <- list(
       engine = degree.search$engine,
@@ -1504,6 +1516,7 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     nmulti = nomad.nmulti,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
+    remin = isTRUE(opt.args$nomad.remin),
     nomad.opts = list(
       DIRECTION_TYPE = "ORTHO 2N",
       QUAD_MODEL_SEARCH = "no",
@@ -1706,7 +1719,8 @@ npcdistbw.default <-
            oxkertype,
            oykertype,
            penalty.multiplier,
-           remin,
+           nomad.remin = FALSE,
+           powell.remin,
            scale.init.categorical.sample,
            scale.factor.search.lower = NULL,
            small,
@@ -1768,6 +1782,9 @@ npcdistbw.default <-
     )
 
     if (isTRUE(nomad.shortcut$enabled)) {
+      if (sum(x.info$icon) == 0L)
+        stop("nomad=TRUE requires at least one continuous predictor for degree search",
+             call. = FALSE)
       if ("degree" %in% mc.names)
         stop("nomad=TRUE does not support an explicit degree; remove degree or set nomad=FALSE")
       if ("regtype" %in% mc.names &&
@@ -1840,6 +1857,7 @@ npcdistbw.default <-
 
     search.mc.names <- names(mc)
     lp.dot.args <- list(...)
+    .np_degree_reject_unknown_dots(lp.dot.args, "npcdistbw")
     random.seed.value <- .np_degree_extract_random_seed(lp.dot.args)
     search.engine.value <- if (!is.null(nomad.shortcut$values$search.engine)) nomad.shortcut$values$search.engine else "nomad+powell"
     scale.factor.search.lower <- npResolveScaleFactorLowerBound(scale.factor.search.lower)
@@ -1931,20 +1949,15 @@ npcdistbw.default <-
       (use.local.compiled.adaptive.cvls ||
        (identical(tbw$regtype.engine, "lp") &&
         identical(tbw$type, "generalized_nn")))
-    keep_local_raw_degree1_cvls <- bandwidth.compute &&
-      identical(tbw$method, "cv.ls") &&
-      identical(tbw$type, "fixed") &&
-      npIsRawDegreeOneConditionalSpec(spec, tbw$xncon)
     if (.npRmpi_autodispatch_active() &&
         !keep_local_cvls_nn &&
-        !keep_local_raw_degree1_cvls &&
         is.null(degree.search))
       return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     ## next grab dummies for actual bandwidth selection and perform call
 
     mc.names <- names(mc)
-    margs <- c("gydat", "nmulti", "remin", "itmax", "do.full.integral", "ngrid", "ftol",
+    margs <- c("gydat", "nmulti", "nomad.remin", "powell.remin", "itmax", "do.full.integral", "ngrid", "ftol",
                "tol", "small", "memfac",
                "lbc.dir", "dfc.dir", "cfac.dir","initc.dir",
                "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir",

@@ -53,6 +53,7 @@ npreg.formula <-
     has.eval <- !is.null(newdata)
     if (has.eval) {
       if (!y.eval){
+        npValidateNewdataFormula(newdata, tt, include.response = FALSE)
         tt <- delete.response(tt)
 
         orig.ts <- .np_terms_ts_mask(terms_obj = tt, data = newdata)
@@ -75,6 +76,8 @@ npreg.formula <-
         }
       }
       
+      if (y.eval)
+        npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
       umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
       emf <- umf
@@ -85,23 +88,33 @@ npreg.formula <-
       exdat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
     }
 
-    reg.args <- list(txdat = txdat, tydat = tydat, bws = bws)
+    dots <- list(...)
+    reg.bws <- if (!is.null(dots$bws)) {
+      out <- dots$bws
+      dots$bws <- NULL
+      out
+    } else {
+      bws
+    }
+
+    reg.args <- list(txdat = txdat, tydat = tydat, bws = reg.bws)
     if (has.eval) {
       reg.args$exdat <- exdat
       if (y.eval)
         reg.args$eydat <- eydat
     }
-    ev <- do.call(npreg, c(reg.args, list(...)))
+    ev <- do.call(npreg, c(reg.args, dots))
     if (!is.null(ev$bws)) {
+      preserve.bws.call <- inherits(bws, "rbandwidth") && !is.null(bws$call)
       bw.call <- mc[c(1, match(c("bws", "data", "subset", "na.action"),
                                names(mc), nomatch = 0))]
       if ("bws" %in% names(bw.call))
         names(bw.call)[names(bw.call) == "bws"] <- "formula"
       bw.call[[1L]] <- quote(npregbw)
       environment(bw.call) <- parent.frame()
-      ev$bws$call <- bw.call
-      ev$bws$formula <- bws
-      ev$bws$terms <- attr(tmf, "terms")
+      ev$bws$call <- if (preserve.bws.call) bws$call else bw.call
+      ev$bws$formula <- if (preserve.bws.call && !is.null(bws$formula)) bws$formula else bws
+      ev$bws$terms <- if (preserve.bws.call && !is.null(bws$terms)) bws$terms else attr(tmf, "terms")
       ev$bws$rows.omit <- as.vector(attr(tmf, "na.action"))
       ev$bws$nobs.omit <- length(ev$bws$rows.omit)
     }
@@ -163,6 +176,11 @@ npreg.rbandwidth <-
     dots <- list(...)
     fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
     regtype.raw <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+    if ("remin" %in% names(dots)) {
+      warning("npreg: bandwidth-selection argument 'remin' is ignored when a bandwidth object is supplied",
+              call. = FALSE)
+      dots$remin <- NULL
+    }
     basis.raw <- npValidateLpBasis(regtype = regtype.raw, basis = bws$basis)
     degree.raw <- npValidateGlpDegree(regtype = regtype.raw,
                                       degree = bws$degree,
@@ -671,8 +689,6 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   .npRmpi_require_active_slave_pool(where = "npreg()")
   .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npreg()")
   nomad <- npValidateScalarLogical(nomad, "nomad")
-  if (.npRmpi_autodispatch_active() && !isTRUE(nomad))
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   if (!missing(bws) &&
       !isa(bws, "rbandwidth") &&
@@ -690,9 +706,15 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
       reg.args$txdat <- txdat
     if (!missing(tydat))
       reg.args$tydat <- tydat
-    dots$.np_fit_progress_handoff <- TRUE
-    return(do.call(npreg, c(reg.args, dots)))
+    fit.dots <- dots
+    fit.dots$remin <- NULL
+    fit.dots$.np_fit_progress_handoff <- TRUE
+    return(do.call(npreg, c(reg.args, fit.dots)))
   }
+
+  has.fixed.bws.value <- !missing(bws) && !isa(bws, "rbandwidth")
+  if (.npRmpi_autodispatch_active() && !isTRUE(nomad) && !isTRUE(has.fixed.bws.value))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   sc <- sys.call()
   sc.names <- names(sc)

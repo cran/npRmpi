@@ -49,7 +49,7 @@ npudensbw(\dots)
           lbd.init = 0.1,
           nmulti,
           penalty.multiplier = 10,
-          remin = TRUE,
+          powell.remin = TRUE,
           scale.init.categorical.sample = FALSE,
           scale.factor.search.lower = NULL,
           small = 1.490116e-05,
@@ -88,7 +88,7 @@ npudensbw(\dots)
           nmulti,
           okertype,
           penalty.multiplier,
-          remin,
+          powell.remin,
           scale.init.categorical.sample,
           scale.factor.search.lower = NULL,
           small,
@@ -372,10 +372,10 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     baseline penalty when \code{invalid.penalty="baseline"}.
     Defaults to \code{10}.}
 
-  \item{remin}{
-    a logical value which when set as \code{TRUE} the search routine
-    restarts from located minima for a minor gain in accuracy. Defaults
-    to \code{TRUE}.
+  \item{powell.remin}{
+    logical flag controlling Powell restart-from-minimum behavior. When
+    \code{TRUE}, the Powell-style search restarts from the located minimum
+    for a minor gain in accuracy. Defaults to \code{TRUE}.
   }
 
   \item{small}{
@@ -442,8 +442,8 @@ or standard-deviation factors.
   not affected by \code{scale.factor.search.lower}.
 
   Documentation guide: see \code{\link{np.kernels}} for kernels,
-  \code{\link{np.options}} for global options, \code{\link{plot}} for
-  plotting options, and \code{\link{npRmpi.init}} for
+  \code{\link{np.options}} for global options, \code{\link{plot}},
+  \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for
   interactive/cluster MPI startup. See \code{\link{npRmpi.init}}
   details for performance tradeoffs (message passing/startup mode) and
   the \code{inst/Rprofile} manual-broadcast template.
@@ -457,10 +457,8 @@ or standard-deviation factors.
   \code{\link{npudens}} without a bandwidth object can pass these same
   bandwidth-selection controls through that function's \code{\dots}.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
 
   Typical usages are (see below for a complete list of options and also
@@ -581,6 +579,18 @@ or standard-deviation factors.
   The functions  \code{\link{predict}}, \code{\link{summary}} and \code{\link{plot}} support
   objects of type \code{bandwidth}.
 }
+\section{Book And Method Pointers}{
+  \code{npudensbw} selects bandwidths for the unconditional density
+  target \eqn{f(x)} estimated by \code{\link{npudens}}. The continuous
+  scale factors and discrete smoothing parameters are those used in the
+  generalized product-kernel density estimator.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 1
+  \emph{Density Estimation}, especially Sections 1.3, 1.6, 1.8, and 1.9,
+  and Chapter 4 \emph{Kernel Estimation with Mixed Data}. The later
+  workflow treatment is Racine (2019), Chapters 2 and 3.
+}
+
 \references{
 
   Aitchison, J. and , C.G.G. Aitken (1976), \dQuote{Multivariate binary
@@ -647,7 +657,7 @@ or standard-deviation factors.
 }
 
 \seealso{
-  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{bw.nrd}}, \code{\link{bw.SJ}},  \code{\link{hist}},
   \code{\link{npudens}}, \code{\link{npudist}} }
 \examples{

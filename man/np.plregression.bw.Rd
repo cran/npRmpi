@@ -38,7 +38,7 @@ npplregbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-          degree.min = NULL,
+            degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -48,7 +48,8 @@ npplregbw(\dots)
           ftol,
           itmax,
           nmulti,
-          remin,
+          nomad.remin,
+          powell.remin,
           small,
           tol,
           \dots)
@@ -172,13 +173,14 @@ These arguments control automatic local-polynomial degree search.
 
   \item{degree.select}{
     character string controlling local-polynomial degree handling for
-    the nonparametric \code{zdat} component. \code{"manual"} (default)
-    treats \code{degree} as fixed. \code{"coordinate"} performs cached
-    coordinate-wise search over admissible degree vectors.
+    the nuisance regressions of \eqn{Y} on \eqn{Z} and each column of
+    \eqn{X} on \eqn{Z}. \code{"manual"} (default) treats \code{degree}
+    as fixed. \code{"coordinate"} performs cached coordinate-wise
+    search over admissible degree vectors.
     \code{"exhaustive"} evaluates the full admissible degree grid when
     \code{search.engine="cell"}. For NOMAD-based search engines, any
-    non-\code{"manual"} value requests direct joint search over degree
-    and bandwidth coordinates for the nonparametric component.
+    non-\code{"manual"} value requests a separate degree and bandwidth
+    search for each nuisance regression.
   }
 
   \item{degree.start}{
@@ -219,7 +221,15 @@ These arguments control fixed local-polynomial specification for the nonparametr
     for local-polynomial partially linear fits, polynomial degree
     specification for each continuous nonparametric regressor in
     \code{zdat}. When supplied with \code{degree.select="manual"},
-    bandwidth optimization treats this vector as fixed input.
+    bandwidth optimization treats this input as fixed. A numeric vector
+    is used as a common degree vector for every nuisance regression.
+    To specify child-specific fixed degrees, supply either a matrix with
+    \eqn{p+1} rows and one column per continuous \code{zdat} predictor,
+    or a list with \eqn{p+1} entries. The child order matches the
+    bandwidth matrix/object order: first the regression of \eqn{Y} on
+    \eqn{Z} (row or entry \code{yzbw}), followed by the regressions of
+    the columns of \eqn{X} on \eqn{Z}. Named matrix rows or list entries
+    are accepted and reordered to this canonical order.
   }
 
 
@@ -229,7 +239,7 @@ These arguments control the optional NOMAD direct-search route for local-polynom
 
   \item{nomad}{
     logical shortcut for the recommended automatic local-polynomial
-    NOMAD route for the nonparametric \code{zdat} component. When
+    NOMAD route for the partially linear nuisance regressions. When
     \code{TRUE}, any missing values among \code{regtype},
     \code{search.engine}, \code{degree.select},
     \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
@@ -250,7 +260,8 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     Returned bandwidth objects retain this normalized preset metadata in
     \code{bw$nomad.shortcut} for a returned object \code{bw}; when
     available, \code{nomad.time} and \code{powell.time} record the
-    direct-search and Powell-polish timing components.
+    direct-search and Powell-polish timing components. Each nuisance
+    regression selects its own admissible degree and bandwidths.
   }
 
   \item{nomad.nmulti}{
@@ -264,15 +275,25 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     controls inner NOMAD multistarts within each outer restart.
   }
 
+  \item{nomad.remin}{
+    logical flag controlling the optional second NOMAD hot start. When
+    \code{TRUE}, NOMAD is restarted once from the best full candidate found,
+    including both bandwidth and degree coordinates. Defaults to \code{FALSE};
+    current simulation evidence favors the one-pass NOMAD default for routine
+    use, while leaving this switch available for sensitivity checks.
+  }
+
+
   \item{search.engine}{
     character string controlling the automatic local-polynomial search
-    backend for the nonparametric \code{zdat} component when
+    backend for each nuisance regression when
     \code{degree.select != "manual"}. \code{"nomad+powell"} (default)
-    performs direct joint search over fixed bandwidths and the degree
-    vector using \code{crs::snomadr()}, then applies one Powell hot
-    start from the NOMAD solution. \code{"nomad"} omits the Powell
-    refinement. \code{"cell"} profiles the criterion over the
-    admissible degree grid using repeated fixed-degree bandwidth solves.
+    performs direct search over fixed bandwidths and the degree vector
+    using \code{crs::snomadr()}, then applies one Powell hot start from
+    the NOMAD solution, separately for each nuisance regression.
+    \code{"nomad"} omits the Powell refinement. \code{"cell"} profiles
+    the criterion over the admissible degree grid using repeated
+    fixed-degree bandwidth solves.
     NOMAD-based search currently requires fixed-bandwidth child
     templates, \code{degree.verify=FALSE}, and the suggested package
     \pkg{crs} to be installed.
@@ -300,10 +321,13 @@ These controls set optimizer tolerances and restart behavior.
     points. Defaults to \code{min(2,ncol(zdat))}.
   }
 
-  \item{remin}{
-    a logical value which when set as \code{TRUE} the search routine
-    restarts from located minima for a minor gain in accuracy. Defaults
-    to \code{TRUE}
+  \item{powell.remin}{
+    logical flag controlling Powell restart-from-minimum behavior. For
+    ordinary fixed-degree Powell-style search, \code{TRUE} restarts the
+    local search from the located minimum. For \code{search.engine="nomad+powell"},
+    this controls only the final Powell bandwidth-polish step. The default
+    is \code{TRUE} for ordinary Powell routes and \code{FALSE} for the
+    Powell polish after NOMAD unless explicitly supplied.
   }
 
   \item{small}{ a small number, at about the precision of the data type
@@ -370,7 +394,7 @@ or standard-deviation factors.
   Documentation guide: see \code{\link{npregbw}} for component
   nonparametric regression bandwidth controls, \code{\link{np.kernels}}
   for kernels, \code{\link{np.options}} for global options,
-  \code{\link{plot}} for plotting options, and
+  \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and
   \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See
   \code{\link{npRmpi.init}} details for performance tradeoffs (message
   passing/startup mode) and the \code{inst/Rprofile} manual-broadcast
@@ -384,10 +408,8 @@ or standard-deviation factors.
   controls; and additional bandwidth, kernel, and support controls that
   are passed to the component \code{\link{npregbw}} searches.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
   \code{npplregbw} implements a variety of methods for nonparametric
  regression on multivariate (\eqn{q}-variate) explanatory data defined
@@ -444,16 +466,18 @@ or standard-deviation factors.
 
  When the nonparametric component is estimated with
  \code{regtype="lp"} and \code{degree.select != "manual"},
- \code{npplregbw} can jointly determine the \code{zdat}-side degree
- vector and the associated bandwidth coordinates. With
+ \code{npplregbw} determines the \code{zdat}-side degree vector and
+ associated bandwidth coordinates separately for the nuisance
+ regressions \eqn{E[Y \mid Z]} and \eqn{E[X_j \mid Z]}. With
  \code{search.engine="cell"}, the criterion is profiled over the degree
  grid using cached coordinate-wise or exhaustive search together with
  repeated fixed-degree bandwidth solves. With
- \code{search.engine="nomad"} or \code{"nomad+powell"}, the criterion
- is optimized directly over the joint degree/bandwidth space using
- \code{crs::snomadr()}; \code{"nomad+powell"} then performs one Powell
- hot start and keeps the better of the direct NOMAD and polished
- solutions. For the nonparametric regression component, this
+ \code{search.engine="nomad"} or \code{"nomad+powell"}, each nuisance
+ criterion is optimized directly over that child's degree/bandwidth
+ space using \code{crs::snomadr()}; \code{"nomad+powell"} then performs
+ one Powell hot start for that child and keeps the better of the direct
+ NOMAD and polished solutions. For the nonparametric regression
+ components, this
  polynomial-adaptive joint-search route follows Hall and Racine (2015).
 
  Setting \code{nomad=TRUE} is a convenience preset for this automatic
@@ -487,6 +511,20 @@ or standard-deviation factors.
   Each subsequent element is the bandwidth object corresponding to the
   regression of the \eqn{i}th column of \eqn{X} on \eqn{Z}. See examples
   for more information.
+}
+
+\section{Book And Method Pointers}{
+  \code{npplregbw} selects the bandwidths and, for local-polynomial
+  routes, child-specific degree/search metadata used by
+  \code{\link{npplreg}}. The target model is
+  \eqn{Y=X\beta+\Theta(Z)+\epsilon}; the bandwidth object controls the
+  nuisance regressions \eqn{E[Y\mid Z]} and \eqn{E[X_j\mid Z]} used in
+  the final partially linear solve.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 7
+  \emph{Semiparametric Partially Linear Models}, especially Sections 7.1,
+  7.2, and 7.4, and Racine (2019), Chapter 8 \emph{Semiparametric
+  Conditional Mean Function Estimation}.
 }
 
 \references{
@@ -557,7 +595,7 @@ or standard-deviation factors.
 }
 
 \seealso{
-  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{npregbw}}, \code{\link{npreg}} }
 \examples{
 \dontrun{

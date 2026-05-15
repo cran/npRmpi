@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
+#include <limits.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -39,6 +40,121 @@ extern  int iNum_Processors;
 extern  int iSeed_my_rank;
 extern  MPI_Status status;
 extern MPI_Comm	*comm;
+
+typedef struct {
+  int chunk_start;
+  int chunk_end;
+  int row_width;
+  int local_rows;
+  int *recvcounts;
+  int *displs;
+  double *sendbuf;
+  double *recvbuf;
+} NPRegMpiOwnerChunk;
+
+static void np_reg_mpi_owner_chunk_init(NPRegMpiOwnerChunk * const chunk,
+                                        const int chunk_start,
+                                        const int chunk_end,
+                                        const int row_width,
+                                        const char * const label){
+  size_t chunk_count;
+  int i;
+
+  if(chunk == NULL)
+    error("\n** Error: invalid MPI owner chunk.");
+  if((chunk_end < chunk_start) || (row_width <= 0))
+    error("\n** Error: invalid MPI owner chunk dimensions.");
+
+  chunk->chunk_start = chunk_start;
+  chunk->chunk_end = chunk_end;
+  chunk->row_width = row_width;
+  chunk->local_rows = 0;
+  chunk->recvcounts = NULL;
+  chunk->displs = NULL;
+  chunk->sendbuf = NULL;
+  chunk->recvbuf = NULL;
+
+  chunk_count = (size_t)(chunk_end - chunk_start)*(size_t)row_width;
+  if(chunk_count > (size_t)INT_MAX)
+    error("%s MPI owner-chunk path exceeds MPI count limit",
+          (label == NULL) ? "npreg" : label);
+
+  chunk->recvcounts = (int *)malloc((size_t)iNum_Processors*sizeof(int));
+  chunk->displs = (int *)malloc((size_t)iNum_Processors*sizeof(int));
+  if((chunk->recvcounts == NULL) || (chunk->displs == NULL))
+    error("\n** Error: memory allocation failed.");
+
+  for(i = 0; i < iNum_Processors; i++){
+    int rows_i = 0;
+    int jj;
+    for(jj = chunk_start + i; jj < chunk_end; jj += iNum_Processors)
+      rows_i++;
+    if(((size_t)rows_i*(size_t)row_width) > (size_t)INT_MAX)
+      error("%s MPI owner-chunk local count exceeds MPI count limit",
+            (label == NULL) ? "npreg" : label);
+    chunk->recvcounts[i] = rows_i*row_width;
+    chunk->displs[i] = (i == 0) ? 0 : (chunk->displs[i-1] + chunk->recvcounts[i-1]);
+    if(i == my_rank)
+      chunk->local_rows = rows_i;
+  }
+
+  chunk->sendbuf = (double *)malloc((size_t)MAX(1, chunk->local_rows)*(size_t)row_width*sizeof(double));
+  chunk->recvbuf = (double *)malloc(MAX((size_t)1, chunk_count)*sizeof(double));
+  if((chunk->sendbuf == NULL) || (chunk->recvbuf == NULL))
+    error("\n** Error: memory allocation failed.");
+}
+
+static void np_reg_mpi_owner_chunk_allgather(const NPRegMpiOwnerChunk * const chunk){
+  if(chunk == NULL)
+    error("\n** Error: invalid MPI owner chunk.");
+  MPI_Allgatherv(chunk->sendbuf,
+                 chunk->local_rows*chunk->row_width,
+                 MPI_DOUBLE,
+                 chunk->recvbuf,
+                 chunk->recvcounts,
+                 chunk->displs,
+                 MPI_DOUBLE,
+                 comm[1]);
+}
+
+static const double *np_reg_mpi_owner_chunk_recv_ptr(const NPRegMpiOwnerChunk * const chunk,
+                                                    const int rank,
+                                                    const int pos){
+  return chunk->recvbuf + (size_t)(chunk->displs[rank] + pos*chunk->row_width);
+}
+
+static int np_reg_mpi_owner_chunk_rows(const int num_obs_eval,
+                                       const int row_width){
+  const int target_local_rows = 512;
+  const int min_chunk_rows = 4096;
+  const int max_recv_doubles = 4000000;
+  int chunk_rows = MAX(min_chunk_rows, target_local_rows*iNum_Processors);
+  int cap_rows;
+
+  if(num_obs_eval <= 0)
+    return 0;
+  if(row_width <= 0)
+    return MIN(num_obs_eval, chunk_rows);
+
+  cap_rows = MAX(iNum_Processors, max_recv_doubles / row_width);
+  chunk_rows = MIN(chunk_rows, cap_rows);
+  chunk_rows = MAX(iNum_Processors, chunk_rows);
+
+  return MIN(num_obs_eval, chunk_rows);
+}
+
+static void np_reg_mpi_owner_chunk_free(NPRegMpiOwnerChunk * const chunk){
+  if(chunk == NULL)
+    return;
+  free(chunk->sendbuf);
+  free(chunk->recvbuf);
+  free(chunk->recvcounts);
+  free(chunk->displs);
+  chunk->sendbuf = NULL;
+  chunk->recvbuf = NULL;
+  chunk->recvcounts = NULL;
+  chunk->displs = NULL;
+}
 #endif
 
 static int np_mpi_rank_failure_injected(const char *env_name){
@@ -271,6 +387,15 @@ static void *np_jksum_malloc_array3_or_die(size_t a, size_t b, size_t c, const c
 {
   return np_jksum_malloc_bytes_or_die(np_jksum_size_mul3_or_die(a, b, c, what), what);
 }
+
+#ifdef MPI2
+static int np_jksum_mpi_count_or_die(size_t count, const char *what)
+{
+  if (count > (size_t)INT_MAX)
+    error("%s: MPI count exceeds INT_MAX", what);
+  return (int)count;
+}
+#endif
 
 int kernel_convolution_weighted_sum(
 int KERNEL_reg,
@@ -5021,6 +5146,9 @@ const int keep_kw_owner_local){
   // switch parallelisation strategies based on biggest stride
  
   int stride = MAX((int)ceil((double) num_obs_eval / (double) iNum_Processors),1);
+  int loop_stride = is_adaptive
+    ? MAX((int)ceil((double) num_obs_train / (double) iNum_Processors),1)
+    : stride;
   num_obs_eval_alloc = suppress_parallel ? num_obs_eval : (stride*iNum_Processors);
 
   int * igatherv = NULL, * idisplsv = NULL;
@@ -5100,7 +5228,8 @@ const int keep_kw_owner_local){
 
 #ifdef MPI2
   if((kw != NULL) && (!suppress_parallel)){
-    kw_work = (double *)calloc((size_t)num_obs_eval_alloc*(size_t)num_xt, sizeof(double));
+    const int kw_rows_alloc = is_adaptive ? loop_stride*iNum_Processors : num_obs_eval_alloc;
+    kw_work = (double *)calloc((size_t)kw_rows_alloc*(size_t)num_xt, sizeof(double));
     if(kw_work == NULL){
       status = KWSNP_ERR_BADINVOC;
       goto cleanup;
@@ -5193,7 +5322,11 @@ const int keep_kw_owner_local){
       ps_okernel = KERNEL_ordered_reg;
     }
 
-    tprod_mp = (double *)malloc(((BANDWIDTH_reg==BW_ADAP_NN)?num_obs_eval:num_obs_train)*p_nvar*sizeof(double));
+    {
+      const size_t tprod_rows = (size_t)((BANDWIDTH_reg==BW_ADAP_NN)?num_obs_eval:num_obs_train);
+      const size_t tprod_count = np_jksum_size_mul_or_die(tprod_rows, (size_t)p_nvar, "tprod_mp");
+      tprod_mp = (double *)malloc(np_jksum_size_mul_or_die(tprod_count, sizeof(double), "tprod_mp"));
+    }
     if(tprod_mp == NULL){
       status = KWSNP_ERR_BADINVOC;
       goto cleanup;
@@ -5598,8 +5731,8 @@ const int keep_kw_owner_local){
   } else {
 #ifdef MPI2
     if((!suppress_parallel) && (!gather_scatter)){
-      js = stride * my_rank;
-      je = MIN(num_obs_train - 1, js + stride - 1);
+      js = loop_stride * my_rank;
+      je = MIN(num_obs_train - 1, js + loop_stride - 1);
       ws = weighted_sum;
       p_ws = weighted_permutation_sum;
 
@@ -6271,23 +6404,50 @@ const int keep_kw_owner_local){
 #ifdef MPI2
     if(!nws){
       if (BANDWIDTH_reg == BW_FIXED || BANDWIDTH_reg == BW_GEN_NN){
-        MPI_Allgather(MPI_IN_PLACE, stride * sum_element_length, MPI_DOUBLE, weighted_sum, stride * sum_element_length, MPI_DOUBLE, comm[1]);
+        const int weighted_count =
+          np_jksum_mpi_count_or_die(np_jksum_size_mul_or_die((size_t)stride,
+                                                             (size_t)sum_element_length,
+                                                             "weighted_sum MPI_Allgather"),
+                                    "weighted_sum MPI_Allgather");
+        MPI_Allgather(MPI_IN_PLACE, weighted_count, MPI_DOUBLE, weighted_sum, weighted_count, MPI_DOUBLE, comm[1]);
       } else if(BANDWIDTH_reg == BW_ADAP_NN){
-        MPI_Allreduce(MPI_IN_PLACE, weighted_sum, num_obs_eval*sum_element_length, MPI_DOUBLE, MPI_SUM, comm[1]);
+        const int weighted_count =
+          np_jksum_mpi_count_or_die(np_jksum_size_mul_or_die((size_t)num_obs_eval,
+                                                             (size_t)sum_element_length,
+                                                             "weighted_sum MPI_Allreduce"),
+                                    "weighted_sum MPI_Allreduce");
+        MPI_Allreduce(MPI_IN_PLACE, weighted_sum, weighted_count, MPI_DOUBLE, MPI_SUM, comm[1]);
       }
     }
 
     if((kw_work != NULL) && (!keep_kw_owner_local)){
-      MPI_Allgather(MPI_IN_PLACE, stride * num_xt, MPI_DOUBLE, kw_work, stride * num_xt, MPI_DOUBLE, comm[1]);
+      const int kw_stride = is_adaptive ? loop_stride : stride;
+      const int kw_count =
+        np_jksum_mpi_count_or_die(np_jksum_size_mul_or_die((size_t)kw_stride,
+                                                           (size_t)num_xt,
+                                                           "kw_work MPI_Allgather"),
+                                  "kw_work MPI_Allgather");
+      MPI_Allgather(MPI_IN_PLACE, kw_count, MPI_DOUBLE, kw_work, kw_count, MPI_DOUBLE, comm[1]);
     }
 
     if(p_nvar > 0){
       if (BANDWIDTH_reg == BW_FIXED || BANDWIDTH_reg == BW_GEN_NN){
         for(ii = 0; ii < p_nvar; ii++){
-          MPI_Allgatherv(MPI_IN_PLACE, igatherv[my_rank], MPI_DOUBLE, weighted_permutation_sum + ii*num_obs_eval*sum_element_length, igatherv, idisplsv, MPI_DOUBLE, comm[1]);
+          const size_t perm_offset =
+            np_jksum_size_mul3_or_die((size_t)ii,
+                                      (size_t)num_obs_eval,
+                                      (size_t)sum_element_length,
+                                      "weighted_permutation_sum offset");
+          MPI_Allgatherv(MPI_IN_PLACE, igatherv[my_rank], MPI_DOUBLE, weighted_permutation_sum + perm_offset, igatherv, idisplsv, MPI_DOUBLE, comm[1]);
         }
       } else if(BANDWIDTH_reg == BW_ADAP_NN){
-        MPI_Allreduce(MPI_IN_PLACE, weighted_permutation_sum, p_nvar*num_obs_eval*sum_element_length, MPI_DOUBLE, MPI_SUM, comm[1]);
+        const int perm_count =
+          np_jksum_mpi_count_or_die(np_jksum_size_mul3_or_die((size_t)p_nvar,
+                                                              (size_t)num_obs_eval,
+                                                              (size_t)sum_element_length,
+                                                              "weighted_permutation_sum MPI_Allreduce"),
+                                    "weighted_permutation_sum MPI_Allreduce");
+        MPI_Allreduce(MPI_IN_PLACE, weighted_permutation_sum, perm_count, MPI_DOUBLE, MPI_SUM, comm[1]);
       }
     }
 #endif
@@ -6719,7 +6879,12 @@ double *cv){
                            matrix_X_continuous,
                            matrix_bandwidth_var,
                            matrix_bandwidth_reg,
-                           lambda)==1){
+	                           lambda)==1){
+#ifdef MPI2
+    free(sum_kerf);
+    free(sum_ker_convolf);
+    free(sum_ker_marginalf);
+#endif
     free(lambda);
     free_mat(matrix_bandwidth_var,num_var_continuous);
     free_mat(matrix_bandwidth_reg,num_reg_continuous);
@@ -7040,6 +7205,8 @@ static int np_glp_enum_terms_rec(const int idx,
   return 1;
 }
 
+static void np_glp_sort_terms(const int ncon, int *terms, const int nterms);
+
 static int np_glp_build_terms(const int ncon,
                               const int *deg,
                               const int basis_mode,
@@ -7096,9 +7263,54 @@ static int np_glp_build_terms(const int ncon,
   }
 
   free(cur);
+  np_glp_sort_terms(ncon, terms, nterms);
   *terms_out = terms;
   *nterms_out = nterms;
   return 1;
+}
+
+static int np_glp_term_total_degree(const int ncon, const int *term){
+  int j, s = 0;
+  for(j = 0; j < ncon; j++)
+    s += term[j];
+  return s;
+}
+
+static int np_glp_term_precedes(const int ncon, const int *a, const int *b){
+  int j;
+  const int sa = np_glp_term_total_degree(ncon, a);
+  const int sb = np_glp_term_total_degree(ncon, b);
+
+  if(sa != sb)
+    return sa < sb;
+
+  for(j = 0; j < ncon; j++){
+    if(a[j] != b[j])
+      return a[j] > b[j];
+  }
+
+  return 0;
+}
+
+static void np_glp_sort_terms(const int ncon, int *terms, const int nterms){
+  int i, j, k;
+  int tmp[MAX(1, ncon)];
+
+  if((ncon <= 0) || (terms == NULL) || (nterms <= 1))
+    return;
+
+  for(i = 1; i < nterms; i++){
+    for(k = 0; k < ncon; k++)
+      tmp[k] = terms[i*ncon + k];
+    j = i - 1;
+    while((j >= 0) && np_glp_term_precedes(ncon, tmp, terms + j*ncon)){
+      for(k = 0; k < ncon; k++)
+        terms[(j + 1)*ncon + k] = terms[j*ncon + k];
+      j--;
+    }
+    for(k = 0; k < ncon; k++)
+      terms[(j + 1)*ncon + k] = tmp[k];
+  }
 }
 
 static void np_glp_fill_basis_raw_train(const int ncon,
@@ -7116,6 +7328,28 @@ static void np_glp_fill_basis_raw_train(const int ncon,
         const int p = et[j];
         if(p > 0)
           b *= ipow(matrix_X_continuous_train[j][i], p);
+      }
+      basis[t][i] = b;
+    }
+  }
+}
+
+static void np_glp_fill_basis_raw_train_centered(const int ncon,
+                                                 const int *terms,
+                                                 const int nterms,
+                                                 double **matrix_X_continuous_train,
+                                                 const double *x0,
+                                                 const int num_obs_train,
+                                                 double **basis){
+  int t, i, j;
+  for(t = 0; t < nterms; t++){
+    const int *et = terms + t*ncon;
+    for(i = 0; i < num_obs_train; i++){
+      double b = 1.0;
+      for(j = 0; j < ncon; j++){
+        const int p = et[j];
+        if(p > 0)
+          b *= ipow(matrix_X_continuous_train[j][i] - x0[j], p);
       }
       basis[t][i] = b;
     }
@@ -7177,6 +7411,49 @@ static void np_glp_fill_basis_eval_deriv_raw(const int which_var,
       }
     }
     eval_deriv[t] = b;
+  }
+}
+
+static void np_glp_fill_basis_eval_raw_centered(const int ncon,
+                                                const int *terms,
+                                                const int nterms,
+                                                double *eval_basis){
+  int t, j;
+  for(t = 0; t < nterms; t++){
+    const int *et = terms + t*ncon;
+    int is_const = 1;
+    for(j = 0; j < ncon; j++){
+      if(et[j] != 0){
+        is_const = 0;
+        break;
+      }
+    }
+    eval_basis[t] = is_const ? 1.0 : 0.0;
+  }
+}
+
+static void np_glp_fill_basis_eval_deriv_raw_centered(const int which_var,
+                                                      const int deriv_order,
+                                                      const int ncon,
+                                                      const int *terms,
+                                                      const int nterms,
+                                                      double *eval_deriv){
+  int t, j;
+  for(t = 0; t < nterms; t++){
+    const int *et = terms + t*ncon;
+    int ok = 1;
+    for(j = 0; j < ncon; j++){
+      if(j == which_var){
+        if(et[j] != deriv_order){
+          ok = 0;
+          break;
+        }
+      } else if(et[j] != 0){
+        ok = 0;
+        break;
+      }
+    }
+    eval_deriv[t] = ok ? np_glp_falling_factorial(deriv_order, deriv_order) : 0.0;
   }
 }
 
@@ -7539,7 +7816,7 @@ static int np_reg_cv_core_cache_prepare(const int KERNEL_reg,
        np_reg_cv_core_cache.kernel_u == NULL ||
        np_reg_cv_core_cache.kernel_o == NULL ||
        np_reg_cv_core_cache.lambda == NULL ||
-       np_reg_cv_core_cache.matrix_bandwidth == NULL){
+       (num_reg_continuous > 0 && np_reg_cv_core_cache.matrix_bandwidth == NULL)){
       np_reg_cv_core_cache_clear();
       return 0;
     }
@@ -7785,27 +8062,6 @@ static inline int np_reg_cv_use_canonical_ll_degree1_lp_objective(const int int_
     (BANDWIDTH_reg == BW_FIXED) &&
     (num_reg_continuous > 0) &&
     (!ks_tree_use);
-}
-
-static inline int np_reg_use_canonical_glp_degree1_estimation(const int int_ll,
-                                                              const int BANDWIDTH_reg,
-                                                              const int num_reg_continuous){
-  int i;
-
-  if((int_ll != LL_LP) ||
-     (BANDWIDTH_reg != BW_GEN_NN) ||
-     (num_reg_continuous <= 0) ||
-     (vector_glp_degree_extern == NULL) ||
-     (int_glp_basis_extern != 1) ||
-     (int_glp_bernstein_extern != 0))
-    return 0;
-
-  for(i = 0; i < num_reg_continuous; i++){
-    if(vector_glp_degree_extern[i] != 1)
-      return 0;
-  }
-
-  return 1;
 }
 
 static inline double np_glp_binom_coeff(const int n, const int k){
@@ -13325,10 +13581,7 @@ double *SIGN){
 
   const int do_grad = (gradient != NULL); 
   const int do_gerr = (gradient_stderr != NULL);
-  const int int_ll_est =
-    np_reg_use_canonical_glp_degree1_estimation(int_ll,
-                                                BANDWIDTH_reg,
-                                                num_reg_continuous) ? LL_LL : int_ll;
+  const int int_ll_est = int_ll;
   np_gate_ctx_clear(&gate_ctx_local);
   const NP_GateOverrideCtx * const est_gate_ctx_ptr = &gate_ctx_local;
 
@@ -14156,16 +14409,27 @@ double *SIGN){
     MATRIX KWM = NULL, XTKY = NULL, DELTA = NULL;
     MATRIX KWM2 = NULL, KWM_INV = NULL, IDEN = NULL;
     double **basis = NULL;
+    double **matrix_bandwidth_eval = NULL;
     double **TCON = NULL, **TUNO = NULL, **TORD = NULL;
     double **Ycols = NULL, **Wcols = NULL;
     double *y2 = NULL, *out = NULL, *out2 = NULL;
+    double *xj = NULL;
     NPGLPBasisCtx *basis_ctx = NULL;
     double *eval_basis = NULL, *eval_deriv = NULL;
     double *tmp_v = NULL, *tmp_w = NULL;
     const double epsilon = 1.0/(double)MAX(1, num_obs_train);
+    int raw_degree1_glp = (!use_bernstein) && (int_glp_basis_extern == 1);
+    int use_ll_compatible_gnn_se = 0;
 
     if((vector_glp_degree_extern == NULL) || (num_reg_continuous <= 0))
       error("glp degree vector unavailable");
+    for(l = 0; l < num_reg_continuous; l++){
+      if(vector_glp_degree_extern[l] != 1){
+        raw_degree1_glp = 0;
+        break;
+      }
+    }
+    use_ll_compatible_gnn_se = raw_degree1_glp && (BANDWIDTH_reg == BW_GEN_NN);
 
     if(!np_glp_build_terms(num_reg_continuous, vector_glp_degree_extern, int_glp_basis_extern, &glp_terms, &glp_nterms))
       error("failed to build glp basis terms");
@@ -14179,6 +14443,7 @@ double *SIGN){
     KWM_INV = mat_creat(glp_nterms, glp_nterms, UNDEFINED);
     IDEN = mat_creat(glp_nterms, glp_nterms, UNDEFINED);
     basis = alloc_matd(num_obs_train, glp_nterms);
+    matrix_bandwidth_eval = alloc_tmatd(1, num_reg_continuous);
     TCON = alloc_matd(1, num_reg_continuous);
     TUNO = alloc_matd(1, num_reg_unordered);
     TORD = alloc_matd(1, num_reg_ordered);
@@ -14187,6 +14452,8 @@ double *SIGN){
     y2 = (double *)malloc((size_t)num_obs_train*sizeof(double));
     out = (double *)malloc((size_t)(glp_nterms + 2)*(size_t)glp_nterms*sizeof(double));
     out2 = (double *)malloc((size_t)glp_nterms*(size_t)glp_nterms*sizeof(double));
+    if(!use_bernstein)
+      xj = (double *)malloc((size_t)num_reg_continuous*sizeof(double));
     tmp_v = (double *)malloc((size_t)glp_nterms*sizeof(double));
     tmp_w = (double *)malloc((size_t)glp_nterms*sizeof(double));
     eval_basis = (double *)malloc((size_t)glp_nterms*sizeof(double));
@@ -14197,11 +14464,13 @@ double *SIGN){
     if(!((KWM != NULL) && (XTKY != NULL) && (DELTA != NULL) &&
       (KWM2 != NULL) && (KWM_INV != NULL) && (IDEN != NULL) &&
       (basis != NULL) &&
+      ((num_reg_continuous == 0) || (matrix_bandwidth_eval != NULL)) &&
       ((num_reg_continuous == 0) || (TCON != NULL)) &&
       ((num_reg_unordered == 0) || (TUNO != NULL)) &&
       ((num_reg_ordered == 0) || (TORD != NULL)) &&
       (Ycols != NULL) && (Wcols != NULL) && (y2 != NULL) && (out != NULL) &&
       (out2 != NULL) && (tmp_v != NULL) && (tmp_w != NULL) &&
+      (use_bernstein || (xj != NULL)) &&
       (eval_basis != NULL) && (eval_deriv != NULL) &&
       (!use_bernstein || (basis_ctx != NULL))))
       error("memory allocation failed in glp path");
@@ -14229,26 +14498,346 @@ double *SIGN){
                               num_obs_train,
                               basis_ctx,
                               basis);
-    } else {
-      np_glp_fill_basis_raw_train(num_reg_continuous,
-                                  glp_terms,
-                                  glp_nterms,
-                                  matrix_X_continuous_train,
-                                  num_obs_train,
-                                  basis);
-    }
+	    } else {
+	      np_glp_fill_basis_raw_train(num_reg_continuous,
+	                                  glp_terms,
+	                                  glp_nterms,
+	                                  matrix_X_continuous_train,
+	                                  num_obs_train,
+	                                  basis);
+	    }
 
-    for(j = 0; j < num_obs_eval; j++){
-      double nepsilon = 0.0;
-      double sk, ey, ey2, sigma2hat;
-      int have_vcov = 0;
+#ifdef MPI2
+	    const int use_mpi_owner_reduce_lp =
+	      (iNum_Processors > 1) &&
+	      (!np_mpi_local_regression_active()) &&
+	      (BANDWIDTH_reg == BW_FIXED);
+	    const int owner_chunk_rows_lp =
+	      np_reg_mpi_owner_chunk_rows(num_obs_eval,
+	                                  2 + (do_grad ? num_reg_continuous*(1 + (do_gerr ? 1 : 0)) : 0));
+#endif
 
-      for(l = 0; l < num_reg_continuous; l++)
-        TCON[l][0] = matrix_X_continuous_eval[l][j];
+	    for(j = 0; j < num_obs_eval; j++){
+	      double nepsilon = 0.0;
+	      double sk, ey, ey2, sigma2hat;
+	      int have_vcov = 0;
+
+#ifdef MPI2
+	      if(use_mpi_owner_reduce_lp && ((j % owner_chunk_rows_lp) == 0)){
+	        const int chunk_start = j;
+	        const int chunk_end = MIN(num_obs_eval, chunk_start + owner_chunk_rows_lp);
+	        const int owner_row_width_lp = 2 + (do_grad ? num_reg_continuous*(1 + (do_gerr ? 1 : 0)) : 0);
+	        NPRegMpiOwnerChunk owner_chunk;
+	        double *kw_owner = NULL;
+	        int local_pos = 0;
+
+	        np_reg_mpi_owner_chunk_init(&owner_chunk,
+	                                    chunk_start,
+	                                    chunk_end,
+	                                    owner_row_width_lp,
+	                                    "npreg LP");
+	        kw_owner = (double *)malloc((size_t)num_obs_train*sizeof(double));
+	        if(kw_owner == NULL)
+	          error("\n** Error: memory allocation failed.");
+
+	        local_pos = 0;
+	        for(int jj = chunk_start + my_rank; jj < chunk_end; jj += iNum_Processors){
+	          double nepsilon_owner = 0.0;
+	          double sk_owner, ey_owner, ey2_owner, sigma2_owner;
+	          int have_vcov_owner = 0;
+	          double * const out_owner = owner_chunk.sendbuf + (size_t)local_pos*(size_t)owner_row_width_lp;
+	          int opos = 0;
+
+	          for(l = 0; l < num_reg_continuous; l++){
+	            TCON[l][0] = matrix_X_continuous_eval[l][jj];
+	            if(!use_bernstein)
+	              xj[l] = TCON[l][0];
+	            matrix_bandwidth_eval[l][0] =
+	              (BANDWIDTH_reg == BW_GEN_NN) ? matrix_bandwidth[l][jj] :
+	              ((BANDWIDTH_reg == BW_FIXED) ? matrix_bandwidth[l][0] : 0.0);
+	          }
+	          for(l = 0; l < num_reg_unordered; l++)
+	            TUNO[l][0] = matrix_X_unordered_eval[l][jj];
+	          for(l = 0; l < num_reg_ordered; l++)
+	            TORD[l][0] = matrix_X_ordered_eval[l][jj];
+
+	          if(!use_bernstein)
+	            np_glp_fill_basis_raw_train_centered(num_reg_continuous,
+	                                                 glp_terms,
+	                                                 glp_nterms,
+	                                                 matrix_X_continuous_train,
+	                                                 xj,
+	                                                 num_obs_train,
+	                                                 basis);
+
+	          Ycols[0] = y2;
+	          Ycols[1] = vector_Y;
+	          for(l = 0; l < glp_nterms; l++){
+	            Ycols[l + 2] = basis[l];
+	            Wcols[l] = basis[l];
+	          }
+
+	          kernel_weighted_sum_np_ctx(kernel_c,
+	                                 kernel_u,
+	                                 kernel_o,
+	                                 BANDWIDTH_reg,
+	                                 num_obs_train,
+	                                 1,
+	                                 num_reg_unordered,
+	                                 num_reg_ordered,
+	                                 num_reg_continuous,
+	                                 0,
+	                                 0,
+	                                 1,
+	                                 1,
+	                                 1,
+	                                 0,
+	                                 0,
+	                                 0,
+	                                 0,
+	                                 operator,
+	                                 OP_NOOP,
+	                                 0,
+	                                 0,
+	                                 NULL,
+	                                 1,
+	                                 glp_nterms + 2,
+	                                 glp_nterms,
+	                                 (BANDWIDTH_reg == BW_ADAP_NN) ? NP_TREE_FALSE : int_TREE_X,
+	                                 0,
+	                                 (BANDWIDTH_reg == BW_ADAP_NN) ? NULL : kdt_extern_X,
+	                                 NULL, NULL, NULL,
+	                                 matrix_X_unordered_train,
+	                                 matrix_X_ordered_train,
+	                                 matrix_X_continuous_train,
+	                                 TUNO,
+	                                 TORD,
+	                                 TCON,
+	                                 Ycols,
+	                                 Wcols,
+	                                 NULL,
+	                                 vector_scale_factor,
+	                                 1,
+	                                 matrix_bandwidth,
+	                                 matrix_bandwidth_eval,
+	                                 lambda,
+	                                 num_categories,
+	                                 matrix_categorical_vals,
+	                                 NULL,
+	                                 out,
+	                                 NULL,
+	                                 kw_owner,
+	                                 est_gate_ctx_ptr);
+
+	          for(i = 0; i < glp_nterms; i++){
+	            const int base = i*(glp_nterms + 2);
+	            XTKY[i][0] = out[base + 1];
+	            for(l = 0; l < glp_nterms; l++)
+	              KWM[i][l] = out[base + (l + 2)];
+	          }
+	          while(mat_solve(KWM, XTKY, DELTA) == NULL){
+	            for(i = 0; i < glp_nterms; i++)
+	              KWM[i][i] += epsilon;
+	            nepsilon_owner += epsilon;
+	          }
+
+	          XTKY[0][0] += nepsilon_owner*XTKY[0][0]/NZD_POS(KWM[0][0]);
+	          if(nepsilon_owner > 0.0){
+	            if(mat_solve(KWM, XTKY, DELTA) == NULL)
+	              error("mat_solve failed in glp owner path");
+	          }
+
+	          if(use_bernstein)
+	            np_glp_fill_basis_eval(num_reg_continuous,
+	                                   glp_terms,
+	                                   glp_nterms,
+	                                   matrix_X_continuous_eval,
+	                                   jj,
+	                                   basis_ctx,
+	                                   eval_basis);
+	          else
+	            np_glp_fill_basis_eval_raw_centered(num_reg_continuous,
+	                                                glp_terms,
+	                                                glp_nterms,
+	                                                eval_basis);
+
+	          out_owner[opos] = 0.0;
+	          for(i = 0; i < glp_nterms; i++)
+	            out_owner[opos] += eval_basis[i]*DELTA[i][0];
+	          opos++;
+
+	          sk_owner = copysign(DBL_MIN, out[2]) + out[2];
+	          ey_owner = out[1]/sk_owner;
+	          ey2_owner = out[0]/sk_owner;
+	          sigma2_owner = ey2_owner - ey_owner*ey_owner;
+	          {
+	            const double v_owner = sigma2_owner * K_INT_KERNEL_P / (sk_owner*hprod);
+	            out_owner[opos] = (v_owner <= 0.0) ? 0.0 : sqrt(v_owner);
+	          }
+	          sigma2_owner = (sigma2_owner <= 0.0) ? 0.0 : sigma2_owner;
+
+	          for(i = 0; i < glp_nterms; i++){
+	            for(l = 0; l < glp_nterms; l++){
+	              KWM2[i][l] = 0.0;
+	              IDEN[i][l] = (i == l) ? 1.0 : 0.0;
+	            }
+	          }
+
+	          for(i = 0; i < num_obs_train; i++){
+	            const double w = kw_owner[i];
+	            const double w2 = w*w;
+	            if(w2 == 0.0)
+	              continue;
+	            for(int a = 0; a < glp_nterms; a++){
+	              const double za = basis[a][i];
+	              for(int b = 0; b < glp_nterms; b++)
+	                KWM2[a][b] += za*basis[b][i]*w2;
+	            }
+	          }
+	          if(mat_solve(KWM, IDEN, KWM_INV) != NULL)
+	            have_vcov_owner = 1;
+
+	          if(have_vcov_owner){
+	            double q = 0.0;
+	            for(i = 0; i < glp_nterms; i++){
+	              double vv = 0.0;
+	              for(int ii = 0; ii < glp_nterms; ii++)
+	                vv += KWM_INV[i][ii]*eval_basis[ii];
+	              tmp_v[i] = vv;
+	            }
+	            for(i = 0; i < glp_nterms; i++){
+	              double ww = 0.0;
+	              for(int ii = 0; ii < glp_nterms; ii++)
+	                ww += KWM2[i][ii]*tmp_v[ii];
+	              tmp_w[i] = ww;
+	            }
+	            for(i = 0; i < glp_nterms; i++)
+	              q += tmp_v[i]*tmp_w[i];
+	            {
+	              const double mv = sigma2_owner*q;
+	              if((mv > 0.0) && isfinite(mv))
+	                out_owner[opos] = sqrt(mv);
+	            }
+	          }
+	          opos++;
+
+	          if(do_grad){
+	            for(l = 0; l < num_reg_continuous; l++){
+	              const int grad_order = (vector_glp_gradient_order_extern != NULL) ?
+	                MAX(1, vector_glp_gradient_order_extern[l]) : 1;
+	              double grad_value = 0.0;
+
+	              if(use_bernstein)
+	                np_glp_fill_basis_eval_deriv(l,
+	                                             grad_order,
+	                                             num_reg_continuous,
+	                                             glp_terms,
+	                                             glp_nterms,
+	                                             matrix_X_continuous_eval,
+	                                             jj,
+	                                             basis_ctx,
+	                                             eval_deriv);
+	              else
+	                np_glp_fill_basis_eval_deriv_raw_centered(l,
+	                                                          grad_order,
+	                                                          num_reg_continuous,
+	                                                          glp_terms,
+	                                                          glp_nterms,
+	                                                          eval_deriv);
+	              for(i = 0; i < glp_nterms; i++)
+	                grad_value += eval_deriv[i]*DELTA[i][0];
+	              out_owner[opos++] = grad_value;
+
+	              if(do_gerr){
+	                double grad_se = 0.0;
+	                if(have_vcov_owner){
+	                  double q = 0.0;
+	                  for(i = 0; i < glp_nterms; i++){
+	                    double vv = 0.0;
+	                    for(int ii = 0; ii < glp_nterms; ii++)
+	                      vv += KWM_INV[i][ii]*eval_deriv[ii];
+	                    tmp_v[i] = vv;
+	                  }
+	                  for(i = 0; i < glp_nterms; i++){
+	                    double ww = 0.0;
+	                    for(int ii = 0; ii < glp_nterms; ii++)
+	                      ww += KWM2[i][ii]*tmp_v[ii];
+	                    tmp_w[i] = ww;
+	                  }
+	                  for(i = 0; i < glp_nterms; i++)
+	                    q += tmp_v[i]*tmp_w[i];
+	                  {
+	                    const double gv = sigma2_owner*q;
+	                    grad_se = (gv > 0.0 && isfinite(gv)) ? sqrt(gv) : 0.0;
+	                  }
+	                }
+	                out_owner[opos++] = grad_se;
+	              }
+	            }
+	          }
+	          local_pos++;
+	        }
+
+	        np_reg_mpi_owner_chunk_allgather(&owner_chunk);
+
+	        for(i = 0; i < iNum_Processors; i++){
+	          int pos_i = 0;
+	          for(int jj = chunk_start + i; jj < chunk_end; jj += iNum_Processors){
+	            const double * const in =
+	              np_reg_mpi_owner_chunk_recv_ptr(&owner_chunk, i, pos_i);
+	            int ipos = 0;
+	            mean[jj] = in[ipos++];
+	            mean_stderr[jj] = in[ipos++];
+	            if(do_grad){
+	              for(l = 0; l < num_reg_continuous; l++){
+	                gradient[l][jj] = in[ipos++];
+	                if(do_gerr)
+	                  gradient_stderr[l][jj] = in[ipos++];
+	              }
+	              for(l = num_reg_continuous;
+	                  l < (num_reg_continuous + num_reg_unordered + num_reg_ordered);
+	                  l++){
+	                gradient[l][jj] = 0.0;
+	                if(do_gerr)
+	                  gradient_stderr[l][jj] = 0.0;
+	              }
+	            }
+	            pos_i++;
+	          }
+	        }
+
+	        np_reg_mpi_owner_chunk_free(&owner_chunk);
+	        free(kw_owner);
+	      }
+
+	      if(use_mpi_owner_reduce_lp){
+	        if (fit_progress_active)
+	          np_progress_fit_loop_step(j + 1, fit_progress_total);
+	        continue;
+	      }
+#endif
+
+	      for(l = 0; l < num_reg_continuous; l++){
+	        TCON[l][0] = matrix_X_continuous_eval[l][j];
+	        if(!use_bernstein)
+	          xj[l] = TCON[l][0];
+	        matrix_bandwidth_eval[l][0] =
+	          (BANDWIDTH_reg == BW_GEN_NN) ? matrix_bandwidth[l][j] :
+	          ((BANDWIDTH_reg == BW_FIXED) ? matrix_bandwidth[l][0] : 0.0);
+	      }
       for(l = 0; l < num_reg_unordered; l++)
         TUNO[l][0] = matrix_X_unordered_eval[l][j];
       for(l = 0; l < num_reg_ordered; l++)
         TORD[l][0] = matrix_X_ordered_eval[l][j];
+
+      if(!use_bernstein)
+        np_glp_fill_basis_raw_train_centered(num_reg_continuous,
+                                             glp_terms,
+                                             glp_nterms,
+                                             matrix_X_continuous_train,
+                                             xj,
+                                             num_obs_train,
+                                             basis);
 
       Ycols[0] = y2;
       Ycols[1] = vector_Y;
@@ -14299,7 +14888,7 @@ double *SIGN){
                              vector_scale_factor,
                              1,
                              matrix_bandwidth,
-                             matrix_bandwidth,
+                             matrix_bandwidth_eval,
                              lambda,
                              num_categories,
                              matrix_categorical_vals,
@@ -14316,7 +14905,6 @@ double *SIGN){
         for(l = 0; l < glp_nterms; l++)
           KWM[i][l] = out[base + (l + 2)]; /* Y columns 2.. are basis terms */
       }
-
       while(mat_solve(KWM, XTKY, DELTA) == NULL){
         for(i = 0; i < glp_nterms; i++)
           KWM[i][i] += epsilon;
@@ -14338,12 +14926,10 @@ double *SIGN){
                                basis_ctx,
                                eval_basis);
       else
-        np_glp_fill_basis_eval_raw(num_reg_continuous,
-                                   glp_terms,
-                                   glp_nterms,
-                                   matrix_X_continuous_eval,
-                                   j,
-                                   eval_basis);
+        np_glp_fill_basis_eval_raw_centered(num_reg_continuous,
+                                            glp_terms,
+                                            glp_nterms,
+                                            eval_basis);
       mean[j] = 0.0;
       for(i = 0; i < glp_nterms; i++)
         mean[j] += eval_basis[i]*DELTA[i][0];
@@ -14355,12 +14941,13 @@ double *SIGN){
       mean_stderr[j] = (sigma2hat <= 0.0) ? 0.0 : sqrt(sigma2hat * K_INT_KERNEL_P / (sk*hprod));
       sigma2hat = (sigma2hat <= 0.0) ? 0.0 : sigma2hat;
 
-      for(l = 0; l < glp_nterms; l++){
-        Ycols[l] = basis[l];
-        Wcols[l] = basis[l];
-      }
+      if(!use_ll_compatible_gnn_se){
+        for(l = 0; l < glp_nterms; l++){
+          Ycols[l] = basis[l];
+          Wcols[l] = basis[l];
+        }
 
-      kernel_weighted_sum_np_ctx(kernel_c,
+        kernel_weighted_sum_np_ctx(kernel_c,
                              kernel_u,
                              kernel_o,
                              BANDWIDTH_reg,
@@ -14402,7 +14989,7 @@ double *SIGN){
                              vector_scale_factor,
                              1,
                              matrix_bandwidth,
-                             matrix_bandwidth,
+                             matrix_bandwidth_eval,
                              lambda,
                              num_categories,
                              matrix_categorical_vals,
@@ -14412,16 +14999,16 @@ double *SIGN){
                              NULL,
                              est_gate_ctx_ptr);
 
-      for(i = 0; i < glp_nterms; i++){
-        const int base = i*glp_nterms;
-        for(l = 0; l < glp_nterms; l++){
-          KWM2[i][l] = out2[base + l];
-          IDEN[i][l] = (i == l) ? 1.0 : 0.0;
+        for(i = 0; i < glp_nterms; i++){
+          const int base = i*glp_nterms;
+          for(l = 0; l < glp_nterms; l++){
+            KWM2[i][l] = out2[base + l];
+            IDEN[i][l] = (i == l) ? 1.0 : 0.0;
+          }
         }
+        if(mat_solve(KWM, IDEN, KWM_INV) != NULL)
+          have_vcov = 1;
       }
-
-      if(mat_solve(KWM, IDEN, KWM_INV) != NULL)
-        have_vcov = 1;
 
       if(have_vcov){
         double q = 0.0;
@@ -14460,19 +15047,20 @@ double *SIGN){
                                          basis_ctx,
                                          eval_deriv);
           else
-            np_glp_fill_basis_eval_deriv_raw(l,
-                                             grad_order,
-                                             num_reg_continuous,
-                                             glp_terms,
-                                             glp_nterms,
-                                             matrix_X_continuous_eval,
-                                             j,
-                                             eval_deriv);
+            np_glp_fill_basis_eval_deriv_raw_centered(l,
+                                                      grad_order,
+                                                      num_reg_continuous,
+                                                      glp_terms,
+                                                      glp_nterms,
+                                                      eval_deriv);
           gradient[l][j] = 0.0;
           for(i = 0; i < glp_nterms; i++)
             gradient[l][j] += eval_deriv[i]*DELTA[i][0];
           if(do_gerr){
-            if(have_vcov){
+            if(use_ll_compatible_gnn_se){
+              gradient_stderr[l][j] =
+                gfac*mean_stderr[j]/((BANDWIDTH_reg == BW_GEN_NN) ? matrix_bandwidth[l][j] : matrix_bandwidth[l][0]);
+            } else if(have_vcov){
               double q = 0.0;
               for(i = 0; i < glp_nterms; i++){
                 double vv = 0.0;
@@ -14514,6 +15102,7 @@ double *SIGN){
     mat_free(KWM_INV);
     mat_free(IDEN);
     free_mat(basis, glp_nterms);
+    if(matrix_bandwidth_eval != NULL) free_tmat(matrix_bandwidth_eval);
     if((TCON != NULL) && (num_reg_continuous > 0)) free_mat(TCON, num_reg_continuous);
     if((TUNO != NULL) && (num_reg_unordered > 0)) free_mat(TUNO, num_reg_unordered);
     if((TORD != NULL) && (num_reg_ordered > 0)) free_mat(TORD, num_reg_ordered);
@@ -14522,6 +15111,7 @@ double *SIGN){
     free(y2);
     free(out);
     free(out2);
+    if(xj != NULL) free(xj);
     free(tmp_v);
     free(tmp_w);
     if(use_bernstein){
@@ -14641,6 +15231,17 @@ double *SIGN){
         moo[l] = matrix_ordered_indices[l];
       }
     }
+#ifdef MPI2
+    const int use_mpi_owner_reduce_ll =
+      (iNum_Processors > 1) &&
+      (!np_mpi_local_regression_active()) &&
+      (BANDWIDTH_reg == BW_FIXED);
+    const int owner_chunk_rows_ll =
+      np_reg_mpi_owner_chunk_rows(num_obs_eval,
+                                  2 + (do_grad ?
+                                       (num_reg_continuous + num_reg_unordered + num_reg_ordered)*
+                                       (1 + (do_gerr ? 1 : 0)) : 0));
+#endif
     for(j = 0; j < num_obs_eval; j++){ // main loop
       nepsilon = 0.0;
 
@@ -14650,8 +15251,322 @@ double *SIGN){
       }
 
 #ifdef MPI2
-      
-      if((j % iNum_Processors) == 0){
+
+      if(use_mpi_owner_reduce_ll && ((j % owner_chunk_rows_ll) == 0)){
+        const int chunk_start = j;
+        const int chunk_end = MIN(num_obs_eval, chunk_start + owner_chunk_rows_ll);
+        const int owner_row_width_ll = 2 + (do_grad ?
+          (num_reg_continuous + num_reg_unordered + num_reg_ordered)*
+          (1 + (do_gerr ? 1 : 0)) : 0);
+        NPRegMpiOwnerChunk owner_chunk;
+        double *kwm2_owner = NULL;
+        double *kw_owner = NULL;
+        MATRIX KWM2_OWNER = NULL;
+        MATRIX KWM_INV_OWNER = NULL;
+        MATRIX IDEN_OWNER = NULL;
+        double *tmp_v_owner = NULL;
+        double *tmp_w_owner = NULL;
+        int local_pos = 0;
+
+        np_reg_mpi_owner_chunk_init(&owner_chunk,
+                                    chunk_start,
+                                    chunk_end,
+                                    owner_row_width_ll,
+                                    "npreg LL");
+        kwm2_owner = (double *)malloc((size_t)nrcc33*sizeof(double));
+        kw_owner = (double *)malloc((size_t)num_obs_train*sizeof(double));
+        KWM2_OWNER = mat_creat(nrc1, nrc1, UNDEFINED);
+        KWM_INV_OWNER = mat_creat(nrc1, nrc1, UNDEFINED);
+        IDEN_OWNER = mat_creat(nrc1, nrc1, UNDEFINED);
+        tmp_v_owner = (double *)malloc((size_t)nrc1*sizeof(double));
+        tmp_w_owner = (double *)malloc((size_t)nrc1*sizeof(double));
+        if((kwm2_owner == NULL) || (kw_owner == NULL) ||
+           (KWM2_OWNER == NULL) || (KWM_INV_OWNER == NULL) ||
+           (IDEN_OWNER == NULL) || (tmp_v_owner == NULL) ||
+           (tmp_w_owner == NULL))
+          error("\n** Error: memory allocation failed.");
+
+        local_pos = 0;
+        for(int jj = chunk_start + my_rank; jj < chunk_end; jj += iNum_Processors){
+          for(l = 0; l < num_reg_continuous; l++){
+            for(i = 0; i < num_obs_train; i++){
+              XTKX[l+3][i] = matrix_X_continuous_train[l][i]-matrix_X_continuous_eval[l][jj];
+            }
+            TCON[l][0] = matrix_X_continuous_eval[l][jj];
+          }
+
+          for(l = 0; l < num_reg_unordered; l++)
+            TUNO[l][0] = matrix_X_unordered_eval[l][jj];
+
+          for(l = 0; l < num_reg_ordered; l++)
+            TORD[l][0] = matrix_X_ordered_eval[l][jj];
+
+          kernel_weighted_sum_np_ctx(kernel_c,
+                                 kernel_u,
+                                 kernel_o,
+                                 BANDWIDTH_reg,
+                                 num_obs_train,
+                                 1,
+                                 num_reg_unordered,
+                                 num_reg_ordered,
+                                 num_reg_continuous,
+                                 0,
+                                 0,
+                                 1,
+                                 1,
+                                 1,
+                                 1,
+                                 0,
+                                 0,
+                                 0,
+                                 operator,
+                                 OP_NOOP,
+                                 0,
+                                 0,
+                                 NULL,
+                                 1,
+                                 nrc3,
+                                 nrc3,
+                                 int_TREE_X,
+                                 0,
+                                 kdt_extern_X,
+                                 NULL, NULL, NULL,
+                                 PXU,
+                                 PXO,
+                                 PXC,
+                                 TUNO,
+                                 TORD,
+                                 TCON,
+                                 XTKX,
+                                 XTKX,
+                                 NULL,
+                                 vsf,
+                                 1,
+                                 matrix_bandwidth,
+                                 matrix_bandwidth_eval,
+                                 lambda,
+                                 num_categories,
+                                 matrix_categorical_vals,
+                                 moo,
+                                 kwm+(size_t)jj*(size_t)nrcc33,
+                                 do_ocg ? (permy+(size_t)jj*(size_t)nrcc33*(size_t)p_nvar) : NULL,
+                                 kw_owner,
+                                 est_gate_ctx_ptr);
+          for(l = 0; l < (nrc1); l++){
+            KWM[l] = &kwm[(size_t)jj*(size_t)nrcc33+(l+2)*(nrc3)+2];
+            XTKY[l] = &kwm[(size_t)jj*(size_t)nrcc33+l+nrc3+2];
+          }
+
+          {
+            double nepsilon_owner = 0.0;
+            while(mat_solve(KWM, XTKY, DELTA) == NULL){
+              for(int ii = 0; ii < (nrc1); ii++)
+                KWM[ii][ii] += epsilon;
+              nepsilon_owner += epsilon;
+            }
+
+            XTKY[0][0] += nepsilon_owner*XTKY[0][0]/NZD_POS(KWM[0][0]);
+            if(nepsilon_owner > 0.0){
+              if(mat_solve(KWM, XTKY, DELTA) == NULL)
+                error("mat_solve failed after ridge adjustment");
+            }
+
+            double * const out = owner_chunk.sendbuf + (size_t)local_pos*(size_t)owner_row_width_ll;
+            const double * const row = kwm+(size_t)jj*(size_t)nrcc33;
+            const double sk = copysign(DBL_MIN, row[2*nrc3+2]) + row[2*nrc3+2];
+            const double ey = row[nrc3+2]/sk;
+            const double ey2 = row[nrc3+1]/sk;
+            double sigma2_owner = ey2 - ey*ey;
+            const double v = sigma2_owner*K_INT_KERNEL_P / (sk*hprod);
+            double mean_se_owner = (v <= 0.0) ? 0.0 : sqrt(v);
+            int opos = 0;
+
+            sigma2_owner = (sigma2_owner <= 0.0) ? 0.0 : sigma2_owner;
+
+            for(int ii = 0; ii < nrcc33; ii++)
+              kwm2_owner[ii] = 0.0;
+
+            for(int kk = 0; kk < num_obs_train; kk++){
+              const double w = kw_owner[kk];
+              const double w2 = w*w;
+              if(w2 == 0.0)
+                continue;
+              for(int ii = 0; ii < nrc1; ii++){
+                const double zi = XTKX[ii+2][kk];
+                const int irow = (ii+2)*nrc3;
+                for(int mm = 0; mm < nrc1; mm++)
+                  kwm2_owner[irow + (mm+2)] += zi*XTKX[mm+2][kk]*w2;
+              }
+            }
+
+            for(int ii = 0; ii < nrc1; ii++){
+              for(int kk = 0; kk < nrc1; kk++){
+                KWM2_OWNER[ii][kk] = kwm2_owner[(ii+2)*nrc3 + (kk+2)];
+                IDEN_OWNER[ii][kk] = (ii == kk) ? 1.0 : 0.0;
+              }
+            }
+
+            if(mat_solve(KWM, IDEN_OWNER, KWM_INV_OWNER) != NULL){
+              double q = 0.0;
+              for(int ii = 0; ii < nrc1; ii++){
+                const double vv = KWM_INV_OWNER[ii][0];
+                tmp_v_owner[ii] = vv;
+              }
+              for(int ii = 0; ii < nrc1; ii++){
+                double ww = 0.0;
+                for(int kk = 0; kk < nrc1; kk++)
+                  ww += KWM2_OWNER[ii][kk]*tmp_v_owner[kk];
+                tmp_w_owner[ii] = ww;
+              }
+              for(int ii = 0; ii < nrc1; ii++)
+                q += tmp_v_owner[ii]*tmp_w_owner[ii];
+              {
+                const double mv = sigma2_owner*q;
+                if((mv > 0.0) && isfinite(mv))
+                  mean_se_owner = sqrt(mv);
+              }
+            }
+
+            out[opos++] = DELTA[0][0];
+            out[opos++] = mean_se_owner;
+
+            if(do_grad){
+              for(int ii = 0; ii < num_reg_continuous; ii++){
+                out[opos++] = DELTA[ii+1][0];
+                if(do_gerr){
+                  double grad_se_owner = 0.0;
+                  if(mat_solve(KWM, IDEN_OWNER, KWM_INV_OWNER) != NULL){
+                    double qg = 0.0;
+                    for(int kk = 0; kk < nrc1; kk++)
+                      tmp_v_owner[kk] = KWM_INV_OWNER[kk][ii+1];
+                    for(int kk = 0; kk < nrc1; kk++){
+                      double ww = 0.0;
+                      for(int mm = 0; mm < nrc1; mm++)
+                        ww += KWM2_OWNER[kk][mm]*tmp_v_owner[mm];
+                      tmp_w_owner[kk] = ww;
+                    }
+                    for(int kk = 0; kk < nrc1; kk++)
+                      qg += tmp_v_owner[kk]*tmp_w_owner[kk];
+                    {
+                      const double gv = sigma2_owner*qg;
+                      grad_se_owner = (gv > 0.0 && isfinite(gv)) ? sqrt(gv) : 0.0;
+                    }
+                  }
+                  out[opos++] = grad_se_owner;
+                }
+              }
+              for(int ii = 0; ii < num_reg_unordered; ii++){
+                const int ojp = ((size_t)jj*(size_t)nrcc33*(size_t)p_nvar) +
+                  ((size_t)ii*(size_t)nrcc33);
+
+                for(int kk = 0; kk < nrc1; kk++){
+                  KWM[kk] = &permy[ojp + (size_t)(kk+2)*(size_t)nrc3 + 2];
+                  XTKY[kk] = &permy[ojp + kk + nrc3 + 2];
+                }
+
+                nepsilon_owner = 0.0;
+                while(mat_solve(KWM, XTKY, DELTA) == NULL){
+                  for(int kk = 0; kk < nrc1; kk++)
+                    KWM[kk][kk] += epsilon;
+                  nepsilon_owner += epsilon;
+                }
+
+                XTKY[0][0] += nepsilon_owner*XTKY[0][0]/NZD_POS(KWM[0][0]);
+                if(nepsilon_owner > 0.0){
+                  if(mat_solve(KWM, XTKY, DELTA) == NULL)
+                    error("mat_solve failed after unordered gradient ridge adjustment");
+                }
+
+                out[opos++] = out[0] - DELTA[0][0];
+
+                if(do_gerr){
+                  const double * const prow = permy + ojp;
+                  const double skg = copysign(DBL_MIN, prow[2*nrc3+2]) + prow[2*nrc3+2];
+                  const double eyg = prow[nrc3+2]/skg;
+                  const double ey2g = prow[nrc3+1]/skg;
+                  const double se2 = (ey2g - eyg*eyg)*K_INT_KERNEL_P / (skg*hprod);
+                  out[opos++] = sqrt(mean_se_owner*mean_se_owner + se2);
+                }
+              }
+              for(int ii = 0; ii < num_reg_ordered; ii++){
+                const int dl = num_reg_unordered + ii;
+                const int ojp = ((size_t)jj*(size_t)nrcc33*(size_t)p_nvar) +
+                  ((size_t)dl*(size_t)nrcc33);
+
+                for(int kk = 0; kk < nrc1; kk++){
+                  KWM[kk] = &permy[ojp + (size_t)(kk+2)*(size_t)nrc3 + 2];
+                  XTKY[kk] = &permy[ojp + kk + nrc3 + 2];
+                }
+
+                nepsilon_owner = 0.0;
+                while(mat_solve(KWM, XTKY, DELTA) == NULL){
+                  for(int kk = 0; kk < nrc1; kk++)
+                    KWM[kk][kk] += epsilon;
+                  nepsilon_owner += epsilon;
+                }
+
+                XTKY[0][0] += nepsilon_owner*XTKY[0][0]/NZD_POS(KWM[0][0]);
+                if(nepsilon_owner > 0.0){
+                  if(mat_solve(KWM, XTKY, DELTA) == NULL)
+                    error("mat_solve failed after ordered gradient ridge adjustment");
+                }
+
+                out[opos++] = (out[0] - DELTA[0][0])*
+                  ((matrix_ordered_indices[ii][jj] != 0) ? 1.0 : -1.0);
+
+                if(do_gerr){
+                  const double * const prow = permy + ojp;
+                  const double skg = copysign(DBL_MIN, prow[2*nrc3+2]) + prow[2*nrc3+2];
+                  const double eyg = prow[nrc3+2]/skg;
+                  const double ey2g = prow[nrc3+1]/skg;
+                  const double se2 = (ey2g - eyg*eyg)*K_INT_KERNEL_P / (skg*hprod);
+                  out[opos++] = sqrt(mean_se_owner*mean_se_owner + se2);
+                }
+              }
+            }
+          }
+          local_pos++;
+        }
+
+        np_reg_mpi_owner_chunk_allgather(&owner_chunk);
+
+        for(i = 0; i < iNum_Processors; i++){
+          int pos_i = 0;
+          for(int jj = chunk_start + i; jj < chunk_end; jj += iNum_Processors){
+            const double * const in =
+              np_reg_mpi_owner_chunk_recv_ptr(&owner_chunk, i, pos_i);
+            int ipos = 0;
+            mean[jj] = in[ipos++];
+            mean_stderr[jj] = in[ipos++];
+            if(do_grad){
+              for(l = 0; l < num_reg_continuous; l++){
+                gradient[l][jj] = in[ipos++];
+                if(do_gerr)
+                  gradient_stderr[l][jj] = in[ipos++];
+              }
+              for(l = num_reg_continuous;
+                  l < (num_reg_continuous + num_reg_unordered + num_reg_ordered);
+                  l++){
+                gradient[l][jj] = in[ipos++];
+                if(do_gerr)
+                  gradient_stderr[l][jj] = in[ipos++];
+              }
+            }
+            pos_i++;
+          }
+        }
+
+        np_reg_mpi_owner_chunk_free(&owner_chunk);
+        free(kwm2_owner);
+        free(kw_owner);
+        mat_free(KWM2_OWNER);
+        mat_free(KWM_INV_OWNER);
+        mat_free(IDEN_OWNER);
+        free(tmp_v_owner);
+        free(tmp_w_owner);
+      }
+
+      if((!use_mpi_owner_reduce_ll) && ((j % iNum_Processors) == 0)){
         if((j+my_rank) < (num_obs_eval)){
           for(l = 0; l < num_reg_continuous; l++){
           
@@ -14809,7 +15724,15 @@ double *SIGN){
                              est_gate_ctx_ptr);
 
 #endif
-      
+
+#ifdef MPI2
+      if(use_mpi_owner_reduce_ll){
+        if (fit_progress_active)
+          np_progress_fit_loop_step(j + 1, fit_progress_total);
+        continue;
+      }
+#endif
+
       if(do_ocg){
         for(l = 0; l < num_reg_ordered; l++){
           moo[l]++;
@@ -14961,7 +15884,6 @@ double *SIGN){
       free(permy);
       free(moo);
     }
-
     free_tmat(matrix_bandwidth_eval);
   }
 
@@ -19934,6 +20856,7 @@ int np_conditional_density_cvls_lp_stream(double *vector_scale_factor,
   const int block_size = MIN(np_conditional_lp_cvls_block_size(), MAX(1, num_obs));
   const int nblocks = (num_obs + block_size - 1)/block_size;
   double **xblock = NULL, **xblock_full = NULL, **yblock = NULL, **yconvblock = NULL;
+  double *quad_cross = NULL;
   double *block_terms = NULL;
   int i0, j0, ii, jj;
   int status = 1;
@@ -19976,15 +20899,16 @@ int np_conditional_density_cvls_lp_stream(double *vector_scale_factor,
      (int_TREE_Y == NP_TREE_TRUE))
     return np_conditional_density_cvls_lp_row_stream(vector_scale_factor, cv);
 
-  xblock = alloc_matd(num_obs, block_size);
-  xblock_full = alloc_matd(num_obs, block_size);
-  yblock = alloc_matd(num_obs, block_size);
-  yconvblock = alloc_matd(num_obs, block_size);
+  xblock = alloc_tmatd(num_obs, block_size);
+  xblock_full = alloc_tmatd(num_obs, block_size);
+  yblock = alloc_tmatd(num_obs, block_size);
+  yconvblock = alloc_tmatd(num_obs, block_size);
+  quad_cross = alloc_vecd(block_size*block_size);
   if(use_parallel_blocks){
     block_terms = (double *)calloc((size_t)nblocks, sizeof(double));
   }
   if((xblock == NULL) || (xblock_full == NULL) || (yblock == NULL) || (yconvblock == NULL) ||
-     (use_parallel_blocks && (block_terms == NULL)))
+     (quad_cross == NULL) || (use_parallel_blocks && (block_terms == NULL)))
     local_fail = 1;
 
   *cv = 0.0;
@@ -20023,15 +20947,14 @@ int np_conditional_density_cvls_lp_stream(double *vector_scale_factor,
         break;
       }
 
+      np_blas_dgemm_tn_int(ib, jb, num_obs, xblock_full[0], yconvblock[0], quad_cross);
       for(ii = 0; ii < ib; ii++){
         double * const ai = xblock_full[ii];
         for(jj = 0; jj < jb; jj++){
           const double aij = ai[j0 + jj];
-          double inner;
           if(aij == 0.0)
             continue;
-          inner = np_blas_ddot_int(num_obs, ai, yconvblock[jj]);
-          quad += aij*inner;
+          quad += aij*quad_cross[ii + jj*ib];
         }
       }
     }
@@ -20068,10 +20991,11 @@ int np_conditional_density_cvls_lp_stream(double *vector_scale_factor,
   status = 0;
 
 cleanup_cvls_lp_block:
-  if(xblock != NULL) free_mat(xblock, block_size);
-  if(xblock_full != NULL) free_mat(xblock_full, block_size);
-  if(yblock != NULL) free_mat(yblock, block_size);
-  if(yconvblock != NULL) free_mat(yconvblock, block_size);
+  if(xblock != NULL) free_tmat(xblock);
+  if(xblock_full != NULL) free_tmat(xblock_full);
+  if(yblock != NULL) free_tmat(yblock);
+  if(yconvblock != NULL) free_tmat(yconvblock);
+  if(quad_cross != NULL) free(quad_cross);
   if(block_terms != NULL) free(block_terms);
   np_glp_cv_clear_extern();
   return status;
@@ -20161,6 +21085,7 @@ int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor,
   const int block_size = MIN(np_conditional_lp_cvls_block_size(), MAX(1, num_train));
   const int nblocks = (num_train + block_size - 1)/block_size;
   double **xblock = NULL, **yintblock = NULL;
+  double *fit_cross = NULL;
   double *block_terms = NULL;
   int i0, j0, ii, jj;
   int status = 1;
@@ -20190,11 +21115,12 @@ int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor,
      (int_TREE_Y == NP_TREE_TRUE))
     return np_conditional_distribution_cvls_lp_row_stream(vector_scale_factor, cv);
 
-  xblock = alloc_matd(num_train, block_size);
-  yintblock = alloc_matd(num_train, block_size);
+  xblock = alloc_tmatd(num_train, block_size);
+  yintblock = alloc_tmatd(num_train, block_size);
+  fit_cross = alloc_vecd(block_size*block_size);
   if(use_parallel_blocks)
     block_terms = (double *)calloc((size_t)nblocks, sizeof(double));
-  if((xblock == NULL) || (yintblock == NULL) ||
+  if((xblock == NULL) || (yintblock == NULL) || (fit_cross == NULL) ||
      (use_parallel_blocks && (block_terms == NULL)))
     goto cleanup_cdist_lp_block;
 
@@ -20228,9 +21154,9 @@ int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor,
         break;
       }
 
+      np_blas_dgemm_tn_int(ib, jb, num_train, xblock[0], yintblock[0], fit_cross);
       for(ii = 0; ii < ib; ii++){
         const int train_i = i0 + ii;
-        double * const ai = xblock[ii];
 
         for(jj = 0; jj < jb; jj++){
           const int eval_j = j0 + jj;
@@ -20240,7 +21166,7 @@ int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor,
           if(cdfontrain_extern && (train_i == eval_j))
             continue;
 
-          fit = np_blas_ddot_int(num_train, ai, yintblock[jj]);
+          fit = fit_cross[ii + jj*ib];
           indy = np_conditional_indicator_row_core(train_i,
                                                    eval_j,
                                                    cdfontrain_extern,
@@ -20287,8 +21213,9 @@ int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor,
   status = 0;
 
 cleanup_cdist_lp_block:
-  if(xblock != NULL) free_mat(xblock, block_size);
-  if(yintblock != NULL) free_mat(yintblock, block_size);
+  if(xblock != NULL) free_tmat(xblock);
+  if(yintblock != NULL) free_tmat(yintblock);
+  if(fit_cross != NULL) free(fit_cross);
   if(block_terms != NULL) free(block_terms);
   np_glp_cv_clear_extern();
   return status;
@@ -22818,6 +23745,233 @@ double * log_likelihood
   free(lambda);
   free_mat(matrix_bandwidth_Y, num_Y_continuous);
   free_mat(matrix_bandwidth_X, num_X_continuous);
+}
+
+static double **np_conditional_subset_eval_matrix(double **src,
+                                                  const int nvar,
+                                                  const int start,
+                                                  const int nloc){
+  double **out = NULL;
+  int i, l;
+
+  if(nvar <= 0)
+    return NULL;
+  out = alloc_matd(MAX(1, nloc), nvar);
+  if(out == NULL)
+    return NULL;
+  for(l = 0; l < nvar; l++)
+    for(i = 0; i < nloc; i++)
+      out[l][i] = src[l][start + i];
+  return out;
+}
+
+int np_kernel_estimate_con_dens_dist_categorical_owner_blocks(
+int KERNEL_Y,
+int KERNEL_unordered_Y,
+int KERNEL_ordered_Y,
+int KERNEL_X,
+int KERNEL_unordered_X,
+int KERNEL_ordered_X,
+int BANDWIDTH_den,
+int yop,
+int num_obs_train,
+int num_obs_eval,
+int num_Y_unordered,
+int num_Y_ordered,
+int num_Y_continuous,
+int num_X_unordered,
+int num_X_ordered,
+int num_X_continuous,
+double **matrix_XY_unordered_train,
+double **matrix_XY_ordered_train,
+double **matrix_XY_continuous_train,
+double **matrix_XY_unordered_eval,
+double **matrix_XY_ordered_eval,
+double **matrix_XY_continuous_eval,
+double *vector_scale_factor,
+int *num_categories,
+int *num_categories_XY,
+double ** matrix_categorical_vals,
+double ** matrix_categorical_vals_XY,
+double * kdf,
+double * kdf_stderr,
+double ** kdf_deriv,
+double ** kdf_deriv_stderr,
+double * log_likelihood
+){
+#ifdef MPI2
+  int *counts = NULL, *displs = NULL;
+  double **eval_uno = NULL, **eval_ord = NULL, **eval_con = NULL;
+  double **deriv_local = NULL, **gerr_local = NULL;
+  double *kdf_local = NULL, *stderr_local = NULL;
+  double local_log_likelihood = 0.0;
+  const int num_X = num_X_continuous + num_X_unordered + num_X_ordered;
+  const int do_deriv = (kdf_deriv != NULL);
+  const int do_gerr = (kdf_deriv_stderr != NULL);
+  int start, stop, nloc, r, l, status = 1;
+
+  if(do_gerr && !do_deriv)
+    return 1;
+  if((BANDWIDTH_den != BW_FIXED) || (num_obs_eval <= 0) || (iNum_Processors <= 1) ||
+     np_mpi_local_regression_active())
+    return 1;
+
+  counts = (int *)malloc((size_t)iNum_Processors*sizeof(int));
+  displs = (int *)malloc((size_t)iNum_Processors*sizeof(int));
+  if((counts == NULL) || (displs == NULL))
+    goto cleanup_owner_blocks;
+
+  for(r = 0; r < iNum_Processors; r++){
+    const int r_start = (int)(((int64_t)num_obs_eval * (int64_t)r) / (int64_t)iNum_Processors);
+    const int r_stop = (int)(((int64_t)num_obs_eval * (int64_t)(r + 1)) / (int64_t)iNum_Processors);
+    displs[r] = r_start;
+    counts[r] = r_stop - r_start;
+  }
+
+  start = displs[my_rank];
+  nloc = counts[my_rank];
+  stop = start + nloc;
+  (void)stop;
+
+  kdf_local = (double *)calloc((size_t)MAX(1, nloc), sizeof(double));
+  stderr_local = (double *)calloc((size_t)MAX(1, nloc), sizeof(double));
+  if((kdf_local == NULL) || (stderr_local == NULL))
+    goto cleanup_owner_blocks;
+  if(do_deriv){
+    deriv_local = alloc_matd(MAX(1, nloc), num_X);
+    if(deriv_local == NULL)
+      goto cleanup_owner_blocks;
+  }
+  if(do_gerr){
+    gerr_local = alloc_matd(MAX(1, nloc), num_X);
+    if(gerr_local == NULL)
+      goto cleanup_owner_blocks;
+  }
+
+  eval_uno = np_conditional_subset_eval_matrix(matrix_XY_unordered_eval,
+                                               num_X_unordered + num_Y_unordered,
+                                               start,
+                                               nloc);
+  eval_ord = np_conditional_subset_eval_matrix(matrix_XY_ordered_eval,
+                                               num_X_ordered + num_Y_ordered,
+                                               start,
+                                               nloc);
+  eval_con = np_conditional_subset_eval_matrix(matrix_XY_continuous_eval,
+                                               num_X_continuous + num_Y_continuous,
+                                               start,
+                                               nloc);
+  if(((num_X_unordered + num_Y_unordered) > 0 && eval_uno == NULL) ||
+     ((num_X_ordered + num_Y_ordered) > 0 && eval_ord == NULL) ||
+     ((num_X_continuous + num_Y_continuous) > 0 && eval_con == NULL))
+    goto cleanup_owner_blocks;
+
+  if(nloc > 0){
+    np_kernel_estimate_con_dens_dist_categorical(KERNEL_Y,
+                                                 KERNEL_unordered_Y,
+                                                 KERNEL_ordered_Y,
+                                                 KERNEL_X,
+                                                 KERNEL_unordered_X,
+                                                 KERNEL_ordered_X,
+                                                 BANDWIDTH_den,
+                                                 yop,
+                                                 num_obs_train,
+                                                 nloc,
+                                                 num_Y_unordered,
+                                                 num_Y_ordered,
+                                                 num_Y_continuous,
+                                                 num_X_unordered,
+                                                 num_X_ordered,
+                                                 num_X_continuous,
+                                                 matrix_XY_unordered_train,
+                                                 matrix_XY_ordered_train,
+                                                 matrix_XY_continuous_train,
+                                                 eval_uno,
+                                                 eval_ord,
+                                                 eval_con,
+                                                 vector_scale_factor,
+                                                 num_categories,
+                                                 num_categories_XY,
+                                                 matrix_categorical_vals,
+                                                 matrix_categorical_vals_XY,
+                                                 kdf_local,
+                                                 stderr_local,
+                                                 deriv_local,
+                                                 gerr_local,
+                                                 &local_log_likelihood);
+  }
+
+  MPI_Allgatherv(kdf_local,
+                 nloc,
+                 MPI_DOUBLE,
+                 kdf,
+                 counts,
+                 displs,
+                 MPI_DOUBLE,
+                 comm[1]);
+  MPI_Allgatherv(stderr_local,
+                 nloc,
+                 MPI_DOUBLE,
+                 kdf_stderr,
+                 counts,
+                 displs,
+                 MPI_DOUBLE,
+                 comm[1]);
+  MPI_Allreduce(&local_log_likelihood,
+                log_likelihood,
+                1,
+                MPI_DOUBLE,
+                MPI_SUM,
+                comm[1]);
+  if(do_deriv){
+    for(l = 0; l < num_X; l++)
+      MPI_Allgatherv(deriv_local[l],
+                     nloc,
+                     MPI_DOUBLE,
+                     kdf_deriv[l],
+                     counts,
+                     displs,
+                     MPI_DOUBLE,
+                     comm[1]);
+  }
+  if(do_gerr){
+    for(l = 0; l < num_X; l++)
+      MPI_Allgatherv(gerr_local[l],
+                     nloc,
+                     MPI_DOUBLE,
+                     kdf_deriv_stderr[l],
+                     counts,
+                     displs,
+                     MPI_DOUBLE,
+                     comm[1]);
+  }
+  status = 0;
+
+cleanup_owner_blocks:
+  if(eval_uno != NULL) free_mat(eval_uno, num_X_unordered + num_Y_unordered);
+  if(eval_ord != NULL) free_mat(eval_ord, num_X_ordered + num_Y_ordered);
+  if(eval_con != NULL) free_mat(eval_con, num_X_continuous + num_Y_continuous);
+  if(deriv_local != NULL) free_mat(deriv_local, num_X);
+  if(gerr_local != NULL) free_mat(gerr_local, num_X);
+  if(kdf_local != NULL) free(kdf_local);
+  if(stderr_local != NULL) free(stderr_local);
+  if(counts != NULL) free(counts);
+  if(displs != NULL) free(displs);
+  return status;
+#else
+  (void)KERNEL_Y; (void)KERNEL_unordered_Y; (void)KERNEL_ordered_Y;
+  (void)KERNEL_X; (void)KERNEL_unordered_X; (void)KERNEL_ordered_X;
+  (void)BANDWIDTH_den; (void)yop; (void)num_obs_train; (void)num_obs_eval;
+  (void)num_Y_unordered; (void)num_Y_ordered; (void)num_Y_continuous;
+  (void)num_X_unordered; (void)num_X_ordered; (void)num_X_continuous;
+  (void)matrix_XY_unordered_train; (void)matrix_XY_ordered_train;
+  (void)matrix_XY_continuous_train; (void)matrix_XY_unordered_eval;
+  (void)matrix_XY_ordered_eval; (void)matrix_XY_continuous_eval;
+  (void)vector_scale_factor; (void)num_categories; (void)num_categories_XY;
+  (void)matrix_categorical_vals; (void)matrix_categorical_vals_XY;
+  (void)kdf; (void)kdf_stderr; (void)kdf_deriv; (void)kdf_deriv_stderr;
+  (void)log_likelihood;
+  return 1;
+#endif
 }
 
 void np_splitxy_vsf_mcv_nc(const int num_var_unordered,

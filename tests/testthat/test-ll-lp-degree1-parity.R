@@ -32,6 +32,91 @@ test_that("npreg cv objective and bandwidths match for ll and lp(degree=1)", {
   }
 })
 
+test_that("npreg multivariate cv.aic matches for ll and lp(all degree=1)", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260509)
+  n <- 90
+  tx <- data.frame(
+    x1 = runif(n, -1, 1),
+    x2 = rnorm(n)
+  )
+  y <- sin(2 * pi * tx$x1) + 0.5 * tx$x2 + rnorm(n, sd = 0.15)
+
+  set.seed(90210)
+  bw.ll <- npregbw(
+    xdat = tx,
+    ydat = y,
+    regtype = "ll",
+    bwmethod = "cv.aic",
+    nmulti = 1L
+  )
+  set.seed(90210)
+  bw.lp <- npregbw(
+    xdat = tx,
+    ydat = y,
+    regtype = "lp",
+    basis = "glp",
+    degree = rep.int(1L, ncol(tx)),
+    bwmethod = "cv.aic",
+    nmulti = 1L
+  )
+
+  expect_equal(as.numeric(bw.ll$fval), as.numeric(bw.lp$fval), tolerance = 1e-10)
+  expect_equal(as.numeric(bw.ll$bw), as.numeric(bw.lp$bw), tolerance = 1e-9)
+})
+
+test_that("npreg categorical-only predictors reject impossible degree structure", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260509)
+  n <- 120
+  tx <- data.frame(
+    f = factor(rbinom(n, 1L, 0.45)),
+    g = ordered(sample(letters[1:3], n, replace = TRUE))
+  )
+  y <- 0.5 * as.integer(tx$f) + 0.2 * as.integer(tx$g) + rnorm(n, sd = 0.35)
+
+  set.seed(90210)
+  bw.lc <- npregbw(xdat = tx, ydat = y, regtype = "lc",
+                   bwmethod = "cv.aic", nmulti = 1L)
+  expect_error(
+    npregbw(xdat = tx, ydat = y, regtype = "ll",
+            bwmethod = "cv.aic", nmulti = 1L),
+    "requires at least one continuous predictor"
+  )
+  expect_error(
+    npregbw(xdat = tx, ydat = y, regtype = "lp", degree = 1L,
+            bwmethod = "cv.aic", nmulti = 1L),
+    "degree must be 0"
+  )
+  expect_error(
+    npregbw(xdat = tx, ydat = y, regtype = "lp",
+            bwmethod = "cv.aic", nmulti = 1L),
+    "degree must be 0"
+  )
+  expect_error(
+    npregbw(xdat = tx, ydat = y, regtype = "lp",
+            degree.select = "coordinate", search.engine = "cell",
+            bwmethod = "cv.aic", nmulti = 1L),
+    "automatic degree search requires at least one continuous"
+  )
+  set.seed(90210)
+  bw.lp <- npregbw(xdat = tx, ydat = y, regtype = "lp", degree = 0L,
+                   bwmethod = "cv.aic", nmulti = 1L)
+
+  expect_identical(bw.lp$regtype, "lp")
+  expect_identical(bw.lp$regtype.engine, "lc")
+  expect_equal(as.numeric(bw.lc$fval), as.numeric(bw.lp$fval), tolerance = 1e-12)
+  expect_equal(as.numeric(bw.lc$bw), as.numeric(bw.lp$bw), tolerance = 1e-12)
+  expect_error(
+    npregbw(xdat = tx, ydat = y, nomad = TRUE),
+    "nomad=TRUE requires at least one continuous predictor"
+  )
+})
+
 test_that("npreg and npreghat match for ll and lp(degree=1) in 1D", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   on.exit(close_mpi_slaves(), add = TRUE)

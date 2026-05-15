@@ -76,6 +76,17 @@ npregbw.NULL <-
     .npRmpi_require_active_slave_pool(where = "npregbw()")
     mc <- match.call(expand.dots = FALSE)
     dots <- list(...)
+    legacy.remin <- "remin" %in% names(dots)
+    if (isTRUE(legacy.remin)) {
+      legacy.remin.value <- npValidateScalarLogical(dots$remin, "remin")
+      warning("npregbw: argument 'remin' is deprecated; use 'powell.remin' and 'nomad.remin'",
+              call. = FALSE)
+      if (!("powell.remin" %in% names(dots)))
+        dots$powell.remin <- legacy.remin.value
+      if (!("nomad.remin" %in% names(dots)))
+        dots$nomad.remin <- legacy.remin.value
+      dots$remin <- NULL
+    }
     dot.names <- names(dots)
     degree.select.value <- if ("degree.select" %in% dot.names) {
       match.arg(as.character(dots$degree.select[[1L]]), c("manual", "coordinate", "exhaustive"))
@@ -104,7 +115,8 @@ npregbw.NULL <-
       automatic.degree.search = automatic.degree.search,
       search.engine = search.engine.value
     )
-    if (.npRmpi_autodispatch_active() && !isTRUE(automatic.degree.search))
+    if (.npRmpi_autodispatch_active() && !isTRUE(automatic.degree.search) &&
+        !isTRUE(legacy.remin))
       return(.npRmpi_autodispatch_call(
         .npRmpi_autodispatch_as_generic_call("npregbw", mc),
         parent.frame()))
@@ -113,7 +125,8 @@ npregbw.NULL <-
 
     bws = double(dim(xdat)[2])
 
-    tbw <- npregbw.default(xdat = xdat, ydat = ydat, bws = bws, ...)
+    tbw <- do.call(npregbw.default,
+                   c(list(xdat = xdat, ydat = ydat, bws = bws), dots))
 
     ## clean up (possible) inconsistencies due to recursion ...
     environment(mc) <- parent.frame()
@@ -150,7 +163,7 @@ npregbw.rbandwidth <-
            lbd.init = 0.1,
            nmulti,
            penalty.multiplier = 10,
-           remin = TRUE,
+           powell.remin = TRUE,
            scale.init.categorical.sample = FALSE,
            scale.factor.search.lower = NULL,
            small = 1.490116e-05,
@@ -164,7 +177,7 @@ npregbw.rbandwidth <-
       nmulti <- npDefaultNmulti(dim(xdat)[2])
     }
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute, "bandwidth.compute")
-    remin <- npValidateScalarLogical(remin, "remin")
+    remin <- npValidateScalarLogical(powell.remin, "powell.remin")
     scale.init.categorical.sample <-
       npValidateScalarLogical(scale.init.categorical.sample, "scale.init.categorical.sample")
     transform.bounds <- npValidateScalarLogical(transform.bounds, "transform.bounds")
@@ -244,6 +257,14 @@ npregbw.rbandwidth <-
                                           ncon = tbw$ncon)
     tbw$bernstein.basis <- npValidateGlpBernstein(regtype = tbw$regtype,
                                                 bernstein.basis = tbw$bernstein.basis)
+    reg.spec <- npCanonicalConditionalRegSpec(
+      regtype = tbw$regtype,
+      basis = tbw$basis,
+      degree = tbw$degree,
+      bernstein.basis = tbw$bernstein.basis,
+      ncon = tbw$ncon,
+      where = "npregbw"
+    )
 
     mysd <- EssDee(rcon)
     nconfac <- nrow^(-1.0/(2.0*bws$ckerorder+bws$ncon))
@@ -252,15 +273,15 @@ npregbw.rbandwidth <-
     invalid.penalty <- match.arg(invalid.penalty)
     penalty_mode <- (if (invalid.penalty == "baseline") 1L else 0L)
 
-    reg.c <- npRegtypeToC(regtype = tbw$regtype,
-                          degree = tbw$degree,
+    reg.c <- npRegtypeToC(regtype = reg.spec$regtype.engine,
+                          degree = reg.spec$degree.engine,
                           ncon = tbw$ncon,
                           context = "npregbw")
     npCheckRegressionDesignCondition(reg.code = reg.c$code,
                                      xcon = rcon,
-                                     basis = tbw$basis,
-                                     degree = tbw$degree,
-                                     bernstein.basis = tbw$bernstein.basis,
+                                     basis = reg.spec$basis.engine,
+                                     degree = reg.spec$degree.engine,
+                                     bernstein.basis = reg.spec$bernstein.basis.engine,
                                      where = "npregbw")
     degree.c <- if (tbw$ncon > 0) {
       as.integer(if (is.null(reg.c$degree)) rep.int(0L, tbw$ncon) else reg.c$degree)
@@ -333,8 +354,8 @@ npregbw.rbandwidth <-
               as.integer(penalty_mode),
               as.double(penalty.multiplier),
               as.integer(degree.c),
-              as.integer(isTRUE(tbw$bernstein.basis)),
-              as.integer(npLpBasisCode(tbw$basis)),
+              as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
+              as.integer(npLpBasisCode(reg.spec$basis.engine)),
               as.double(cker.bounds.c$lb),
               as.double(cker.bounds.c$ub),
               PACKAGE = "npRmpi"))[1]
@@ -485,7 +506,8 @@ npregbw.rbandwidth <-
                                             penalty.multiplier = 10,
                                             transform.bounds = FALSE,
                                             scale.factor.search.lower = NULL,
-                                            eval.only = FALSE) {
+                                            eval.only = FALSE,
+                                            localize = TRUE) {
   invalid.penalty <- match.arg(invalid.penalty)
   scale.factor.search.lower <- npResolveScaleFactorLowerBound(
     if (is.null(scale.factor.search.lower)) npGetScaleFactorSearchLower(bws) else scale.factor.search.lower
@@ -534,11 +556,19 @@ npregbw.rbandwidth <-
   ncatfac <- nrow^(-2.0 / (2.0 * bws$ckerorder + bws$ncon))
 
   penalty_mode <- if (invalid.penalty == "baseline") 1L else 0L
-  reg.c <- npRegtypeToC(regtype = bws$regtype,
-                        degree = bws$degree,
+  reg.spec <- npCanonicalConditionalRegSpec(
+    regtype = bws$regtype,
+    basis = bws$basis,
+    degree = bws$degree,
+    bernstein.basis = bws$bernstein.basis,
+    ncon = bws$ncon,
+    where = "npregbw"
+  )
+  reg.c <- npRegtypeToC(regtype = reg.spec$regtype.engine,
+                        degree = reg.spec$degree.engine,
                         ncon = bws$ncon,
                         context = "npregbw")
-  degree.c <- if (bws$ncon > 0) as.integer(bws$degree) else integer(1L)
+  degree.c <- if (bws$ncon > 0) as.integer(reg.spec$degree.engine) else integer(1L)
   nmulti <- as.integer(nmulti[1L])
 
   myopti <- list(
@@ -604,47 +634,53 @@ npregbw.rbandwidth <-
   cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
   if (isTRUE(eval.only)) {
-    out <- .npRmpi_with_local_regression(.Call(
-      C_np_regression_bw_eval,
-      as.double(runo),
-      as.double(rord),
-      as.double(rcon),
-      as.double(ydat),
-      as.double(mysd),
-      as.integer(myopti),
-      as.double(myoptd),
-      as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
-      as.integer(1L),
-      as.integer(penalty_mode),
-      as.double(penalty.multiplier),
-      as.integer(degree.c),
-      as.integer(isTRUE(bws$bernstein.basis)),
-      as.integer(npLpBasisCode(bws$basis)),
-      as.double(cker.bounds.c$lb),
-      as.double(cker.bounds.c$ub),
-      PACKAGE = "npRmpi"
-    ))
+    eval_core <- function() {
+      .Call(
+        C_np_regression_bw_eval,
+        as.double(runo),
+        as.double(rord),
+        as.double(rcon),
+        as.double(ydat),
+        as.double(mysd),
+        as.integer(myopti),
+        as.double(myoptd),
+        as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+        as.integer(1L),
+        as.integer(penalty_mode),
+        as.double(penalty.multiplier),
+        as.integer(degree.c),
+        as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
+        as.integer(npLpBasisCode(reg.spec$basis.engine)),
+        as.double(cker.bounds.c$lb),
+        as.double(cker.bounds.c$ub),
+        PACKAGE = "npRmpi"
+      )
+    }
+    out <- if (isTRUE(localize)) .npRmpi_with_local_regression(eval_core()) else eval_core()
   } else {
-    out <- .npRmpi_with_local_regression(.Call(
-      C_np_regression_bw,
-      as.double(runo),
-      as.double(rord),
-      as.double(rcon),
-      as.double(ydat),
-      as.double(mysd),
-      as.integer(myopti),
-      as.double(myoptd),
-      as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
-      as.integer(max(1L, nmulti)),
-      as.integer(penalty_mode),
-      as.double(penalty.multiplier),
-      as.integer(degree.c),
-      as.integer(isTRUE(bws$bernstein.basis)),
-      as.integer(npLpBasisCode(bws$basis)),
-      as.double(cker.bounds.c$lb),
-      as.double(cker.bounds.c$ub),
-      PACKAGE = "npRmpi"
-    ))
+    search_core <- function() {
+      .Call(
+        C_np_regression_bw,
+        as.double(runo),
+        as.double(rord),
+        as.double(rcon),
+        as.double(ydat),
+        as.double(mysd),
+        as.integer(myopti),
+        as.double(myoptd),
+        as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+        as.integer(max(1L, nmulti)),
+        as.integer(penalty_mode),
+        as.double(penalty.multiplier),
+        as.integer(degree.c),
+        as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
+        as.integer(npLpBasisCode(reg.spec$basis.engine)),
+        as.double(cker.bounds.c$lb),
+        as.double(cker.bounds.c$ub),
+        PACKAGE = "npRmpi"
+      )
+    }
+    out <- if (isTRUE(localize)) .npRmpi_with_local_regression(search_core()) else search_core()
   }
 
   rorder <- numeric(length(bws$bw))
@@ -696,7 +732,8 @@ npregbw.rbandwidth <-
 .npregbw_run_fixed_degree_source_of_truth <- function(xdat,
                                                       ydat,
                                                       bws,
-                                                      opt.args) {
+                                                      opt.args,
+                                                      localize = TRUE) {
   opt.value <- function(name, default) {
     if (is.null(opt.args[[name]])) default else opt.args[[name]]
   }
@@ -708,7 +745,7 @@ npregbw.rbandwidth <-
     bws = bws,
     nmulti = opt.value("nmulti", npDefaultNmulti(dim(toFrame(xdat))[2L])),
     itmax = opt.value("itmax", 10000L),
-    remin = opt.value("remin", TRUE),
+    remin = opt.value("powell.remin", TRUE),
     scale.init.categorical.sample = opt.value("scale.init.categorical.sample", FALSE),
     ftol = opt.value("ftol", 1.490116e-07),
     tol = opt.value("tol", 1.490116e-04),
@@ -731,7 +768,8 @@ npregbw.rbandwidth <-
     penalty.multiplier = opt.value("penalty.multiplier", 10),
     transform.bounds = opt.value("transform.bounds", FALSE),
     scale.factor.search.lower = opt.value("scale.factor.search.lower", NULL),
-    eval.only = FALSE
+    eval.only = FALSE,
+    localize = localize
   )
 
   .npregbw_finalize_fixed_degree_payload(
@@ -759,7 +797,8 @@ npregbw.rbandwidth <-
     xdat = xdat,
     ydat = ydat,
     bws = bws,
-    opt.args = opt.args
+    opt.args = opt.args,
+    localize = FALSE
   )
 }
 
@@ -793,7 +832,8 @@ npregbw.rbandwidth <-
     xdat = xdat,
     ydat = ydat,
     bws = bws,
-    opt.args = opt.args
+    opt.args = opt.args,
+    localize = !isTRUE(.npRmpi_autodispatch_called_from_bcast())
   )
 }
 
@@ -878,14 +918,16 @@ npregbw.rbandwidth <-
                                ydat,
                                bws,
                                invalid.penalty = c("baseline", "dbmax"),
-                               penalty.multiplier = 10) {
+                               penalty.multiplier = 10,
+                               localize = TRUE) {
   out <- .npregbw_call_fixed_degree_core(
     xdat = xdat,
     ydat = ydat,
     bws = bws,
     invalid.penalty = invalid.penalty,
     penalty.multiplier = penalty.multiplier,
-    eval.only = TRUE
+    eval.only = TRUE,
+    localize = localize
   )
 
   list(
@@ -958,6 +1000,10 @@ npRmpiNomadShadowEvalRegression <- function(bw, degree) {
 
 npRmpiNomadShadowClearRegression <- function() {
   .Call("C_np_regression_nomad_shadow_clear", PACKAGE = "npRmpi")
+}
+
+.npregbw_nomad_shadow_template <- function(template) {
+  template[c("bw", "icon", "iuno", "iord", "scaling")]
 }
 
 npRmpiNomadEvalOnlyRegression <- function(runo,
@@ -1040,11 +1086,19 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
   )
 
   penalty_mode <- if (match.arg(invalid.penalty) == "baseline") 1L else 0L
-  reg.c <- npRegtypeToC(regtype = bws$regtype,
-                        degree = bws$degree,
+  reg.spec <- npCanonicalConditionalRegSpec(
+    regtype = bws$regtype,
+    basis = bws$basis,
+    degree = bws$degree,
+    bernstein.basis = bws$bernstein.basis,
+    ncon = bws$ncon,
+    where = "npregbw"
+  )
+  reg.c <- npRegtypeToC(regtype = reg.spec$regtype.engine,
+                        degree = reg.spec$degree.engine,
                         ncon = bws$ncon,
                         context = "npregbw")
-  degree.c <- if (bws$ncon > 0) as.integer(bws$degree) else integer(0L)
+  degree.c <- if (bws$ncon > 0) as.integer(reg.spec$degree.engine) else integer(0L)
 
   myopti <- list(
     num_obs_train = nrow,
@@ -1125,8 +1179,8 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
     penalty_mode = as.integer(penalty_mode),
     penalty_multiplier = as.double(penalty.multiplier),
     degree = as.integer(degree.c),
-    bernstein = as.integer(isTRUE(bws$bernstein.basis)),
-    basis = as.integer(npLpBasisCode(bws$basis)),
+    bernstein = as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
+    basis = as.integer(npLpBasisCode(reg.spec$basis.engine)),
     ckerlb = as.double(cker.bounds.c$lb),
     ckerub = as.double(cker.bounds.c$ub)
   )
@@ -1318,7 +1372,7 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
                                             done = NULL,
                                             detail = NULL,
                                             now = .np_progress_now()) {
-  fields <- character()
+  fields <- .np_degree_progress_context_fields()
   elapsed <- max(0, now - state$started)
 
   fields <- c(fields, sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)))
@@ -1368,6 +1422,7 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
       surface = "bandwidth"
     )
     active.state$unknown_total_fields <- .npregbw_powell_progress_fields
+    active.state$nomad_nmulti <- 1L
     active.state$nomad_current_degree <- as.integer(degree)
     active.state <- .np_progress_show_now(active.state)
     .np_progress_runtime$bandwidth_state <- active.state
@@ -1392,12 +1447,9 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
   value
 }
 
-npRmpiNomadShadowSearchRegression <- function(xdat,
-                                              ydat,
-                                              template,
+npRmpiNomadShadowSearchRegression <- function(template,
                                               setup,
                                               prep,
-                                              reg.args,
                                               degree.search,
                                               x0,
                                               bbin,
@@ -1405,8 +1457,8 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
                                               ub,
                                               nomad.nmulti = 1L,
                                               nomad.inner.nmulti = 0L,
-                                              penalty.multiplier = 10,
-                                              random.seed = 42L) {
+                                              random.seed = 42L,
+                                              remin = FALSE) {
   rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
   old.messages <- getOption("np.messages")
   old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
@@ -1505,6 +1557,7 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
+    remin = isTRUE(remin),
     nomad.opts = list(
       DIRECTION_TYPE = "ORTHO 2N",
       QUAD_MODEL_SEARCH = "no",
@@ -1631,8 +1684,11 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
     direct.objective <- as.numeric(best_record$objective)
 
     if (identical(degree.search$engine, "nomad+powell")) {
-      hot.opt.args <- opt.args
-      hot.opt.args$nmulti <- .np_nomad_powell_hotstart_nmulti("disable_multistart")
+      hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
+        opt.args,
+        strategy = "disable_multistart",
+        remin = isTRUE(opt.args$powell.remin)
+      )
       powell.start <- proc.time()[3L]
       hot.payload <- .npregbw_with_powell_refinement_progress(degree, local({
         .npregbw_run_fixed_degree_source_of_truth_collective(
@@ -1669,14 +1725,12 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
       penalty.multiplier = if (is.null(opt.args$penalty.multiplier)) 10 else opt.args$penalty.multiplier
     )
 
+    shadow.template <- .npregbw_nomad_shadow_template(template)
     mc <- substitute(
       get("npRmpiNomadShadowSearchRegression", envir = asNamespace("npRmpi"), inherits = FALSE)(
-        XDAT,
-        YDAT,
         TEMPLATE,
         SETUP,
         PREP,
-        REGARGS,
         DEGREESEARCH,
         X0,
         BBIN,
@@ -1684,16 +1738,13 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
         UB,
         NOMADNMULTI,
         INNERNMULTI,
-        PENMULT,
-        RSEED
+        RSEED,
+        REMIN
       ),
       list(
-        XDAT = xdat,
-        YDAT = ydat,
-        TEMPLATE = template,
+        TEMPLATE = shadow.template,
         SETUP = setup,
         PREP = prep,
-        REGARGS = reg.args,
         DEGREESEARCH = degree.search,
         X0 = x0,
         BBIN = bbin,
@@ -1701,8 +1752,8 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
         UB = ub,
         NOMADNMULTI = nomad.nmulti,
         INNERNMULTI = nomad.inner.nmulti,
-        PENMULT = if (is.null(opt.args$penalty.multiplier)) 10 else opt.args$penalty.multiplier,
-        RSEED = random.seed
+        RSEED = random.seed,
+        REMIN = isTRUE(opt.args$nomad.remin)
       )
     )
 
@@ -1814,6 +1865,7 @@ npRmpiNomadShadowSearchRegression <- function(xdat,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
+    remin = isTRUE(opt.args$nomad.remin),
     nomad.opts = list(
       DIRECTION_TYPE = "ORTHO 2N",
       QUAD_MODEL_SEARCH = "no",
@@ -1995,7 +2047,8 @@ npregbw.default <-
            okertype,
            penalty.multiplier = 10,
            regtype,
-           remin,
+           nomad.remin = FALSE,
+           powell.remin,
            scale.init.categorical.sample,
            scale.factor.search.lower = NULL,
            small,
@@ -2005,6 +2058,16 @@ npregbw.default <-
            ...){
     .npRmpi_require_active_slave_pool(where = "npregbw()")
     lp.dot.args <- list(...)
+    if ("remin" %in% names(lp.dot.args)) {
+      legacy.remin <- npValidateScalarLogical(lp.dot.args$remin, "remin")
+      warning("npregbw: argument 'remin' is deprecated; use 'powell.remin' and 'nomad.remin'",
+              call. = FALSE)
+      if (missing(powell.remin))
+        powell.remin <- legacy.remin
+      if (missing(nomad.remin))
+        nomad.remin <- legacy.remin
+      lp.dot.args$remin <- NULL
+    }
     npRejectLegacyLpArgs(names(lp.dot.args), where = "npregbw")
     random.seed.value <- .np_degree_extract_random_seed(lp.dot.args)
     scale.factor.search.lower <- npResolveScaleFactorLowerBound(scale.factor.search.lower)
@@ -2041,6 +2104,9 @@ npregbw.default <-
     )
 
     if (isTRUE(nomad.shortcut$enabled)) {
+      if (sum(untangle(xdat)$icon) == 0L)
+        stop("nomad=TRUE requires at least one continuous predictor for degree search",
+             call. = FALSE)
       if ("degree" %in% mc.names)
         stop("nomad=TRUE does not support an explicit degree; remove degree or set nomad=FALSE")
       if ("regtype" %in% mc.names &&
@@ -2112,7 +2178,7 @@ npregbw.default <-
       bw.args[nms] <- mget(nms, envir = environment(), inherits = FALSE)
     }
 
-    margs <- c("nmulti", "remin", "itmax", "ftol", "tol",
+    margs <- c("nmulti", "nomad.remin", "powell.remin", "itmax", "ftol", "tol",
                "small",
                "lbc.dir", "dfc.dir", "cfac.dir","initc.dir",
                "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir",

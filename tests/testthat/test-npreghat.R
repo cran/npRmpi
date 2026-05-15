@@ -156,13 +156,20 @@ test_that("npreghat lp bernstein path matches predict semantics", {
 
   fit.raw <- npreg(txdat = tx, tydat = y, exdat = ex, bws = bw.raw, gradients = FALSE, warn.glp.gradient = FALSE)
   fit.bern <- npreg(txdat = tx, tydat = y, exdat = ex, bws = bw.bern, gradients = FALSE, warn.glp.gradient = FALSE)
+  grad.raw <- npreg(txdat = tx, tydat = y, exdat = ex, bws = bw.raw, gradients = TRUE, warn.glp.gradient = FALSE)
+  grad.bern <- npreg(txdat = tx, tydat = y, exdat = ex, bws = bw.bern, gradients = TRUE, warn.glp.gradient = FALSE)
 
   hat.raw <- npreghat(bws = bw.raw, txdat = tx, exdat = ex, y = y, output = "apply", s = 0L)
   hat.bern <- npreghat(bws = bw.bern, txdat = tx, exdat = ex, y = y, output = "apply", s = 0L)
+  dhat.raw <- npreghat(bws = bw.raw, txdat = tx, exdat = ex, y = y, output = "apply", s = 1L)
+  dhat.bern <- npreghat(bws = bw.bern, txdat = tx, exdat = ex, y = y, output = "apply", s = 1L)
 
   expect_equal(as.vector(hat.raw), as.vector(fit.raw$mean), tolerance = 1e-8)
   expect_equal(as.vector(hat.bern), as.vector(fit.bern$mean), tolerance = 1e-8)
   expect_equal(as.vector(fit.bern$mean), as.vector(fit.raw$mean), tolerance = 1e-8)
+  expect_equal(as.vector(dhat.raw), as.vector(grad.raw$grad[, 1L]), tolerance = 1e-8)
+  expect_equal(as.vector(dhat.bern), as.vector(grad.bern$grad[, 1L]), tolerance = 1e-8)
+  expect_equal(as.vector(grad.bern$grad[, 1L]), as.vector(grad.raw$grad[, 1L]), tolerance = 1e-8)
 })
 
 test_that("npreghat apply mode matches npreg across bwtypes", {
@@ -291,4 +298,81 @@ test_that("npreghat nonfixed higher-order lp operator matches npreg and matrix a
     expect_equal(as.vector(case$H %*% case$y), as.vector(case$a.vec), tolerance = 1e-10)
     expect_equal(case$H %*% case$Y, case$a.mat, tolerance = 1e-10, ignore_attr = TRUE)
   }
+})
+
+test_that("npreghat constraint output is exact row-weighted transpose", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260513)
+  n <- 24L
+  x <- sort(runif(n))
+  y <- sin(2 * pi * x) + rnorm(n, sd = 0.05)
+  tx <- data.frame(x = x)
+  ex <- data.frame(x = seq(0.05, 0.95, length.out = 6L))
+
+  make_bw <- function(regtype, bwtype) {
+    args <- list(
+      xdat = tx,
+      ydat = y,
+      regtype = regtype,
+      bwtype = bwtype,
+      bandwidth.compute = FALSE,
+      bws = if (identical(bwtype, "fixed")) 0.25 else 7L
+    )
+    if (identical(regtype, "lp")) {
+      args$degree <- 2L
+      args$basis <- "glp"
+      args$bernstein.basis <- FALSE
+    }
+    do.call(npregbw, args)
+  }
+
+  for (regtype in c("lc", "ll", "lp")) {
+    bwtype <- "fixed"
+    bw <- make_bw(regtype, bwtype)
+    H <- npreghat(bws = bw, txdat = tx, exdat = ex, output = "matrix")
+    A <- npreghat(bws = bw, txdat = tx, exdat = ex, y = y, output = "constraint")
+    expect_equal(
+      A,
+      t(H) * y,
+      tolerance = 0,
+      ignore_attr = TRUE,
+      info = paste("mean", regtype, bwtype)
+    )
+
+    if (!identical(regtype, "lc")) {
+      H.grad <- npreghat(bws = bw, txdat = tx, exdat = ex, output = "matrix", s = 1L)
+      A.grad <- npreghat(bws = bw, txdat = tx, exdat = ex, y = y,
+                         output = "constraint", s = 1L)
+      expect_equal(
+        A.grad,
+        t(H.grad) * y,
+        tolerance = 1e-14,
+        ignore_attr = TRUE,
+        info = paste("gradient", regtype, bwtype)
+      )
+    }
+  }
+
+  bw <- make_bw("ll", "fixed")
+  H <- npreghat(bws = bw, txdat = tx, exdat = ex, output = "matrix")
+  expect_error(
+    npreghat(bws = bw, txdat = tx, exdat = ex, output = "constraint"),
+    "argument 'y' is required"
+  )
+  expect_error(
+    npreghat(bws = bw, txdat = tx, exdat = ex, y = cbind(y, y),
+             output = "constraint"),
+    "one-column"
+  )
+  expect_error(
+    npreghat(bws = bw, txdat = tx, exdat = ex, y = y[-1L],
+             output = "constraint"),
+    "must match"
+  )
+
+  H.obj <- npreghat(bws = bw, txdat = tx, output = "matrix")
+  A.pred <- predict(H.obj, newdata = ex, y = y, output = "constraint")
+  expect_equal(A.pred, t(H) * y, tolerance = 1e-14, ignore_attr = TRUE)
 })

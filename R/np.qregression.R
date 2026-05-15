@@ -20,15 +20,54 @@ npqreg <-
     }
   }
 
-.npqreg.fit.control.names <- c("data", "newdata", "tau", "gradients", "tol", "small", "itmax")
+.npqreg.fit.control.names <- c("data", "newdata", "exdat", "tau", "gradients", "tol", "small", "itmax")
 .npqreg.removed.solver.controls <- c("ftol",
                                      "lbc.dir", "dfc.dir", "cfac.dir", "initc.dir",
                                      "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir")
 
+.npqreg_validate_tau <- function(tau) {
+  if (!is.numeric(tau) || !length(tau) || anyNA(tau) ||
+      any(!is.finite(tau)) || any(tau <= 0) || any(tau >= 1))
+    stop("'tau' must contain numeric values in (0,1)")
+  as.double(tau)
+}
+
+.npqreg_tau_labels <- function(tau) {
+  paste0("tau=", format(tau, trim = TRUE, scientific = FALSE))
+}
+
+.npqreg_napredict_eval <- function(omit, x) {
+  if (!length(omit))
+    return(x)
+  if (length(dim(x)) <= 2L)
+    return(napredict(omit, x))
+  d <- dim(x)
+  dn <- dimnames(x)
+  if (!is.null(dn))
+    dn[[1L]] <- NULL
+  out <- array(NA_real_,
+               dim = c(d[1L] + length(omit), d[-1L]),
+               dimnames = dn)
+  keep <- seq_len(dim(out)[1L])[-as.integer(omit)]
+  out[keep, , ] <- x
+  out
+}
+
+.npqreg_validate_newdata_terms <- function(newdata, xnames) {
+  nd <- toFrame(newdata)
+  missing.names <- setdiff(xnames, names(nd))
+  if (length(missing.names))
+    stop(sprintf(
+      "newdata must contain columns: %s",
+      paste(shQuote(xnames), collapse = ", ")
+    ), call. = FALSE)
+  invisible(TRUE)
+}
+
 .npqreg_fit_dots <- function(dots, allow.bandwidth.controls = FALSE) {
   dot.names <- names(dots)
   if (is.null(dot.names))
-    return(dots)
+    dot.names <- rep("", length(dots))
 
   stale <- intersect(dot.names[nzchar(dot.names)], .npqreg.removed.solver.controls)
   if (length(stale) && !allow.bandwidth.controls) {
@@ -39,8 +78,646 @@ npqreg <-
     ))
   }
 
+  if (!allow.bandwidth.controls) {
+    bad <- dot.names == "" | !(dot.names %in% .npqreg.fit.control.names)
+    if (any(bad))
+      .np_reject_unused_dots(dots[bad], "npqreg")
+  }
+
   keep <- (!nzchar(dot.names)) | (dot.names %in% .npqreg.fit.control.names)
   dots[keep]
+}
+
+.npqreg_strip_fit_controls_from_bw_call <- function(call) {
+  for (nm in c("tau", "gradients", "tol", "small", "itmax", "newdata", "exdat")) {
+    if (nm %in% names(call))
+      call[[nm]] <- NULL
+  }
+  call
+}
+
+.npqreg_quantile_delta_from_conditional <- function(bws,
+                                                    xdat,
+                                                    ydat,
+                                                    exdat,
+                                                    quantile,
+                                                    gradients = FALSE) {
+  xdat <- toFrame(xdat)
+  ydat <- toFrame(ydat)
+  exdat <- toFrame(exdat)
+  quantile <- as.double(quantile)
+  gradients <- npValidateScalarLogical(gradients, "gradients")
+
+  if (length(quantile) != nrow(exdat))
+    stop("quantile delta helper requires one quantile per evaluation row")
+  if (ncol(ydat) != 1L)
+    stop("quantile delta helper requires a single response")
+
+  eydat <- stats::setNames(data.frame(quantile), names(ydat)[1L])
+  cdf.obj <- .np_conditional_eval_selected(
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    eydat = eydat,
+    cdf = TRUE,
+    gradients = gradients
+  )
+  dens.obj <- .np_conditional_eval_selected(
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    eydat = eydat,
+    cdf = FALSE,
+    gradients = FALSE
+  )
+
+  dens <- as.double(dens.obj$condens)
+  quanterr <- as.double(cdf.obj$conderr) / NZD(dens)
+  quanterr[!is.finite(quanterr) | quanterr < 0.0] <- NA_real_
+
+  if (!gradients) {
+    return(list(
+      quanterr = quanterr,
+      quantgrad = NA,
+      quantgerr = NA,
+      cdf = cdf.obj,
+      dens = dens.obj
+    ))
+  }
+
+  dens.mat <- matrix(NZD(dens),
+                     nrow = nrow(cdf.obj$congrad),
+                     ncol = ncol(cdf.obj$congrad))
+  grad <- -cdf.obj$congrad / dens.mat
+  grad[!is.finite(grad)] <- NA_real_
+
+  gerr <- cdf.obj$congerr / dens.mat
+  gerr[!is.finite(gerr) | gerr < 0.0] <- NA_real_
+
+  list(
+    quanterr = quanterr,
+    quantgrad = grad,
+    quantgerr = gerr,
+    cdf = cdf.obj,
+    dens = dens.obj
+  )
+}
+
+.npqreg_selected_cdf_values <- function(bws,
+                                        xdat,
+                                        ydat,
+                                        exdat,
+                                        ycand) {
+  ydat <- toFrame(ydat)
+  yname <- names(ydat)[1L]
+  eydat <- stats::setNames(data.frame(as.double(ycand)), yname)
+  as.double(.np_conditional_eval_selected(
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    eydat = eydat,
+    cdf = TRUE,
+    gradients = FALSE
+  )$condist)
+}
+
+.npRmpi_npqreg_parallel_context <- function(bws, comm = 1L) {
+  isTRUE(isa(bws, "condbandwidth")) &&
+    isTRUE(.npRmpi_has_active_slave_pool(comm = comm)) &&
+    !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
+    !isTRUE(.npRmpi_autodispatch_called_from_bcast())
+}
+
+.npRmpi_npqreg_chunk_size <- function(n.eval, comm = 1L) {
+  n.eval <- as.integer(n.eval)
+  if (is.na(n.eval) || n.eval < 1L)
+    return(1L)
+
+  opt <- suppressWarnings(as.integer(getOption("npRmpi.npqreg.chunk.size", NA_integer_))[1L])
+  if (!is.na(opt) && opt > 0L)
+    return(min(n.eval, opt))
+
+  workers <- .npRmpi_bootstrap_worker_count(comm = comm)
+  slots <- max(1L, workers + 1L)
+  max(1L, as.integer(ceiling(n.eval / slots)))
+}
+
+.npRmpi_npqreg_parallel_min_eval <- function(comm = 1L) {
+  opt <- suppressWarnings(as.integer(getOption("npRmpi.npqreg.parallel.min.eval", NA_integer_))[1L])
+  if (!is.na(opt) && opt > 0L)
+    return(opt)
+
+  workers <- .npRmpi_bootstrap_worker_count(comm = comm)
+  max(2000L, 8L * (workers + 1L))
+}
+
+.npRmpi_npqreg_parallel_ready <- function(bws,
+                                          n.eval,
+                                          comm = 1L,
+                                          what = "npqreg",
+                                          force.parallel = FALSE) {
+  n.eval <- as.integer(n.eval)
+  if (is.na(n.eval))
+    return(FALSE)
+  if (!isTRUE(force.parallel) &&
+      n.eval < .npRmpi_npqreg_parallel_min_eval(comm = comm))
+    return(FALSE)
+  if (!.npRmpi_npqreg_parallel_context(bws, comm = comm))
+    return(FALSE)
+
+  .npRmpi_bootstrap_fanout_enabled(
+    comm = comm,
+    n = n.eval,
+    B = n.eval,
+    chunk.size = .npRmpi_npqreg_chunk_size(n.eval = n.eval, comm = comm),
+    what = what
+  )
+  TRUE
+}
+
+.npRmpi_npqreg_reset_worker_comm_state <- function(comm = 1L) {
+  if (isTRUE(.npRmpi_autodispatch_called_from_bcast()) ||
+      !isTRUE(.npRmpi_has_active_slave_pool(comm = comm)))
+    return(invisible(FALSE))
+
+  cmd <- quote({
+    try(.Call("C_np_set_local_regression_mode", FALSE, PACKAGE = "npRmpi"),
+        silent = TRUE)
+    try(.Call("C_np_set_active_comm", FALSE, as.integer(1L), PACKAGE = "npRmpi"),
+        silent = TRUE)
+    invisible(NULL)
+  })
+  try(.npRmpi_bcast_cmd_expr(cmd, comm = comm, caller.execute = TRUE),
+      silent = TRUE)
+  invisible(TRUE)
+}
+
+.npqreg_selected_cdf_values_parallel <- function(bws,
+                                                 xdat,
+                                                 ydat,
+                                                 exdat,
+                                                 ycand,
+                                                 comm = 1L) {
+  exdat <- toFrame(exdat)
+  n.eval <- nrow(exdat)
+  if (!.npRmpi_npqreg_parallel_ready(
+        bws = bws,
+        n.eval = n.eval,
+        comm = comm,
+        what = "npqreg selected CDF"
+      )) {
+    return(.npRmpi_with_local_cdist_eval(.npqreg_selected_cdf_values(
+      bws = bws,
+      xdat = xdat,
+      ydat = ydat,
+      exdat = exdat,
+      ycand = ycand
+    )))
+  }
+
+  ycand <- as.double(ycand)
+  on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = comm), add = TRUE)
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = n.eval,
+    chunk.size = .npRmpi_npqreg_chunk_size(n.eval = n.eval, comm = comm)
+  )
+  worker <- function(task, bws, xdat, ydat, exdat, ycand) {
+    idx <- seq.int(as.integer(task$start),
+                   length.out = as.integer(task$bsz))
+    .npRmpi_with_local_cdist_eval(.npqreg_selected_cdf_values(
+      bws = bws,
+      xdat = xdat,
+      ydat = ydat,
+      exdat = exdat[idx, , drop = FALSE],
+      ycand = ycand[idx]
+    ))
+  }
+
+  out <- .npRmpi_bootstrap_run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = 1L,
+    what = "npqreg selected CDF",
+    progress.label = "npqreg selected CDF",
+    profile.where = "npqreg:selected-cdf",
+    comm = comm,
+    master_local_chunk = TRUE,
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    ycand = ycand
+  )
+
+  as.double(out[, 1L])
+}
+
+.npqreg_quantile_delta_matrix <- function(delta, gradients = FALSE) {
+  quanterr <- as.double(delta$quanterr)
+  if (!isTRUE(gradients))
+    return(matrix(quanterr, ncol = 1L))
+
+  cbind(
+    quanterr,
+    as.matrix(delta$quantgrad),
+    as.matrix(delta$quantgerr)
+  )
+}
+
+.npqreg_quantile_delta_from_conditional_parallel <- function(bws,
+                                                             xdat,
+                                                             ydat,
+                                                             exdat,
+                                                             quantile,
+                                                             gradients = FALSE,
+                                                             comm = 1L) {
+  exdat <- toFrame(exdat)
+  n.eval <- nrow(exdat)
+  gradients <- npValidateScalarLogical(gradients, "gradients")
+  grad.cols <- if (isTRUE(gradients)) as.integer(bws$xndim) else 0L
+  if (is.na(grad.cols) || grad.cols < 0L)
+    grad.cols <- 0L
+
+  if (!.npRmpi_npqreg_parallel_ready(
+        bws = bws,
+        n.eval = n.eval,
+        comm = comm,
+        what = "npqreg quantile delta"
+      )) {
+    return(.npRmpi_with_local_cdist_eval(.npqreg_quantile_delta_from_conditional(
+      bws = bws,
+      xdat = xdat,
+      ydat = ydat,
+      exdat = exdat,
+      quantile = quantile,
+      gradients = gradients
+    )))
+  }
+
+  quantile <- as.double(quantile)
+  on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = comm), add = TRUE)
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = n.eval,
+    chunk.size = .npRmpi_npqreg_chunk_size(n.eval = n.eval, comm = comm)
+  )
+  worker <- function(task, bws, xdat, ydat, exdat, quantile, gradients) {
+    idx <- seq.int(as.integer(task$start),
+                   length.out = as.integer(task$bsz))
+    .npRmpi_with_local_cdist_eval(.npqreg_quantile_delta_matrix(
+      .npqreg_quantile_delta_from_conditional(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = exdat[idx, , drop = FALSE],
+        quantile = quantile[idx],
+        gradients = gradients
+      ),
+      gradients = gradients
+    ))
+  }
+
+  out <- .npRmpi_bootstrap_run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = 1L + 2L * grad.cols,
+    what = "npqreg quantile delta",
+    progress.label = "npqreg quantile delta",
+    profile.where = "npqreg:quantile-delta",
+    comm = comm,
+    master_local_chunk = TRUE,
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    quantile = quantile,
+    gradients = gradients
+  )
+
+  quanterr <- as.double(out[, 1L])
+  if (!isTRUE(gradients)) {
+    return(list(
+      quanterr = quanterr,
+      quantgrad = NA,
+      quantgerr = NA,
+      cdf = NULL,
+      dens = NULL
+    ))
+  }
+
+  grad.idx <- seq.int(2L, length.out = grad.cols)
+  gerr.idx <- seq.int(2L + grad.cols, length.out = grad.cols)
+  list(
+    quanterr = quanterr,
+    quantgrad = out[, grad.idx, drop = FALSE],
+    quantgerr = out[, gerr.idx, drop = FALSE],
+    cdf = NULL,
+    dens = NULL
+  )
+}
+
+.npqreg_fit_tau_vector_parallel_matrix <- function(bws,
+                                                   xdat,
+                                                   ydat,
+                                                   exdat,
+                                                   tau,
+                                                   gradients = FALSE,
+                                                   tol,
+                                                   small,
+                                                   itmax,
+                                                   comm = 1L,
+                                                   force.parallel = FALSE) {
+  exdat <- toFrame(exdat)
+  n.eval <- nrow(exdat)
+  tau <- .npqreg_validate_tau(tau)
+  gradients <- npValidateScalarLogical(gradients, "gradients")
+  grad.cols <- if (isTRUE(gradients)) as.integer(bws$xndim) else 0L
+  if (is.na(grad.cols) || grad.cols < 0L)
+    grad.cols <- 0L
+  cols.per.tau <- 2L + 2L * grad.cols
+
+  fit_chunk <- function(ex.chunk) {
+    pieces <- vector("list", length(tau))
+    for (j in seq_along(tau)) {
+      yq <- .npRmpi_with_local_cdist_eval(.npqreg_invert_selected_cdf(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = ex.chunk,
+        tau = tau[[j]],
+        tol = tol,
+        small = small,
+        itmax = itmax,
+        parallel = FALSE
+      ))
+      delta <- .npRmpi_with_local_cdist_eval(.npqreg_quantile_delta_from_conditional(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = ex.chunk,
+        quantile = yq,
+        gradients = gradients
+      ))
+      pieces[[j]] <- cbind(yq, .npqreg_quantile_delta_matrix(delta, gradients = gradients))
+    }
+    do.call(cbind, pieces)
+  }
+
+  if (!.npRmpi_npqreg_parallel_ready(
+        bws = bws,
+        n.eval = n.eval,
+        comm = comm,
+        what = "npqreg tau block",
+        force.parallel = force.parallel
+      )) {
+    return(fit_chunk(exdat))
+  }
+
+  on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = comm), add = TRUE)
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = n.eval,
+    chunk.size = .npRmpi_npqreg_chunk_size(n.eval = n.eval, comm = comm)
+  )
+  worker <- function(task, bws, xdat, ydat, exdat, tau, gradients, tol, small, itmax) {
+    idx <- seq.int(as.integer(task$start),
+                   length.out = as.integer(task$bsz))
+    ex.chunk <- exdat[idx, , drop = FALSE]
+    pieces <- vector("list", length(tau))
+    for (j in seq_along(tau)) {
+      yq <- .npRmpi_with_local_cdist_eval(.npqreg_invert_selected_cdf(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = ex.chunk,
+        tau = tau[[j]],
+        tol = tol,
+        small = small,
+        itmax = itmax,
+        parallel = FALSE
+      ))
+      delta <- .npRmpi_with_local_cdist_eval(.npqreg_quantile_delta_from_conditional(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = ex.chunk,
+        quantile = yq,
+        gradients = gradients
+      ))
+      pieces[[j]] <- cbind(yq, .npqreg_quantile_delta_matrix(delta, gradients = gradients))
+    }
+    do.call(cbind, pieces)
+  }
+
+  .npRmpi_bootstrap_run_fanout(
+    tasks = tasks,
+    worker = worker,
+    ncol.out = length(tau) * cols.per.tau,
+    what = "npqreg tau block",
+    progress.label = "npqreg tau block",
+    profile.where = "npqreg:tau-block",
+    comm = comm,
+    master_local_chunk = TRUE,
+    bws = bws,
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    tau = tau,
+    gradients = gradients,
+    tol = tol,
+    small = small,
+    itmax = itmax
+  )
+}
+
+.npqreg_fit_tau_vector_from_parallel_matrix <- function(mat,
+                                                        tau,
+                                                        gradients = FALSE,
+                                                        grad.names = NULL) {
+  tau <- .npqreg_validate_tau(tau)
+  gradients <- npValidateScalarLogical(gradients, "gradients")
+  grad.cols <- if (isTRUE(gradients)) {
+    per.tau.raw <- ncol(mat) / length(tau)
+    (per.tau.raw - 2L) / 2L
+  } else {
+    0L
+  }
+  if (!is.finite(grad.cols) || grad.cols < 0L || grad.cols != floor(grad.cols))
+    stop("internal error: malformed npqreg parallel gradient payload", call. = FALSE)
+  grad.cols <- as.integer(grad.cols)
+  cols.per.tau <- 2L + 2L * grad.cols
+  if (ncol(mat) != length(tau) * cols.per.tau)
+    stop("internal error: malformed npqreg parallel tau payload", call. = FALSE)
+
+  n.eval <- nrow(mat)
+  yq <- matrix(NA_real_, nrow = n.eval, ncol = length(tau))
+  yqerr <- matrix(NA_real_, nrow = n.eval, ncol = length(tau))
+  if (isTRUE(gradients)) {
+    yqgrad <- array(NA_real_, dim = c(n.eval, grad.cols, length(tau)))
+    yqgerr <- array(NA_real_, dim = c(n.eval, grad.cols, length(tau)))
+  }
+
+  for (j in seq_along(tau)) {
+    offset <- (j - 1L) * cols.per.tau
+    yq[, j] <- mat[, offset + 1L]
+    yqerr[, j] <- mat[, offset + 2L]
+    if (isTRUE(gradients) && grad.cols > 0L) {
+      grad.idx <- seq.int(offset + 3L, length.out = grad.cols)
+      gerr.idx <- seq.int(offset + 3L + grad.cols, length.out = grad.cols)
+      yqgrad[, , j] <- mat[, grad.idx, drop = FALSE]
+      yqgerr[, , j] <- mat[, gerr.idx, drop = FALSE]
+    }
+  }
+
+  tau.labels <- .npqreg_tau_labels(tau)
+  if (length(tau) == 1L) {
+    return(list(
+      yq = as.double(yq[, 1L]),
+      yqerr = as.double(yqerr[, 1L]),
+      yqgrad = if (isTRUE(gradients)) {
+        out <- yqgrad[, , 1L, drop = FALSE]
+        dim(out) <- c(n.eval, grad.cols)
+        if (!is.null(grad.names) && length(grad.names) == grad.cols)
+          colnames(out) <- grad.names
+        out
+      } else NA,
+      yqgerr = if (isTRUE(gradients)) {
+        out <- yqgerr[, , 1L, drop = FALSE]
+        dim(out) <- c(n.eval, grad.cols)
+        if (!is.null(grad.names) && length(grad.names) == grad.cols)
+          colnames(out) <- grad.names
+        out
+      } else NA
+    ))
+  }
+
+  colnames(yq) <- tau.labels
+  colnames(yqerr) <- tau.labels
+  if (isTRUE(gradients)) {
+    dimnames(yqgrad) <- list(NULL, NULL, tau.labels)
+    dimnames(yqgerr) <- list(NULL, NULL, tau.labels)
+    if (!is.null(grad.names) && length(grad.names) == grad.cols) {
+      dimnames(yqgrad)[[2L]] <- grad.names
+      dimnames(yqgerr)[[2L]] <- grad.names
+    }
+  }
+  list(
+    yq = yq,
+    yqerr = yqerr,
+    yqgrad = if (isTRUE(gradients)) yqgrad else NA,
+    yqgerr = if (isTRUE(gradients)) yqgerr else NA
+  )
+}
+
+.npqreg_assert_selected_cdf_metadata <- function(bws) {
+  reg.engine <- if (is.null(bws$regtype.engine)) {
+    if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+  } else {
+    as.character(bws$regtype.engine)
+  }
+  if (!identical(reg.engine, "lp"))
+    return(invisible(TRUE))
+
+  if (is.null(bws$degree.engine) && is.null(bws$degree))
+    stop("selected LP conditional distribution metadata missing from bandwidth object: degree")
+  invisible(TRUE)
+}
+
+.npqreg_invert_selected_cdf <- function(bws,
+                                        xdat,
+                                        ydat,
+                                        exdat,
+                                        tau,
+                                        tol,
+                                        small,
+                                        itmax,
+                                        parallel = FALSE,
+                                        comm = 1L) {
+  .npqreg_assert_selected_cdf_metadata(bws)
+
+  xdat <- toFrame(xdat)
+  ydat <- toFrame(ydat)
+  exdat <- toFrame(exdat)
+  y <- as.double(ydat[[1L]])
+  y <- y[is.finite(y)]
+  if (!length(y))
+    stop("npqreg selected-CDF inversion requires finite response support")
+
+  n.eval <- nrow(exdat)
+  y.min <- min(y)
+  y.max <- max(y)
+  if (!is.finite(y.min) || !is.finite(y.max))
+    stop("npqreg selected-CDF inversion found non-finite response support")
+  if (identical(y.min, y.max))
+    return(rep.int(y.min, n.eval))
+
+  lo <- rep.int(y.min, n.eval)
+  hi <- rep.int(y.max, n.eval)
+  cdf_values <- if (isTRUE(parallel)) {
+    function(bws, xdat, ydat, exdat, ycand) {
+      .npqreg_selected_cdf_values_parallel(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = exdat,
+        ycand = ycand,
+        comm = comm
+      )
+    }
+  } else {
+    function(bws, xdat, ydat, exdat, ycand) {
+      .npRmpi_with_local_cdist_eval(.npqreg_selected_cdf_values(
+        bws = bws,
+        xdat = xdat,
+        ydat = ydat,
+        exdat = exdat,
+        ycand = ycand
+      ))
+    }
+  }
+
+  flo <- cdf_values(bws, xdat, ydat, exdat, lo)
+  fhi <- cdf_values(bws, xdat, ydat, exdat, hi)
+  if (any(!is.finite(flo)) || any(!is.finite(fhi)))
+    stop("npqreg selected-CDF inversion encountered non-finite bracket values")
+
+  done.low <- flo >= tau
+  done.high <- fhi < tau
+  active <- !(done.low | done.high)
+
+  maxiter <- min(as.integer(itmax), 1000L)
+  iter <- 0L
+  while (any(active) && iter < maxiter) {
+    iter <- iter + 1L
+    mid <- (lo[active] + hi[active]) / 2.0
+    fmid <- cdf_values(
+      bws = bws,
+      xdat = xdat,
+      ydat = ydat,
+      exdat = exdat[active, , drop = FALSE],
+      ycand = mid
+    )
+    if (any(!is.finite(fmid)))
+      stop("npqreg selected-CDF inversion encountered non-finite refinement values")
+
+    active.idx <- which(active)
+    upper <- fmid >= tau
+    hi[active.idx[upper]] <- mid[upper]
+    lo[active.idx[!upper]] <- mid[!upper]
+
+    width <- hi[active.idx] - lo[active.idx]
+    scale <- pmax(abs(hi[active.idx]), abs(lo[active.idx]), 1.0)
+    active[active.idx] <- width > (tol * scale + small)
+  }
+
+  if (any(active))
+    stop("npqreg selected-CDF inversion failed to converge within 'itmax'")
+
+  out <- hi
+  out[done.low] <- y.min
+  out[done.high] <- y.max
+  out
 }
 
 npqreg.formula <-
@@ -60,6 +737,7 @@ npqreg.formula <-
 
     has.eval <- !is.null(newdata)
     if (has.eval) {
+      .npqreg_validate_newdata_terms(newdata, bws$variableNames[["terms"]])
       tt <- drop.terms(tt, match(bws$variableNames$response, attr(tt, 'term.labels')))
       umf.args <- list(formula = tt, data = newdata)
       umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
@@ -77,11 +755,12 @@ npqreg.formula <-
     tbw$rows.omit <- as.vector(tbw$omit)
     tbw$nobs.omit <- length(tbw$rows.omit)
 
-    tbw$quantile <- napredict(tbw$omit, tbw$quantile)
-    tbw$quanterr <- napredict(tbw$omit, tbw$quanterr)
+    tbw$quantile <- .npqreg_napredict_eval(tbw$omit, tbw$quantile)
+    tbw$quanterr <- .npqreg_napredict_eval(tbw$omit, tbw$quanterr)
 
     if(tbw$gradients){
-        tbw$quantgrad <- napredict(tbw$omit, tbw$quantgrad)
+        tbw$quantgrad <- .npqreg_napredict_eval(tbw$omit, tbw$quantgrad)
+        tbw$quantgerr <- .npqreg_napredict_eval(tbw$omit, tbw$quantgerr)
     }
 
     return(tbw)
@@ -103,6 +782,17 @@ npqreg.conbandwidth <-
   isa(bws, "condbandwidth")
 }
 
+.npRmpi_npqreg_eval_local_no_dispatch <- function(expr) {
+  old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
+  old.ctx <- getOption("npRmpi.autodispatch.context", FALSE)
+  options(npRmpi.autodispatch.disable = TRUE)
+  options(npRmpi.autodispatch.context = TRUE)
+  on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
+  on.exit(options(npRmpi.autodispatch.context = old.ctx), add = TRUE)
+  on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = 1L), add = TRUE)
+  force(expr)
+}
+
 npqreg.condbandwidth <-
   function(bws,
            txdat = stop("training data 'txdat' missing"),
@@ -115,6 +805,7 @@ npqreg.condbandwidth <-
            ...){
 
     fit.start <- proc.time()[3]
+    tau <- .npqreg_validate_tau(tau)
     fit.dots <- .npqreg_fit_dots(list(...))
     if (length(fit.dots))
       stop(sprintf("unused npqreg fit argument '%s'", names(fit.dots)[1L]))
@@ -132,10 +823,26 @@ npqreg.condbandwidth <-
     tol <- as.double(tol)
     small <- as.double(small)
     .npRmpi_require_active_slave_pool(where = "npqreg()")
+    parallel.cond <- .npRmpi_npqreg_parallel_context(bws, comm = 1L)
+    if (isTRUE(parallel.cond)) {
+      n.eval.pre <- suppressWarnings(as.integer(tryCatch(
+        if (missing(exdat)) NROW(txdat) else NROW(exdat),
+        error = function(e) NA_integer_
+      ))[1L])
+      if (is.na(n.eval.pre) ||
+          n.eval.pre < .npRmpi_npqreg_parallel_min_eval(comm = 1L))
+        parallel.cond <- FALSE
+    }
+    if (isTRUE(parallel.cond))
+      on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = 1L), add = TRUE)
     if (.npRmpi_npqreg_should_localize(bws) &&
-        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
-      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
-    if (.npRmpi_autodispatch_active())
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
+        !isTRUE(.npRmpi_autodispatch_in_context()) &&
+        !isTRUE(parallel.cond))
+      return(.npRmpi_npqreg_eval_local_no_dispatch(
+        .npRmpi_eval_without_dispatch(match.call(), parent.frame())
+      ))
+    if (.npRmpi_autodispatch_active() && !isTRUE(parallel.cond))
       return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
     no.ex = missing(exdat)
@@ -143,8 +850,8 @@ npqreg.condbandwidth <-
     txdat = toFrame(txdat)
     tydat = toFrame(tydat)
 
-    if (!is.numeric(tau) || length(tau) != 1 || is.na(tau) || tau <= 0 || tau >= 1)
-      stop("'tau' must be a single numeric value in (0,1)")
+    ntau <- length(tau)
+    tau.labels <- .npqreg_tau_labels(tau)
 
     if (dim(tydat)[2] != 1)
       stop("'tydat' has more than one column")
@@ -156,9 +863,6 @@ npqreg.condbandwidth <-
         stop("'txdat' and 'exdat' are not similar data frames!")
     }
 
-    if(gradients)
-      stop("gradients not currently supported for this object")
-    
     if (length(bws$xbw) != length(txdat))
       stop("length of bandwidth vector does not match number of columns of 'txdat'")
 
@@ -220,161 +924,83 @@ npqreg.condbandwidth <-
     if (!no.ex)
       exdat.df <- exdat
 
-    ## at this stage, data to be sent to the c routines must be converted to
-    ## numeric type.
-    
-    tydat = toMatrix(tydat)
-
-    txdat = toMatrix(txdat)
-
-    txuno = txdat[, bws$ixuno, drop = FALSE]
-    txcon = txdat[, bws$ixcon, drop = FALSE]
-    txord = txdat[, bws$ixord, drop = FALSE]
-
-    if (!no.ex){
-      exdat = toMatrix(exdat)
-
-      exuno = exdat[, bws$ixuno, drop = FALSE]
-      excon = exdat[, bws$ixcon, drop = FALSE]
-      exord = exdat[, bws$ixord, drop = FALSE]
+    if (isTRUE(parallel.cond)) {
+      mat <- .npqreg_fit_tau_vector_parallel_matrix(
+        bws = bws,
+        xdat = txdat.df,
+        ydat = tydat.df,
+        exdat = txeval,
+        tau = tau,
+        gradients = gradients,
+        tol = tol,
+        small = small,
+        itmax = itmax,
+        comm = 1L,
+        force.parallel = TRUE
+      )
+      myout <- .npqreg_fit_tau_vector_from_parallel_matrix(
+        mat,
+        tau = tau,
+        gradients = gradients
+      )
     } else {
-      exuno = data.frame()
-      excon = data.frame()
-      exord = data.frame()
-    }
-
-    myopti = list(
-      num_obs_train = tnrow,
-      num_obs_eval = enrow,
-      int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
-      BANDWIDTH_den_extern = switch(bws$type,
-        fixed = BW_FIXED,
-        generalized_nn = BW_GEN_NN,
-        adaptive_nn = BW_ADAP_NN),
-      int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE,
-      xkerneval = switch(bws$cxkertype,
-        gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
-        epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
-        uniform = CKER_UNI,
-        "truncated gaussian" = CKER_TGAUSS),
-      ykerneval = switch(bws$cykertype,
-        gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
-        epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
-        uniform = CKER_UNI,
-        "truncated gaussian" = CKER_TGAUSS),
-      uxkerneval = switch(bws$uxkertype,
-        aitchisonaitken = UKER_AIT,
-        liracine = UKER_LR),
-      uykerneval = switch(bws$uykertype,
-        aitchisonaitken = UKER_AIT,
-        liracine = UKER_LR),
-      oxkerneval = switch(bws$oxkertype,
-        wangvanryzin = OKER_WANG,
-        liracine = OKER_LR,
-        "racineliyan" = OKER_RLY),
-      oykerneval = switch(bws$oykertype,
-        wangvanryzin = OKER_WANG,
-        liracine = OKER_NLR,
-        "racineliyan" = OKER_RLY),
-      num_yuno = bws$ynuno,
-      num_yord = bws$ynord,
-      num_ycon = bws$yncon,
-      num_xuno = bws$xnuno,
-      num_xord = bws$xnord,
-      num_xcon = bws$xncon,
-      no.ex = no.ex,
-      gradients = gradients,
-      itmax = itmax,
-      xmcv.numRow = attr(bws$xmcv, "num.row"),
-      nmulti = itmax,
-      qreg.unused = 0L)
-
-    myoptd = c(
-      qreg.unused = 0.0,
-      tol = tol,
-      small = small,
-      rep(0.0, 7L))
-    
-    myout <-
-      .Call("C_np_quantile_conditional",
-            as.double(tydat),
-            as.double(txuno), as.double(txord), as.double(txcon),
-            as.double(exuno), as.double(exord), as.double(excon),
-            as.double(tau),
-            as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
-                        bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
-                        bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
-            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-            as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
-            as.integer(myopti),
-            as.double(myoptd),
-            as.integer(enrow),
-            as.integer(bws$xndim),
-            as.logical(gradients),
-            PACKAGE="npRmpi")[c("yq", "yqerr", "yqgrad")]
-
-    if (all(!is.finite(myout$yqerr) | myout$yqerr <= 0.0)) {
-      dens.bw <- tryCatch(
-        conbandwidth(
-          xbw = bws$xbw,
-          ybw = bws$ybw,
-          bwmethod = "manual",
-          bwscaling = bws$scaling,
-          bwtype = bws$type,
-          cxkertype = bws$cxkertype,
-          cxkerorder = bws$cxkerorder,
-          cxkerbound = bws$cxkerbound,
-          cxkerlb = bws$cxkerlb,
-          cxkerub = bws$cxkerub,
-          uxkertype = bws$uxkertype,
-          oxkertype = bws$oxkertype,
-          cykertype = bws$cykertype,
-          cykerorder = bws$cykerorder,
-          cykerbound = bws$cykerbound,
-          cykerlb = bws$cykerlb,
-          cykerub = bws$cykerub,
-          uykertype = bws$uykertype,
-          oykertype = bws$oykertype,
-          nobs = nrow(txdat.df),
-          xdati = bws$xdati,
-          ydati = bws$ydati,
-          xnames = bws$xnames,
-          ynames = bws$ynames,
-          sfactor = bws$sfactor,
-          bandwidth = bws$bw,
-          bandwidth.compute = FALSE
-        ),
-        error = function(e) NULL
-      )
-      dens.obj <- tryCatch(
-        npcdens(
-          txdat = txdat.df,
-          tydat = tydat.df,
-          exdat = if (no.ex) txdat.df else exdat.df,
-          eydat = data.frame(y = as.double(myout$yq)),
-          bws = dens.bw
-        ),
-        error = function(e) NULL
-      )
-      if (!is.null(dens.obj)) {
-        dens.q <- as.double(dens.obj$condens)
-        qvar <- tau * (1.0 - tau) / (tnrow * NZD(dens.q)^2)
-        myout$yqerr <- sqrt(pmax(qvar, 0.0))
-        myout$yqerr[!is.finite(myout$yqerr)] <- NA_real_
+      fit_one_tau <- function(tau_i) {
+        yq <- .npqreg_invert_selected_cdf(
+          bws = bws,
+          xdat = txdat.df,
+          ydat = tydat.df,
+          exdat = txeval,
+          tau = tau_i,
+          tol = tol,
+          small = small,
+          itmax = itmax
+        )
+        qdelta <- .npRmpi_with_local_cdist_eval(
+          .npqreg_quantile_delta_from_conditional(
+            bws = bws,
+            xdat = txdat.df,
+            ydat = tydat.df,
+            exdat = txeval,
+            quantile = yq,
+            gradients = gradients
+          )
+        )
+        list(
+          yq = yq,
+          yqerr = qdelta$quanterr,
+          yqgrad = if (gradients) qdelta$quantgrad else NA,
+          yqgerr = if (gradients) qdelta$quantgerr else NA
+        )
       }
-    }
 
-    ##need to untangle yqgrad
+      tau.out <- lapply(tau, fit_one_tau)
 
-    if(gradients){
-      myout$yqgrad = matrix(data=myout$yqgrad, nrow = enrow, ncol = bws$xndim, byrow = FALSE) 
-      rorder = numeric(bws$xndim)
-      xidx <- seq_len(bws$xndim)
-      rorder[c(xidx[bws$ixcon], xidx[bws$ixuno], xidx[bws$ixord])] <- xidx
-      myout$yqgrad = myout$yqgrad[, rorder, drop = FALSE]
-
-    } else {
-      myout$yqgrad = NA
+      if (ntau == 1L) {
+        myout <- tau.out[[1L]]
+      } else {
+        myout <- list(
+          yq = do.call(cbind, lapply(tau.out, `[[`, "yq")),
+          yqerr = do.call(cbind, lapply(tau.out, `[[`, "yqerr")),
+          yqgrad = NA,
+          yqgerr = NA
+        )
+        colnames(myout$yq) <- tau.labels
+        colnames(myout$yqerr) <- tau.labels
+        if (gradients) {
+          p <- ncol(tau.out[[1L]]$yqgrad)
+          grad.names <- colnames(tau.out[[1L]]$yqgrad)
+          myout$yqgrad <- array(NA_real_,
+                                dim = c(enrow, p, ntau),
+                                dimnames = list(NULL, grad.names, tau.labels))
+          myout$yqgerr <- array(NA_real_,
+                                dim = c(enrow, p, ntau),
+                                dimnames = list(NULL, grad.names, tau.labels))
+          for (j in seq_len(ntau)) {
+            myout$yqgrad[, , j] <- tau.out[[j]]$yqgrad
+            myout$yqgerr[, , j] <- tau.out[[j]]$yqgerr
+          }
+        }
+      }
     }
 
 
@@ -388,6 +1014,7 @@ npqreg.condbandwidth <-
                 quantile = myout$yq,
                 quanterr = myout$yqerr,
                 quantgrad = myout$yqgrad,
+                quantgerr = myout$yqgerr,
                 ntrain = tnrow,
                 trainiseval = no.ex,
                 gradients = gradients,
@@ -396,20 +1023,88 @@ npqreg.condbandwidth <-
   }
 
 
-npqreg.default <- function(bws, txdat, tydat, ...){
-  .npRmpi_require_active_slave_pool(where = "npqreg()")
-  if (!missing(bws) &&
-      .npRmpi_npqreg_should_localize(bws) &&
-      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
-    return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
-  if (.npRmpi_autodispatch_active())
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+npqreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
+  nomad <- npValidateScalarLogical(nomad, "nomad")
+  early.dots <- list(...)
+  if ("tau" %in% names(early.dots))
+    .npqreg_validate_tau(early.dots$tau)
 
   if (!missing(bws) && inherits(bws, "formula")) {
     dots <- list(...)
-    tbw <- do.call(npcdistbw, c(list(formula = bws), dots))
-    return(npqreg(bws = tbw, ...))
+    dot.names <- names(dots)
+    if (is.null(dot.names))
+      dot.names <- rep("", length(dots))
+    fit.names <- c("newdata", "exdat", "tau", "gradients", "tol", "small", "itmax")
+    fit.dots <- .npqreg_fit_dots(dots[nzchar(dot.names) & dot.names %in% fit.names])
+    bw.dots <- dots[!(nzchar(dot.names) & dot.names %in% fit.names)]
+    bw.args <- c(list(formula = bws, nomad = nomad), bw.dots)
+    bw.call <- as.call(c(list(quote(npcdistbw)), bw.args))
+    use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
+      bw.call,
+      caller_env = parent.frame()
+    )
+    tbw <- if (use.outer.bandwidth.progress) {
+      .np_progress_select_bandwidth_enhanced(
+        "Selecting conditional distribution bandwidth",
+        do.call(npcdistbw, bw.args)
+      )
+    } else {
+      do.call(npcdistbw, bw.args)
+    }
+    return(do.call(npqreg, c(list(bws = tbw), fit.dots)))
   }
+
+  if (!missing(txdat) && inherits(txdat, "formula") &&
+      !missing(bws) && !isa(bws, "condbandwidth")) {
+    dots <- list(...)
+    dot.names <- names(dots)
+    if (is.null(dot.names))
+      dot.names <- rep("", length(dots))
+    fit.names <- c("newdata", "exdat", "tau", "gradients", "tol", "small", "itmax")
+    fit.dots <- .npqreg_fit_dots(dots[nzchar(dot.names) & dot.names %in% fit.names])
+    bw.dots <- dots[!(nzchar(dot.names) & dot.names %in% fit.names)]
+    bw.args <- c(list(formula = txdat, bws = bws, nomad = nomad), bw.dots)
+    bw.call <- as.call(c(list(quote(npcdistbw)), bw.args))
+    use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
+      bw.call,
+      caller_env = parent.frame()
+    )
+    tbw <- if (use.outer.bandwidth.progress) {
+      .np_progress_select_bandwidth_enhanced(
+        "Selecting conditional distribution bandwidth",
+        do.call(npcdistbw, bw.args)
+      )
+    } else {
+      do.call(npcdistbw, bw.args)
+    }
+    return(do.call(npqreg, c(list(bws = tbw), fit.dots)))
+  }
+
+  .npRmpi_require_active_slave_pool(where = "npqreg()")
+  parallel.cond <- (!missing(bws)) &&
+    .npRmpi_npqreg_should_localize(bws) &&
+    .npRmpi_npqreg_parallel_context(bws, comm = 1L)
+  if (isTRUE(parallel.cond)) {
+    n.eval.pre <- suppressWarnings(as.integer(tryCatch(
+      if (missing(txdat)) NA_integer_ else NROW(txdat),
+      error = function(e) NA_integer_
+    ))[1L])
+    if (is.na(n.eval.pre) ||
+        n.eval.pre < .npRmpi_npqreg_parallel_min_eval(comm = 1L))
+      parallel.cond <- FALSE
+  }
+  if (isTRUE(parallel.cond))
+    on.exit(.npRmpi_npqreg_reset_worker_comm_state(comm = 1L), add = TRUE)
+  if (!missing(bws) &&
+      .npRmpi_npqreg_should_localize(bws) &&
+      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
+      !isTRUE(.npRmpi_autodispatch_in_context()) &&
+      !isTRUE(parallel.cond))
+    return(.npRmpi_npqreg_eval_local_no_dispatch(
+      .npRmpi_eval_without_dispatch(match.call(), parent.frame())
+    ))
+  if (.npRmpi_autodispatch_active() && !isTRUE(parallel.cond))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   sc <- sys.call()
   sc.names <- names(sc)
@@ -426,6 +1121,7 @@ npqreg.default <- function(bws, txdat, tydat, ...){
   no.txdat <- missing(txdat)
   no.tydat <- missing(tydat)
   has.explicit.bws <- (!no.bws) && isa(bws, "condbandwidth")
+  bws.formula <- (!no.bws) && inherits(bws, "formula")
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
@@ -436,8 +1132,13 @@ npqreg.default <- function(bws, txdat, tydat, ...){
     tydat <- toFrame(tydat)
 
   sc.bw <- sc
-  
+  if (bws.formula) {
+    sc.bw$`bws` <- NULL
+    bws.named <- FALSE
+  }
+
   sc.bw[[1]] <- quote(npcdistbw)
+  sc.bw <- .npqreg_strip_fit_controls_from_bw_call(sc.bw)
 
   if(bws.named){
     sc.bw$bandwidth.compute <- FALSE
@@ -451,12 +1152,21 @@ npqreg.default <- function(bws, txdat, tydat, ...){
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
-    
+
+  use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
+    sc.bw,
+    caller_env = parent.frame()
+  )
+
   tbw <- if (!has.explicit.bws) {
-    .np_progress_select_bandwidth(
-      "Selecting conditional distribution bandwidth",
+    if (use.outer.bandwidth.progress) {
+      .np_progress_select_bandwidth_enhanced(
+        "Selecting conditional distribution bandwidth",
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+      )
+    } else {
       .np_eval_bw_call(sc.bw, caller_env = parent.frame())
-    )
+    }
   } else {
     .np_eval_bw_call(sc.bw, caller_env = parent.frame())
   }

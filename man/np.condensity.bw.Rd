@@ -48,7 +48,7 @@ npcdensbw(\dots)
           memfac = 500,
           nmulti,
           penalty.multiplier = 10,
-          remin = TRUE,
+          powell.remin = TRUE,
           scale.init.categorical.sample = FALSE,
           scale.factor.search.lower = NULL,
           cvls.quadrature.grid = NULL,
@@ -99,7 +99,8 @@ npcdensbw(\dots)
           oxkertype,
           oykertype,
           penalty.multiplier,
-          remin,
+          nomad.remin = FALSE,
+          powell.remin,
           scale.init.categorical.sample,
           scale.factor.search.lower = NULL,
           cvls.quadrature.grid = c("hybrid", "uniform", "sample"),
@@ -118,7 +119,7 @@ npcdensbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-          degree.min = NULL,
+            degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -550,7 +551,9 @@ These arguments control the local-polynomial estimator, basis, and fixed degree 
     integer scalar or integer vector of polynomial degrees for
     continuous \code{xdat} variables when \code{regtype="lp"}.
     If scalar, the value is recycled to all continuous \code{xdat}
-    variables.
+    variables. With no continuous \code{xdat} predictors,
+    \code{regtype="lp"} is only admissible when \code{degree=0}, the
+    local-constant equivalent.
   }
 
   \item{regtype}{
@@ -559,7 +562,10 @@ These arguments control the local-polynomial estimator, basis, and fixed degree 
     \code{"lc"}, \code{"ll"}, and \code{"lp"}.
     For \code{npc*} methods, \code{"ll"} is implemented via the
     canonical local polynomial engine with \code{degree = 1} and
-    \code{basis = "glp"}. If local-linear \code{cv.ls} search fails
+    \code{basis = "glp"}. \code{"ll"} and positive-degree
+    \code{"lp"} require at least one continuous \code{xdat} predictor;
+    for categorical-only \code{xdat}, use \code{"lc"} or
+    \code{"lp"} with \code{degree=0}. If local-linear \code{cv.ls} search fails
     while using this canonical raw basis, retrying explicitly with
     \code{regtype="lp"}, \code{degree=1}, and
     \code{bernstein.basis=TRUE}, or centering/scaling the continuous
@@ -586,7 +592,8 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     immediately; in particular, \code{nomad=TRUE} currently requires
     \code{regtype="lp"}, \code{bwtype="fixed"}, automatic degree
     search, \code{bernstein.basis=TRUE}, no explicit \code{degree},
-    and \code{search.engine \%in\% c("nomad", "nomad+powell")}.
+    at least one continuous \code{xdat} predictor, and
+    \code{search.engine \%in\% c("nomad", "nomad+powell")}.
     This shortcut does not change the meaning of \code{nmulti} or
     \code{nomad.nmulti}: \code{nmulti} remains the outer restart count,
     while \code{nomad.nmulti} controls inner
@@ -607,6 +614,15 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     \code{nmulti} controls outer restarts, while \code{nomad.nmulti}
     controls inner NOMAD multistarts within each outer restart.
   }
+
+  \item{nomad.remin}{
+    logical flag controlling the optional second NOMAD hot start. When
+    \code{TRUE}, NOMAD is restarted once from the best full candidate found,
+    including both bandwidth and degree coordinates. Defaults to \code{FALSE};
+    current simulation evidence favors the one-pass NOMAD default for routine
+    use, while leaving this switch available for sensitivity checks.
+  }
+
 
   \item{search.engine}{
     character string controlling the automatic local-polynomial search
@@ -668,10 +684,13 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     baseline penalty when \code{invalid.penalty="baseline"}.
     Defaults to \code{10}.}
 
-  \item{remin}{
-    a logical value which when set as \code{TRUE} the search routine
-    restarts from located minima for a minor gain in accuracy. Defaults
-    to \code{TRUE}.
+  \item{powell.remin}{
+    logical flag controlling Powell restart-from-minimum behavior. For
+    ordinary fixed-degree Powell-style search, \code{TRUE} restarts the
+    local search from the located minimum. For \code{search.engine="nomad+powell"},
+    this controls only the final Powell bandwidth-polish step. The default
+    is \code{TRUE} for ordinary Powell routes and \code{FALSE} for the
+    Powell polish after NOMAD unless explicitly supplied.
   }
 
   \item{small}{
@@ -737,7 +756,7 @@ or standard-deviation factors.
   \code{lbd.init}, and \code{hbd.init} have separate semantics and are
   not affected by \code{scale.factor.search.lower}.
 
-  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
+  Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
   The bandwidth-selection argument surface is easiest to read by
   decision group. Start by initializing MPI execution if needed, then
@@ -757,10 +776,8 @@ or standard-deviation factors.
   \code{bernstein.basis}) are relevant when using the explicit
   local-polynomial route.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
 
   \code{npcdensbw} implements a variety of methods for choosing
@@ -892,6 +909,19 @@ or standard-deviation factors.
   objects of type \code{conbandwidth}.
 }
 
+\section{Book And Method Pointers}{
+  \code{npcdensbw} selects response and conditioning bandwidths, and
+  when requested local-polynomial degree/search metadata, for the
+  conditional density target \eqn{f(y\mid x)} estimated by
+  \code{\link{npcdens}}.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 5
+  \emph{Conditional Density Estimation}, especially Sections 5.1-5.4, and
+  Chapter 4 \emph{Kernel Estimation with Mixed Data}. The later workflow
+  treatment is Racine (2019), Chapter 4 \emph{Conditional Probability
+  Density and Cumulative Distribution Functions}.
+}
+
 \references{
 
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
@@ -961,7 +991,7 @@ or standard-deviation factors.
 }
 
 \seealso{
-  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}
+  \code{\link{np.kernels}}, \code{\link{np.options}}, \code{\link{plot}}, \code{\link{plot.np}}
   \code{\link{bw.nrd}}, \code{\link{bw.SJ}}, \code{\link{hist}},
   \code{\link{npudens}}, \code{\link{npudist}}
 }

@@ -5,7 +5,7 @@ test_that("plot contract: bootstrap args require explicit bootstrap mode across 
   on.exit(close_mpi_slaves(), add = TRUE)
   options(npRmpi.autodispatch = TRUE)
 
-  msg <- "plot.errors.method must be set to 'bootstrap' when bootstrap error arguments are supplied"
+  msg <- "bootstrap controls require errors = \"bootstrap\""
 
   set.seed(812)
   n <- 50
@@ -46,27 +46,27 @@ test_that("plot contract: bootstrap args require explicit bootstrap mode across 
   )
 
   expect_error(
-    suppressWarnings(plot(rbw, plot.behavior = "data", perspective = FALSE, plot.errors.boot.num = 5)),
+    suppressWarnings(plot(rbw, output = "data", perspective = FALSE, B = 5)),
     msg,
     fixed = TRUE
   )
   expect_error(
-    suppressWarnings(plot(ubw, plot.behavior = "data", perspective = FALSE, plot.errors.boot.num = 5)),
+    suppressWarnings(plot(ubw, output = "data", perspective = FALSE, B = 5)),
     msg,
     fixed = TRUE
   )
   expect_error(
-    suppressWarnings(plot(dbw, plot.behavior = "data", perspective = FALSE, plot.errors.boot.num = 5)),
+    suppressWarnings(plot(dbw, output = "data", perspective = FALSE, B = 5)),
     msg,
     fixed = TRUE
   )
   expect_error(
-    suppressWarnings(plot(cbw, plot.behavior = "data", perspective = FALSE, plot.errors.boot.num = 5)),
+    suppressWarnings(plot(cbw, output = "data", perspective = FALSE, B = 5)),
     msg,
     fixed = TRUE
   )
   expect_error(
-    suppressWarnings(plot(cdbw, plot.behavior = "data", perspective = FALSE, plot.errors.boot.num = 5)),
+    suppressWarnings(plot(cdbw, output = "data", perspective = FALSE, B = 5)),
     msg,
     fixed = TRUE
   )
@@ -77,9 +77,9 @@ test_that("plot contract: bootstrap args require explicit bootstrap mode across 
         xdat = data.frame(x = z),
         ydat = y,
         zdat = data.frame(z = x),
-        plot.behavior = "data",
+        output = "data",
         perspective = FALSE,
-        plot.errors.boot.num = 5
+        B = 5
       )
     ),
     msg,
@@ -91,9 +91,9 @@ test_that("plot contract: bootstrap args require explicit bootstrap mode across 
         sbw,
         xdat = data.frame(x = x, x2 = x2),
         ydat = y,
-        plot.behavior = "data",
+        output = "data",
         perspective = FALSE,
-        plot.errors.boot.num = 5
+        B = 5
       )
     ),
     msg,
@@ -106,12 +106,63 @@ test_that("plot contract: bootstrap args require explicit bootstrap mode across 
         xdat = data.frame(x = x),
         ydat = y,
         zdat = data.frame(z = z),
-        plot.behavior = "data",
+        output = "data",
         perspective = FALSE,
-        plot.errors.boot.num = 5
+        B = 5
       )
     ),
     msg,
     fixed = TRUE
+  )
+})
+
+test_that("plot contract: package legends are user-controllable on band-all plots (npRmpi)", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  old.auto <- getOption("npRmpi.autodispatch", FALSE)
+  on.exit(options(npRmpi.autodispatch = old.auto), add = TRUE)
+  on.exit(close_mpi_slaves(), add = TRUE)
+  options(npRmpi.autodispatch = TRUE)
+
+  set.seed(20260511)
+  n <- 36L
+  x <- runif(n)
+  y <- sin(2 * pi * x) + rnorm(n, sd = 0.1)
+  rbw <- npregbw(
+    xdat = data.frame(x = x),
+    ydat = y,
+    bws = 0.35,
+    bandwidth.compute = FALSE
+  )
+
+  old.dev <- grDevices::dev.cur()
+  grDevices::pdf(file = tempfile(fileext = ".pdf"))
+  on.exit({
+    grDevices::dev.off()
+    if (old.dev > 1L)
+      grDevices::dev.set(old.dev)
+  }, add = TRUE)
+
+  expect_silent(suppressWarnings(plot(
+    rbw, xdat = data.frame(x = x), ydat = y, perspective = FALSE,
+    errors = "bootstrap", bootstrap = "wild", B = 9L, band = "all",
+    neval = 6L, legend = FALSE
+  )))
+  expect_silent(suppressWarnings(plot(
+    rbw, xdat = data.frame(x = x), ydat = y, perspective = FALSE,
+    errors = "bootstrap", bootstrap = "wild", B = 9L, band = "all",
+    neval = 6L, legend = "bottomright"
+  )))
+  expect_silent(suppressWarnings(plot(
+    rbw, xdat = data.frame(x = x), ydat = y, perspective = FALSE,
+    errors = "bootstrap", bootstrap = "wild", B = 9L, band = "all",
+    neval = 6L, legend = list(x = "bottomleft", bty = "o")
+  )))
+  expect_error(
+    suppressWarnings(plot(
+      rbw, xdat = data.frame(x = x), ydat = y, perspective = FALSE,
+      errors = "bootstrap", bootstrap = "wild", B = 9L, band = "all",
+      neval = 6L, legend = 1
+    )),
+    "legend must be TRUE/FALSE"
   )
 })

@@ -11,10 +11,10 @@ test_that("plot works with autodispatch for non-bootstrap paths", {
 
   bw <- npregbw(y ~ x, data = d, regtype = "lc", bwmethod = "cv.ls", nmulti = 1)
   out <- suppressWarnings(plot(bw,
-                               persp = FALSE,
+                               perspective = FALSE,
                                view = "fixed",
-                               plot.behavior = "data",
-                               plot.errors.method = "none"))
+                               output = "data",
+                               errors = "none"))
 
   expect_type(out, "list")
   expect_true(length(out) > 0)
@@ -35,11 +35,11 @@ test_that("plot bootstrap path works under autodispatch", {
 
   out <- suppressWarnings(
     plot(bw,
-         persp = FALSE,
+         perspective = FALSE,
          view = "fixed",
-         plot.behavior = "data",
-         plot.errors.method = "bootstrap",
-         plot.errors.boot.num = 9)
+         output = "data",
+         errors = "bootstrap",
+         B = 9)
   )
 
   expect_type(out, "list")
@@ -63,7 +63,7 @@ test_that("autodispatch keeps formula bws usable for condensity plot()", {
 
   pdf(file = tempfile(fileext = ".pdf"))
   on.exit(dev.off(), add = TRUE)
-  expect_error(plot(fit, perspective = FALSE, plot.errors.method = "none"), NA)
+  expect_error(plot(fit, perspective = FALSE, errors = "none"), NA)
   expect_false(grepl("\\.__npRmpi_autod_", paste(deparse(fit$bws$call), collapse = " ")))
 })
 

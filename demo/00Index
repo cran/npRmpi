@@ -1,77 +1,78 @@
-npcdensls_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npcdensls_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npcdensls_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npcdensml_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npcdensml_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npcdensml_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npcdistls_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npcdistls_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npcdistls_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npcmstest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npcmstest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npcmstest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npconmode_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npconmode_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npconmode_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npcopula_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npcopula_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npcopula_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npdeneqtest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npdeneqtest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npdeneqtest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npdeptest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npdeptest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npdeptest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npindexich_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npindexich_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npindexich_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npindexks_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npindexks_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npindexks_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npplreg_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npplreg_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npplreg_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npqreg_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npqreg_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npqreg_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npregiv_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npregiv_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npregiv_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npreglcaic_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npreglcaic_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npreglcaic_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npreglcls_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npreglcls_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npreglcls_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npregllaic_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npregllaic_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npregllaic_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npregllls_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npregllls_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npregllls_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npscoef_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npscoef_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npscoef_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npsdeptest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npsdeptest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npsdeptest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npsigtest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npsigtest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npsigtest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npsymtest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npsymtest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npsymtest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npudensls_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npudensls_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npudensls_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npudensml_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npudensml_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npudensml_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npudistcdf_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npudistcdf_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npudistcdf_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
-npunitest_npRmpi_attach	sample program for np (_serial) and npRmpi attach mode (_npRmpi_attach)
-npunitest_npRmpi_profile	sample program for np (_serial) and npRmpi profile/manual mode (_npRmpi_profile)
-npunitest_serial	sample program for np (_serial) and npRmpi modes (_npRmpi_attach/_npRmpi_profile)
+npcdens_npRmpi_attach	matrix-driven npcdens demo for npRmpi attach mode
+npcdens_npRmpi_profile	matrix-driven npcdens demo for npRmpi profile/manual mode
+npcdens_npRmpi_session	matrix-driven npcdens demo for npRmpi session/spawn mode
+npcdens_serial	matrix-driven npcdens demo for np serial comparison
+npcdist_npRmpi_attach	matrix-driven npcdist demo for npRmpi attach mode
+npcdist_npRmpi_profile	matrix-driven npcdist demo for npRmpi profile/manual mode
+npcdist_npRmpi_session	matrix-driven npcdist demo for npRmpi session/spawn mode
+npcdist_serial	matrix-driven npcdist demo for np serial comparison
+npcmstest_npRmpi_attach	matrix-driven npcmstest demo for npRmpi attach mode
+npcmstest_npRmpi_profile	matrix-driven npcmstest demo for npRmpi profile/manual mode
+npcmstest_npRmpi_session	matrix-driven npcmstest demo for npRmpi session/spawn mode
+npcmstest_serial	matrix-driven npcmstest demo for np serial comparison
+npconmode_npRmpi_attach	matrix-driven npconmode demo for npRmpi attach mode
+npconmode_npRmpi_profile	matrix-driven npconmode demo for npRmpi profile/manual mode
+npconmode_npRmpi_session	matrix-driven npconmode demo for npRmpi session/spawn mode
+npconmode_serial	matrix-driven npconmode demo for np serial comparison
+npcopula_npRmpi_attach	matrix-driven npcopula demo for npRmpi attach mode
+npcopula_npRmpi_profile	matrix-driven npcopula demo for npRmpi profile/manual mode
+npcopula_npRmpi_session	matrix-driven npcopula demo for npRmpi session/spawn mode
+npcopula_serial	matrix-driven npcopula demo for np serial comparison
+npdeneqtest_npRmpi_attach	matrix-driven npdeneqtest demo for npRmpi attach mode
+npdeneqtest_npRmpi_profile	matrix-driven npdeneqtest demo for npRmpi profile/manual mode
+npdeneqtest_npRmpi_session	matrix-driven npdeneqtest demo for npRmpi session/spawn mode
+npdeneqtest_serial	matrix-driven npdeneqtest demo for np serial comparison
+npdeptest_npRmpi_attach	matrix-driven npdeptest demo for npRmpi attach mode
+npdeptest_npRmpi_profile	matrix-driven npdeptest demo for npRmpi profile/manual mode
+npdeptest_npRmpi_session	matrix-driven npdeptest demo for npRmpi session/spawn mode
+npdeptest_serial	matrix-driven npdeptest demo for np serial comparison
+npindex_npRmpi_attach	matrix-driven npindex demo for npRmpi attach mode
+npindex_npRmpi_profile	matrix-driven npindex demo for npRmpi profile/manual mode
+npindex_npRmpi_session	matrix-driven npindex demo for npRmpi session/spawn mode
+npindex_serial	matrix-driven npindex demo for np serial comparison
+npplreg_npRmpi_attach	matrix-driven npplreg demo for npRmpi attach mode
+npplreg_npRmpi_profile	matrix-driven npplreg demo for npRmpi profile/manual mode
+npplreg_npRmpi_session	matrix-driven npplreg demo for npRmpi session/spawn mode
+npplreg_serial	matrix-driven npplreg demo for np serial comparison
+npqreg_npRmpi_attach	matrix-driven npqreg demo for npRmpi attach mode
+npqreg_npRmpi_profile	matrix-driven npqreg demo for npRmpi profile/manual mode
+npqreg_npRmpi_session	matrix-driven npqreg demo for npRmpi session/spawn mode
+npqreg_serial	matrix-driven npqreg demo for np serial comparison
+npregiv_npRmpi_attach	matrix-driven npregiv demo for npRmpi attach mode
+npregiv_npRmpi_profile	matrix-driven npregiv demo for npRmpi profile/manual mode
+npregiv_npRmpi_session	matrix-driven npregiv demo for npRmpi session/spawn mode
+npregiv_serial	matrix-driven npregiv demo for np serial comparison
+npreg_npRmpi_attach	matrix-driven npreg demo for npRmpi attach mode
+npreg_npRmpi_profile	matrix-driven npreg demo for npRmpi profile/manual mode
+npreg_npRmpi_session	matrix-driven npreg demo for npRmpi session/spawn mode
+npreg_serial	matrix-driven npreg demo for np serial comparison
+npscoef_npRmpi_attach	matrix-driven npscoef demo for npRmpi attach mode
+npscoef_npRmpi_profile	matrix-driven npscoef demo for npRmpi profile/manual mode
+npscoef_npRmpi_session	matrix-driven npscoef demo for npRmpi session/spawn mode
+npscoef_serial	matrix-driven npscoef demo for np serial comparison
+npsdeptest_npRmpi_attach	matrix-driven npsdeptest demo for npRmpi attach mode
+npsdeptest_npRmpi_profile	matrix-driven npsdeptest demo for npRmpi profile/manual mode
+npsdeptest_npRmpi_session	matrix-driven npsdeptest demo for npRmpi session/spawn mode
+npsdeptest_serial	matrix-driven npsdeptest demo for np serial comparison
+npsigtest_npRmpi_attach	matrix-driven npsigtest demo for npRmpi attach mode
+npsigtest_npRmpi_profile	matrix-driven npsigtest demo for npRmpi profile/manual mode
+npsigtest_npRmpi_session	matrix-driven npsigtest demo for npRmpi session/spawn mode
+npsigtest_serial	matrix-driven npsigtest demo for np serial comparison
+npsymtest_npRmpi_attach	matrix-driven npsymtest demo for npRmpi attach mode
+npsymtest_npRmpi_profile	matrix-driven npsymtest demo for npRmpi profile/manual mode
+npsymtest_npRmpi_session	matrix-driven npsymtest demo for npRmpi session/spawn mode
+npsymtest_serial	matrix-driven npsymtest demo for np serial comparison
+npudens_npRmpi_attach	matrix-driven npudens demo for npRmpi attach mode
+npudens_npRmpi_profile	matrix-driven npudens demo for npRmpi profile/manual mode
+npudens_npRmpi_session	matrix-driven npudens demo for npRmpi session/spawn mode
+npudens_serial	matrix-driven npudens demo for np serial comparison
+npudist_npRmpi_attach	matrix-driven npudist demo for npRmpi attach mode
+npudist_npRmpi_profile	matrix-driven npudist demo for npRmpi profile/manual mode
+npudist_npRmpi_session	matrix-driven npudist demo for npRmpi session/spawn mode
+npudist_serial	matrix-driven npudist demo for np serial comparison
+npunitest_npRmpi_attach	matrix-driven npunitest demo for npRmpi attach mode
+npunitest_npRmpi_profile	matrix-driven npunitest demo for npRmpi profile/manual mode
+npunitest_npRmpi_session	matrix-driven npunitest demo for npRmpi session/spawn mode
+npunitest_serial	matrix-driven npunitest demo for np serial comparison
 npregiv	R example for npregiv
 Engel95	R example for Engel 1995 data

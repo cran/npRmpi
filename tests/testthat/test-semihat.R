@@ -60,6 +60,17 @@ test_that("npscoefhat reproduces npscoef fitted values and supports matrix RHS",
 
   expect_equal(as.vector(H.train %*% y), as.vector(fit.train$mean), tolerance = 1e-8)
   expect_equal(as.vector(H.eval %*% y), as.vector(fit.eval$mean), tolerance = 1e-8)
+  A.eval <- npscoefhat(
+    bws = bw,
+    txdat = tx,
+    tzdat = tz,
+    exdat = ex,
+    ezdat = ez,
+    y = y,
+    output = "constraint",
+    iterate = FALSE
+  )
+  expect_equal(A.eval, t(H.eval) * y, tolerance = 1e-14, ignore_attr = TRUE)
 
   ystar <- cbind(y, y + 0.1)
   hy <- npscoefhat(
@@ -184,6 +195,16 @@ test_that("npplreghat reproduces npplreg fitted values and supports matrix RHS",
 
   expect_equal(as.vector(H.train %*% y), as.vector(fit.train$mean), tolerance = 1e-8)
   expect_equal(as.vector(H.eval %*% y), as.vector(fit.eval$mean), tolerance = 1e-8)
+  A.eval <- npplreghat(
+    bws = bw,
+    txdat = tx,
+    tzdat = tz,
+    exdat = ex,
+    ezdat = ez,
+    y = y,
+    output = "constraint"
+  )
+  expect_equal(A.eval, t(H.eval) * y, tolerance = 1e-14, ignore_attr = TRUE)
 
   ystar <- cbind(y, y + 0.05)
   hy <- npplreghat(
@@ -328,11 +349,11 @@ test_that("npplreg generalized-nn inid plot helper completes in session mode", {
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "bootstrap",
-    plot.errors.boot.method = "inid",
-    plot.errors.boot.num = 5
+    errors = "bootstrap",
+    bootstrap = "inid",
+    B = 5
   )
 
   expect_true(is.list(out))
@@ -374,9 +395,9 @@ test_that("npplreg generalized-nn wild plot helper preserves means in session mo
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "none"
+    errors = "none"
   )
 
   set.seed(20260308)
@@ -385,11 +406,11 @@ test_that("npplreg generalized-nn wild plot helper preserves means in session mo
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "bootstrap",
-    plot.errors.boot.method = "wild",
-    plot.errors.boot.num = 5
+    errors = "bootstrap",
+    bootstrap = "wild",
+    B = 5
   )
 
   expect_equal(as.vector(wild.out[[1L]]$mean), as.vector(none.out[[1L]]$mean), tolerance = 1e-10)
@@ -429,9 +450,9 @@ test_that("npplreg adaptive-nn wild plot helper preserves means in session mode"
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "none"
+    errors = "none"
   )
 
   set.seed(20260311)
@@ -440,11 +461,11 @@ test_that("npplreg adaptive-nn wild plot helper preserves means in session mode"
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "bootstrap",
-    plot.errors.boot.method = "wild",
-    plot.errors.boot.num = 5
+    errors = "bootstrap",
+    bootstrap = "wild",
+    B = 5
   )
 
   expect_equal(as.vector(wild.out[[1L]]$mean), as.vector(none.out[[1L]]$mean), tolerance = 1e-10)
@@ -484,9 +505,9 @@ test_that("npplreg generalized-nn plot means match public estimator in session m
     xdat = tx,
     ydat = y,
     zdat = tz,
-    plot.behavior = "data",
+    output = "data",
     perspective = FALSE,
-    plot.errors.method = "none"
+    errors = "none"
   )
 
   ex.x <- out[[1L]]$evalx
@@ -629,6 +650,24 @@ test_that("npindexhat reproduces npindex fit and approximates gradient", {
 
   expect_equal(as.vector(H0 %*% y), as.vector(fit.mean$mean), tolerance = 1e-8)
   expect_equal(as.vector(H1 %*% y), as.vector(fit.grad$grad[, 1]), tolerance = 5e-3)
+  A0 <- npindexhat(
+    bws = bw,
+    txdat = tx,
+    exdat = tx,
+    y = y,
+    s = 0L,
+    output = "constraint"
+  )
+  A1 <- npindexhat(
+    bws = bw,
+    txdat = tx,
+    exdat = tx,
+    y = y,
+    s = 1L,
+    output = "constraint"
+  )
+  expect_equal(A0, t(H0) * y, tolerance = 1e-14, ignore_attr = TRUE)
+  expect_equal(A1, t(H1) * y, tolerance = 1e-14, ignore_attr = TRUE)
 
   ystar <- cbind(y, y - 0.05)
   hy <- npindexhat(
@@ -1143,6 +1182,21 @@ test_that("semihat validates class and scalar controls", {
   expect_error(npindexhat(bws = rbw, txdat = data.frame(x = x)), "sibandwidth")
   expect_error(npplreghat(bws = rbw, txdat = data.frame(x = x), tzdat = data.frame(z = z)), "plbandwidth")
   expect_error(npscoefhat(bws = rbw, txdat = data.frame(x = x), tzdat = data.frame(z = z)), "scbandwidth")
+  expect_error(
+    npindexhat(bws = structure(list(), class = "sibandwidth"),
+               txdat = data.frame(x = x), foo = TRUE),
+    "unused argument in npindexhat: 'foo'"
+  )
+  expect_error(
+    npplreghat(bws = structure(list(), class = "plbandwidth"),
+               txdat = data.frame(x = x), tzdat = data.frame(z = z), foo = TRUE),
+    "unused argument in npplreghat: 'foo'"
+  )
+  expect_error(
+    npscoefhat(bws = structure(list(), class = "scbandwidth"),
+               txdat = data.frame(x = x), tzdat = data.frame(z = z), foo = TRUE),
+    "unused argument in npscoefhat: 'foo'"
+  )
 
   sibw <- npindexbw(
     xdat = data.frame(x = x, x2 = x^2),
@@ -1204,10 +1258,10 @@ test_that("plot bootstrap supports wild for sc/pl/si bandwidth objects", {
       ydat = y,
       zdat = data.frame(z = z),
       perspective = FALSE,
-      plot.behavior = "data",
-      plot.errors.method = "bootstrap",
-      plot.errors.boot.method = "wild",
-      plot.errors.boot.num = 19
+      output = "data",
+      errors = "bootstrap",
+      bootstrap = "wild",
+      B = 19
     )
   )
   expect_type(sc.out, "list")
@@ -1220,12 +1274,12 @@ test_that("plot bootstrap supports wild for sc/pl/si bandwidth objects", {
       ydat = y,
       zdat = data.frame(z = z),
       perspective = FALSE,
-      plot.behavior = "data",
-      plot.errors.method = "bootstrap",
-      plot.errors.boot.method = "wild",
-      plot.errors.boot.wild = "rademacher",
-      plot.errors.type = "pointwise",
-      plot.errors.boot.num = 19
+      output = "data",
+      errors = "bootstrap",
+      bootstrap = "wild",
+      boot_control = np_boot_control(wild = "rademacher"),
+      band = "pointwise",
+      B = 19
     )
   )
   expect_type(sc.out.rad, "list")
@@ -1265,10 +1319,10 @@ test_that("plot bootstrap supports wild for sc/pl/si bandwidth objects", {
         ydat = y,
         zdat = data.frame(z = z),
         perspective = FALSE,
-        plot.behavior = "data",
-        plot.errors.method = "bootstrap",
-        plot.errors.boot.method = "wild",
-        plot.errors.boot.num = 9
+        output = "data",
+        errors = "bootstrap",
+        bootstrap = "wild",
+        B = 9
       )
     )
     expect_true(is.list(pl.out), info = cfg$label)
@@ -1286,10 +1340,10 @@ test_that("plot bootstrap supports wild for sc/pl/si bandwidth objects", {
       sibw,
       xdat = data.frame(x1 = x, x2 = z),
       ydat = y,
-      plot.behavior = "data",
-      plot.errors.method = "bootstrap",
-      plot.errors.boot.method = "wild",
-      plot.errors.boot.num = 19
+      output = "data",
+      errors = "bootstrap",
+      bootstrap = "wild",
+      B = 19
     )
   )
   expect_type(si.out, "list")

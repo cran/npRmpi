@@ -766,13 +766,43 @@ npscoefbw.NULL <-
   if (is.null(pool) || !is.list(pool) || is.null(pool$nslaves) || pool$nslaves < 1L)
     return(invisible(NULL))
 
+  ack.tag <- function(rank) {
+    as.integer(pool$res.base + 1000L + as.integer(rank))
+  }
+
+  sent <- integer(0)
   for (rk in seq_len(pool$nslaves)) {
-    mpi.send.Robj(
-      obj = list(type = "stop"),
-      dest = rk,
-      tag = pool$req.base + rk,
-      comm = pool$comm
+    ok <- try(
+      mpi.send.Robj(
+        obj = list(type = "stop"),
+        dest = rk,
+        tag = pool$req.base + rk,
+        comm = pool$comm
+      ),
+      silent = TRUE
     )
+    if (!inherits(ok, "try-error"))
+      sent <- c(sent, rk)
+  }
+
+  if (!length(sent))
+    return(invisible(NULL))
+
+  deadline <- as.numeric(Sys.time()) + .npRmpi_attach_close_ack_timeout()
+  pending <- as.integer(sent)
+  while (length(pending) && as.numeric(Sys.time()) < deadline) {
+    for (rk in pending) {
+      tag <- ack.tag(rk)
+      if (!isTRUE(.npRmpi_safe(mpi.iprobe(source = rk, tag = tag, comm = pool$comm),
+                               fallback = FALSE)))
+        next
+      msg <- .npRmpi_safe(mpi.recv.Robj(source = rk, tag = tag, comm = pool$comm),
+                          fallback = NULL)
+      if (is.list(msg) && identical(as.character(msg$type)[1L], "stopped"))
+        pending <- pending[pending != rk]
+    }
+    if (length(pending))
+      Sys.sleep(0.01)
   }
 
   invisible(NULL)
@@ -794,8 +824,18 @@ npscoefbw.NULL <-
 
   repeat {
     msg <- mpi.recv.Robj(source = 0L, tag = REQ_BASE + rank, comm = COMM)
-    if (is.list(msg) && identical(msg$type, "stop"))
+    if (is.list(msg) && identical(msg$type, "stop")) {
+      try(
+        mpi.send.Robj(
+          obj = list(type = "stopped", rank = rank),
+          dest = 0L,
+          tag = RES_BASE + 1000L + rank,
+          comm = COMM
+        ),
+        silent = TRUE
+      )
       break
+    }
 
     out <- tryCatch(
       .npscoefbw_nomad_lp_eval_subset(
@@ -1069,6 +1109,13 @@ npscoefbw.NULL <-
   on.exit(.npscoefbw_nomad_context_cleanup(ctx, comm = 1L), add = TRUE)
   pool <- .npscoefbw_nomad_pool_start(ctx, comm = 1L)
   on.exit(.npscoefbw_nomad_pool_stop(pool), add = TRUE)
+  stop_pool_before_collective <- function() {
+    if (!is.null(pool)) {
+      .npscoefbw_nomad_pool_stop(pool)
+      pool <<- NULL
+    }
+    invisible(NULL)
+  }
 
   .np_nomad_baseline_note(degree.search$start.degree)
 
@@ -1097,13 +1144,25 @@ npscoefbw.NULL <-
       bw = bw_vec
     )
 
-    out <- .npscoefbw_eval_pool(
-      ctx = ctx,
-      bws = tbw,
-      pool = pool,
-      invalid.penalty = "baseline",
-      penalty.multiplier = if (is.null(opt.args$penalty.multiplier)) 10 else opt.args$penalty.multiplier
-    )
+    penalty.multiplier <- if (is.null(opt.args$penalty.multiplier)) 10 else opt.args$penalty.multiplier
+    out <- if (isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
+               .npRmpi_safe_int(mpi.comm.size(1L)) > 1L) {
+      .npscoefbw_nomad_lp_eval_direct(
+        ctx = ctx,
+        bws = tbw,
+        invalid.penalty = "baseline",
+        penalty.multiplier = penalty.multiplier,
+        localize = FALSE
+      )
+    } else {
+      .npscoefbw_eval_pool(
+        ctx = ctx,
+        bws = tbw,
+        pool = pool,
+        invalid.penalty = "baseline",
+        penalty.multiplier = penalty.multiplier
+      )
+    }
     nomad.num.feval.total <<- nomad.num.feval.total + as.numeric(out$num.feval[1L])
     nomad.num.feval.fast.total <<- nomad.num.feval.fast.total + as.numeric(out$num.feval.fast[1L])
 
@@ -1162,12 +1221,17 @@ npscoefbw.NULL <-
       hot.reg.args$regtype <- "lp"
       hot.reg.args$degree <- degree
       hot.reg.args$bernstein.basis <- degree.search$bernstein.basis
-      hot.opt.args <- opt.args
-      hot.opt.args$nmulti <- .np_nomad_powell_hotstart_nmulti("single_iteration")
+      hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
+        opt.args,
+        strategy = "single_iteration",
+        remin = isTRUE(opt.args$powell.remin)
+      )
+      stop_pool_before_collective()
       powell.start <- proc.time()[3L]
       hot.payload <- .np_nomad_with_powell_progress(
-        degree,
-        .npscoefbw_run_fixed_degree_collective(
+        degree = degree,
+        best_record = best_record,
+        expr = .npscoefbw_run_fixed_degree_collective(
           xdat = xdat,
           ydat = ydat,
           zdat = zdat,
@@ -1208,6 +1272,7 @@ npscoefbw.NULL <-
     nmulti = nomad.nmulti,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = if (!is.null(opt.args$random.seed)) opt.args$random.seed else 42L,
+    remin = isTRUE(opt.args$nomad.remin),
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -2463,6 +2528,8 @@ npscoefbw.default <-
            degree.max.cycles = 20L,
            degree.verify = FALSE,
            nmulti,
+           nomad.remin = FALSE,
+           powell.remin = TRUE,
            okertype,
            optim.abstol,
            optim.maxattempts,
@@ -2631,6 +2698,8 @@ npscoefbw.default <-
     ## next grab dummies for actual bandwidth selection and perform call
     margs <- c("zdat",
                "nmulti",
+               "nomad.remin",
+               "powell.remin",
                "random.seed",
                "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
                "lbd.init", "hbd.init", "dfac.init",

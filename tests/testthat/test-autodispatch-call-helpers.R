@@ -6,11 +6,14 @@
 .npRmpi_autodispatch_eval_arg <- getFromNamespace(".npRmpi_autodispatch_eval_arg", "npRmpi")
 .npRmpi_autodispatch_cleanup <- getFromNamespace(".npRmpi_autodispatch_cleanup", "npRmpi")
 .npRmpi_distributed_call_impl <- getFromNamespace(".npRmpi_distributed_call_impl", "npRmpi")
+.npRmpi_autodispatch_materialize_call <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
 .npRmpi_bootstrap_compute_payload <- getFromNamespace(".npRmpi_bootstrap_compute_payload", "npRmpi")
 .npRmpi_rm_existing <- getFromNamespace(".npRmpi_rm_existing", "npRmpi")
 .np_eval_bws_call_arg <- getFromNamespace(".np_eval_bws_call_arg", "npRmpi")
 .npRmpi_autodispatch_target_args <- getFromNamespace(".npRmpi_autodispatch_target_args", "npRmpi")
 .npRmpi_autodispatch_replace_tmps <- getFromNamespace(".npRmpi_autodispatch_replace_tmps", "npRmpi")
+.npRmpi_autodispatch_sanitize_object <- getFromNamespace(".npRmpi_autodispatch_sanitize_object", "npRmpi")
+.npRmpi_autodispatch_remote_ref <- getFromNamespace(".npRmpi_autodispatch_remote_ref", "npRmpi")
 .npRmpi_is_missing_call_arg <- getFromNamespace(".npRmpi_is_missing_call_arg", "npRmpi")
 
 test_that(".npRmpi_bcast_cmd_expr forwards command expression structurally", {
@@ -79,11 +82,65 @@ test_that("autodispatch uses safe cleanup helper for temporary symbols", {
 test_that("autodispatch return rewriting covers prepublished temporary arguments", {
   impl.body <- paste(deparse(body(.npRmpi_distributed_call_impl), width.cutoff = 500L), collapse = " ")
   sanitize.body <- paste(deparse(body(.npRmpi_autodispatch_sanitize_object), width.cutoff = 500L), collapse = " ")
+  eval.body <- paste(deparse(body(getFromNamespace(".npRmpi_spmd_eval_payload", "npRmpi")), width.cutoff = 500L), collapse = " ")
 
   expect_match(impl.body, "tmpreplace <- c\\(prepared\\$tmpvals, prepared\\$prepublish\\)")
+  expect_match(impl.body, "prepublish\\.names = names\\(prepared\\$prepublish\\)")
+  expect_match(eval.body, "prepublish\\.names <- payload\\$prepublish\\.names")
   expect_match(impl.body, "\\.npRmpi_autodispatch_sanitize_object\\(result, tmpvals = tmpreplace\\)")
   expect_match(impl.body, "\\.npRmpi_autodispatch_replace_tmps\\(result, tmpvals = tmpreplace\\)")
   expect_match(sanitize.body, "\\.npRmpi_autodispatch_replace_tmp_calls\\(x, tmpvals = tmpvals\\)")
+})
+
+test_that("autodispatch prepublishes large implicit formula data", {
+  withr::local_options(npRmpi.autodispatch.arg.broadcast.threshold.regression = 1L)
+
+  env <- new.env(parent = .GlobalEnv)
+  env$x <- seq_len(10)
+  env$y <- env$x + 1
+
+  prepared <- .npRmpi_autodispatch_materialize_call(
+    quote(npregbw(y ~ x, regtype = "ll")),
+    caller_env = env
+  )
+
+  expect_true(any(grepl("^\\.__npRmpi_autod_data_", prepared$tmpnames)))
+  expect_true(any(grepl("^\\.__npRmpi_autod_data_", names(prepared$prepublish))))
+  expect_false(any(grepl("^\\.__npRmpi_autod_data_", names(prepared$tmpvals))))
+})
+
+test_that("autodispatch reuses semiparametric remote bandwidth references", {
+  withr::local_options(npRmpi.autodispatch.arg.broadcast.threshold.regression = 1L)
+
+  env <- new.env(parent = .GlobalEnv)
+  env$sibw <- structure(
+    list(call = quote(npindexbw(y ~ x1 + x2, data = mydat)),
+         formula = y ~ x1 + x2,
+         ballast = seq_len(100)),
+    class = "sibandwidth"
+  )
+  attr(env$sibw, "npRmpi.autodispatch.remote") <- ".__npRmpi_remote_sibw"
+  env$scbw <- structure(
+    list(call = quote(npscoefbw(y ~ x | z, data = mydat)),
+         formula = y ~ x | z,
+         ballast = seq_len(100)),
+    class = "scbandwidth"
+  )
+  attr(env$scbw, "npRmpi.autodispatch.remote") <- ".__npRmpi_remote_scbw"
+
+  si <- .npRmpi_autodispatch_materialize_call(
+    quote(npindex(bws = sibw, gradients = FALSE)),
+    caller_env = env
+  )
+  sc <- .npRmpi_autodispatch_materialize_call(
+    quote(npscoef(bws = scbw, gradients = FALSE)),
+    caller_env = env
+  )
+
+  expect_identical(as.character(si$call$bws), .npRmpi_autodispatch_remote_ref(env$sibw))
+  expect_identical(as.character(sc$call$bws), .npRmpi_autodispatch_remote_ref(env$scbw))
+  expect_false(any(vapply(si$prepublish, inherits, logical(1), "sibandwidth")))
+  expect_false(any(vapply(sc$prepublish, inherits, logical(1), "scbandwidth")))
 })
 
 test_that("autodispatch target argument set covers gdat alias", {

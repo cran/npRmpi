@@ -82,8 +82,8 @@ These arguments identify the bandwidth specification, formula/data interface, an
   }
 
 
-\subsection{Bandwidth Search Shortcut}{
-This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npregbw}} when bandwidths are computed inside \code{npreg}.
+\subsection{Local-Polynomial Degree And Bandwidth Search}{
+This argument controls the recommended automatic local-polynomial NOMAD route, which jointly selects continuous polynomial degree and bandwidths when these are computed inside \code{npreg}.
 }
 
   \item{nomad}{
@@ -93,7 +93,7 @@ This argument passes the recommended automatic local-polynomial NOMAD preset to 
     \code{regtype}, \code{search.engine}, \code{degree.select},
     \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
     \code{degree.verify}, and \code{bwtype} with the recommended
-    automatic LP NOMAD preset documented in \code{\link{npregbw}}.
+    automatic local-polynomial degree-and-bandwidth NOMAD preset documented in \code{\link{npregbw}}.
     Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
     also be supplied through \code{\dots}; \code{nmulti} remains the
     outer restart count while \code{nomad.nmulti} controls inner
@@ -126,8 +126,9 @@ These arguments control where the regression is evaluated and which fitted quant
     integer (or integer vector with one entry per continuous predictor)
     specifying derivative order(s). Defaults to \code{1L}. Orders
     exceeding \code{degree} for a variable are returned as
-    \code{NA}; orders greater than one are currently reserved for
-    future extension and return \code{NA}.
+    \code{NA}. Higher-order derivatives are available for continuous
+    predictors when the requested order does not exceed the
+    corresponding local-polynomial degree.
   }
 
 
@@ -136,9 +137,10 @@ These arguments control where the regression is evaluated and which fitted quant
     returned in the resulting \code{npregression} object. Defaults to
     \code{FALSE}. For \code{regtype="lp"}, derivative components that
     are not defined (requested order exceeds the variable-specific
-    polynomial degree) are returned as \code{NA}. Higher-order GLP
-    derivatives (order \eqn{>1}) are reserved for future C-level
-    extraction and currently return \code{NA}.
+    polynomial degree) are returned as \code{NA}. For ordered and
+    unordered predictors the gradient columns are first-order
+    effects/contrasts where supported; \code{gradient.order} controls
+    derivative order for continuous predictors.
   }
 
 
@@ -204,10 +206,8 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   then kernel/support controls, and finally local-polynomial/NOMAD
   controls when using polynomial-adaptive fits.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
 
   Typical usages are (see below for a complete list of options and also
@@ -279,11 +279,14 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   controls basis construction: \code{FALSE} (default) uses raw
   local-polynomial powers, while \code{TRUE} uses a Bernstein/B-spline basis. The
   homogeneous degree-0 and degree-1 cases remain
-  equivalent to \code{lc} and \code{ll}, respectively. Current GLP
-  derivative output is first-order for continuous predictors; higher
-  order and cross-partial extraction are reserved for future extension.
-  In mixed-data GLP settings, derivative entries for unordered/ordered
-  predictors are returned as \code{NA}.
+  equivalent to \code{lc} and \code{ll}, respectively. For continuous
+  predictors, \code{gradients=TRUE} returns the derivative order(s)
+  requested by \code{gradient.order}; the associated \code{gerr}
+  entries are standard errors for those same derivative orders. Both
+  raw and Bernstein/B-spline bases report fitted values and derivatives
+  on the original response/predictor scale. In mixed-data GLP settings,
+  unordered and ordered predictors contribute first-order
+  effects/contrasts rather than higher-order derivatives.
   When \code{npregbw(..., regtype="lp")} is used with
   \code{degree.select="manual"}, the degree vector remains fixed user
   input. When \code{degree.select != "manual"}, \code{npregbw} can
@@ -345,6 +348,25 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   \item{SIGN}{ fraction of observations where fitted and observed values
   agree in sign }
 
+}
+
+\section{Book And Method Pointers}{
+  The regression target is the conditional mean
+  \eqn{m(x)=E[Y\mid X=x]}. Local-constant estimation can be written
+  schematically as \eqn{\hat m(x)=\sum_i W_i(x)Y_i}, where the weights
+  are normalized generalized product-kernel weights over the continuous,
+  unordered, and ordered components of \eqn{X}. Local-polynomial
+  regression replaces this scalar weighted average by a weighted least
+  squares fit in powers of the continuous coordinates around \eqn{x};
+  the fitted intercept is the estimate of \eqn{m(x)} and the fitted
+  slope terms give the reported gradients where available.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 2
+  \emph{Regression}, especially Sections 2.1, 2.2, 2.4, and 2.5, and
+  Chapter 4 \emph{Kernel Estimation with Mixed Data}, especially Sections
+  4.2 and 4.4. The later workflow treatment is Racine (2019), Chapter 6
+  \emph{Conditional Mean Function Estimation}, including the local
+  polynomial and mixed-data marginal-effect discussion.
 }
 
 \references{

@@ -163,14 +163,27 @@ npValidateGlpDegree <- function(regtype, degree, ncon, argname = "degree") {
   if (!identical(regtype, "lp"))
     return(NULL)
 
-  if (is.null(degree)) {
-    if (ncon == 0L)
+  if (ncon == 0L) {
+    if (is.null(degree))
+      stop(sprintf("%s must be 0 when regtype='lp' has no continuous predictors",
+                   argname),
+           call. = FALSE)
+    if (!length(degree))
       return(integer(0))
-    stop(sprintf("%s must be supplied explicitly when regtype='lp'", argname))
+    if (!is.numeric(degree) ||
+        length(degree) != 1L ||
+        anyNA(degree) ||
+        any(!is.finite(degree)) ||
+        degree != 0L)
+      stop(sprintf("%s must be 0 when regtype='lp' has no continuous predictors",
+                   argname),
+           call. = FALSE)
+    return(integer(0))
   }
 
-  if (!length(degree) && ncon == 0L)
-    return(integer(0))
+  if (is.null(degree)) {
+    stop(sprintf("%s must be supplied explicitly when regtype='lp'", argname))
+  }
 
   if (length(degree) != ncon)
     stop(sprintf("%s must have one entry per continuous predictor (%d expected, got %d)",
@@ -232,6 +245,27 @@ npValidateScalarLogical <- function(value, argname) {
   if (length(value) != 1L || is.na(value))
     stop(sprintf("'%s' must be TRUE or FALSE", argname))
   value
+}
+
+npValidateNewdataColumns <- function(newdata, required, argname = "newdata") {
+  nd <- toFrame(newdata)
+  required <- unique(as.character(required))
+  required <- required[nzchar(required)]
+  missing.names <- setdiff(required, names(nd))
+  if (length(missing.names) > 0L) {
+    stop(sprintf("%s must contain columns: %s",
+                 argname, paste(shQuote(required), collapse = ", ")),
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+npValidateNewdataFormula <- function(newdata, formula, include.response = TRUE,
+                                     argname = "newdata") {
+  tt <- terms(formula)
+  if (!isTRUE(include.response))
+    tt <- delete.response(tt)
+  npValidateNewdataColumns(newdata, all.vars(tt), argname = argname)
 }
 
 .np_prepare_nomad_shortcut <- function(nomad,
@@ -347,8 +381,22 @@ npValidateScalarLogical <- function(value, argname) {
   bws <- .npRmpi_reconcile_nomad_bws_timing(bws)
   result$bws <- .npRmpi_reconcile_nomad_bws_timing(result$bws)
 
-  # Fit objects should preserve the selected bandwidth object's telemetry and labels.
+  # Fit objects should preserve reconstruction metadata, telemetry, and labels
+  # from the selected bandwidth object.
   bandwidth.metadata.fields <- c(
+    "call",
+    "formula",
+    "terms",
+    "xterms",
+    "chromoly",
+    "xnames",
+    "ynames",
+    "znames",
+    "varnames",
+    "vartitle",
+    "vartitleabb",
+    "rows.omit",
+    "nobs.omit",
     "method",
     "pmethod",
     "fval",
@@ -670,6 +718,78 @@ npValidateGlpGradientOrder <- function(regtype,
   as.integer(gradient.order)
 }
 
+npConditionalRegEngineSpec <- function(bws, where = "conditional estimator") {
+  reg.engine <- if (is.null(bws$regtype.engine)) {
+    if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+  } else {
+    as.character(bws$regtype.engine)
+  }
+  basis.engine <- if (is.null(bws$basis.engine)) {
+    if (is.null(bws$basis)) "glp" else bws$basis
+  } else {
+    bws$basis.engine
+  }
+  degree.engine <- if (is.null(bws$degree.engine)) {
+    if (bws$xncon > 0L) {
+      if (identical(reg.engine, "lc")) {
+        rep.int(0L, bws$xncon)
+      } else {
+        npValidateGlpDegree(
+          regtype = "lp",
+          degree = bws$degree,
+          ncon = bws$xncon
+        )
+      }
+    } else {
+      integer(0)
+    }
+  } else {
+    as.integer(bws$degree.engine)
+  }
+  bernstein.engine <- if (is.null(bws$bernstein.basis.engine)) {
+    isTRUE(bws$bernstein.basis)
+  } else {
+    isTRUE(bws$bernstein.basis.engine)
+  }
+
+  if (!identical(reg.engine, "lp") && bws$xncon > 0L)
+    degree.engine <- rep.int(if (identical(reg.engine, "ll")) 1L else 0L, bws$xncon)
+
+  list(
+    reg.engine = reg.engine,
+    basis.engine = basis.engine,
+    degree.engine = degree.engine,
+    bernstein.engine = bernstein.engine
+  )
+}
+
+npConditionalGradientOrder <- function(bws,
+                                       reg.engine,
+                                       gradient.order,
+                                       where = "conditional estimator") {
+  if (bws$xncon == 0L)
+    return(integer(0))
+
+  gorder <- if (is.null(gradient.order)) {
+    rep.int(1L, bws$xncon)
+  } else {
+    npValidateGlpGradientOrder(
+      regtype = "lp",
+      gradient.order = gradient.order,
+      ncon = bws$xncon
+    )
+  }
+
+  if (!identical(reg.engine, "lp") && any(gorder > 1L)) {
+    stop(sprintf(
+      "%s supports gradient.order > 1 only for regtype='lp' continuous explanatory predictors",
+      where
+    ), call. = FALSE)
+  }
+
+  gorder
+}
+
 npCheckRegressionDesignCondition <- function(reg.code,
                                              xcon,
                                              basis = "glp",
@@ -771,6 +891,11 @@ npCanonicalConditionalRegSpec <- function(regtype = c("lc", "ll", "lp"),
   }
 
   if (identical(regtype, "ll")) {
+    if (ncon == 0L)
+      stop(sprintf("%s: regtype='ll' requires at least one continuous predictor; use regtype='lc' for categorical-only predictors",
+                   where),
+           call. = FALSE)
+
     if (ncon > 0L) {
       degree <- rep.int(1L, ncon)
       basis <- "glp"
@@ -784,7 +909,7 @@ npCanonicalConditionalRegSpec <- function(regtype = c("lc", "ll", "lp"),
       basis = basis,
       degree = degree,
       bernstein.basis = FALSE,
-      regtype.engine = "lp",
+      regtype.engine = if (ncon > 0L) "lp" else "lc",
       basis.engine = basis,
       degree.engine = degree,
       bernstein.basis.engine = FALSE
@@ -794,12 +919,14 @@ npCanonicalConditionalRegSpec <- function(regtype = c("lc", "ll", "lp"),
   degree <- npValidateGlpDegree(regtype = "lp",
                                 degree = degree,
                                 ncon = ncon)
+  if (ncon == 0L && length(degree) == 0L)
+    bernstein.basis <- FALSE
   list(
     regtype = "lp",
     basis = basis,
     degree = degree,
     bernstein.basis = bernstein.basis,
-    regtype.engine = "lp",
+    regtype.engine = if (ncon > 0L) "lp" else "lc",
     basis.engine = basis,
     degree.engine = degree,
     bernstein.basis.engine = bernstein.basis
@@ -917,6 +1044,9 @@ npRejectLegacyLpArgs <- function(dotnames, where = "npreg") {
   if (length(bad))
     stop(sprintf("%s: legacy arguments %s are no longer supported; use basis, degree and bernstein.basis",
                  where, paste(sprintf("'%s'", bad), collapse = ", ")))
+  if ("remin" %in% dotnames)
+    stop(sprintf("%s: argument 'remin' has been replaced by 'powell.remin' and 'nomad.remin'",
+                 where))
   invisible(NULL)
 }
 
@@ -2029,6 +2159,9 @@ genTimingStr <- function(x){
   bws$nomad.restart.starts <- search_result$restart.starts
   bws$nomad.restart.degree.starts <- search_result$restart.degree.starts
   bws$nomad.restart.bandwidth.starts <- search_result$restart.bandwidth.starts
+  bws$nomad.remin <- isTRUE(search_result$nomad.remin)
+  bws$nomad.remin.index <- search_result$nomad.remin.index
+  bws$nomad.remin.roundtrip <- search_result$nomad.remin.roundtrip
   bws
 }
 
@@ -2092,7 +2225,7 @@ genRegEstStr <- function(x){
   basis.family.str <- if (is.null(basis.family)) "" else paste("\nLP Basis Family:", basis.family)
   basis.rep.str <- if (is.null(basis.rep)) "" else paste("\nLP Basis Representation:", basis.rep)
   ptype.str <- if (is.null(x$ptype)) "" else paste("\nBandwidth Type:", x$ptype)
-  tau.str <- if (is.null(x$tau)) "" else paste("\nTau:", x$tau)
+  tau.str <- if (is.null(x$tau)) "" else paste("\nTau:", paste(x$tau, collapse = ", "))
   paste(est.label.str, basis.family.str, basis.rep.str, ptype.str, tau.str, sep = "")
 }
 
@@ -2159,6 +2292,10 @@ npFormatRegressionType <- function(x){
     "glp"
   }
   basis.family <- npLpBasisFamilyLabel(basis)
+
+  if (!is.null(x$child.degree.common) && !isTRUE(x$child.degree.common))
+    return(sprintf("Local-Polynomial (%s basis; child-specific degree)",
+                   basis.family))
 
   sprintf("Local-Polynomial (%s basis; degree = %s)",
           basis.family, paste(degree, collapse = ","))
@@ -2481,6 +2618,38 @@ EssDee <- function(y){
   return(a)
 }
 
+.npConditionalNomadContScale <- function(ycon, xcon, iycon, ixcon, nconfac, where) {
+  y_scale <- if (length(which(iycon)) > 0L) EssDee(ycon) else numeric(0L)
+  x_scale <- if (length(which(ixcon)) > 0L) EssDee(xcon) else numeric(0L)
+  cont_scale <- c(y_scale, x_scale) * nconfac
+  expected <- length(which(iycon)) + length(which(ixcon))
+
+  if (length(cont_scale) != expected) {
+    stop(sprintf(
+      "%s: internal NOMAD bandwidth scale mismatch (%d scale values for %d continuous bandwidth slots)",
+      where, length(cont_scale), expected
+    ))
+  }
+
+  cont_scale
+}
+
+.npAssertConditionalNomadSetup <- function(setup, where) {
+  if (length(setup$cont_scale) != length(setup$cont_flat)) {
+    stop(sprintf(
+      "%s: internal NOMAD bandwidth transform mismatch (%d continuous scales for %d continuous slots)",
+      where, length(setup$cont_scale), length(setup$cont_flat)
+    ))
+  }
+  if (length(setup$cat_upper) != length(setup$cat_flat)) {
+    stop(sprintf(
+      "%s: internal NOMAD bandwidth transform mismatch (%d categorical bounds for %d categorical slots)",
+      where, length(setup$cat_upper), length(setup$cat_flat)
+    ))
+  }
+  invisible(setup)
+}
+
 
 ##EssDee <- function(y){
 ##
@@ -2556,6 +2725,23 @@ gradients <- function(x, ...){
   UseMethod("gradients",x)
 }
 
+.np_reject_unused_dots <- function(dots, where) {
+  if (length(dots) == 0L)
+    return(invisible(TRUE))
+
+  dot.names <- names(dots)
+  if (is.null(dot.names))
+    dot.names <- rep("", length(dots))
+
+  labels <- ifelse(nzchar(dot.names), dot.names, "<unnamed>")
+  labels <- paste(sprintf("'%s'", labels), collapse = ", ")
+  stop(sprintf("unused argument%s in %s: %s",
+               if (length(dots) == 1L) "" else "s",
+               where,
+               labels),
+       call. = FALSE)
+}
+
 ## From crs to avoid crs:::W.glp
 
 mypoly <- function(x,
@@ -2618,7 +2804,7 @@ mypoly <- function(x,
         for (k in 0:r) {
           j <- idx - k
           if (j >= 0L && j <= m) {
-            out <- out + ((-1.0)^k) * choose(r, k) * choose(m, j) * (u^j) * ((1.0 - u)^(m - j))
+            out <- out + ((-1.0)^(r - k)) * choose(r, k) * choose(m, j) * (u^j) * ((1.0 - u)^(m - j))
           }
         }
         coef.deriv * out
@@ -2712,9 +2898,9 @@ W.lp <- function(xdat = NULL,
     ## Local constant OR no continuous variables
 
     if(is.null(exdat)) {
-      return(matrix(1,nrow=nrow(xdat.numeric),ncol=1))
+      return(matrix(1,nrow=nrow(as.data.frame(xdat)),ncol=1))
     } else {
-      return(matrix(1,nrow=nrow(exdat.numeric),ncol=1))
+      return(matrix(1,nrow=nrow(as.data.frame(exdat)),ncol=1))
     }
 
   } else {

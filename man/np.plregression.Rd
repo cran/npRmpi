@@ -98,8 +98,8 @@ These arguments identify the bandwidth specification, formula/data interface, an
   }
 
 
-\subsection{Bandwidth Search Shortcut}{
-This argument passes the recommended automatic local-polynomial NOMAD preset to \code{\link{npplregbw}} when bandwidths are computed inside \code{npplreg}.
+\subsection{Local-Polynomial Degree And Bandwidth Search}{
+This argument controls the recommended automatic local-polynomial NOMAD route, which jointly selects continuous polynomial degree and bandwidths when these are computed inside \code{npplreg}.
 }
 
   \item{nomad}{
@@ -109,7 +109,10 @@ This argument passes the recommended automatic local-polynomial NOMAD preset to 
     \code{regtype}, \code{search.engine}, \code{degree.select},
     \code{bernstein.basis}, \code{degree.min}, \code{degree.max},
     \code{degree.verify}, and \code{bwtype} with the recommended
-    automatic LP NOMAD preset documented in \code{\link{npplregbw}}.
+    automatic local-polynomial degree-and-bandwidth NOMAD preset documented in \code{\link{npplregbw}}.
+    The preset selects local-polynomial degrees and bandwidths
+    separately for the nuisance regressions \eqn{E[Y \mid Z]} and
+    \eqn{E[X_j \mid Z]} before the final partially linear solve.
     Additional NOMAD tuning arguments such as \code{nomad.nmulti} may
     also be supplied through \code{\dots}; \code{nmulti} remains the
     outer restart count while \code{nomad.nmulti} controls inner
@@ -183,7 +186,9 @@ Further arguments are passed to \code{\link{npplregbw}} and its component \code{
     \code{bernstein.basis}, \code{degree.select}, and
     \code{nomad.nmulti} are supplied. See \code{\link{npplregbw}} and
     \code{\link{npregbw}} for the complete bandwidth-selection
-    argument surface.
+    argument surface, including the child-indexed matrix/list
+    \code{degree} form for fixed local-polynomial partially linear
+    fits.
   }
 }
 \details{
@@ -211,10 +216,8 @@ Further arguments are passed to \code{\link{npplregbw}} and its component \code{
   \code{Z}-side nonparametric regressions, and finally
   local-polynomial/NOMAD controls when using polynomial-adaptive fits.
 
-  For S3 plotting help, use \code{methods("plot")} and query
-  class-specific help topics such as \code{?plot.npregression} and
-  \code{?plot.rbandwidth}. You can inspect implementations with
-  \code{getS3method("plot","npregression")}.
+  For S3 plotting help, see \code{\link{plot.np}}. You can list
+  available plot methods with \code{methods("plot")}.
 
  \code{npplreg} uses a combination of OLS and nonparametric
  regression to estimate the parameter \eqn{\beta}{B} in the model
@@ -250,7 +253,7 @@ Further arguments are passed to \code{\link{npplregbw}} and its component \code{
  Aitken's (1976) kernel, while ordered data types use a variation of the
  Wang and van Ryzin (1981) kernel.
 
- For practitioners who want the recommended automatic LP NOMAD route
+ For practitioners who want the recommended automatic local-polynomial degree-and-bandwidth NOMAD route
  without spelling out all LP tuning arguments,
  \code{npplreg(..., nomad=TRUE)} and \code{npplregbw(..., nomad=TRUE)}
  expand missing settings to the same documented preset. Explicit
@@ -268,6 +271,12 @@ Further arguments are passed to \code{\link{npplregbw}} and its component \code{
   the returned object. Furthermore, the functions \code{summary}
   and \code{plot} support objects of this type. The returned object
   has the following components:
+
+  For \code{plregression} objects, \code{predict(object, se.fit = TRUE)}
+  returns a list with components \code{fit} and \code{se.fit}. The
+  \code{se.fit} component contains asymptotic prediction standard errors
+  computed from the partially linear fitted-value linear operator and
+  the squared residuals from the training fit.
 
   \item{evalx}{ evaluation points }
   \item{evalz}{ evaluation points }
@@ -290,6 +299,24 @@ Further arguments are passed to \code{\link{npplregbw}} and its component \code{
   \item{SIGN}{ fraction of observations where fitted and observed values
     agree in sign }
 
+}
+
+\section{Book And Method Pointers}{
+  The partially linear model is
+  \eqn{Y=X\beta+\Theta(Z)+\epsilon}. The Robinson-style construction
+  residualizes \eqn{Y} and each column of \eqn{X} on \eqn{Z}, then
+  solves the final least-squares problem using those residualized
+  variables. Thus the nonparametric part of the problem is a sequence
+  of conditional-mean regressions \eqn{E[Y\mid Z]} and
+  \eqn{E[X_j\mid Z]}, followed by the parametric solve for
+  \eqn{\beta}. In local-polynomial/NOMAD fits, the nuisance regressions
+  may select child-specific continuous polynomial degrees.
+
+  For book-length derivations, see Li and Racine (2007), Chapter 7
+  \emph{Semiparametric Partially Linear Models}, especially Sections 7.1,
+  7.2, and 7.4, and Racine (2019), Chapter 8 \emph{Semiparametric
+  Conditional Mean Function Estimation}, especially Robinson's
+  partially linear model.
 }
 
 \references{

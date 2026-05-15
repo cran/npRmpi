@@ -231,11 +231,11 @@ test_that("session smooth-coefficient ll coef plot-data route completes in subpr
       "out <- suppressWarnings(plot(",
       "  fit,",
       "  coef=TRUE,",
-      "  coef.index=1,",
+      "  coef_index=1,",
       "  perspective=FALSE,",
       "  neval=20,",
-      "  plot.behavior='plot-data',",
-      "  plot.errors.method='none'))",
+      "  output = 'plot-data',",
+      "  errors='none'))",
       "stopifnot(is.list(out))",
       "stopifnot(length(out) > 0L)",
       "stopifnot(all(vapply(out, inherits, logical(1), 'smoothcoefficient')))",
@@ -267,7 +267,7 @@ test_that("session npindex ichimura plain plot-data returns gradient-bearing pay
       "y <- sin(x1 + x2) + rnorm(n, sd=0.1)",
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='lc', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
-      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, plot.behavior='data', plot.errors.method='none'))",
+      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', errors='none'))",
       "stopifnot(length(out) == 1L)",
       "stopifnot(all(c('index', 'mean', 'grad') %in% names(out[[1]])))",
       "cat('SESSION_NPINDEX_ICH_PLAIN_PAYLOAD_OK\\n')"
@@ -298,7 +298,7 @@ test_that("session npindex ichimura gradient plot-data returns serial payload co
       "y <- sin(x1 + x2) + rnorm(n, sd=0.1)",
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='ll', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
-      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, plot.behavior='data', gradients=TRUE))",
+      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', gradients=TRUE))",
       "stopifnot(length(out) == 1L)",
       "needed <- c('index', 'mean', 'merr', 'grad', 'gerr', 'mean.grad', 'mean.gerr', 'gradients')",
       "stopifnot(all(needed %in% names(out[[1]])))",
@@ -330,7 +330,7 @@ test_that("session npindex ichimura gradient lc fixed plot-data completes locall
       "y <- sin(x1 + x2) + rnorm(n, sd=0.1)",
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='lc', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
-      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, plot.behavior='data', gradients=TRUE))",
+      "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', gradients=TRUE))",
       "needed <- c('index', 'mean', 'merr', 'grad', 'gerr', 'mean.grad', 'mean.gerr', 'gradients')",
       "stopifnot(length(out) == 1L)",
       "stopifnot(all(needed %in% names(out[[1]])))",
@@ -364,9 +364,9 @@ test_that("session npplreg plain fixed lc plot-data completes locally", {
       "tz <- data.frame(x=x)",
       "bw.fix <- npplregbw(xdat=tx, zdat=tz, ydat=y, regtype='lc', bwmethod='cv.ls', bwtype='fixed', nmulti=1)",
       "bw.ann <- npplregbw(xdat=tx, zdat=tz, ydat=y, regtype='lc', bwmethod='cv.ls', bwtype='adaptive_nn', nmulti=1)",
-      "data.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, plot.behavior='data', perspective=FALSE, plot.errors.method='none'))",
-      "plot.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, plot.behavior='plot-data', perspective=FALSE, plot.errors.method='none'))",
-      "ann.out <- suppressWarnings(plot(bw.ann, xdat=tx, ydat=y, zdat=tz, plot.behavior='data', perspective=FALSE, plot.errors.method='none'))",
+      "data.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
+      "plot.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'plot-data', perspective=FALSE, errors='none'))",
+      "ann.out <- suppressWarnings(plot(bw.ann, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
       "stopifnot(is.list(data.out), length(data.out) == 2L, identical(names(data.out), names(plot.out)))",
       "for (i in seq_along(data.out)) {",
       "  stopifnot(inherits(data.out[[i]], 'plregression'))",
@@ -738,6 +738,38 @@ test_that("session npreghat smoke completes in subprocess", {
               info = paste(res$output, collapse = "\n"))
 })
 
+test_that("session npindex ichimura lp search avoids nested-MPI optimizer divergence", {
+  skip_on_cran()
+  env <- subprocess_env()
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+  res <- run_rscript_subprocess(
+    lines = c(
+      "suppressPackageStartupMessages(library(npRmpi))",
+      "options(np.messages=FALSE, np.tree=FALSE)",
+      "set.seed(20260509)",
+      "n <- 240L",
+      "x1 <- runif(n, -1, 1)",
+      "x2 <- rnorm(n)",
+      "xdat <- data.frame(x1=x1, x2=x2)",
+      "y <- sin(2*pi*x1) + 0.5*x2 + rnorm(n, sd=0.35)",
+      "npRmpi.init(nslaves=1, quiet=TRUE)",
+      "on.exit(try(npRmpi.quit(), silent=TRUE), add=TRUE)",
+      "bw.mpi <- npindexbw(xdat=xdat, ydat=y, method='ichimura', regtype='lp', degree=2L, bernstein.basis=TRUE, nmulti=1L)",
+      "fit <- npindex(bws=bw.mpi, gradients=FALSE)",
+      "stopifnot(is.finite(bw.mpi$fval))",
+      "stopifnot(all(is.finite(as.numeric(bw.mpi$bw))))",
+      "stopifnot(inherits(fit, 'singleindex'))",
+      "cat('SESSION_NPINDEX_ICHIMURA_LP_OK\\n')"
+    ),
+    timeout = 45L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl("SESSION_NPINDEX_ICHIMURA_LP_OK", res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+})
+
 test_that("session adaptive-nn npreghat matrix owner stays exact in subprocess", {
   skip_on_cran()
   env <- subprocess_env()
@@ -1007,10 +1039,10 @@ test_that("session wild selector plot smoke completes in subprocess", {
       "  bw,",
       "  xdat=data.frame(x=x),",
       "  ydat=y,",
-      "  plot.behavior='data',",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='wild',",
-      "  plot.errors.boot.num=9",
+      "  output = 'data',",
+      "  errors='bootstrap',",
+      "  bootstrap='wild',",
+      "  B=9",
       "))",
       "stopifnot(is.list(out), length(out) > 0)",
       "cat('SESSION_WILD_PLOT_OK\\n')"
@@ -1042,19 +1074,19 @@ test_that("session wild then inid plot sequence keeps worker pool responsive", {
       "  bw,",
       "  xdat=data.frame(x=x),",
       "  ydat=y,",
-      "  plot.behavior='data',",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='wild',",
-      "  plot.errors.boot.num=40",
+      "  output = 'data',",
+      "  errors='bootstrap',",
+      "  bootstrap='wild',",
+      "  B=40",
       "))",
       "out.i <- suppressWarnings(plot(",
       "  bw,",
       "  xdat=data.frame(x=x),",
       "  ydat=y,",
-      "  plot.behavior='data',",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='inid',",
-      "  plot.errors.boot.num=40",
+      "  output = 'data',",
+      "  errors='bootstrap',",
+      "  bootstrap='inid',",
+      "  B=40",
       "))",
       "stopifnot(is.list(out.w), length(out.w) > 0)",
       "stopifnot(is.list(out.i), length(out.i) > 0)",
@@ -1090,9 +1122,9 @@ test_that("session inid plot smoke completes in subprocess", {
       "suppressWarnings(plot(g))",
       "suppressWarnings(plot(",
       "  g,",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='inid',",
-      "  plot.errors.boot.num=999",
+      "  errors='bootstrap',",
+      "  bootstrap='inid',",
+      "  B=999",
       "))",
       "cat('SESSION_INID_PLOT_OK\\n')"
     ),
@@ -1138,10 +1170,10 @@ test_that("session npindex inid consumer plot preserves bwtype variants in subpr
       "    bw,",
       "    xdat=tx,",
       "    ydat=y,",
-      "    plot.behavior='data',",
-      "    plot.errors.method='bootstrap',",
-      "    plot.errors.boot.method='inid',",
-      "    plot.errors.boot.num=9",
+      "    output = 'data',",
+      "    errors='bootstrap',",
+      "    bootstrap='inid',",
+      "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
       "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
@@ -1158,6 +1190,38 @@ test_that("session npindex inid consumer plot preserves bwtype variants in subpr
   expect_true(any(grepl("SESSION_NPINDEX_BWTYPE_INID_PLOT_OK bwtype=generalized_nn", res$output, fixed = TRUE)),
               info = paste(res$output, collapse = "\n"))
   expect_true(any(grepl("SESSION_NPINDEX_BWTYPE_INID_PLOT_OK bwtype=adaptive_nn", res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+})
+
+test_that("session npindex fitted NOMAD object plot recovers formula data in subprocess", {
+  skip_on_cran()
+  env <- subprocess_env()
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+  res <- run_rscript_subprocess(
+    lines = c(
+      "suppressPackageStartupMessages(library(npRmpi))",
+      "npRmpi.init(nslaves=1, quiet=TRUE)",
+      "on.exit(try(npRmpi.quit(), silent=TRUE), add=TRUE)",
+      "options(npRmpi.autodispatch=TRUE)",
+      "set.seed(12345)",
+      "n <- 70",
+      "x1 <- runif(n, min=-1, max=1)",
+      "x2 <- runif(n, min=-1, max=1)",
+      "y <- x1 - x2 + rnorm(n)",
+      "fit <- npindex(y ~ x1 + x2, nomad=TRUE)",
+      "stopifnot(inherits(fit, 'singleindex'))",
+      "stopifnot(!is.null(fit$bws$formula), !is.null(fit$bws$call))",
+      "out <- suppressWarnings(plot(fit, output='data'))",
+      "stopifnot(is.list(out), length(out) > 0L)",
+      "stopifnot(inherits(out[[1]], 'singleindex'))",
+      "cat('SESSION_NPINDEX_NOMAD_FIT_PLOT_OK\\n')"
+    ),
+    timeout = 120L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl("SESSION_NPINDEX_NOMAD_FIT_PLOT_OK", res$output, fixed = TRUE)),
               info = paste(res$output, collapse = "\n"))
 })
 
@@ -1194,11 +1258,11 @@ test_that("session npindex fixed-block consumer plot preserves bwtype variants i
       "    bw,",
       "    xdat=tx,",
       "    ydat=y,",
-      "    plot.behavior='data',",
-      "    plot.errors.method='bootstrap',",
-      "    plot.errors.boot.method='fixed',",
-      "    plot.errors.boot.blocklen=3,",
-      "    plot.errors.boot.num=9",
+      "    output = 'data',",
+      "    errors='bootstrap',",
+      "    bootstrap='fixed',",
+      "    boot_control=np_boot_control(blocklen=3),",
+      "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
       "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
@@ -1251,11 +1315,11 @@ test_that("session npindex geom-block consumer plot preserves bwtype variants in
       "    bw,",
       "    xdat=tx,",
       "    ydat=y,",
-      "    plot.behavior='data',",
-      "    plot.errors.method='bootstrap',",
-      "    plot.errors.boot.method='geom',",
-      "    plot.errors.boot.blocklen=3,",
-      "    plot.errors.boot.num=9",
+      "    output = 'data',",
+      "    errors='bootstrap',",
+      "    bootstrap='geom',",
+      "    boot_control=np_boot_control(blocklen=3),",
+      "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
       "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
@@ -1300,19 +1364,19 @@ test_that("session inid density plot smoke completes in subprocess", {
       "out.ud <- suppressWarnings(plot(",
       "  bw_ud,",
       "  xdat=xd,",
-      "  plot.behavior='data',",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='inid',",
-      "  plot.errors.boot.num=5",
+      "  output = 'data',",
+      "  errors='bootstrap',",
+      "  bootstrap='inid',",
+      "  B=5",
       "))",
       "out.cd <- suppressWarnings(plot(",
       "  bw_cd,",
       "  xdat=xd,",
       "  ydat=yd,",
-      "  plot.behavior='data',",
-      "  plot.errors.method='bootstrap',",
-      "  plot.errors.boot.method='inid',",
-      "  plot.errors.boot.num=3",
+      "  output = 'data',",
+      "  errors='bootstrap',",
+      "  bootstrap='inid',",
+      "  B=3",
       "))",
       "stopifnot(is.list(out.ud), length(out.ud) > 0)",
       "stopifnot(is.list(out.cd), length(out.cd) > 0)",
@@ -1890,11 +1954,11 @@ test_that("attach smooth-coefficient ll coef plot-data route completes under mpi
     "  out <- suppressWarnings(plot(",
     "    fit,",
     "    coef=TRUE,",
-    "    coef.index=1,",
+    "    coef_index=1,",
     "    perspective=FALSE,",
     "    neval=20,",
-    "    plot.behavior='plot-data',",
-    "    plot.errors.method='none'))",
+    "    output = 'plot-data',",
+    "    errors='none'))",
     "  stopifnot(is.list(out))",
     "  stopifnot(length(out) > 0L)",
     "  stopifnot(all(vapply(out, inherits, logical(1), 'smoothcoefficient')))",
@@ -2547,5 +2611,73 @@ test_that("session npindex nearest-neighbor exact route selects integer support 
 
   expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
   expect_true(any(grepl("SESSION_NPINDEX_NN_EXACT_OK", res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+})
+
+test_that("session conditional density fixed ll cv.ls uses MPI autodispatch route", {
+  skip_on_cran()
+  env <- subprocess_env()
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+  res <- run_rscript_subprocess(
+    lines = c(
+      "suppressPackageStartupMessages(library(npRmpi))",
+      "npRmpi.init(nslaves=1, quiet=TRUE)",
+      "on.exit(try(npRmpi.quit(), silent=TRUE), add=TRUE)",
+      "options(npRmpi.autodispatch=TRUE, np.messages=FALSE, npRmpi.profile.level='detailed')",
+      "set.seed(20260509)",
+      "n <- 90L",
+      "x <- data.frame(x1=runif(n), x2=rnorm(n))",
+      "y <- data.frame(y1=sin(2*pi*x$x1) + 0.5*x$x2 + rnorm(n, sd=0.25))",
+      "bw <- npcdensbw(xdat=x, ydat=y, regtype='ll', bwmethod='cv.ls', nmulti=1, itmax=1)",
+      "stopifnot(inherits(bw, 'conbandwidth'))",
+      "stopifnot(identical(bw$regtype.engine, 'lp'))",
+      "stopifnot(all(as.integer(bw$degree.engine) == 1L))",
+      "stopifnot(is.finite(bw$fval))",
+      "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
+      "stopifnot(is.list(bw$timing.profile))",
+      "stopifnot(identical(bw$timing.profile$where, 'npcdensbw'))",
+      "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
+      "cat('SESSION_NPCDENS_LL_CVLS_AUTODISPATCH_OK\\n')"
+    ),
+    timeout = 120L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl("SESSION_NPCDENS_LL_CVLS_AUTODISPATCH_OK", res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+})
+
+test_that("session conditional distribution fixed ll cv.ls uses MPI autodispatch route", {
+  skip_on_cran()
+  env <- subprocess_env()
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+  res <- run_rscript_subprocess(
+    lines = c(
+      "suppressPackageStartupMessages(library(npRmpi))",
+      "npRmpi.init(nslaves=1, quiet=TRUE)",
+      "on.exit(try(npRmpi.quit(), silent=TRUE), add=TRUE)",
+      "options(npRmpi.autodispatch=TRUE, np.messages=FALSE, npRmpi.profile.level='detailed')",
+      "set.seed(20260510)",
+      "n <- 90L",
+      "x <- data.frame(x1=runif(n), x2=rnorm(n))",
+      "y <- data.frame(y1=sin(2*pi*x$x1) + 0.5*x$x2 + rnorm(n, sd=0.25))",
+      "bw <- npcdistbw(xdat=x, ydat=y, regtype='ll', bwmethod='cv.ls', nmulti=1, itmax=1)",
+      "stopifnot(inherits(bw, 'condbandwidth'))",
+      "stopifnot(identical(bw$regtype.engine, 'lp'))",
+      "stopifnot(all(as.integer(bw$degree.engine) == 1L))",
+      "stopifnot(is.finite(bw$fval))",
+      "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
+      "stopifnot(is.list(bw$timing.profile))",
+      "stopifnot(identical(bw$timing.profile$where, 'npcdistbw'))",
+      "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
+      "cat('SESSION_NPCDIST_LL_CVLS_AUTODISPATCH_OK\\n')"
+    ),
+    timeout = 120L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl("SESSION_NPCDIST_LL_CVLS_AUTODISPATCH_OK", res$output, fixed = TRUE)),
               info = paste(res$output, collapse = "\n"))
 })

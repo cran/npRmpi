@@ -115,10 +115,17 @@
   if (is.null(.npRmpi_autodispatch_remote_ref(val)))
     return(FALSE)
 
-  if (!call.base %in% c("npreg", "npplreg"))
+  allowed <- list(
+    npreg = "rbandwidth",
+    npplreg = "plbandwidth",
+    npindex = "sibandwidth",
+    npscoef = "scbandwidth"
+  )
+  cls <- allowed[[call.base]]
+  if (is.null(cls))
     return(FALSE)
 
-  if (!(inherits(val, "rbandwidth") || inherits(val, "plbandwidth")))
+  if (!inherits(val, cls))
     return(FALSE)
 
   if (!is.null(val$call) && .npRmpi_autodispatch_has_tmp_symbols(val$call))
@@ -161,6 +168,20 @@
   if (!is.numeric(rthr) || length(rthr) != 1L || is.na(rthr) || rthr < 0)
     return(thr)
   as.integer(rthr)
+}
+
+.npRmpi_autodispatch_store_tmp <- function(name,
+                                           value,
+                                           tmpvals,
+                                           prepublish,
+                                           threshold,
+                                           force.inline = FALSE) {
+  if (isTRUE(force.inline) || as.numeric(object.size(value)) < threshold) {
+    tmpvals[[name]] <- value
+  } else {
+    prepublish[[name]] <- value
+  }
+  list(tmpvals = tmpvals, prepublish = prepublish)
 }
 
 .npRmpi_autodispatch_as_generic_call <- function(generic, mc) {
@@ -234,13 +255,10 @@
 .npRmpi_with_manual_bcast_context <- function(expr) {
   old <- getOption("npRmpi.manual.bcast.context", FALSE)
   old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
-  disable.autodispatch <- isTRUE(getOption("npRmpi.profile.active", FALSE))
   options(npRmpi.manual.bcast.context = TRUE)
-  if (disable.autodispatch)
-    options(npRmpi.autodispatch.disable = TRUE)
+  options(npRmpi.autodispatch.disable = TRUE)
   on.exit({
-    if (disable.autodispatch)
-      options(npRmpi.autodispatch.disable = old.disable)
+    options(npRmpi.autodispatch.disable = old.disable)
     options(npRmpi.manual.bcast.context = old)
   }, add = TRUE)
   force(expr)
@@ -296,6 +314,8 @@
 .npRmpi_has_active_slave_pool <- function(comm = 1L) {
   if (!isTRUE(getOption("npRmpi.mpi.initialized", FALSE)))
     return(FALSE)
+  if (!isTRUE(getOption("npRmpi.pool.active", FALSE)))
+    return(FALSE)
   size <- tryCatch(mpi.comm.size(comm), error = function(e) NA_integer_)
   rank <- tryCatch(mpi.comm.rank(comm), error = function(e) NA_integer_)
   if (is.null(size) || is.null(rank) ||
@@ -324,6 +344,9 @@
                                               where = "this call") {
   .npRmpi_abort_if_rmpi_attached(where = where)
   if (isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+    return(invisible(TRUE))
+  if (isTRUE(.npRmpi_autodispatch_in_context()) ||
+      isTRUE(.npRmpi_manual_bcast_in_context()))
     return(invisible(TRUE))
   if (.npRmpi_has_active_slave_pool(comm = comm))
     return(invisible(TRUE))
@@ -434,6 +457,7 @@
   opt.verify <- isTRUE(payload$opt.verify)
   tmpvals <- payload$tmpvals
   tmpnames <- payload$tmpnames
+  prepublish.names <- payload$prepublish.names
   remote.name <- payload$remote.name
 
   if (!is.null(opt.keys) && length(opt.keys)) {
@@ -463,8 +487,16 @@
     on.exit(get(".npRmpi_rm_existing", envir = asNamespace("npRmpi"), inherits = FALSE)(tmpnames, envir = .GlobalEnv), add = TRUE)
 
   res <- .npRmpi_eval_scmd(call.obj, envir = .GlobalEnv)
-  if (!is.null(tmpvals) && length(tmpvals))
-    res <- .npRmpi_autodispatch_sanitize_object(res, tmpvals = tmpvals)
+  tmpreplace <- tmpvals
+  if (!is.null(prepublish.names) && length(prepublish.names)) {
+    prepublish.names <- unique(as.character(prepublish.names))
+    for (nm in prepublish.names) {
+      if (nzchar(nm) && exists(nm, envir = .GlobalEnv, inherits = FALSE))
+        tmpreplace[[nm]] <- get(nm, envir = .GlobalEnv, inherits = FALSE)
+    }
+  }
+  if (!is.null(tmpreplace) && length(tmpreplace))
+    res <- .npRmpi_autodispatch_sanitize_object(res, tmpvals = tmpreplace)
   if (is.character(remote.name) && length(remote.name) == 1L && nzchar(remote.name))
     .GlobalEnv[[remote.name]] <- res
   res
@@ -1369,7 +1401,9 @@
      "weights", "bandwidth.divide", "compute.ocg", "compute.score", "kernel.pow",
      "leave.one.out", "operator", "permutation.operator", "return.kernel.weights",
      "regtype", "basis", "degree", "bernstein.basis",
-     "nmulti", "bandwidth.compute", "remin", "itmax", "ftol", "tol", "small",
+     "bwmethod", "bwtype", "bwscaling",
+     "ckertype", "ckerorder", "ukertype", "okertype",
+     "nmulti", "bandwidth.compute", "nomad.remin", "powell.remin", "itmax", "ftol", "tol", "small",
      "gradients", "residuals", "errors", "gradient.order",
      "proper", "proper.method", "proper.control",
      "alpha", "alpha.iter", "alpha.max", "alpha.min", "alpha.tol",
@@ -1482,7 +1516,15 @@
       tmp <- sprintf(".__npRmpi_autod_data_%d", idx)
       out[["data"]] <- as.name(tmp)
       tmpnames <- c(tmpnames, tmp)
-      tmpvals[[tmp]] <- as.data.frame(dlist, stringsAsFactors = FALSE)
+      stored <- .npRmpi_autodispatch_store_tmp(
+        name = tmp,
+        value = as.data.frame(dlist, stringsAsFactors = FALSE),
+        tmpvals = tmpvals,
+        prepublish = prepublish,
+        threshold = large.arg.threshold
+      )
+      tmpvals <- stored$tmpvals
+      prepublish <- stored$prepublish
     }
   }
 
@@ -1541,11 +1583,16 @@
     # npsigtest formulas store master-only symbols in bws$call; forcing the
     # bws object through inline payload avoids worker-side prepublish divergence.
     force.inline <- identical(call.base, "npsigtest") && identical(nm, "bws")
-    if (!force.inline && as.numeric(object.size(val)) >= large.arg.threshold) {
-      prepublish[[tmp]] <- val
-    } else {
-      tmpvals[[tmp]] <- val
-    }
+    stored <- .npRmpi_autodispatch_store_tmp(
+      name = tmp,
+      value = val,
+      tmpvals = tmpvals,
+      prepublish = prepublish,
+      threshold = large.arg.threshold,
+      force.inline = force.inline
+    )
+    tmpvals <- stored$tmpvals
+    prepublish <- stored$prepublish
   }
 
   list(call = out, tmpnames = unique(tmpnames), tmpvals = tmpvals, prepublish = prepublish)
@@ -1859,6 +1906,7 @@
     call = prepared$call,
     tmpvals = prepared$tmpvals,
     tmpnames = prepared$tmpnames,
+    prepublish.names = names(prepared$prepublish),
     opt.keys = opt.keys,
     opt.vals = opt.vals,
     opt.verify = opt.verify,

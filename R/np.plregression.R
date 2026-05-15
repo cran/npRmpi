@@ -48,7 +48,9 @@ npplreg.formula <-
 
     has.eval <- !is.null(newdata)
     if (has.eval) {
+      npValidateNewdataFormula(newdata, tt.xf, include.response = FALSE)
       if (!y.eval){
+        npValidateNewdataFormula(newdata, tt, include.response = FALSE)
         tt <- delete.response(tt)
         
         bronze <- lapply(bws$chromoly, paste, collapse = " + ")
@@ -79,6 +81,8 @@ npplreg.formula <-
           
       }
       
+      if (y.eval)
+        npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
       umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
       emf <- umf
@@ -129,7 +133,7 @@ npplreg.call <-
   }
 
 .np_plreg_fit_progress_targets <- function(xnames) {
-  c("y~z", sprintf("%s~z", xnames))
+  c("E[y|z]", sprintf("E[%s|z]", xnames), "final partially linear solve")
 }
 
 .np_plreg_fit_progress_begin <- function(xnames, handoff = FALSE) {
@@ -430,6 +434,12 @@ npplreg.plbandwidth <-
         detail = fit.progress.targets[i + 1L]
       )
     }
+
+    fit.progress <- .np_progress_step(
+      fit.progress,
+      done = ncol + 2L,
+      detail = fit.progress.targets[ncol + 2L]
+    )
 
     B = coef((model = lm(resy ~ resx - 1)))
 

@@ -1,5 +1,5 @@
 qregression <- 
-    function(bws, xeval, tau, quantile, quanterr = NA, quantgrad = NA, ntrain, trainiseval = FALSE, gradients = FALSE,
+    function(bws, xeval, tau, quantile, quanterr = NA, quantgrad = NA, quantgerr = NA, ntrain, trainiseval = FALSE, gradients = FALSE,
              timing = NA, total.time = NA, optim.time = NA, fit.time = NA){
 
         if (missing(bws) || missing(xeval) || missing(tau) || missing(quantile) || missing(ntrain))
@@ -33,6 +33,7 @@ qregression <-
             quantile = quantile,
             quanterr = quanterr,
             quantgrad = quantgrad,
+            quantgerr = quantgerr,
             ntrain = ntrain,
             trainiseval = trainiseval,
             gradients = gradients,
@@ -40,6 +41,13 @@ qregression <-
             optim.time = optim.time, fit.time = fit.time)
 
         class(d) <- "qregression"
+
+        reset <- get0(".npRmpi_npqreg_reset_worker_comm_state",
+                      envir = asNamespace("npRmpi"),
+                      inherits = FALSE)
+        if (is.function(reset) &&
+            !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+            reset(comm = 1L)
 
         return(d)
     }
@@ -50,6 +58,8 @@ print.qregression <- function(x, digits=NULL, ...){
       " in ", x$xndim + x$yndim, " variable(s)",
       "\n(", x$yndim, " dependent variable(s), and ", x$xndim, " explanatory variable(s))\n\n",
       sep="")
+  if (length(x$tau) > 1L)
+    cat("Tau values:", paste(format(x$tau, trim = TRUE), collapse = ", "), "\n\n")
   print(matrix(x$ybw,ncol=x$yndim,dimnames=list(paste("Dep. Var. ",x$pscaling,":",sep=""),x$ynames)))
 
   print(matrix(x$xbw,ncol=x$xndim,dimnames=list(paste("Exp. Var. ",x$pscaling,":",sep=""),x$xnames)))
@@ -67,8 +77,47 @@ fitted.qregression <- function(object, ...){
  object$quantile 
 }
 quantile.qregression <- function(x, ...){ x$quantile }
+.npqreg_predict_newdata_to_exdat <- function(object, newdata) {
+  if (is.data.frame(newdata) && !is.null(names(newdata))) {
+    xnames <- object$bws$xnames
+    if (length(xnames)) {
+      missing.names <- setdiff(xnames, names(newdata))
+      if (length(missing.names))
+        stop(sprintf(
+          "newdata must contain columns: %s",
+          paste(shQuote(xnames), collapse = ", ")
+        ), call. = FALSE)
+      return(newdata[, xnames, drop = FALSE])
+    }
+  }
+  newdata
+}
+
 predict.qregression <- function(object, se.fit = FALSE, ...) {
-  tr <- do.call(npqreg, c(list(bws = object$bws), list(...)))
+  se.fit <- npValidateScalarLogical(se.fit, "se.fit")
+  dots <- list(...)
+  has.formula.route <- !is.null(object$bws$formula)
+
+  if (!is.null(dots$exdat) && !is.null(dots$newdata))
+    dots$newdata <- NULL
+  if (has.formula.route) {
+    if (!is.null(dots$exdat)) {
+      dots$newdata <- .npqreg_predict_newdata_to_exdat(object, dots$exdat)
+      dots$exdat <- NULL
+    } else if (!is.null(dots$newdata)) {
+      dots$newdata <- .npqreg_predict_newdata_to_exdat(object, dots$newdata)
+    }
+  } else {
+    if (!is.null(dots$newdata) && is.null(dots$exdat))
+      dots$newdata <- .npqreg_predict_newdata_to_exdat(object, dots$newdata)
+    if (is.null(dots$exdat) && !is.null(dots$newdata)) {
+      dots$exdat <- dots$newdata
+      dots$newdata <- NULL
+    }
+  }
+  if (is.null(dots$tau))
+    dots$tau <- object$tau
+  tr <- do.call(npqreg, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs, residual.scale = NA))
@@ -78,11 +127,13 @@ predict.qregression <- function(object, se.fit = FALSE, ...) {
 
 se.qregression <- function(x) { x$quanterr }
 gradients.qregression <- function(x, errors = FALSE, ...) {
-  if (errors)
-    stop("gradient standard errors are not available for qregression")
-  gout <- x$quantgrad
+  errors <- npValidateScalarLogical(errors, "errors")
+  gout <- if (!errors) x$quantgrad else x$quantgerr
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop("gradients are not available: fit the model with gradients=TRUE")
+    stop(if (!errors)
+      "gradients are not available: fit the model with gradients=TRUE"
+    else
+      "gradient standard errors are not available: fit the model with gradients=TRUE")
   gout
 }
 
@@ -94,6 +145,8 @@ summary.qregression <- function(object, ...) {
       sep="")
 
   cat(genOmitStr(object))
+  if (length(object$tau) > 1L)
+    cat("Tau values:", paste(format(object$tau, trim = TRUE), collapse = ", "), "\n\n")
 
   print(matrix(object$ybw,ncol=object$yndim,dimnames=list(paste("Dep. Var. ",object$pscaling,":",sep=""),object$ynames)))
 

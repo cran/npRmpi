@@ -79,6 +79,14 @@ rbandwidth <-
                                     ncon = ncon)
   bernstein.basis <- npValidateGlpBernstein(regtype = regtype,
                                           bernstein.basis = bernstein.basis)
+  reg.spec <- npCanonicalConditionalRegSpec(
+    regtype = regtype,
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
+    ncon = ncon,
+    where = "rbandwidth"
+  )
   if (identical(regtype, "lp") && ncon > 0L && is.finite(nobs)) {
     lp.dim <- dim_basis(basis = basis,
                         kernel = TRUE,
@@ -121,6 +129,10 @@ rbandwidth <-
     basis = basis,
     degree = degree,
     bernstein.basis = bernstein.basis,
+    regtype.engine = reg.spec$regtype.engine,
+    basis.engine = reg.spec$basis.engine,
+    degree.engine = reg.spec$degree.engine,
+    bernstein.basis.engine = reg.spec$bernstein.basis.engine,
     method = bwmethod,
     pmethod = bwmToPrint(bwmethod),
     fval = fval,
@@ -242,7 +254,7 @@ print.rbandwidth <- function(x, digits=NULL, ...){
 }
 
 
-predict.rbandwidth <- function(...) { do.call(npreg, list(...)) }
+predict.rbandwidth <- function(object, ...) { npreg(bws = object, ...) }
 
 summary.rbandwidth <- function(object, ...){
   cat("\nRegression Data (",object$nobs," observations, ",object$ndim," variable(s)):\n",sep="")
