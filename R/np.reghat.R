@@ -120,6 +120,7 @@ npreghat <-
     s <- integer(bws$ncon)
 
   want.grad <- length(s) > 0L && any(s > 0L)
+  tree.enabled <- npUseContinuousTree(ncon = bws$ncon, bws = bws)
   target.col <- NULL
   if (want.grad) {
     if (!(sum(s) == 1L && all(s %in% c(0L, 1L))))
@@ -291,7 +292,8 @@ npreghat <-
     exdat = if (miss.ex) NULL else eval.data,
     leave.one.out = FALSE,
     bandwidth.divide = identical(bws$type, "adaptive_nn"),
-    kernel.pow = 1.0
+    kernel.pow = 1.0,
+    int.do.tree = .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord)
   )
 
   xcon.train <- as.matrix(txdat[, bws$icon, drop = FALSE])
@@ -354,6 +356,7 @@ npreghat <-
   ntrain <- nrow(txdat)
   neval <- nrow(eval.data)
   want.grad <- length(s) > 0L && any(s > 0L)
+  tree.enabled <- npUseContinuousTree(ncon = bws$ncon, bws = bws)
 
   if (identical(bws$type, "generalized_nn") &&
       any(degree > 1L) &&
@@ -369,7 +372,7 @@ npreghat <-
 
   if (identical(bws$type, "generalized_nn") &&
       any(degree > 1L) &&
-      !isTRUE(getOption("np.tree"))) {
+      !tree.enabled) {
     return(.npreghat_exact_lp_matrix_from_regression_core_chunked(
       bws = bws,
       txdat = txdat,
@@ -387,7 +390,8 @@ npreghat <-
     exdat = if (miss.ex) NULL else eval.data,
     leave.one.out = FALSE,
     bandwidth.divide = TRUE,
-    kernel.pow = 1.0
+    kernel.pow = 1.0,
+    int.do.tree = .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord)
   )
 
   W.train <- W.lp(
@@ -533,7 +537,10 @@ npreghat <-
   H <- matrix(0.0, nrow = neval, ncol = ntrain)
   chunk.size <- max(1L, min(as.integer(chunk.size), ntrain))
   bw.vec <- as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord]))
-  tree.flag <- isTRUE(getOption("np.tree"))
+  tree.flag <- identical(
+    .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
+    DO_TREE_YES
+  )
   grad.vec <- if (length(s) && any(s > 0L)) as.integer(s) else integer(0L)
   on.exit(
     tryCatch(.Call("C_np_shadow_reset_state", PACKAGE = "npRmpi"),
@@ -578,7 +585,8 @@ npreghat <-
                                       leave.one.out = FALSE,
                                       bandwidth.divide = TRUE,
                                       kernel.pow = 1.0,
-                                      operator = NULL) {
+                                      operator = NULL,
+                                      int.do.tree = NULL) {
   miss.ex <- is.null(exdat)
   txdat <- toFrame(txdat)
   if (!miss.ex) {
@@ -597,6 +605,8 @@ npreghat <-
   bandwidth.divide <- npValidateScalarLogical(bandwidth.divide, "bandwidth.divide")
   if (!miss.ex && leave.one.out)
     stop("you may not specify 'leave.one.out = TRUE' and provide evaluation data")
+  if (is.null(int.do.tree))
+    int.do.tree <- npDoTreeOrCategoricalCompress(ncon = bws$ncon, ncat = bws$nuno + bws$nord, bws = bws)
 
   if (is.null(operator)) {
     operator <- rep.int("normal", length(txdat))
@@ -675,7 +685,7 @@ npreghat <-
     mcv.numRow = attr(bws$xmcv, "num.row"),
     wncol = 0L,
     yncol = 0L,
-    int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO,
+    int_do_tree = int.do.tree,
     return.kernel.weights = TRUE,
     permutation.operator = PERMUTATION_OPERATORS[["none"]],
     compute.score = FALSE,
@@ -840,15 +850,23 @@ npreghat <-
   } else {
     NULL
   }
+  lp.degree0.lc.gradient <- isTRUE(gradients) &&
+    npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = reg.spec$regtype.engine,
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = glp.gradient.order,
+      ncon = bws$ncon
+    )
   if (isTRUE(gradients) &&
       identical(reg.spec$regtype.engine, "lp") &&
       (bws$ncon > 0L) &&
+      !lp.degree0.lc.gradient &&
       all(reg.spec$degree.engine == 0L)) {
     stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
   }
 
-  reg.c <- npRegtypeToC(regtype = reg.spec$regtype.engine,
-                        degree = reg.spec$degree.engine,
+  reg.c <- npRegtypeToC(regtype = if (lp.degree0.lc.gradient) "lc" else reg.spec$regtype.engine,
+                        degree = if (lp.degree0.lc.gradient) rep.int(0L, bws$ncon) else reg.spec$degree.engine,
                         ncon = bws$ncon,
                         context = ".np_regression_direct")
   degree.c <- if (bws$ncon > 0L) {
@@ -954,7 +972,7 @@ npreghat <-
     regtype = reg.c$code,
     no.ex = no.ex,
     mcv.numRow = attr(bws$xmcv, "num.row"),
-    int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO,
+    int_do_tree = .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
     old.reg = FALSE
   )
 
@@ -1014,7 +1032,7 @@ npreghat <-
     rorder[c(ord.idx[bws$icon], ord.idx[bws$iuno], ord.idx[bws$iord])] <- ord.idx
     grad <- as.matrix(grad[, rorder, drop = FALSE])
 
-    if (identical(regtype, "lp")) {
+    if (identical(regtype, "lp") && !lp.degree0.lc.gradient) {
       cont.idx <- which(bws$icon)
       if (length(cont.idx)) {
         invalid.order <- glp.gradient.order > degree

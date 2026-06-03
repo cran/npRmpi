@@ -146,6 +146,7 @@ npscoef.call <-
 npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   .npRmpi_require_active_slave_pool(where = "npscoef()")
   explicit.scbandwidth <- (!missing(bws)) && inherits(bws, "scbandwidth")
+  formula.forwarded <- (!missing(txdat)) && inherits(txdat, "formula")
   nomad <- npValidateScalarLogical(nomad, "nomad")
   degree.select.value <- if (isTRUE(nomad)) {
     "coordinate"
@@ -159,6 +160,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
     return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
   if (.npRmpi_autodispatch_active() &&
+      !formula.forwarded &&
       (explicit.scbandwidth || identical(degree.select.value, "manual")))
     return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
@@ -615,7 +617,93 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       moment_npksum(list(...))
     }
 
+    cat.profile.moments.cache <- NULL
+    get_cat_profile_moments_cache <- function() {
+      if (is.null(cat.profile.moments.cache)) {
+        yW.local <- cbind(tydat, W.train)
+        train.codes <- .np_cat_profile_code_matrix(tzdat)
+        train.keys <- .np_cat_profile_keys(train.codes)
+        profile.keys <- unique(train.keys)
+        train.id <- match(train.keys, profile.keys)
+        train.rep <- match(profile.keys, train.keys)
+        train.profile.codes <- train.codes[train.rep, , drop = FALSE]
+        train.profile.dat <- tzdat[train.rep, , drop = FALSE]
+        G <- length(profile.keys)
+        p <- ncol(yW.local)
+        cross.profile <- matrix(0.0, nrow = G, ncol = p * p)
+        for (j in seq_len(p)) {
+          for (k in seq_len(p)) {
+            cross.profile[, (j - 1L) * p + k] <-
+              .np_cat_profile_rowsum(yW.local[, j] * yW.local[, k],
+                                     train.id, G)[, 1L]
+          }
+        }
+        cat.profile.moments.cache <<- list(
+          train.id = train.id,
+          train.profile.codes = train.profile.codes,
+          train.profile.dat = train.profile.dat,
+          G = G,
+          p = p,
+          cross.profile = cross.profile
+        )
+      }
+      cat.profile.moments.cache
+    }
+
+    lc_cat_profile_moments <- function(z.eval, u2 = NULL) {
+      z.eval.local <- if (is.null(z.eval)) tzdat else z.eval
+      eval.codes <- .np_cat_profile_code_matrix(z.eval.local)
+      cp <- get_cat_profile_moments_cache()
+
+      L.eval <- .np_regression_cat_profile_kernel_matrix(
+        eval.codes = eval.codes,
+        train.codes = cp$train.profile.codes,
+        xdat = cp$train.profile.dat,
+        bws = bws
+      )
+
+      p <- cp$p
+      main.flat <- L.eval %*% cp$cross.profile
+      main.ks <- array(t(main.flat),
+                       dim = c(p, p, nrow(z.eval.local)))
+      tyw.out <- main.ks[-1L, 1L, , drop = FALSE]
+      if (length(dim(tyw.out)) == 3L)
+        dim(tyw.out) <- c(dim(tyw.out)[1L], dim(tyw.out)[3L])
+      tww.out <- main.ks[-1L, -1L, , drop = FALSE]
+
+      s.out <- NULL
+      if (!is.null(u2)) {
+        pw <- ncol(W.train)
+        cross.s.profile <- matrix(0.0, nrow = cp$G, ncol = pw * pw)
+        for (j in seq_len(pw)) {
+          for (k in seq_len(pw)) {
+            cross.s.profile[, (j - 1L) * pw + k] <-
+              .np_cat_profile_rowsum(as.double(u2) * W.train[, j] * W.train[, k],
+                                     cp$train.id, cp$G)[, 1L]
+          }
+        }
+        s.flat <- (L.eval^2) %*% cross.s.profile
+        s.out <- array(t(s.flat),
+                       dim = c(pw, pw, nrow(z.eval.local)))
+      }
+
+      list(tyw = tyw.out, tww = tww.out, s = s.out)
+    }
+
+    use.cat.profile.lc <- identical(reg.engine, "lc") &&
+      !leave.one.out &&
+      identical(bws$type, "fixed") &&
+      npUseCategoricalCompress(ncon = bws$ncon,
+                               ncat = bws$nuno + bws$nord) &&
+      !miss.z &&
+      isTRUE(bws$ncon == 0L) &&
+      isTRUE((bws$nuno + bws$nord) > 0L) &&
+      !(iterate && !is.null(bws$bw.fitted) && miss.ex)
+
     lc_moments <- function(z.eval, leave.one.out.eval, u2 = NULL) {
+      if (use.cat.profile.lc && !leave.one.out.eval)
+        return(lc_cat_profile_moments(z.eval = z.eval, u2 = u2))
+
       yW.local <- cbind(tydat, W.train)
       ksum.args <- list(
         txdat = tzdat,

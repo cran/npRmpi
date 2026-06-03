@@ -74,9 +74,15 @@ print.condensity <- function(x, digits=NULL, ...){
       " in ", x$xndim + x$yndim, " variable(s)",
       "\n(", x$yndim, " dependent variable(s), and ", x$xndim, " explanatory variable(s))\n\n",
       sep="")
-  print(matrix(x$ybw,ncol=x$yndim,dimnames=list(paste("Dep. Var. ",x$pscaling,":",sep=""),x$ynames)))
+  printSearchParameterSummary(x$ybw, x$ynames, x$bws, vari = "y",
+                              role = "Dependent",
+                              fallback.label = paste("Dep. Var. ", x$pscaling, ":", sep = ""),
+                              digits = digits)
 
-  print(matrix(x$xbw,ncol=x$xndim,dimnames=list(paste("Exp. Var. ",x$pscaling,":",sep=""),x$xnames)))
+  printSearchParameterSummary(x$xbw, x$xnames, x$bws, vari = "x",
+                              role = "Explanatory",
+                              fallback.label = paste("Exp. Var. ", x$pscaling, ":", sep = ""),
+                              digits = digits)
 
   cat(genDenEstStr(x))
   cat(genBwKerStrs(x$bws))
@@ -143,12 +149,20 @@ gradients.condensity <- function(x, errors = FALSE, gradient.order = NULL, ...) 
   gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$ixcon)
   if (length(cont.idx)) {
+    lp.degree0.lc.gradient <- npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = reg.spec$reg.engine,
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = gorder,
+      ncon = x$bws$xncon
+    )
     keep.cont <- (gorder <= reg.spec$degree.engine)
+    if (lp.degree0.lc.gradient)
+      keep.cont[] <- TRUE
     if (any(keep.cont)) {
       keep.idx <- cont.idx[keep.cont]
       gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]
     }
-    if (any(gorder > reg.spec$degree.engine))
+    if (any(gorder > reg.spec$degree.engine) && !lp.degree0.lc.gradient)
       .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
   }
   gout.masked
@@ -210,9 +224,13 @@ summary.condensity <- function(object, ...){
       sep="")
 
   cat(genOmitStr(object))
-  print(matrix(object$ybw,ncol=object$yndim,dimnames=list(paste("Dep. Var. ",object$pscaling,":",sep=""),object$ynames)))
+  printSearchParameterSummary(object$ybw, object$ynames, object$bws, vari = "y",
+                              role = "Dependent",
+                              fallback.label = paste("Dep. Var. ", object$pscaling, ":", sep = ""))
 
-  print(matrix(object$xbw,ncol=object$xndim,dimnames=list(paste("Exp. Var. ",object$pscaling,":",sep=""),object$xnames)))
+  printSearchParameterSummary(object$xbw, object$xnames, object$bws, vari = "x",
+                              role = "Explanatory",
+                              fallback.label = paste("Exp. Var. ", object$pscaling, ":", sep = ""))
 
   cat(genDenEstStr(object))
 

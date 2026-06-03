@@ -204,10 +204,17 @@ These arguments control automatic local-polynomial degree search.
   }
 
   \item{degree.verify}{
-    logical value indicating whether a coordinate-search solution should
-    be exhaustively verified over the admissible degree grid after the
-    heuristic phase completes. Available only for
-    \code{search.engine="cell"}.
+    logical value indicating whether an automatic degree-search solution
+    should be exhaustively certified over the admissible degree grid after
+    the heuristic phase completes. With \code{search.engine="cell"}, this
+    verifies a coordinate-search solution using repeated fixed-degree
+    solves. With NOMAD-based search engines, this first runs the joint NOMAD
+    search over bandwidth and degree coordinates, then verifies the result
+    over the requested degree grid using repeated fixed-degree solves. The
+    default is \code{FALSE} because certification can be substantially
+    slower than the heuristic search. Set \code{degree.verify=TRUE} when
+    degree-selection certification or sensitivity checking is more important
+    than runtime.
   }
 
 
@@ -301,12 +308,12 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     \code{bwtype="fixed"}. Explicit incompatible settings error
     immediately; in particular, \code{nomad=TRUE} currently requires
     \code{regtype="lp"}, \code{bwtype="fixed"}, automatic degree
-    search, \code{bernstein.basis=TRUE}, no explicit \code{degree},
+    search, no explicit \code{degree},
     and \code{search.engine \%in\% c("nomad", "nomad+powell")}.
     This shortcut does not change the meaning of \code{nmulti} or
     \code{nomad.nmulti}: \code{nmulti} remains the outer restart count,
     while \code{nomad.nmulti} controls inner
-    \code{crs::snomadr()} multistarts within each outer restart.
+    native \pkg{crs} NOMAD API multistarts within each outer restart.
     Returned bandwidth objects retain this normalized preset metadata in
     \code{bw$nomad.shortcut} for a returned object \code{bw}; when
     available, \code{nomad.time} and \code{powell.time} record the
@@ -315,13 +322,18 @@ These arguments control the optional NOMAD direct-search route for local-polynom
 
   \item{nomad.nmulti}{
     non-negative integer controlling the inner
-    \code{crs::snomadr()} multistart count used within each outer
+    the native \pkg{crs} NOMAD C API multistart count used within each outer
     NOMAD restart when \code{regtype="lp"} and automatic degree search
     uses \code{search.engine="nomad"} or \code{"nomad+powell"}.
     Defaults to \code{0L}, which preserves the current one-start-per-
     restart behavior. This does not replace \code{nmulti}:
     \code{nmulti} controls outer restarts, while \code{nomad.nmulti}
-    controls inner NOMAD multistarts within each outer restart.
+    controls inner NOMAD multistarts within each outer restart. Advanced
+    native NOMAD parameters may be supplied as \code{nomad.opts} through
+    \code{...}; invalid or unsupported parameters are rejected by NOMAD
+    rather than silently ignored. Routes that evaluate R callbacks require
+    serial callback evaluation and reject parallel callback settings such as
+    \code{NB_THREADS_PARALLEL_EVAL > 1}.
   }
 
   \item{nomad.remin}{
@@ -338,12 +350,16 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     backend when \code{regtype="lp"} and
     \code{degree.select != "manual"}. \code{"nomad+powell"} (default)
     performs direct joint search over the index-smoother bandwidth and
-    degree using \code{crs::snomadr()}, then applies one Powell hot
+    degree using the native \pkg{crs} NOMAD C API, then applies one Powell hot
     start from the NOMAD solution. \code{"nomad"} omits the Powell
     refinement. \code{"cell"} profiles the criterion over the
-    admissible degree grid using repeated fixed-degree solves.
-    NOMAD-based search currently requires \code{degree.verify=FALSE}
-    and the suggested package \pkg{crs} to be installed.
+    admissible degree grid using repeated fixed-degree solves. Direct
+    exhaustive degree-grid search is available with
+    \code{degree.select="exhaustive"} and \code{search.engine="cell"}.
+    NOMAD-based search is intended to avoid exhaustive degree enumeration;
+    users who want post-search certification over the requested degree grid
+    can set \code{degree.verify=TRUE}. NOMAD-based search requires the
+    suggested package \pkg{crs} to be installed.
   }
 
 
@@ -528,7 +544,7 @@ or standard-deviation factors.
   admissible degree grid using cached coordinate-wise or exhaustive
   search. With \code{search.engine="nomad"} or
   \code{"nomad+powell"}, the criterion is optimized directly over the
-  joint degree/bandwidth space using \code{crs::snomadr()};
+  joint degree/bandwidth space using the native \pkg{crs} NOMAD C API;
   \code{"nomad+powell"} then performs one Powell hot start and retains
   the better of the direct NOMAD and polished solutions. For the
   index-smoother local-polynomial component, this polynomial-adaptive

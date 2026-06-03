@@ -4,6 +4,7 @@
 #include <time.h>
 
 #include <R.h>
+#include <Rinternals.h>
 
 #include "headers.h"
 
@@ -19,6 +20,70 @@ extern  int iNum_Processors;
 extern  int iSeed_my_rank;
 extern  MPI_Status status;
 extern MPI_Comm	*comm;
+
+static int mpi_gatherv_nn_distance_exact(int n, int stride, double *nn_distance)
+{
+    int r, local_start, local_end, local_count;
+    int *recvcounts;
+    int *displs;
+    int mpi_status;
+
+    if ((n < 1) || (stride < 1) || (nn_distance == NULL))
+        return 1;
+
+    recvcounts = (int *) malloc((size_t) iNum_Processors * sizeof(int));
+    displs = (int *) malloc((size_t) iNum_Processors * sizeof(int));
+
+    if ((recvcounts == NULL) || (displs == NULL)) {
+        if (recvcounts != NULL)
+            free(recvcounts);
+        if (displs != NULL)
+            free(displs);
+        return 1;
+    }
+
+    for (r = 0; r < iNum_Processors; r++) {
+        const int start = r * stride;
+        const int end = MIN(n, (r + 1) * stride);
+        recvcounts[r] = (start < n) ? MAX(0, end - start) : 0;
+        displs[r] = MIN(start, n);
+    }
+
+    local_start = my_rank * stride;
+    local_end = MIN(n, (my_rank + 1) * stride);
+    local_count = (local_start < n) ? MAX(0, local_end - local_start) : 0;
+
+    if (my_rank == 0) {
+        mpi_status = MPI_Gatherv(
+            MPI_IN_PLACE,
+            local_count,
+            MPI_DOUBLE,
+            nn_distance,
+            recvcounts,
+            displs,
+            MPI_DOUBLE,
+            0,
+            comm[1]
+        );
+    } else {
+        mpi_status = MPI_Gatherv(
+            nn_distance,
+            local_count,
+            MPI_DOUBLE,
+            NULL,
+            recvcounts,
+            displs,
+            MPI_DOUBLE,
+            0,
+            comm[1]
+        );
+    }
+
+    free(recvcounts);
+    free(displs);
+
+    return (mpi_status == MPI_SUCCESS) ? 0 : 1;
+}
 #endif
 
 /* This function generates the index for bootstrap samples of size n */
@@ -28,6 +93,8 @@ extern int int_DEBUG;
 extern int int_VERBOSE;
 extern int int_ROBUST;
 extern int int_nn_k_min_extern;
+extern double *vector_extendednn_upper_extern;
+extern int int_extendednn_upper_num_extern;
 extern double nconfac_extern;
 extern double *vector_continuous_stddev_extern;
 
@@ -80,6 +147,47 @@ int np_fround(double x)
 #include <math.h>
 #include <limits.h>
 #include <float.h>
+
+static int np_extendednn_enabled_statmods(void)
+{
+  const SEXP val = Rf_GetOption1(Rf_install("np.extendednn"));
+  const int flag = Rf_asLogical(val);
+  return flag == TRUE;
+}
+
+static int np_nn_scale_factor_is_valid(double value,
+                                       int lower,
+                                       int upper,
+                                       int allow_extended)
+{
+  int rounded;
+
+  if(!isfinite(value) || (value < 1.0) || (value > ((double)INT_MAX / 2.0)))
+    return 0;
+
+  rounded = np_fround(value);
+
+  if(rounded < lower)
+    return 0;
+
+  if(rounded > upper)
+    return allow_extended && np_extendednn_enabled_statmods();
+
+  return 1;
+}
+
+static double np_extendednn_upper_for_reg(const int zero_index, const double fallback)
+{
+  if ((vector_extendednn_upper_extern != NULL) &&
+      (zero_index >= 0) &&
+      (zero_index < int_extendednn_upper_num_extern) &&
+      isfinite(vector_extendednn_upper_extern[zero_index]) &&
+      (vector_extendednn_upper_extern[zero_index] >= fallback)) {
+    return vector_extendednn_upper_extern[zero_index];
+  }
+
+  return fallback;
+}
 
 
 int simple_unique(int n, double * vector){
@@ -443,7 +551,10 @@ static int compute_nn_distance_observation_support_subset(int num_obs,
   support_count = NULL;
   support_radius = NULL;
 
-  if ((query_start < 0) || (query_end >= num_obs) || (query_start > query_end))
+  if (query_start > query_end)
+    return 0;
+
+  if ((query_start < 0) || (query_end >= num_obs))
     return 1;
 
   if (build_sorted_unique_support(num_obs, vector_data, &support, &support_count, &support_n) != 0)
@@ -601,7 +712,10 @@ static int compute_nn_distance_train_eval_observation_support_subset(int num_obs
   support = NULL;
   support_count = NULL;
 
-  if ((query_start < 0) || (query_end >= num_obs_eval) || (query_start > query_end))
+  if (query_start > query_end)
+    return 0;
+
+  if ((query_start < 0) || (query_end >= num_obs_eval))
     return 1;
 
   if (build_sorted_unique_support(num_obs_train, vector_data_train, &support, &support_count, &support_n) != 0)
@@ -696,14 +810,11 @@ int int_k_nn, double *nn_distance)
 			return(1);
 		}
 
-    if(!suppress_parallel){
-      if(my_rank == 0){
-        MPI_Gather(MPI_IN_PLACE, stride, MPI_DOUBLE, nn_distance, stride, MPI_DOUBLE, 0, comm[1]);
-      } else {
-        MPI_Gather(nn_distance, stride, MPI_DOUBLE, NULL, stride, MPI_DOUBLE, 0, comm[1]);
-      }
-      MPI_Bcast(nn_distance, num_obs, MPI_DOUBLE, 0, comm[1]);
-    }
+	    if(!suppress_parallel){
+	      if (mpi_gatherv_nn_distance_exact(num_obs, stride, nn_distance) != 0)
+	        return(1);
+	      MPI_Bcast(nn_distance, num_obs, MPI_DOUBLE, 0, comm[1]);
+	    }
 #endif
 
     return(0);
@@ -788,14 +899,11 @@ int compute_nn_distance_train_eval(int num_obs_train,
 			return(1);
 		}
 
-    if(!suppress_parallel){
-      if(my_rank == 0){
-        MPI_Gather(MPI_IN_PLACE, stride, MPI_DOUBLE, nn_distance, stride, MPI_DOUBLE, 0, comm[1]);
-      } else {
-        MPI_Gather(nn_distance, stride, MPI_DOUBLE, NULL, stride, MPI_DOUBLE, 0, comm[1]);
-      }
-      MPI_Bcast(nn_distance, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
-    }
+	    if(!suppress_parallel){
+	      if (mpi_gatherv_nn_distance_exact(num_obs_eval, stride, nn_distance) != 0)
+	        return(1);
+	      MPI_Bcast(nn_distance, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+	    }
 #endif
 
     return(0);
@@ -859,15 +967,15 @@ int initialize_nr_directions(int BANDWIDTH,
   }else{
     for(i = 1; i <= num_reg_continuous; i++){
       const double bw_max =
-        ((BANDWIDTH == BW_ADAP_NN) || (BANDWIDTH == BW_GEN_NN)) ?
-        (double)(num_obs - 1) :
+        ((BANDWIDTH == BW_GEN_NN) || (BANDWIDTH == BW_ADAP_NN)) ?
+        np_extendednn_upper_for_reg(i - 1, (double)(num_obs - 1)) :
         (double)(simple_unique(num_obs,matrix_x_continuous[i-1]) - 1);
       matrix_y[i][i] = ceil(MIN(vector_scale_factor[i], bw_max - vector_scale_factor[i])*(random ? ran3(&seed): 1.0));
     }
     for(i = num_reg_continuous+1; i <= li; i++){
       const double bw_max =
         ((BANDWIDTH == BW_ADAP_NN) || (BANDWIDTH == BW_GEN_NN)) ?
-        (double)(num_obs - 1) :
+        np_extendednn_upper_for_reg(i - 1, (double)(num_obs - 1)) :
         (double)(simple_unique(num_obs,matrix_y_continuous[i-num_reg_continuous-1]) - 1);
       matrix_y[i][i] = ceil(MIN(vector_scale_factor[i], bw_max - vector_scale_factor[i])*(random ? ran3(&seed): 1.0));
     }
@@ -987,6 +1095,8 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
         }
       } else {
         const double bw_kmax =
+          ((BANDWIDTH == BW_GEN_NN) || (BANDWIDTH == BW_ADAP_NN)) ?
+          np_extendednn_upper_for_reg(i, (double)(num_obs - 1)) :
           count_bw ? (double)(num_obs - 1) : (double)(simple_unique(num_obs,matrix_x_continuous[i]) - 1);
         if((vector_scale_factor[l+1] < bw_cmin) || (vector_scale_factor[l+1] > bw_kmax)){
           REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
@@ -1026,6 +1136,8 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
         }
       } else {
         const double bw_kmax =
+          ((BANDWIDTH == BW_GEN_NN) || (BANDWIDTH == BW_ADAP_NN)) ?
+          np_extendednn_upper_for_reg(l, (double)(num_obs - 1)) :
           count_bw ? (double)(num_obs - 1) : (double)(simple_unique(num_obs,matrix_y_continuous[i]) - 1);
         if((vector_scale_factor[l+1] < bw_cmin) || (vector_scale_factor[l+1] > bw_kmax)){
           REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
@@ -1702,7 +1814,13 @@ double *vector_scale_factor)
         }
         else if((BANDWIDTH == 1)||(BANDWIDTH == 2))
         {
-            if( (np_fround(vector_scale_factor[i]) < MAX(1, int_nn_k_min_extern)) || (np_fround(vector_scale_factor[i]) > num_obs_m_1) )
+            if(!np_nn_scale_factor_is_valid(vector_scale_factor[i],
+                                            MAX(1, int_nn_k_min_extern),
+                                            (int)MIN((double)INT_MAX / 2.0,
+                                                     np_extendednn_upper_for_reg(i - 1, (double)num_obs_m_1)),
+                                            (BANDWIDTH == 1) &&
+                                            (num_var_continuous == 0) &&
+                                            (vector_extendednn_upper_extern == NULL)))
             {
                 return(1);
             }
@@ -1723,7 +1841,11 @@ double *vector_scale_factor)
         }
         else if((BANDWIDTH == 1)||(BANDWIDTH == 2))
         {
-            if( (np_fround(vector_scale_factor[i]) < MAX(1, int_nn_k_min_extern)) || (np_fround(vector_scale_factor[i]) > num_obs_m_1 ) )
+            if(!np_nn_scale_factor_is_valid(vector_scale_factor[i],
+                                            MAX(1, int_nn_k_min_extern),
+                                            (int)MIN((double)INT_MAX / 2.0,
+                                                     np_extendednn_upper_for_reg(i - 1, (double)num_obs_m_1)),
+                                            0))
             {
                 return(1);
             }

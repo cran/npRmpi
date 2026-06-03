@@ -27,7 +27,7 @@
 
 .np_with_seed <- function(random.seed = 42L, code) {
   seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state), add = TRUE)
+  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
   force(code)
 }
 
@@ -1028,7 +1028,7 @@
   TRUE
 }
 
-.npRmpi_bootstrap_chunk_tasks <- function(B, chunk.size) {
+.npRmpi_bootstrap_chunk_tasks <- function(B, chunk.size, with.seeds = TRUE) {
   B <- as.integer(B)
   chunk.size <- as.integer(chunk.size)
   if (B < 1L || chunk.size < 1L)
@@ -1036,7 +1036,8 @@
 
   starts <- seq.int(1L, B, by = chunk.size)
   lens <- pmin(chunk.size, B - starts + 1L)
-  seeds <- sample.int(.Machine$integer.max, length(starts))
+  with.seeds <- isTRUE(with.seeds)
+  seeds <- if (with.seeds) sample.int(.Machine$integer.max, length(starts)) else rep.int(NA_integer_, length(starts))
 
   lapply(seq_along(starts), function(i) {
     list(
@@ -1045,6 +1046,78 @@
       seed = as.integer(seeds[i])
     )
   })
+}
+
+.npRmpi_bootstrap_attach_rng_stream <- function(tasks, advance) {
+  if (!is.list(tasks) || !length(tasks))
+    return(tasks)
+  if (!is.function(advance))
+    stop("advance must be a function")
+  if (!exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+    sample.int(1L, 0L)
+
+  for (i in seq_along(tasks)) {
+    tasks[[i]]$rng_state <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    advance(tasks[[i]])
+  }
+
+  attr(tasks, "rng_final_state") <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  tasks
+}
+
+.npRmpi_bootstrap_use_task_rng <- function(task) {
+  if (!is.null(task$rng_state)) {
+    assign(".Random.seed", as.integer(task$rng_state), envir = .GlobalEnv)
+  } else {
+    set.seed(as.integer(task$seed))
+  }
+  invisible(TRUE)
+}
+
+.npRmpi_bootstrap_task_rmultinom <- function(task, n, prob, size = n) {
+  .npRmpi_bootstrap_use_task_rng(task)
+  stats::rmultinom(n = as.integer(task$bsz),
+                   size = as.integer(size),
+                   prob = prob)
+}
+
+.npRmpi_bootstrap_rmultinom_tasks <- function(B, chunk.size, size, prob) {
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = B,
+    chunk.size = chunk.size,
+    with.seeds = FALSE
+  )
+  .npRmpi_bootstrap_attach_rng_stream(
+    tasks,
+    function(task) {
+      invisible(stats::rmultinom(
+        n = as.integer(task$bsz),
+        size = as.integer(size),
+        prob = prob
+      ))
+    }
+  )
+}
+
+.npRmpi_bootstrap_task_runif_matrix <- function(task, n) {
+  .npRmpi_bootstrap_use_task_rng(task)
+  matrix(stats::runif(as.integer(n) * as.integer(task$bsz)),
+         nrow = as.integer(n),
+         ncol = as.integer(task$bsz))
+}
+
+.npRmpi_bootstrap_runif_tasks <- function(B, chunk.size, n) {
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = B,
+    chunk.size = chunk.size,
+    with.seeds = FALSE
+  )
+  .npRmpi_bootstrap_attach_rng_stream(
+    tasks,
+    function(task) {
+      invisible(stats::runif(as.integer(n) * as.integer(task$bsz)))
+    }
+  )
 }
 
 .npRmpi_bootstrap_collect_chunks <- function(parts, tasks, ncol.out, what = "bootstrap") {
@@ -1238,6 +1311,12 @@
                                          master_local_chunk = TRUE,
                                          required.bindings = NULL,
                                          ...) {
+  rng.final.state <- attr(tasks, "rng_final_state", exact = TRUE)
+  if (!is.null(rng.final.state)) {
+    on.exit({
+      assign(".Random.seed", as.integer(rng.final.state), envir = .GlobalEnv)
+    }, add = TRUE)
+  }
   total.boot <- sum(vapply(tasks, function(tt) as.integer(tt$bsz), integer(1)))
   progress.label <- if (is.null(progress.label)) {
     sprintf("Plot bootstrap %s", what)
@@ -1708,7 +1787,7 @@
     chunk.size = chunk.size,
     what = "wild"
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+  tasks <- .npRmpi_bootstrap_runif_tasks(B = B, chunk.size = chunk.size, n = n)
   if (!length(tasks))
     .npRmpi_bootstrap_fail_or_fallback(
       msg = "wild fan-out produced no tasks",
@@ -1726,9 +1805,8 @@
 
   worker <- function(task, n, p, H.vec, fit.mean, residuals, wild.method) {
     H <- matrix(as.double(H.vec), nrow = p, ncol = n)
-    set.seed(as.integer(task$seed))
     bsz <- as.integer(task$bsz)
-    u <- matrix(stats::runif(n * bsz), nrow = n, ncol = bsz)
+    u <- .npRmpi_bootstrap_task_runif_matrix(task = task, n = n)
     if (identical(wild.method, "mammen")) {
       a <- (1 - sqrt(5)) / 2
       p.a <- (sqrt(5) + 1) / (2 * sqrt(5))
@@ -1907,12 +1985,7 @@
     ))
   }
 
-  chunk.size <- .npRmpi_bootstrap_tune_chunk_size(
-    B = B,
-    chunk.size = .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer)),
-    comm = 1L,
-    include.master = TRUE
-  )
+  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer))
   if (!is.null(counts.drawer)) {
     tmat <- matrix(NA_real_, nrow = B, ncol = nrow(H))
     W.local <- W
@@ -1975,13 +2048,17 @@
     chunk.size = chunk.size,
     what = "inid-lc"
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   prob <- rep.int(1 / n, n)
+  tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+    B = B,
+    chunk.size = chunk.size,
+    size = n,
+    prob = prob
+  )
 
   worker <- function(task) {
-    set.seed(as.integer(task$seed))
     bsz <- as.integer(task$bsz)
-    counts.chunk <- stats::rmultinom(n = bsz, size = n, prob = prob)
+    counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
     den <- crossprod(counts.chunk, W)
     num <- crossprod(counts.chunk, Wy)
     num / pmax(den, .Machine$double.eps)
@@ -2307,14 +2384,14 @@
           chunk.size = chunk.size,
           what = "inid-index-localpoly"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
-        counts.chunk <- stats::rmultinom(
-          n = as.integer(task$bsz),
-          size = n,
-          prob = prob
-        )
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         compute_chunk(counts.chunk = counts.chunk)
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -2492,7 +2569,12 @@
     out
   }
 
-  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer))
+  chunk.size <- .npRmpi_bootstrap_tune_chunk_size(
+    B = B,
+    chunk.size = .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer)),
+    comm = 1L,
+    include.master = TRUE
+  )
   use.mpi <- isTRUE(getOption("npRmpi.mpi.initialized", FALSE)) &&
     isTRUE(.npRmpi_has_active_slave_pool(comm = 1L))
   if (isTRUE(use.mpi)) {
@@ -2572,14 +2654,14 @@
           chunk.size = chunk.size,
           what = "inid-index-exact"
         )
-        tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+        tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+          B = B,
+          chunk.size = chunk.size,
+          size = n,
+          prob = prob
+        )
         worker <- function(task) {
-          set.seed(as.integer(task$seed))
-          compute_chunk(stats::rmultinom(
-            n = as.integer(task$bsz),
-            size = n,
-            prob = prob
-          ))
+          compute_chunk(.npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob))
         }
         tmat <- .npRmpi_bootstrap_run_fanout(
           tasks = tasks,
@@ -2633,6 +2715,570 @@
   }
 
   list(t = tmat, t0 = t0)
+}
+
+.np_cat_profile_rowsum <- function(x, id, G) {
+  rowsum(x = as.matrix(x),
+         group = factor(id, levels = seq_len(G)),
+         reorder = FALSE)
+}
+
+.np_cat_profile_keys <- function(codes) {
+  codes <- as.matrix(codes)
+  if (ncol(codes) == 1L)
+    return(as.character(codes[, 1L]))
+  do.call(paste, c(as.data.frame(codes), sep = "\r"))
+}
+
+.np_cat_profile_code_matrix <- function(dat) {
+  mat <- as.matrix(toMatrix(toFrame(dat)))
+  storage.mode(mat) <- "double"
+  mat
+}
+
+.np_cat_ordered_support_values <- function(x) {
+  values <- suppressWarnings(as.numeric(levels(x)))
+  if (length(values) == nlevels(x) && !anyNA(values))
+    values
+  else
+    seq_len(nlevels(x))
+}
+
+.np_regression_cat_profile_kernel_matrix <- function(eval.codes,
+                                                     train.codes,
+                                                     xdat,
+                                                     bws) {
+  eval.codes <- as.matrix(eval.codes)
+  train.codes <- as.matrix(train.codes)
+  if (ncol(eval.codes) != ncol(train.codes))
+    stop("profile code matrices must have matching columns")
+
+  W <- matrix(1.0, nrow = nrow(eval.codes), ncol = nrow(train.codes))
+  lambda <- as.double(bws$bw)
+
+  for (j in seq_len(ncol(train.codes))) {
+    if (is.factor(xdat[[j]]) && !is.ordered(xdat[[j]])) {
+      same <- outer(eval.codes[, j], train.codes[, j], "==")
+      ncat <- nlevels(xdat[[j]])
+      if (ncat < 2L) {
+        Kj <- ifelse(same, 1.0, 0.0)
+      } else if (identical(bws$ukertype, "aitchisonaitken")) {
+        Kj <- ifelse(same, 1.0 - lambda[j], lambda[j] / (ncat - 1.0))
+      } else if (identical(bws$ukertype, "liracine")) {
+        Kj <- ifelse(same, 1.0, lambda[j])
+      } else {
+        stop("unsupported unordered categorical kernel in profile bootstrap")
+      }
+    } else if (is.ordered(xdat[[j]])) {
+      d <- abs(outer(eval.codes[, j], train.codes[, j], "-"))
+      if (identical(bws$okertype, "wangvanryzin")) {
+        Kj <- ifelse(d == 0, 1.0 - lambda[j],
+                     (lambda[j]^d) * (1.0 - lambda[j]) * 0.5)
+      } else if (identical(bws$okertype, "liracine")) {
+        Kj <- lambda[j]^d
+      } else if (identical(bws$okertype, "nliracine")) {
+        Kj <- (lambda[j]^d) * (1.0 - lambda[j]) / (1.0 + lambda[j])
+      } else if (identical(bws$okertype, "racineliyan")) {
+        support <- .np_cat_ordered_support_values(xdat[[j]])
+        den <- vapply(train.codes[, j],
+                      function(x) sum(lambda[j]^abs(x - support)),
+                      numeric(1))
+        Kj <- t(t(lambda[j]^d) / den)
+      } else {
+        stop("unsupported ordered categorical kernel in profile bootstrap")
+      }
+    } else {
+      stop("profile bootstrap requires categorical predictors")
+    }
+    W <- W * Kj
+  }
+
+  W
+}
+
+.np_regression_cat_profile_mean <- function(bws, txdat, tydat, exdat = NULL) {
+  if (!npUseCategoricalCompress(ncon = bws$ncon,
+                                ncat = bws$nuno + bws$nord))
+    return(NULL)
+  if (!identical(bws$type, "fixed"))
+    return(NULL)
+  if (!isTRUE(bws$ncon == 0L) || (bws$nuno + bws$nord) < 1L)
+    return(NULL)
+
+  regtype <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+  if (!(identical(regtype, "lc") || identical(regtype, "lp")))
+    return(NULL)
+  if (identical(regtype, "lp") && length(bws$degree) && any(bws$degree > 0L))
+    return(NULL)
+
+  txdat <- toFrame(txdat)
+  no.ex <- is.null(exdat)
+  if (no.ex) {
+    exdat <- txdat
+  } else {
+    exdat <- toFrame(exdat)
+    if (!(txdat %~% exdat))
+      return(NULL)
+  }
+
+  if (ncol(txdat) != length(bws$bw) || ncol(exdat) != ncol(txdat))
+    return(NULL)
+  if (length(tydat) != nrow(txdat))
+    return(NULL)
+
+  if (!all(vapply(txdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+  if (!all(vapply(exdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+
+  if (is.factor(tydat)) {
+    tydat <- adjustLevels(data.frame(tydat), bws$ydati)[, 1L]
+    tydat <- (bws$ydati$all.dlev[[1L]])[as.integer(tydat)]
+  } else {
+    tydat <- as.double(tydat)
+  }
+  if (anyNA(tydat))
+    return(NULL)
+
+  txdat <- adjustLevels(txdat, bws$xdati)
+  exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
+
+  if (!all(vapply(seq_along(txdat), function(j) {
+    identical(is.ordered(txdat[[j]]), is.ordered(exdat[[j]])) &&
+      identical(levels(txdat[[j]]), levels(exdat[[j]]))
+  }, logical(1))))
+    return(NULL)
+
+  train.codes <- .np_cat_profile_code_matrix(txdat)
+  eval.codes <- .np_cat_profile_code_matrix(exdat)
+  if (anyNA(train.codes) || anyNA(eval.codes))
+    return(NULL)
+
+  train.keys <- .np_cat_profile_keys(train.codes)
+  eval.keys <- .np_cat_profile_keys(eval.codes)
+  train.profile.keys <- unique(train.keys)
+  eval.profile.keys <- unique(eval.keys)
+  train.id <- match(train.keys, train.profile.keys)
+  eval.id <- match(eval.keys, eval.profile.keys)
+  train.rep <- match(train.profile.keys, train.keys)
+  eval.rep <- match(eval.profile.keys, eval.keys)
+  G <- length(train.profile.keys)
+
+  train.profile.codes <- train.codes[train.rep, , drop = FALSE]
+  eval.profile.codes <- eval.codes[eval.rep, , drop = FALSE]
+  train.profile.dat <- txdat[train.rep, , drop = FALSE]
+  L.eval <- tryCatch(
+    .np_regression_cat_profile_kernel_matrix(
+      eval.codes = eval.profile.codes,
+      train.codes = train.profile.codes,
+      xdat = train.profile.dat,
+      bws = bws
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(L.eval))
+    return(NULL)
+
+  counts <- as.double(tabulate(train.id, nbins = G))
+  sums <- as.vector(.np_cat_profile_rowsum(tydat, train.id, G))
+  den <- as.vector(L.eval %*% counts)
+  if (any(!is.finite(den)) || any(!(abs(den) > .Machine$double.xmin)))
+    return(NULL)
+
+  profile.mean <- as.vector(L.eval %*% sums / den)
+  profile.mean[eval.id]
+}
+
+.np_density_cat_profile_kernel_matrix <- function(eval.codes,
+                                                  train.codes,
+                                                  xdat,
+                                                  bws) {
+  eval.codes <- as.matrix(eval.codes)
+  train.codes <- as.matrix(train.codes)
+  if (ncol(eval.codes) != ncol(train.codes))
+    stop("profile code matrices must have matching columns")
+
+  W <- matrix(1.0, nrow = nrow(eval.codes), ncol = nrow(train.codes))
+  lambda <- as.double(bws$bw)
+
+  for (j in seq_len(ncol(train.codes))) {
+    if (is.factor(xdat[[j]]) && !is.ordered(xdat[[j]])) {
+      same <- outer(eval.codes[, j], train.codes[, j], "==")
+      ncat <- nlevels(xdat[[j]])
+      if (ncat < 2L) {
+        Kj <- ifelse(same, 1.0, 0.0)
+      } else if (identical(bws$ukertype, "aitchisonaitken")) {
+        Kj <- ifelse(same, 1.0 - lambda[j], lambda[j] / (ncat - 1.0))
+      } else if (identical(bws$ukertype, "liracine")) {
+        Kj <- ifelse(same, 1.0, lambda[j])
+      } else {
+        stop("unsupported unordered categorical kernel in density profile bootstrap")
+      }
+    } else if (is.ordered(xdat[[j]])) {
+      d <- abs(outer(eval.codes[, j], train.codes[, j], "-"))
+      if (identical(bws$okertype, "wangvanryzin")) {
+        Kj <- ifelse(d == 0, 1.0 - lambda[j],
+                     (lambda[j]^d) * (1.0 - lambda[j]) * 0.5)
+      } else if (identical(bws$okertype, "liracine")) {
+        Kj <- lambda[j]^d
+      } else if (identical(bws$okertype, "nliracine")) {
+        Kj <- (lambda[j]^d) * (1.0 - lambda[j]) / (1.0 + lambda[j])
+      } else if (identical(bws$okertype, "racineliyan")) {
+        support <- .np_cat_ordered_support_values(xdat[[j]])
+        den <- vapply(train.codes[, j],
+                      function(x) sum(lambda[j]^abs(x - support)),
+                      numeric(1))
+        Kj <- t(t(lambda[j]^d) / den)
+      } else {
+        stop("unsupported ordered categorical kernel in density profile bootstrap")
+      }
+    } else {
+      stop("density profile bootstrap requires categorical predictors")
+    }
+    W <- W * Kj
+  }
+
+  W
+}
+
+.np_regression_cat_profile_boot_setup <- function(xdat, exdat, ydat, bws) {
+  if (!npUseCategoricalCompress(ncon = bws$ncon,
+                                ncat = bws$nuno + bws$nord))
+    return(NULL)
+  if (!identical(bws$type, "fixed"))
+    return(NULL)
+  if (!isTRUE(bws$ncon == 0L) || (bws$nuno + bws$nord) < 1L)
+    return(NULL)
+
+  regtype <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+  if (!(identical(regtype, "lc") || identical(regtype, "lp")))
+    return(NULL)
+  if (identical(regtype, "lp") && length(bws$degree) && any(bws$degree > 0L))
+    return(NULL)
+
+  xdat <- toFrame(xdat)
+  exdat <- toFrame(exdat)
+  ydat <- as.double(ydat)
+  if (length(ydat) != nrow(xdat) || nrow(exdat) < 1L)
+    return(NULL)
+  if (ncol(xdat) != length(bws$bw) || ncol(exdat) != ncol(xdat))
+    return(NULL)
+  if (!all(vapply(xdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+  if (!all(vapply(exdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+  if (!all(vapply(seq_along(xdat), function(j) {
+    identical(is.ordered(xdat[[j]]), is.ordered(exdat[[j]])) &&
+      identical(levels(xdat[[j]]), levels(exdat[[j]]))
+  }, logical(1))))
+    return(NULL)
+
+  train.codes <- .np_cat_profile_code_matrix(xdat)
+  eval.codes <- .np_cat_profile_code_matrix(exdat)
+  train.keys <- .np_cat_profile_keys(train.codes)
+  eval.keys <- .np_cat_profile_keys(eval.codes)
+
+  train.profile.keys <- unique(train.keys)
+  eval.profile.keys <- unique(eval.keys)
+  train.id <- match(train.keys, train.profile.keys)
+  eval.id <- match(eval.keys, eval.profile.keys)
+  train.rep <- match(train.profile.keys, train.keys)
+  eval.rep <- match(eval.profile.keys, eval.keys)
+  G <- length(train.profile.keys)
+  A <- length(eval.profile.keys)
+
+  if (G < 1L || A < 1L || (4L * G > 3L * nrow(xdat)))
+    return(NULL)
+
+  train.profile.codes <- train.codes[train.rep, , drop = FALSE]
+  eval.profile.codes <- eval.codes[eval.rep, , drop = FALSE]
+  L.eval <- tryCatch(
+    .np_regression_cat_profile_kernel_matrix(
+      eval.codes = eval.profile.codes,
+      train.codes = train.profile.codes,
+      xdat = xdat,
+      bws = bws
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(L.eval))
+    return(NULL)
+
+  counts <- as.double(tabulate(train.id, nbins = G))
+  sums <- as.vector(.np_cat_profile_rowsum(ydat, train.id, G))
+  den.eval <- as.vector(L.eval %*% counts)
+  if (any(!is.finite(den.eval)) || any(!(abs(den.eval) > .Machine$double.xmin)))
+    return(NULL)
+  t0.profile <- as.vector(L.eval %*% sums / den.eval)
+
+  L.train <- tryCatch(
+    .np_regression_cat_profile_kernel_matrix(
+      eval.codes = train.profile.codes,
+      train.codes = train.profile.codes,
+      xdat = xdat,
+      bws = bws
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(L.train))
+    return(NULL)
+  den.train <- as.vector(L.train %*% counts)
+  if (any(!is.finite(den.train)) || any(!(abs(den.train) > .Machine$double.xmin)))
+    return(NULL)
+  fit.train.profile <- as.vector(L.train %*% sums / den.train)
+
+  list(
+    L.eval = L.eval,
+    train.id = train.id,
+    eval.id = eval.id,
+    G = G,
+    A = A,
+    counts = counts,
+    den.eval = den.eval,
+    t0 = t0.profile[eval.id],
+    ydat = ydat,
+    fit.train = fit.train.profile[train.id],
+    fit.train.profile = fit.train.profile
+  )
+}
+
+.np_unconditional_density_cat_profile_boot_setup <- function(xdat,
+                                                             exdat,
+                                                             bws,
+                                                             operator) {
+  if (!npUseCategoricalCompress(ncon = bws$ncon,
+                                ncat = bws$nuno + bws$nord))
+    return(NULL)
+  if (!identical(bws$type, "fixed"))
+    return(NULL)
+  if (!identical(operator, "normal"))
+    return(NULL)
+  if (!isTRUE(bws$ncon == 0L) || (bws$nuno + bws$nord) < 1L)
+    return(NULL)
+
+  xdat <- toFrame(xdat)
+  exdat <- toFrame(exdat)
+  if (nrow(xdat) < 1L || nrow(exdat) < 1L)
+    return(NULL)
+  if (ncol(xdat) != length(bws$bw) || ncol(exdat) != ncol(xdat))
+    return(NULL)
+  if (!all(vapply(xdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+  if (!all(vapply(exdat, function(z) is.factor(z) || is.ordered(z), logical(1))))
+    return(NULL)
+  if (!all(vapply(seq_along(xdat), function(j) {
+    identical(is.ordered(xdat[[j]]), is.ordered(exdat[[j]])) &&
+      identical(levels(xdat[[j]]), levels(exdat[[j]]))
+  }, logical(1))))
+    return(NULL)
+
+  train.codes <- .np_cat_profile_code_matrix(xdat)
+  eval.codes <- .np_cat_profile_code_matrix(exdat)
+  train.keys <- .np_cat_profile_keys(train.codes)
+  eval.keys <- .np_cat_profile_keys(eval.codes)
+
+  train.profile.keys <- unique(train.keys)
+  eval.profile.keys <- unique(eval.keys)
+  train.id <- match(train.keys, train.profile.keys)
+  eval.id <- match(eval.keys, eval.profile.keys)
+  train.rep <- match(train.profile.keys, train.keys)
+  eval.rep <- match(eval.profile.keys, eval.keys)
+  G <- length(train.profile.keys)
+  A <- length(eval.profile.keys)
+
+  if (G < 1L || A < 1L || (4L * G > 3L * nrow(xdat)))
+    return(NULL)
+
+  train.profile.codes <- train.codes[train.rep, , drop = FALSE]
+  eval.profile.codes <- eval.codes[eval.rep, , drop = FALSE]
+  L.eval <- tryCatch(
+    .np_density_cat_profile_kernel_matrix(
+      eval.codes = eval.profile.codes,
+      train.codes = train.profile.codes,
+      xdat = xdat,
+      bws = bws
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(L.eval))
+    return(NULL)
+
+  counts <- as.double(tabulate(train.id, nbins = G))
+  n <- nrow(xdat)
+  t0.profile <- as.vector(L.eval %*% counts / n)
+
+  list(
+    L.eval = L.eval,
+    train.id = train.id,
+    eval.id = eval.id,
+    G = G,
+    A = A,
+    counts = counts,
+    n = n,
+    t0 = t0.profile[eval.id]
+  )
+}
+
+.np_inid_boot_from_unconditional_density_cat_profile <- function(setup,
+                                                                 B,
+                                                                 counts = NULL,
+                                                                 counts.drawer = NULL,
+                                                                 progress.label = NULL) {
+  B <- as.integer(B)
+  n <- setup$n
+  if (B < 1L || n < 1L || setup$G < 1L)
+    stop("invalid unconditional density profile bootstrap dimensions")
+
+  counts.mat <- if (!is.null(counts))
+    .np_inid_counts_matrix(n = n, B = B, counts = counts)
+  else NULL
+  chunk.size <- .np_inid_chunk_size(n = n, B = B,
+                                    progress_cap = !is.null(counts.drawer))
+  prob <- setup$counts / n
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(setup$t0))
+  progress.label <- if (is.null(progress.label)) {
+    if (!is.null(counts.drawer)) "Plot bootstrap block" else "Plot bootstrap inid"
+  } else {
+    progress.label
+  }
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit(.np_plot_progress_end(progress), add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size,
+                                                        progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    profile.counts <- if (!is.null(counts.mat)) {
+      .np_cat_profile_rowsum(counts.mat[, start:stopi, drop = FALSE],
+                             setup$train.id,
+                             setup$G)
+    } else if (!is.null(counts.drawer)) {
+      .np_cat_profile_rowsum(
+        .np_inid_counts_matrix(n = n, B = bsz, counts = counts.drawer(start, stopi)),
+        setup$train.id,
+        setup$G
+      )
+    } else {
+      stats::rmultinom(n = bsz, size = n, prob = prob)
+    }
+
+    prof <- tcrossprod(t(profile.counts), setup$L.eval) / n
+    tmat[start:stopi, ] <- prof[, setup$eval.id, drop = FALSE]
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = setup$t0)
+}
+
+.np_inid_boot_from_regression_cat_profile <- function(setup,
+                                                      B,
+                                                      counts = NULL,
+                                                      counts.drawer = NULL,
+                                                      progress.label = NULL) {
+  B <- as.integer(B)
+  n <- length(setup$ydat)
+  if (B < 1L || n < 1L)
+    stop("invalid categorical profile bootstrap dimensions")
+
+  counts.mat <- if (!is.null(counts))
+    .np_inid_counts_matrix(n = n, B = B, counts = counts)
+  else NULL
+  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer))
+  prob <- rep.int(1 / n, n)
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(setup$t0))
+  progress.label <- if (is.null(progress.label)) {
+    if (!is.null(counts.drawer)) "Plot bootstrap block" else "Plot bootstrap inid"
+  } else {
+    progress.label
+  }
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit(.np_plot_progress_end(progress), add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size,
+                                                        progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    counts.chunk <- if (!is.null(counts.mat)) {
+      counts.mat[, start:stopi, drop = FALSE]
+    } else if (!is.null(counts.drawer)) {
+      .np_inid_counts_matrix(n = n, B = bsz, counts = counts.drawer(start, stopi))
+    } else {
+      stats::rmultinom(n = bsz, size = n, prob = prob)
+    }
+    Cg <- .np_cat_profile_rowsum(counts.chunk, setup$train.id, setup$G)
+    Sg <- .np_cat_profile_rowsum(counts.chunk * setup$ydat,
+                                 setup$train.id,
+                                 setup$G)
+    den <- tcrossprod(t(Cg), setup$L.eval)
+    num <- tcrossprod(t(Sg), setup$L.eval)
+    prof <- num / pmax(den, .Machine$double.eps)
+    tmat[start:stopi, ] <- prof[, setup$eval.id, drop = FALSE]
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = setup$t0)
+}
+
+.np_wild_boot_from_regression_cat_profile <- function(setup,
+                                                      B,
+                                                      wild,
+                                                      progress.label = NULL) {
+  B <- as.integer(B)
+  n <- length(setup$ydat)
+  if (B < 1L || n < 1L)
+    stop("invalid categorical profile wild bootstrap dimensions")
+
+  chunk.size <- .np_wild_chunk_size(n = n, B = B)
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(setup$t0))
+  residuals <- setup$ydat - setup$fit.train
+  base.sums <- setup$counts * setup$fit.train.profile
+  wild <- .np_plot_normalize_wild(wild)
+  draw.fun <- if (identical(wild, "mammen")) .np_mammen_draws else .np_rademacher_draws
+  progress.label <- if (is.null(progress.label)) "Plot bootstrap wild" else progress.label
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit(.np_plot_progress_end(progress), add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size,
+                                                        progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    draws <- draw.fun(n = n, B = bsz)
+    Rg <- .np_cat_profile_rowsum(draws * residuals, setup$train.id, setup$G)
+    Sg <- sweep(Rg, 1L, base.sums, "+", check.margin = FALSE)
+    num <- tcrossprod(t(Sg), setup$L.eval)
+    prof <- sweep(num, 2L, setup$den.eval, "/", check.margin = FALSE)
+    tmat[start:stopi, ] <- prof[, setup$eval.id, drop = FALSE]
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = setup$t0)
 }
 
 .np_inid_lp_unpack_sym_row <- function(mrow, p) {
@@ -2996,11 +3642,9 @@
   if (n < 1L || neval < 1L || B < 1L)
     stop("invalid exact regression bootstrap dimensions")
 
-  # Exact plot bootstrap repeatedly refits on resamples; keep nonfixed direct
-  # regression evaluations local so the helper does not re-enter pooled MPI
-  # execution while a plot-owned worker/bootstrap context is active.
-  use.local.direct <- identical(bws$type, "generalized_nn") ||
-    identical(bws$type, "adaptive_nn")
+  # Exact plot bootstrap repeatedly refits on resamples; keep direct regression
+  # evaluations local so plot-owned bootstrap work cannot re-enter pooled MPI.
+  use.local.direct <- TRUE
 
   fit_one <- function(x.train, y.train) {
     fit <- .np_regression_direct(
@@ -3133,11 +3777,15 @@
           chunk.size = chunk.size,
           what = "inid-regression-exact"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
         bsz <- as.integer(task$bsz)
-        counts.chunk <- stats::rmultinom(n = bsz, size = n, prob = prob)
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         compute_chunk(counts.chunk = counts.chunk)
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -3236,7 +3884,13 @@
         gradient.order = gradient.order,
         ncon = ncon
       )
-      if (gradient.order[cpos] > degree[cpos]) {
+      if (gradient.order[cpos] > degree[cpos] &&
+          !npGlpDegree0FirstDerivativeLcOk(
+            regtype.engine = regtype,
+            degree.engine = degree,
+            gradient.order = gradient.order,
+            ncon = ncon
+          )) {
         return(list(
           t = matrix(NA_real_, nrow = B, ncol = neval),
           t0 = rep(NA_real_, neval)
@@ -3449,11 +4103,15 @@
           chunk.size = chunk.size,
           what = what.base
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
         bsz <- as.integer(task$bsz)
-        counts.chunk <- stats::rmultinom(n = bsz, size = n, prob = prob)
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         compute_chunk(counts.chunk = counts.chunk)
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -3886,6 +4544,30 @@
   if (length(ydat) != nrow(txdat))
     stop("length of ydat must match training rows in smooth coefficient inid helper")
 
+  profile.eligible <- identical(bws$regtype, "lc") &&
+    !leave.one.out &&
+    identical(bws$type, "fixed") &&
+    npUseCategoricalCompress(ncon = bws$ncon,
+                             ncat = bws$nuno + bws$nord) &&
+    !miss.z &&
+    isTRUE(bws$ncon == 0L) &&
+    isTRUE((bws$nuno + bws$nord) > 0L)
+
+  if (profile.eligible) {
+    return(.np_inid_boot_from_scoef_cat_profile(
+      txdat = txdat,
+      ydat = .np_inid_scoef_numeric_y(ydat = ydat, bws = bws),
+      tzdat = tzdat,
+      exdat = exdat,
+      ezdat = ezdat,
+      bws = bws,
+      B = B,
+      counts = counts,
+      counts.drawer = counts.drawer,
+      progress.label = progress.label
+    ))
+  }
+
   hat.args <- list(
     bws = bws,
     txdat = txdat,
@@ -3908,6 +4590,169 @@
     counts.drawer = counts.drawer,
     progress.label = progress.label
   )
+}
+
+.np_inid_boot_from_scoef_cat_profile <- function(txdat,
+                                                 ydat,
+                                                 tzdat,
+                                                 exdat,
+                                                 ezdat,
+                                                 bws,
+                                                 B,
+                                                 counts = NULL,
+                                                 counts.drawer = NULL,
+                                                 progress.label = NULL,
+                                                 ridge = 0.0) {
+  txdat <- adjustLevels(txdat, bws$xdati)
+  exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
+  tzdat <- adjustLevels(tzdat, bws$zdati)
+  ezdat <- adjustLevels(ezdat, bws$zdati, allowNewCells = TRUE)
+
+  X.train <- toMatrix(txdat)
+  X.eval <- toMatrix(exdat)
+  W.train <- cbind(1.0, X.train)
+  W.eval <- cbind(1.0, X.eval)
+  ydat <- as.double(ydat)
+  B <- as.integer(B)
+  n <- nrow(W.train)
+  m <- nrow(W.eval)
+  p <- ncol(W.train)
+
+  train.codes <- .np_cat_profile_code_matrix(tzdat)
+  eval.codes <- .np_cat_profile_code_matrix(ezdat)
+  train.keys <- .np_cat_profile_keys(train.codes)
+  profile.keys <- unique(train.keys)
+  train.id <- match(train.keys, profile.keys)
+  train.rep <- match(profile.keys, train.keys)
+  G <- length(profile.keys)
+  L.eval <- .np_regression_cat_profile_kernel_matrix(
+    eval.codes = eval.codes,
+    train.codes = train.codes[train.rep, , drop = FALSE],
+    xdat = tzdat[train.rep, , drop = FALSE],
+    bws = bws
+  )
+
+  sww.profile <- matrix(0.0, nrow = G, ncol = p * p)
+  swy.profile <- matrix(0.0, nrow = G, ncol = p)
+  for (j in seq_len(p)) {
+    for (k in seq_len(p)) {
+      sww.profile[, (j - 1L) * p + k] <-
+        .np_cat_profile_rowsum(W.train[, j] * W.train[, k],
+                               train.id, G)[, 1L]
+    }
+    swy.profile[, j] <-
+      .np_cat_profile_rowsum(W.train[, j] * ydat, train.id, G)[, 1L]
+  }
+
+  sww.eval <- L.eval %*% sww.profile
+  swy.eval <- L.eval %*% swy.profile
+  ridge.grid <- npRidgeSequenceFromBase(
+    n.train = n,
+    ridge.base = max(0.0, as.double(ridge)),
+    cap = 1.0
+  )
+  V <- matrix(NA_real_, nrow = p, ncol = m)
+  for (ii in seq_len(m)) {
+    XtWX <- matrix(sww.eval[ii, ], nrow = p, ncol = p, byrow = TRUE)
+    diag.loc <- cbind(seq_len(p), seq_len(p))
+    XtWX.diag <- XtWX[diag.loc]
+    solved <- FALSE
+    for (ridge.try in ridge.grid) {
+      A <- XtWX
+      if (ridge.try > 0)
+        A[diag.loc] <- XtWX.diag + ridge.try
+      v <- tryCatch(
+        solve(t(A), matrix(W.eval[ii, ], ncol = 1L)),
+        error = function(e) NULL
+      )
+      if (!is.null(v) && all(is.finite(v))) {
+        V[, ii] <- drop(v)
+        solved <- TRUE
+        break
+      }
+    }
+    if (!solved)
+      stop(sprintf("failed to solve smooth coefficient profile bootstrap row %d", ii))
+  }
+
+  t0 <- as.vector(colSums(V * t(swy.eval)))
+  tmat <- matrix(NA_real_, nrow = B, ncol = m)
+
+  if (!is.null(counts)) {
+    counts.mat <- .np_inid_counts_matrix(n = n, B = B, counts = counts)
+    for (bb in seq_len(B)) {
+      cw.profile <- matrix(0.0, nrow = G, ncol = p)
+      cwy.profile <- matrix(0.0, nrow = G, ncol = p)
+      counts.b <- counts.mat[, bb]
+      for (j in seq_len(p)) {
+        cw.profile[, j] <-
+          .np_cat_profile_rowsum(counts.b * W.train[, j],
+                                 train.id, G)[, 1L]
+        cwy.profile[, j] <-
+          .np_cat_profile_rowsum(counts.b * W.train[, j] * ydat,
+                                 train.id, G)[, 1L]
+      }
+      den <- L.eval %*% cw.profile
+      num <- L.eval %*% cwy.profile
+      tmat[bb, ] <- colSums(V * t(num)) /
+        pmax(colSums(V * t(den)), .Machine$double.eps)
+    }
+    return(list(t = tmat, t0 = t0))
+  }
+
+  chunk.size <- .np_inid_chunk_size(n = n, B = B,
+                                    progress_cap = !is.null(counts.drawer))
+  prob <- rep.int(1 / n, n)
+  progress.label <- if (is.null(progress.label)) {
+    if (!is.null(counts.drawer)) "Plot bootstrap block" else "Plot bootstrap inid"
+  } else {
+    progress.label
+  }
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size,
+                                                        progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    counts.chunk <- if (!is.null(counts.drawer)) {
+      .np_inid_counts_matrix(n = n, B = bsz, counts = counts.drawer(start, stopi))
+    } else {
+      stats::rmultinom(n = bsz, size = n, prob = prob)
+    }
+    for (jj in seq_len(bsz)) {
+      bb <- start + jj - 1L
+      cw.profile <- matrix(0.0, nrow = G, ncol = p)
+      cwy.profile <- matrix(0.0, nrow = G, ncol = p)
+      counts.b <- counts.chunk[, jj]
+      for (j in seq_len(p)) {
+        cw.profile[, j] <-
+          .np_cat_profile_rowsum(counts.b * W.train[, j],
+                                 train.id, G)[, 1L]
+        cwy.profile[, j] <-
+          .np_cat_profile_rowsum(counts.b * W.train[, j] * ydat,
+                                 train.id, G)[, 1L]
+      }
+      den <- L.eval %*% cw.profile
+      num <- L.eval %*% cwy.profile
+      tmat[bb, ] <- colSums(V * t(num)) /
+        pmax(colSums(V * t(den)), .Machine$double.eps)
+    }
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
 }
 
 .np_inid_boot_from_scoef_localpoly_fixed <- function(txdat,
@@ -4181,14 +5026,14 @@
           chunk.size = chunk.size,
           what = "inid-scoef-localpoly"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
-        counts.chunk <- stats::rmultinom(
-          n = as.integer(task$bsz),
-          size = n,
-          prob = prob
-        )
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         compute_chunk(counts.chunk = counts.chunk)
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -4387,14 +5232,14 @@
           chunk.size = chunk.size,
           what = "inid-scoef-exact"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
-        counts.chunk <- stats::rmultinom(
-          n = as.integer(task$bsz),
-          size = n,
-          prob = prob
-        )
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         compute_chunk(counts.chunk = counts.chunk)
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -5092,7 +5937,6 @@
   workers <- .npRmpi_bootstrap_worker_count(comm = 1L)
   nslots <- max(1L, workers + 1L)
   chunk.size <- max(1L, as.integer(ceiling(B / nslots)))
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   prob.local <- rep.int(1 / n, n)
   has.counts.mat.local <- !is.null(counts.mat)
   counts.mat.local <- if (is.null(counts.mat)) {
@@ -5105,6 +5949,11 @@
     function(start, stop) stop("counts.drawer is not available")
   } else {
     counts.drawer
+  }
+  tasks <- if (!isTRUE(has.counts.mat.local) && !isTRUE(has.counts.drawer.local)) {
+    .npRmpi_bootstrap_rmultinom_tasks(B = B, chunk.size = chunk.size, size = n, prob = prob.local)
+  } else {
+    .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   }
 
   worker <- function(task) {
@@ -5120,8 +5969,7 @@
         counts = counts.drawer.local(start, stopi)
       )
     } else {
-      set.seed(as.integer(task$seed))
-      stats::rmultinom(n = bsz, size = n, prob = prob.local)
+      .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob.local)
     }
     .np_inid_boot_from_plreg_state_chunk(
       counts.chunk = counts.chunk,
@@ -5262,7 +6110,6 @@
   workers <- .npRmpi_bootstrap_worker_count(comm = 1L)
   nslots <- max(1L, workers + 1L)
   chunk.size <- max(1L, as.integer(ceiling(B / nslots)))
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   prob.local <- rep.int(1 / n, n)
   has.counts.mat.local <- !is.null(counts.mat)
   counts.mat.local <- if (is.null(counts.mat)) {
@@ -5275,6 +6122,11 @@
     function(start, stop) stop("counts.drawer is not available")
   } else {
     counts.drawer
+  }
+  tasks <- if (!isTRUE(has.counts.mat.local) && !isTRUE(has.counts.drawer.local)) {
+    .npRmpi_bootstrap_rmultinom_tasks(B = B, chunk.size = chunk.size, size = n, prob = prob.local)
+  } else {
+    .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   }
 
   worker <- function(task) {
@@ -5290,8 +6142,7 @@
         counts = counts.drawer.local(start, stopi)
       )
     } else {
-      set.seed(as.integer(task$seed))
-      stats::rmultinom(n = bsz, size = n, prob = prob.local)
+      .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob.local)
     }
     .np_inid_boot_from_plreg_lc_fixed_chunk(
       counts.chunk = counts.chunk,
@@ -6094,7 +6945,11 @@
     mcv.numRow = attr(bws$xmcv, "num.row"),
     wncol = 0L,
     yncol = 0L,
-    int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO,
+    int_do_tree = npDoTreeOrCategoricalCompress(
+      ncon = bws$ncon,
+      ncat = bws$nuno + bws$nord,
+      bws = bws
+    ),
     return.kernel.weights = TRUE,
     permutation.operator = PERMUTATION_OPERATORS[["none"]],
     compute.score = FALSE,
@@ -6389,11 +7244,15 @@
           chunk.size = chunk.size,
           what = "inid-ksum-unconditional-exact"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
         bsz <- as.integer(task$bsz)
-        counts.chunk <- stats::rmultinom(n = bsz, size = n, prob = prob)
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         out <- matrix(NA_real_, nrow = bsz, ncol = nout)
         for (jj in seq_len(bsz)) {
           active.sample <- .np_active_boot_sample(
@@ -6541,11 +7400,19 @@
         chunk.size = chunk.size,
         what = what.base
       )) {
-    tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+    tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n.local,
+      prob = prob.local
+    )
     worker <- function(task) {
-      set.seed(as.integer(task$seed))
       bsz <- as.integer(task$bsz)
-      counts.chunk <- stats::rmultinom(n = bsz, size = n.local, prob = prob.local)
+      counts.chunk <- .npRmpi_bootstrap_task_rmultinom(
+        task = task,
+        n = n.local,
+        prob = prob.local
+      )
       crossprod(counts.chunk, HT.local)
     }
     tmat <- .npRmpi_bootstrap_run_fanout(
@@ -6693,6 +7560,22 @@
   if (n < 1L || neval < 1L || B < 1L)
     stop("invalid unconditional inid bootstrap dimensions")
 
+  cat.setup <- .np_unconditional_density_cat_profile_boot_setup(
+    xdat = xdat,
+    exdat = exdat,
+    bws = bws,
+    operator = operator
+  )
+  if (!is.null(cat.setup)) {
+    return(.np_inid_boot_from_unconditional_density_cat_profile(
+      setup = cat.setup,
+      B = B,
+      counts = counts,
+      counts.drawer = counts.drawer,
+      progress.label = progress.label
+    ))
+  }
+
   progress.label <- if (is.null(progress.label)) {
     if (!is.null(counts.drawer)) "Plot bootstrap block" else "Plot bootstrap inid"
   } else {
@@ -6777,11 +7660,19 @@
           chunk.size = chunk.size,
           what = "inid-ksum-unconditional"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n.local,
+        prob = prob.local
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
         bsz <- as.integer(task$bsz)
-        counts.chunk <- stats::rmultinom(n = bsz, size = n.local, prob = prob.local)
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(
+          task = task,
+          n = n.local,
+          prob = prob.local
+        )
         crossprod(counts.chunk, kw.local) / n.local
       }
       tmat <- .npRmpi_bootstrap_run_fanout(
@@ -6901,11 +7792,19 @@
         chunk.size = chunk.size,
         what = "inid-ksum-unconditional"
       )) {
-    tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+    tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n.local,
+      prob = prob.local
+    )
     worker <- function(task) {
-      set.seed(as.integer(task$seed))
       bsz <- as.integer(task$bsz)
-      counts.chunk <- stats::rmultinom(n = bsz, size = n.local, prob = prob.local)
+      counts.chunk <- .npRmpi_bootstrap_task_rmultinom(
+        task = task,
+        n = n.local,
+        prob = prob.local
+      )
       t(K.local %*% counts.chunk)
     }
     tmat <- .npRmpi_bootstrap_run_fanout(
@@ -7071,14 +7970,14 @@
           chunk.size = chunk.size,
           what = "inid-hat-frozen-conditional"
         )
-        tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+        tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+          B = B,
+          chunk.size = chunk.size,
+          size = n,
+          prob = prob
+        )
         worker <- function(task) {
-          set.seed(as.integer(task$seed))
-          compute_chunk(stats::rmultinom(
-            n = as.integer(task$bsz),
-            size = n,
-            prob = prob
-          ))
+          compute_chunk(.npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob))
         }
         tmat <- .npRmpi_bootstrap_run_fanout(
           tasks = tasks,
@@ -7442,7 +8341,11 @@
     mcv.numRow = attr(state$bws$xmcv, "num.row"),
     wncol = 1L,
     yncol = 1L,
-    int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO,
+    int_do_tree = npDoTreeOrCategoricalCompress(
+      ncon = state$bws$ncon,
+      ncat = state$bws$nuno + state$bws$nord,
+      bws = state$bws
+    ),
     return.kernel.weights = FALSE,
     permutation.operator = PERMUTATION_OPERATORS[["none"]],
     compute.score = FALSE,
@@ -8026,13 +8929,30 @@
       comm = 1L,
       include.master = TRUE
     )
-    tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
     counts.mode <- if (!is.null(counts.mat)) {
       "matrix"
     } else if (!is.null(counts.drawer)) {
       "drawer"
     } else {
       "random"
+    }
+    tasks <- .npRmpi_bootstrap_chunk_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      with.seeds = !identical(counts.mode, "random")
+    )
+    if (identical(counts.mode, "random")) {
+      prob.local <- rep.int(1 / state$n, state$n)
+      tasks <- .npRmpi_bootstrap_attach_rng_stream(
+        tasks,
+        function(task) {
+          invisible(stats::rmultinom(
+            n = as.integer(task$bsz),
+            size = state$n,
+            prob = prob.local
+          ))
+        }
+      )
     }
 
     worker <- function(task) {
@@ -8047,8 +8967,11 @@
           counts = counts.drawer(start, stopi)
         )
       } else {
-        set.seed(as.integer(task$seed))
-        .np_inid_counts_matrix(n = state$n, B = as.integer(task$bsz))
+        .npRmpi_bootstrap_task_rmultinom(
+          task = task,
+          n = state$n,
+          prob = rep.int(1 / state$n, state$n)
+        )
       }
 
       .np_inid_boot_from_conditional_localpoly_fixed_fill_chunk(
@@ -8073,6 +8996,8 @@
           feat.list = feat.list,
           counts.mode = counts.mode,
           .np_inid_counts_matrix = .np_inid_counts_matrix,
+          .npRmpi_bootstrap_task_rmultinom = .npRmpi_bootstrap_task_rmultinom,
+          .npRmpi_bootstrap_use_task_rng = .npRmpi_bootstrap_use_task_rng,
           .np_inid_boot_from_conditional_localpoly_fixed_fill_chunk =
             .np_inid_boot_from_conditional_localpoly_fixed_fill_chunk,
           .np_inid_boot_from_conditional_localpoly_fixed_chunk =
@@ -8303,10 +9228,15 @@
       return(out)
   } else {
     prob <- rep.int(1 / n, n)
+    tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n,
+      prob = prob
+    )
     worker <- function(task) {
-      set.seed(as.integer(task$seed))
       eval_counts_chunk(
-        stats::rmultinom(n = as.integer(task$bsz), size = n, prob = prob)
+        .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
       )
     }
     out <- run_adaptive_fanout(
@@ -8739,11 +9669,15 @@
           chunk.size = chunk.size,
           what = "inid-ksum-conditional-exact"
         )) {
-      tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+      tasks <- .npRmpi_bootstrap_rmultinom_tasks(
+        B = B,
+        chunk.size = chunk.size,
+        size = n,
+        prob = prob
+      )
       worker <- function(task) {
-        set.seed(as.integer(task$seed))
         bsz <- as.integer(task$bsz)
-        counts.chunk <- stats::rmultinom(n = bsz, size = n, prob = prob)
+        counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         out <- matrix(NA_real_, nrow = bsz, ncol = nout)
         for (jj in seq_len(bsz)) {
           active.sample <- if (use.matrix.fast) {
@@ -9046,16 +9980,36 @@
       chunk.size = chunk.size,
       what = "inid-ksum-conditional-fixed-lc"
     )
-    tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+    tasks <- .npRmpi_bootstrap_chunk_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      with.seeds = !is.null(counts.drawer)
+    )
     counts.mode <- if (!is.null(counts.drawer)) "drawer" else "random"
+    if (identical(counts.mode, "random")) {
+      prob.local <- rep.int(1 / n, n)
+      tasks <- .npRmpi_bootstrap_attach_rng_stream(
+        tasks,
+        function(task) {
+          invisible(stats::rmultinom(
+            n = as.integer(task$bsz),
+            size = n,
+            prob = prob.local
+          ))
+        }
+      )
+    }
     worker <- function(task) {
       start <- as.integer(task$start)
       stopi <- start + as.integer(task$bsz) - 1L
       counts.chunk <- if (identical(counts.mode, "drawer")) {
         .np_inid_counts_matrix(n = n, B = as.integer(task$bsz), counts = counts.drawer(start, stopi))
       } else {
-        set.seed(as.integer(task$seed))
-        stats::rmultinom(n = as.integer(task$bsz), size = n, prob = rep.int(1 / n, n))
+        .npRmpi_bootstrap_task_rmultinom(
+          task = task,
+          n = n,
+          prob = rep.int(1 / n, n)
+        )
       }
       .np_inid_boot_from_ksum_conditional_fixed_lc_chunk(
         ops = ops,
@@ -9078,6 +10032,8 @@
             n = n,
             counts.mode = counts.mode,
             .np_inid_counts_matrix = .np_inid_counts_matrix,
+            .npRmpi_bootstrap_task_rmultinom = .npRmpi_bootstrap_task_rmultinom,
+            .npRmpi_bootstrap_use_task_rng = .npRmpi_bootstrap_use_task_rng,
             .np_inid_boot_from_ksum_conditional_fixed_lc_chunk =
               .np_inid_boot_from_ksum_conditional_fixed_lc_chunk
           ),
@@ -9134,12 +10090,12 @@ gen.tflabel = function(condition, tlabel, flabel){
   paste(if (isTRUE(condition)) tlabel else flabel)
 }
 
-draw.error.bands = function(ex, ely, ehy, lty = 2, col = par("col")){
+draw.error.bands = function(ex, ely, ehy, lty = .np_plot_lty("interval"), col = par("col")){
   lines(ex,ely,lty=lty,col=col)
   lines(ex,ehy,lty=lty,col=col)
 }
 
-draw.error.bars = function(ex, ely, ehy, hbar = TRUE, hbarscale = 0.3, lty = 2, col = par("col")){
+draw.error.bars = function(ex, ely, ehy, hbar = TRUE, hbarscale = 0.3, lty = .np_plot_lty("interval"), col = par("col")){
   yy = double(3*length(ex))
   jj = seq_along(ex)*3
 
@@ -9209,7 +10165,7 @@ draw.all.error.types <- function(ex, center, all.err,
                                  plot.errors.style = "band",
                                  plot.errors.bar = "|",
                                  plot.errors.bar.num = min(length(ex), 25),
-                                 lty = 2, add.legend = TRUE, legend.loc = "topleft",
+                                 lty = .np_plot_lty("interval"), add.legend = TRUE, legend.loc = "topleft",
                                  legend = TRUE,
                                  xi.factor = FALSE){
   if (is.null(all.err)) return(invisible(NULL))
@@ -9247,9 +10203,9 @@ draw.all.error.types <- function(ex, center, all.err,
     legend.args <- .np_plot_legend_args(
       list(x = legend.loc,
            legend = c("Pointwise","Simultaneous","Bonferroni"),
-           lty = 2,
+           lty = .np_plot_lty("interval"),
            col = unname(band.cols[c("pointwise", "simultaneous", "bonferroni")]),
-           lwd = 2,
+           lwd = .np_plot_lwd("band_all_1d"),
            bty = "n"),
       legend = legend.value,
       context = "legend"
@@ -9285,7 +10241,7 @@ plotFactor <- function(f, y, ...){
 
   l.y = unlist(lapply(y, function (p) { c(0,p,NA) }))
 
-  line.args <- list(x = l.f, y = l.y, lty = 2)
+  line.args <- list(x = l.f, y = l.y, lty = .np_plot_lty("interval"))
   if (!is.null(dot.args$col)) line.args$col <- dot.args$col
   if (!is.null(dot.args$lty)) line.args$lty <- dot.args$lty
   if (!is.null(dot.args$lwd)) line.args$lwd <- dot.args$lwd
@@ -9411,10 +10367,17 @@ plotFactor <- function(f, y, ...){
     gradient.order = gradient.order,
     where = "plot conditional"
   )
+  lp.degree0.lc.gradient <- isTRUE(gradients) &&
+    npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = reg.engine,
+      degree.engine = degree.engine,
+      gradient.order = glp.gradient.order,
+      ncon = bws$xncon
+    )
 
   reg.c <- npRegtypeToC(
-    regtype = if (identical(reg.engine, "lp")) "lp" else "lc",
-    degree = degree.engine,
+    regtype = if (identical(reg.engine, "lp") && !lp.degree0.lc.gradient) "lp" else "lc",
+    degree = if (lp.degree0.lc.gradient) rep.int(0L, bws$xncon) else degree.engine,
     ncon = bws$xncon,
     context = if (isTRUE(cdf)) "npcdist" else "npcdens"
   )
@@ -9476,7 +10439,11 @@ plotFactor <- function(f, y, ...){
     ymcv.numRow = attr(bws$ymcv, "num.row"),
     xmcv.numRow = attr(bws$xmcv, "num.row"),
     densOrDist = if (isTRUE(cdf)) NP_DO_DIST else NP_DO_DENS,
-    int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO
+    int_do_tree = npDoTreeOrCategoricalCompress(
+      ncon = bws$yncon + bws$xncon,
+      ncat = bws$ynuno + bws$ynord + bws$xnuno + bws$xnord,
+      bws = bws
+    )
   )
 
   cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
@@ -9522,7 +10489,7 @@ plotFactor <- function(f, y, ...){
     myout$congerr <- matrix(data = myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
     myout$congerr <- myout$congerr[, rorder, drop = FALSE]
 
-    if (identical(reg.engine, "lp") && bws$xncon > 0L) {
+    if (identical(reg.engine, "lp") && bws$xncon > 0L && !lp.degree0.lc.gradient) {
       cont.idx <- which(bws$ixcon)
       invalid.order <- glp.gradient.order > degree.engine
       if (any(invalid.order)) {
@@ -9667,7 +10634,7 @@ plotFactor <- function(f, y, ...){
     max(existing.range[2L], yr[2L], na.rm = TRUE))
 }
 
-.np_plot_overlay_points_1d <- function(x, y, col = NULL, pch = 20, cex = 0.5, ...) {
+.np_plot_overlay_points_1d <- function(x, y, col = NULL, pch = .np_plot_pch("data_overlay"), cex = .np_plot_cex("data_overlay"), ...) {
   if (is.null(x) || is.null(y))
     return(invisible(FALSE))
   if (is.factor(x) || is.ordered(x))
@@ -9678,16 +10645,16 @@ plotFactor <- function(f, y, ...){
     return(invisible(FALSE))
 
   if (is.null(col))
-    col <- grDevices::adjustcolor("gray30", alpha.f = 0.35)
+    col <- .np_plot_color("data_overlay")
   if (is.null(pch))
-    pch <- 20
+    pch <- .np_plot_pch("data_overlay")
   if (is.null(cex))
-    cex <- 0.5
+    cex <- .np_plot_cex("data_overlay")
   points(x[ok], y[ok], pch = pch, cex = cex, col = col, ...)
   invisible(TRUE)
 }
 
-.np_plot_overlay_points_factor <- function(x, y, col = NULL, pch = 20, cex = 0.5, ...) {
+.np_plot_overlay_points_factor <- function(x, y, col = NULL, pch = .np_plot_pch("data_overlay"), cex = .np_plot_cex("data_overlay"), ...) {
   if (is.null(x) || is.null(y))
     return(invisible(FALSE))
   if (!(is.factor(x) || is.ordered(x)))
@@ -9698,16 +10665,16 @@ plotFactor <- function(f, y, ...){
     return(invisible(FALSE))
 
   if (is.null(col))
-    col <- grDevices::adjustcolor("gray30", alpha.f = 0.35)
+    col <- .np_plot_color("data_overlay")
   if (is.null(pch))
-    pch <- 20
+    pch <- .np_plot_pch("data_overlay")
   if (is.null(cex))
-    cex <- 0.5
+    cex <- .np_plot_cex("data_overlay")
   points(x[ok], y[ok], pch = pch, cex = cex, col = col, ...)
   invisible(TRUE)
 }
 
-.np_plot_overlay_points_persp <- function(x1, x2, y, persp.mat, col = NULL, pch = 20, cex = 0.5, ...) {
+.np_plot_overlay_points_persp <- function(x1, x2, y, persp.mat, col = NULL, pch = .np_plot_pch("data_overlay"), cex = .np_plot_cex("data_overlay"), ...) {
   if (is.null(x1) || is.null(x2) || is.null(y))
     return(invisible(FALSE))
 
@@ -9716,11 +10683,11 @@ plotFactor <- function(f, y, ...){
     return(invisible(FALSE))
 
   if (is.null(col))
-    col <- grDevices::adjustcolor("gray30", alpha.f = 0.35)
+    col <- .np_plot_color("data_overlay")
   if (is.null(pch))
-    pch <- 20
+    pch <- .np_plot_pch("data_overlay")
   if (is.null(cex))
-    cex <- 0.5
+    cex <- .np_plot_cex("data_overlay")
   xyz <- trans3d(x1[ok], x2[ok], y[ok], persp.mat)
   points(xyz, pch = pch, cex = cex, col = col, ...)
   invisible(TRUE)
@@ -9742,9 +10709,9 @@ plotFactor <- function(f, y, ...){
       x = x1[ok],
       y = x2[ok],
       z = y[ok],
-      color = grDevices::adjustcolor("gray20", alpha.f = 0.6),
-      alpha = 0.6,
-      size = 5
+      color = .np_plot_color("data_overlay", alpha = 1),
+      alpha = 0.35,
+      size = 2
     ),
     points3d.args
   )
@@ -9798,7 +10765,7 @@ plotFactor <- function(f, y, ...){
   args <- .np_plot_merge_override_args(
     list(
       x = x[ok],
-      col = grDevices::adjustcolor("gray20", alpha.f = 0.6),
+      col = .np_plot_color("support"),
       quiet = TRUE
     ),
     rug.args
@@ -9839,8 +10806,8 @@ plotFactor <- function(f, y, ...){
       y0 = lower$y,
       x1 = upper$x,
       y1 = upper$y,
-      col = grDevices::adjustcolor("gray20", alpha.f = 0.55),
-      lwd = 1.25
+      col = .np_plot_color("support_floor"),
+      lwd = .np_plot_lwd("support")
     ),
     segments.args
   )
@@ -9875,9 +10842,9 @@ plotFactor <- function(f, y, ...){
       x = rbind(x1[ok], x1[ok]),
       y = rbind(x2[ok], x2[ok]),
       z = rbind(rep.int(zfloor, sum(ok)), rep.int(ztop, sum(ok))),
-      color = grDevices::adjustcolor("gray20", alpha.f = 0.55),
-      alpha = 0.55,
-      lwd = 2
+      color = .np_plot_color("support_floor"),
+      alpha = 0.40,
+      lwd = .np_plot_lwd("support")
     ),
     segments3d.args
   )
@@ -9918,8 +10885,8 @@ plotFactor <- function(f, y, ...){
         y0 = pts$y[1L],
         x1 = pts$x[2L],
         y1 = pts$y[2L],
-        col = grDevices::adjustcolor("grey60", alpha.f = 0.45),
-        lwd = 0.9
+        col = .np_plot_color("support_grid"),
+        lwd = .np_plot_lwd("support_grid")
       ),
       grid.args
     )
@@ -10010,10 +10977,10 @@ plotFactor <- function(f, y, ...){
                    simultaneous = "Simultaneous",
                    bonferroni = "Bonferroni")[drawn.bands],
         col = unname(band.cols[drawn.bands]),
-        lty = 1,
-        lwd = 2.15,
-        cex = 0.8,
-        bg = "white",
+        lty = .np_plot_lty("solid"),
+        lwd = .np_plot_lwd("band_all_surface"),
+        cex = .np_plot_cex("legend"),
+        bg = .np_plot_color("legend_bg"),
         bty = "n"
       ),
       legend3d.args
@@ -10022,8 +10989,8 @@ plotFactor <- function(f, y, ...){
     return(invisible(TRUE))
   }
 
-  draw_one(lerr, "grey40")
-  draw_one(herr, "grey40")
+  draw_one(lerr, .np_plot_color("context_wire"))
+  draw_one(herr, .np_plot_color("context_wire"))
   invisible(TRUE)
 }
 
@@ -10106,10 +11073,180 @@ plotFactor <- function(f, y, ...){
 }
 
 .np_plot_all_band_colors <- function() {
-  c(
-    pointwise = "#D55E00",
-    simultaneous = "#7B3294",
-    bonferroni = "#0072B2"
+  .np_plot_viridis_at(
+    c(pointwise = 0.18, simultaneous = 0.50, bonferroni = 0.78)
+  )
+}
+
+.np_plot_viridis_at <- function(x, begin = 0.12, end = 0.88, alpha = 1) {
+  x.names <- names(x)
+  x <- as.double(x)
+  x <- pmax.int(0, pmin.int(1, x))
+  grid <- grDevices::hcl.colors(256L, palette = "viridis")
+  pos <- begin + x * (end - begin)
+  idx <- 1L + round(pos * (length(grid) - 1L))
+  idx <- pmax.int(1L, pmin.int(length(grid), idx))
+  cols <- grid[idx]
+  if (!identical(alpha, 1))
+    cols <- grDevices::adjustcolor(cols, alpha.f = alpha)
+  names(cols) <- x.names
+  cols
+}
+
+.np_plot_viridis_role <- function(x) {
+  unname(.np_plot_viridis_at(x))[1L]
+}
+
+.np_plot_color <- function(role, alpha = NULL) {
+  role <- as.character(role)[1L]
+  spec <- switch(
+    role,
+    primary = list(col = .np_plot_viridis_role(0.02), alpha = 1),
+    median = list(col = .np_plot_viridis_role(0.02), alpha = 1),
+    surface_border = list(col = .np_plot_viridis_role(0.02), alpha = 1),
+    context_border = list(col = .np_plot_viridis_role(0.30), alpha = 1),
+    context_wire = list(col = .np_plot_viridis_role(0.25), alpha = 1),
+    data_overlay = list(col = .np_plot_viridis_role(0.08), alpha = 0.35),
+    support = list(col = .np_plot_viridis_role(0.12), alpha = 0.60),
+    support_floor = list(col = .np_plot_viridis_role(0.18), alpha = 0.55),
+    support_grid = list(col = .np_plot_viridis_role(0.50), alpha = 0.45),
+    component_context = list(col = .np_plot_viridis_role(0.68), alpha = 1),
+    interval_context = list(col = .np_plot_viridis_role(0.78), alpha = 1),
+    legend_bg = list(col = .np_plot_viridis_role(0.98), alpha = 0.18),
+    stop("unknown plot color role: ", role, call. = FALSE)
+  )
+  alpha <- if (is.null(alpha)) spec$alpha else alpha
+  if (isTRUE(all.equal(alpha, 1))) spec$col else grDevices::adjustcolor(spec$col, alpha.f = alpha)
+}
+
+.np_plot_lty <- function(role) {
+  role <- as.character(role)[1L]
+  switch(
+    role,
+    solid = 1L,
+    interval = 2L,
+    center = 3L,
+    lower_quantile = 2L,
+    upper_quantile = 4L,
+    pointwise = 2L,
+    simultaneous = 3L,
+    bonferroni = 4L,
+    stop("unknown plot line-type role: ", role, call. = FALSE)
+  )
+}
+
+.np_plot_lwd <- function(role, base = graphics::par()$lwd) {
+  role <- as.character(role)[1L]
+  base <- as.double(base)[1L]
+  switch(
+    role,
+    primary = base,
+    surface_border = 0.8 * base,
+    interval = base,
+    band_all_1d = 2 * base,
+    band_all_surface = 2.15 * base,
+    interval_surface = 2 * base,
+    support = 1.25 * base,
+    support_floor = 2 * base,
+    support_grid = 0.9 * base,
+    quantile_multi = 1.5 * base,
+    component_context = base,
+    stop("unknown plot line-width role: ", role, call. = FALSE)
+  )
+}
+
+.np_plot_pch <- function(role) {
+  role <- as.character(role)[1L]
+  switch(
+    role,
+    data_overlay = 20L,
+    stop("unknown plot point-character role: ", role, call. = FALSE)
+  )
+}
+
+.np_plot_cex <- function(role) {
+  role <- as.character(role)[1L]
+  switch(
+    role,
+    data_overlay = 0.5,
+    copula_pair = 0.25,
+    legend = 0.8,
+    stop("unknown plot character-expansion role: ", role, call. = FALSE)
+  )
+}
+
+.np_plot_is_median_tau <- function(tau, tol = 1.0e-12) {
+  is.finite(tau) & abs(tau - 0.5) <= tol
+}
+
+.np_plot_tau_values_from_labels <- function(tau.labels, ntau) {
+  if (is.null(tau.labels))
+    return(NULL)
+  tau.labels <- as.character(tau.labels)
+  tau <- suppressWarnings(as.numeric(sub("^tau[[:space:]]*=[[:space:]]*", "", tau.labels)))
+  if (length(tau) != ntau || anyNA(tau) || any(!is.finite(tau)) ||
+      any(tau <= 0) || any(tau >= 1))
+    return(NULL)
+  tau
+}
+
+.np_plot_quantile_aesthetics <- function(ntau,
+                                         tau = NULL,
+                                         tau.labels = NULL,
+                                         col = NULL,
+                                         lty = NULL,
+                                         lwd = NULL) {
+  ntau <- as.integer(ntau)[1L]
+  if (is.na(ntau) || ntau < 1L)
+    stop("'ntau' must be a positive integer", call. = FALSE)
+
+  if (is.null(tau))
+    tau <- .np_plot_tau_values_from_labels(tau.labels, ntau)
+  if (!is.null(tau)) {
+    tau <- as.double(tau)
+    if (length(tau) != ntau || anyNA(tau) || any(!is.finite(tau)) ||
+        any(tau <= 0) || any(tau >= 1))
+      tau <- NULL
+  }
+
+  multi <- ntau > 1L
+  if (is.null(col)) {
+    curve.col <- if (is.null(tau)) {
+      seq_len(ntau)
+    } else {
+      med <- .np_plot_is_median_tau(tau)
+      out <- .np_plot_viridis_at(tau)
+      out[med] <- .np_plot_color("median")
+      unname(out)
+    }
+  } else {
+    curve.col <- col
+  }
+
+  if (is.null(lty)) {
+    curve.lty <- if (is.null(tau)) {
+      seq_len(ntau)
+    } else {
+      med <- .np_plot_is_median_tau(tau)
+      out <- rep.int(.np_plot_lty("lower_quantile"), ntau)
+      out[med] <- .np_plot_lty("solid")
+      out[!med & tau > 0.5] <- .np_plot_lty("upper_quantile")
+      out
+    }
+  } else {
+    curve.lty <- lty
+  }
+
+  if (is.null(lwd)) {
+    curve.lwd <- rep(if (multi) .np_plot_lwd("quantile_multi") else graphics::par()$lwd, ntau)
+  } else {
+    curve.lwd <- lwd
+  }
+
+  list(
+    col = rep(curve.col, length.out = ntau),
+    lty = rep(curve.lty, length.out = ntau),
+    lwd = rep(curve.lwd, length.out = ntau)
   )
 }
 
@@ -10169,7 +11306,7 @@ plotFactor <- function(f, y, ...){
                                              zmat,
                                              persp.mat,
                                              col,
-                                             lwd = 0.8) {
+                                             lwd = .np_plot_lwd("surface_border")) {
   row_pts <- .np_plot_project_wire_matrix_persp(
     xmat = templates$row_x,
     ymat = templates$row_y,
@@ -10201,15 +11338,15 @@ plotFactor <- function(f, y, ...){
                                                  herr = NULL,
                                                  lerr.all = NULL,
                                                  herr.all = NULL,
-                                                 border = "grey",
-                                                 lwd = 0.8) {
+                                                 border = .np_plot_color("context_border"),
+                                                 lwd = .np_plot_lwd("surface_border")) {
   templates <- .np_plot_wireframe_templates_persp(x = x, y = y)
 
   if (identical(as.character(plot.errors.type)[1L], "all") &&
       !is.null(lerr.all) && !is.null(herr.all)) {
     band.cols <- .np_plot_all_band_colors()
     band.alpha <- .np_plot_all_band_alpha()
-    band.lwd <- 2.15 * lwd
+    band.lwd <- .np_plot_lwd("band_all_surface", lwd)
 
     for (bn in c("pointwise", "simultaneous", "bonferroni")) {
       band.col <- grDevices::adjustcolor(band.cols[[bn]], alpha.f = band.alpha[[bn]])
@@ -10235,10 +11372,10 @@ plotFactor <- function(f, y, ...){
   }
 
   wire.col <- grDevices::adjustcolor(
-    "black",
+    .np_plot_color("primary"),
     alpha.f = max(.np_plot_error_wire_alpha(plot.errors.type = plot.errors.type), 0.18)
   )
-  wire.lwd <- 2.0 * lwd
+  wire.lwd <- .np_plot_lwd("interval_surface", lwd)
 
   .np_plot_draw_wire_surface_persp(
     templates = templates,
@@ -10380,7 +11517,7 @@ plotFactor <- function(f, y, ...){
                                         theta,
                                         phi,
                                         col = NULL,
-                                        border = "black",
+                                        border = .np_plot_color("surface_border"),
                                         zlim = NULL,
                                         par3d.args = list(),
                                         view3d.args = list(),
@@ -10580,8 +11717,8 @@ plotFactor <- function(f, y, ...){
 
 .np_plot_draw_all_band_legend <- function(legend = TRUE,
                                           x = "topright",
-                                          lty = 1,
-                                          lwd = 2,
+                                          lty = .np_plot_lty("solid"),
+                                          lwd = .np_plot_lwd("band_all_1d"),
                                           bty = "n") {
   band.cols <- .np_plot_all_band_colors()
   legend.value <- if (is.list(legend) && any(names(legend) %in% c("tau", "bands"))) {
@@ -10601,6 +11738,261 @@ plotFactor <- function(f, y, ...){
   )
   if (!is.null(legend.args))
     do.call(graphics::legend, legend.args)
+  invisible(NULL)
+}
+
+.np_plot_legend_role <- function(legend, role) {
+  if (is.list(legend) && any(names(legend) %in% c("tau", "bands"))) {
+    if (!is.null(legend[[role]])) legend[[role]] else TRUE
+  } else {
+    legend
+  }
+}
+
+.np_plot_multi_tau_error_range <- function(value,
+                                           err,
+                                           all.err,
+                                           plotOnEstimate,
+                                           plot.errors.type) {
+  if (is.null(err))
+    return(NULL)
+  ntau <- dim(err)[3L]
+  ranges <- matrix(NA_real_, nrow = ntau, ncol = 2L)
+  for (kk in seq_len(ntau)) {
+    center.k <- if (plotOnEstimate) value[, kk] else err[, 3L, kk]
+    if (identical(plot.errors.type, "all")) {
+      if (is.null(all.err) || is.null(all.err[[kk]]))
+        next
+      ranges[kk, ] <- compute.all.error.range(center.k, all.err[[kk]])
+    } else {
+      if (!any(is.finite(center.k)) ||
+          !any(is.finite(err[, 1L, kk])) ||
+          !any(is.finite(err[, 2L, kk])))
+        next
+      ranges[kk, ] <- compute.default.error.range(center.k, err[, , kk])
+    }
+  }
+  if (!any(is.finite(ranges)))
+    return(NULL)
+  rng <- range(ranges, finite = TRUE)
+  if (length(rng) == 2L && all(is.finite(rng))) rng else NULL
+}
+
+.np_plot_draw_multi_tau_errors <- function(ei,
+                                           value,
+                                           err,
+                                           all.err,
+                                           xi.factor,
+                                           plotOnEstimate,
+                                           cols,
+                                           plot.errors.type,
+                                           plot.errors.style,
+                                           plot.errors.bar,
+                                           plot.errors.bar.num) {
+  if (is.null(err))
+    return(invisible(NULL))
+  nkeep <- nrow(value)
+  mat.x <- if (xi.factor) seq_len(nkeep) else ei[seq_len(nkeep)]
+  ntau <- ncol(value)
+  cols <- rep(cols, length.out = ntau)
+  for (kk in seq_len(ntau)) {
+    center.k <- if (plotOnEstimate) value[, kk] else err[, 3L, kk]
+    if (identical(plot.errors.type, "all")) {
+      if (is.null(all.err) || is.null(all.err[[kk]]))
+        next
+      all.k <- all.err[[kk]]
+      lty.map <- c(pointwise = 2L, simultaneous = 3L, bonferroni = 4L)
+      for (nm in intersect(names(lty.map), names(all.k))) {
+        err.k <- all.k[[nm]]
+        if (is.null(err.k))
+          next
+        draw.errors(
+          ex = mat.x,
+          ely = center.k - err.k[, 1L],
+          ehy = center.k + err.k[, 2L],
+          plot.errors.style = if (xi.factor) "bar" else plot.errors.style,
+          plot.errors.bar = if (xi.factor) "I" else plot.errors.bar,
+          plot.errors.bar.num = plot.errors.bar.num,
+          lty = lty.map[[nm]],
+          col = cols[[kk]]
+        )
+      }
+    } else {
+      if (!xi.factor && !plotOnEstimate)
+        graphics::lines(mat.x, err[, 3L, kk], lty = .np_plot_lty("center"), col = cols[[kk]])
+      lower.k <- if (plotOnEstimate) value[, kk] - err[, 1L, kk] else err[, 3L, kk] - err[, 1L, kk]
+      upper.k <- if (plotOnEstimate) value[, kk] + err[, 2L, kk] else err[, 3L, kk] + err[, 2L, kk]
+      good <- complete.cases(mat.x, lower.k, upper.k)
+      if (!any(good))
+        next
+      draw.errors(
+        ex = mat.x[good],
+        ely = lower.k[good],
+        ehy = upper.k[good],
+        plot.errors.style = if (xi.factor) "bar" else plot.errors.style,
+        plot.errors.bar = if (xi.factor) "I" else plot.errors.bar,
+        plot.errors.bar.num = plot.errors.bar.num,
+        lty = if (xi.factor) 1 else 2,
+        col = cols[[kk]]
+      )
+    }
+  }
+  invisible(NULL)
+}
+
+.np_plot_quantile_overlay_1d <- function(ei,
+                                         value,
+                                         xi.factor,
+                                         xlab.value,
+                                         ylab.value,
+                                         err = NULL,
+                                         all.err = NULL,
+                                         tau.labels = colnames(value),
+                                         tau = NULL,
+                                         overlay.x = NULL,
+                                         overlay.y = NULL,
+                                         plot.data.overlay = FALSE,
+                                         gradients = FALSE,
+                                         plotOnEstimate = TRUE,
+                                         plot.errors.type = "pointwise",
+                                         plot.errors.style = "band",
+                                         plot.errors.bar = "|",
+                                         plot.errors.bar.num = min(nrow(value), 25),
+                                         plot.user.args = list(),
+                                         legend = TRUE,
+                                         col = NULL,
+                                         lty = NULL,
+                                         lwd = NULL,
+                                         type = NULL,
+                                         xlim = NULL,
+                                         ylim = NULL,
+                                         main = NULL,
+                                         sub = NULL,
+                                         cex.axis = NULL,
+                                         cex.lab = NULL,
+                                         cex.main = NULL,
+                                         cex.sub = NULL) {
+  scalar_default <- function(value, default) {
+    if (is.null(value)) default else value
+  }
+  nkeep <- nrow(value)
+  if (is.null(tau.labels))
+    tau.labels <- colnames(value)
+  mat.x <- if (xi.factor) seq_len(nkeep) else ei[seq_len(nkeep)]
+  curve.aes <- .np_plot_quantile_aesthetics(
+    ntau = ncol(value),
+    tau = tau,
+    tau.labels = tau.labels,
+    col = col,
+    lty = lty,
+    lwd = lwd
+  )
+  curve.col <- curve.aes$col
+  curve.lty <- curve.aes$lty
+  curve.lwd <- curve.aes$lwd
+  error.ylim <- .np_plot_multi_tau_error_range(
+    value = value,
+    err = err,
+    all.err = all.err,
+    plotOnEstimate = plotOnEstimate,
+    plot.errors.type = plot.errors.type
+  )
+  y.range <- range(value, finite = TRUE)
+  if (!is.null(error.ylim))
+    y.range <- range(y.range, error.ylim, finite = TRUE)
+  overlay.ok <- isTRUE(plot.data.overlay) && !isTRUE(gradients)
+  if (overlay.ok && !is.null(overlay.y))
+    y.range <- .np_plot_overlay_range(y.range, overlay.y)
+  if (!is.null(ylim))
+    y.range <- ylim
+
+  plot.args <- list(
+    xlab = xlab.value,
+    ylab = ylab.value,
+    main = scalar_default(main, ""),
+    sub = scalar_default(sub, ""),
+    ylim = y.range,
+    cex.axis = scalar_default(cex.axis, graphics::par()$cex.axis),
+    cex.lab = scalar_default(cex.lab, graphics::par()$cex.lab),
+    cex.main = scalar_default(cex.main, graphics::par()$cex.main),
+    cex.sub = scalar_default(cex.sub, graphics::par()$cex.sub)
+  )
+  if (!xi.factor && !is.null(xlim))
+    plot.args$xlim <- xlim
+  plot.args <- .np_plot_merge_user_args(plot.args, plot.user.args)
+
+  if (overlay.ok && !is.null(overlay.x) && !is.null(overlay.y)) {
+    if (xi.factor) {
+      data.args <- plot.args
+      data.args$x <- overlay.x
+      data.args$y <- overlay.y
+      data.args$type <- NULL
+      data.args$lty <- NULL
+      data.args$lwd <- NULL
+      data.args$col <- NULL
+      do.call(graphics::plot, data.args)
+    } else {
+      overlay.args <- plot.args
+      overlay.args$x <- overlay.x
+      overlay.args$y <- overlay.y
+      overlay.args$type <- "p"
+      overlay.args$lty <- NULL
+      overlay.args$lwd <- NULL
+      overlay.args$pch <- scalar_default(overlay.args$pch, 20)
+      overlay.args$cex <- scalar_default(overlay.args$cex, 0.5)
+      overlay.args$col <- .np_plot_color("data_overlay")
+      do.call(graphics::plot, overlay.args)
+    }
+  } else {
+    empty.args <- plot.args
+    empty.args$x <- mat.x
+    empty.args$y <- value[, 1L]
+    empty.args$type <- "n"
+    empty.args$xaxt <- if (xi.factor) "n" else "s"
+    do.call(graphics::plot, empty.args)
+    if (xi.factor)
+      graphics::axis(1, at = mat.x, labels = as.character(ei[seq_len(nkeep)]))
+  }
+
+  .np_plot_draw_multi_tau_errors(
+    ei = ei,
+    value = value,
+    err = err,
+    all.err = all.err,
+    xi.factor = xi.factor,
+    plotOnEstimate = plotOnEstimate,
+    cols = curve.col,
+    plot.errors.type = plot.errors.type,
+    plot.errors.style = plot.errors.style,
+    plot.errors.bar = plot.errors.bar,
+    plot.errors.bar.num = plot.errors.bar.num
+  )
+  for (kk in seq_len(ncol(value))) {
+    graphics::lines(mat.x, value[, kk], type = scalar_default(type, "l"),
+                    col = curve.col[[kk]], lty = curve.lty[[kk]],
+                    lwd = curve.lwd[[kk]])
+  }
+  tau.legend.args <- .np_plot_legend_args(
+    list(x = "topright", legend = tau.labels, col = curve.col,
+         lty = curve.lty, lwd = curve.lwd, bty = "n"),
+    legend = .np_plot_legend_role(legend, "tau"),
+    context = "legend"
+  )
+  if (!is.null(tau.legend.args))
+    do.call(graphics::legend, tau.legend.args)
+  if (identical(plot.errors.type, "all") && !is.null(err)) {
+    band.legend.args <- .np_plot_legend_args(
+      list(x = "topleft",
+           legend = c("Pointwise", "Simultaneous", "Bonferroni"),
+           lty = c(.np_plot_lty("pointwise"), .np_plot_lty("simultaneous"), .np_plot_lty("bonferroni")),
+           col = graphics::par("col"),
+           bty = "n"),
+      legend = .np_plot_legend_role(legend, "bands"),
+      context = "legend"
+    )
+    if (!is.null(band.legend.args))
+      do.call(graphics::legend, band.legend.args)
+  }
   invisible(NULL)
 }
 
@@ -11386,7 +12778,6 @@ plotFactor <- function(f, y, ...){
     chunk.size = chunk.size,
     what = "conditional-gradient"
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   counts.mat <- if (!is.null(counts)) {
     .np_inid_counts_matrix(n = n, B = B, counts = counts)
   } else {
@@ -11398,6 +12789,17 @@ plotFactor <- function(f, y, ...){
     "drawer"
   } else {
     "random"
+  }
+  prob <- rep.int(1 / n, n)
+  tasks <- if (identical(counts.mode, "random")) {
+    .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n,
+      prob = prob
+    )
+  } else {
+    .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size, with.seeds = FALSE)
   }
 
   worker <- function(task) {
@@ -11412,8 +12814,7 @@ plotFactor <- function(f, y, ...){
         counts = counts.drawer(start, stopi)
       )
     } else {
-      set.seed(as.integer(task$seed))
-      stats::rmultinom(n = as.integer(task$bsz), size = n, prob = rep.int(1 / n, n))
+      .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
     }
 
     .npRmpi_with_local_bootstrap(
@@ -11454,6 +12855,7 @@ plotFactor <- function(f, y, ...){
           gradient.index = gradient.index,
           gradient.order = gradient.order,
           n = n,
+          prob = prob,
           counts.mode = counts.mode,
           .np_inid_boot_from_conditional_gradient_local =
             .np_inid_boot_from_conditional_gradient_local,
@@ -11530,7 +12932,6 @@ plotFactor <- function(f, y, ...){
     chunk.size = chunk.size,
     what = "quantile-level"
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   counts.mat <- if (!is.null(counts)) {
     .np_inid_counts_matrix(n = n, B = B, counts = counts)
   } else {
@@ -11542,6 +12943,17 @@ plotFactor <- function(f, y, ...){
     "drawer"
   } else {
     "random"
+  }
+  prob <- rep.int(1 / n, n)
+  tasks <- if (identical(counts.mode, "random")) {
+    .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n,
+      prob = prob
+    )
+  } else {
+    .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size, with.seeds = FALSE)
   }
 
   worker <- function(task) {
@@ -11556,8 +12968,7 @@ plotFactor <- function(f, y, ...){
         counts = counts.drawer(start, stopi)
       )
     } else {
-      set.seed(as.integer(task$seed))
-      stats::rmultinom(n = as.integer(task$bsz), size = n, prob = rep.int(1 / n, n))
+      .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
     }
 
     .npRmpi_with_local_bootstrap(
@@ -11592,6 +13003,7 @@ plotFactor <- function(f, y, ...){
           bws = bws,
           tau = tau,
           n = n,
+          prob = prob,
           counts.mode = counts.mode,
           .np_inid_boot_from_quantile_level_local =
             .np_inid_boot_from_quantile_level_local,
@@ -11671,7 +13083,6 @@ plotFactor <- function(f, y, ...){
     chunk.size = chunk.size,
     what = "quantile-gradient"
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
   counts.mat <- if (!is.null(counts)) {
     .np_inid_counts_matrix(n = n, B = B, counts = counts)
   } else {
@@ -11683,6 +13094,17 @@ plotFactor <- function(f, y, ...){
     "drawer"
   } else {
     "random"
+  }
+  prob <- rep.int(1 / n, n)
+  tasks <- if (identical(counts.mode, "random")) {
+    .npRmpi_bootstrap_rmultinom_tasks(
+      B = B,
+      chunk.size = chunk.size,
+      size = n,
+      prob = prob
+    )
+  } else {
+    .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size, with.seeds = FALSE)
   }
 
   worker <- function(task) {
@@ -11697,8 +13119,7 @@ plotFactor <- function(f, y, ...){
         counts = counts.drawer(start, stopi)
       )
     } else {
-      set.seed(as.integer(task$seed))
-      stats::rmultinom(n = as.integer(task$bsz), size = n, prob = rep.int(1 / n, n))
+      .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
     }
 
     .npRmpi_with_local_bootstrap(
@@ -11735,6 +13156,7 @@ plotFactor <- function(f, y, ...){
           tau = tau,
           gradient.index = gradient.index,
           n = n,
+          prob = prob,
           counts.mode = counts.mode,
           .np_inid_boot_from_quantile_gradient_local =
             .np_inid_boot_from_quantile_gradient_local,
@@ -11760,6 +13182,18 @@ plotFactor <- function(f, y, ...){
                                    small = 1.490116e-05,
                                    itmax = 10000,
                                    ...) {
+  if (inherits(bws, "lsqregressionbandwidth")) {
+    return(.np_plot_lsqregression_eval(
+      bws = bws,
+      txdat = txdat,
+      tydat = tydat,
+      exdat = exdat,
+      tau = tau,
+      gradients = gradients,
+      need.errors = need.errors,
+      ...
+    ))
+  }
   tau <- .npqreg_validate_tau(tau)
   .npqreg_assert_selected_cdf_metadata(bws)
   plot.fit.label <- if (length(tau) == 1L) {
@@ -11871,7 +13305,15 @@ plotFactor <- function(f, y, ...){
           gradients = gradients
         )
       } else {
-      fit.one.tau <- function(tau.i) {
+        cdf.cache <- .npqreg_selected_cdf_cache_new(
+          .npqreg_selected_cdf_cache_should_enable(tau = tau, exdat = txeval)
+        )
+        cdf.row.keys <- if (isTRUE(cdf.cache$enabled))
+          .npqreg_selected_cdf_cache_row_keys(txeval)
+        else NULL
+        on.exit(.npqreg_selected_cdf_cache_clear(cdf.cache), add = TRUE)
+
+        fit.one.tau <- function(tau.i) {
         yq <- .npqreg_invert_selected_cdf(
           bws = bws,
           xdat = xdat.df,
@@ -11880,7 +13322,9 @@ plotFactor <- function(f, y, ...){
           tau = tau.i,
           tol = tol,
           small = small,
-          itmax = itmax
+          itmax = itmax,
+          cdf.cache = cdf.cache,
+          cdf.row.keys = cdf.row.keys
         )
         if (!isTRUE(need.errors) && !isTRUE(gradients)) {
           return(list(
@@ -12777,6 +14221,16 @@ compute.bootstrap.errors.rbandwidth =
       stop("bootstrap=\"wild\" supports gradients only for continuous or categorical slices in npRmpi; no serial fallback is permitted", call. = FALSE)
     }
 
+    profile.setup <- NULL
+    if (!isTRUE(gradients)) {
+      profile.setup <- .np_regression_cat_profile_boot_setup(
+        xdat = xdat,
+        exdat = exdat,
+        ydat = ydat,
+        bws = bws
+      )
+    }
+
     inid.helper.ok <- isTRUE(.np_plot_inid_fastpath_enabled())
     block.helper.ok <- isTRUE(.np_plot_block_fastpath_enabled())
 
@@ -12797,7 +14251,14 @@ compute.bootstrap.errors.rbandwidth =
         NULL
       }
       boot.out <- tryCatch(
-        if (use.frozen.nonfixed) {
+        if (!is.null(profile.setup)) {
+          .np_inid_boot_from_regression_cat_profile(
+            setup = profile.setup,
+            B = plot.errors.boot.num,
+            counts.drawer = counts.drawer,
+            progress.label = progress.label
+          )
+        } else if (use.frozen.nonfixed) {
           .np_inid_boot_from_regression_frozen(
             xdat = xdat,
             exdat = exdat,
@@ -12839,6 +14300,14 @@ compute.bootstrap.errors.rbandwidth =
 
     if (is.null(boot.out) && is.wild.hat) {
       plot.errors.boot.wild <- .np_plot_normalize_wild(plot.errors.boot.wild)
+      if (!is.null(profile.setup)) {
+        boot.out <- .np_wild_boot_from_regression_cat_profile(
+          setup = profile.setup,
+          B = plot.errors.boot.num,
+          wild = plot.errors.boot.wild,
+          progress.label = progress.label
+        )
+      } else {
       if (!is.null(fit.mean.train)) {
         fit.mean.train <- as.double(fit.mean.train)
         if (length(fit.mean.train) != length(ydat) || any(!is.finite(fit.mean.train))) {
@@ -12975,6 +14444,7 @@ compute.bootstrap.errors.rbandwidth =
             t_cols = ncol(boot.out$t)
           )
         )
+      }
     }
 
     if (is.null(boot.out))

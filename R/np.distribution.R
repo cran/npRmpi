@@ -100,6 +100,8 @@ npudist.dbandwidth <-
          !all(vapply(as.data.frame(tdat[, bws$iuno]), inherits, logical(1), "factor"))))
       stop("supplied bandwidths do not match 'tdat' in type")
 
+    npValidateExtendedNnContinuousBandwidth(bws, where = "npudist")
+
     tdat = na.omit(tdat)
     rows.omit <- unclass(na.action(tdat))
 
@@ -178,7 +180,7 @@ npudist.dbandwidth <-
       mcv.numRow = attr(bws$xmcv, "num.row"),
       densOrDist = NP_DO_DIST,
       old.dist = FALSE,
-      int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO)
+      int_do_tree = npDoTreeOrCategoricalCompress(ncon = bws$ncon, ncat = bws$nuno + bws$nord, bws = bws))
     cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
     myout <- .np_with_compiled_fit_progress(
@@ -214,7 +216,11 @@ npudist.dbandwidth <-
 
 npudist.default <- function(bws, tdat, ...){
   .npRmpi_require_active_slave_pool(where = "npudist()")
-  if (.npRmpi_autodispatch_active())
+  bws.formula.early <- (!missing(bws)) && inherits(bws, "formula")
+  tdat.formula.early <- (!missing(tdat)) && inherits(tdat, "formula")
+  if (.npRmpi_autodispatch_active() &&
+      !bws.formula.early &&
+      !tdat.formula.early)
     return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
 
   if (!missing(bws) && inherits(bws, "formula")) {

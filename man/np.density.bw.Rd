@@ -50,11 +50,13 @@ npudensbw(\dots)
           nmulti,
           penalty.multiplier = 10,
           powell.remin = TRUE,
+          bwsolver = c("powell", "mads", "mads+powell"),
           scale.init.categorical.sample = FALSE,
           scale.factor.search.lower = NULL,
           small = 1.490116e-05,
           tol = 1.490116e-04,
           transform.bounds = FALSE,
+          eval.only = FALSE,
           \dots)
 
 \method{npudensbw}{default}(dat = stop("invoked without input data 'dat'"),
@@ -89,6 +91,7 @@ npudensbw(\dots)
           okertype,
           penalty.multiplier,
           powell.remin,
+          bwsolver = c("powell", "mads", "mads+powell"),
           scale.init.categorical.sample,
           scale.factor.search.lower = NULL,
           small,
@@ -378,6 +381,16 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     for a minor gain in accuracy. Defaults to \code{TRUE}.
   }
 
+  \item{bwsolver}{
+    bandwidth optimizer for fixed-degree searches. The default
+    \code{"powell"} preserves the historical Powell route. \code{"mads"}
+    uses the native \pkg{crs} NOMAD C API over the bandwidth coordinates, and
+    \code{"mads+powell"} applies one Powell hot start from the MADS
+    solution. Advanced native NOMAD parameters may be supplied through
+    \code{nomad.opts} in \code{...}; invalid or unsupported parameters are
+    rejected by NOMAD rather than silently ignored.
+  }
+
   \item{small}{
     a small number used to bracket a minimum (it is hopeless to ask for
     a bracketing interval of width less than sqrt(epsilon) times its
@@ -397,6 +410,12 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     applies an internal transformation that maps the unconstrained
     search to the feasible bandwidth domain. Defaults to
     \code{FALSE}.}
+
+  \item{eval.only}{
+    internal logical flag used by solver wrappers to evaluate an
+    existing bandwidth candidate without running a bandwidth search.
+    Ordinary users should leave this at its default \code{FALSE}.
+  }
 
 
 \subsection{Additional Arguments}{
@@ -440,6 +459,22 @@ or standard-deviation factors.
   Categorical search-start controls such as \code{dfac.init},
   \code{lbd.init}, and \code{hbd.init} have separate semantics and are
   not affected by \code{scale.factor.search.lower}.
+
+  For \code{bwmethod="cv.ml"}, the ordinary contribution is based on
+  \eqn{\log(\hat f_i)}{log(fhat_i)}. Compact-support kernels can yield
+  zero leave-one-out density estimates, and higher-order kernels can
+  yield negative estimates. In those cases the package optimizes a
+  guarded CVML criterion rather than the literal log likelihood. Let
+  \eqn{\epsilon}{epsilon} denote the positive machine floor used for the
+  guard. Positive fitted values use the ordinary branch
+  \eqn{-\log(\hat f_i)}{-log(fhat_i)}. Near-zero fitted values use
+  \eqn{-\log(\epsilon)}{-log(epsilon)}, and negative fitted values use
+  the smooth penalty
+  \eqn{\log(-\hat f_i)-2\log(\epsilon)}{log(-fhat_i)-2*log(epsilon)}.
+  The \code{guarded} count reported in bandwidth summaries records
+  objective evaluations in which this guard was used. The
+  \code{bwmethod="cv.ls"} criterion remains well defined for negative
+  kernel density estimates and is not modified by this CVML guard.
 
   Documentation guide: see \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, \code{\link{plot}},

@@ -43,8 +43,17 @@
   .np_warn_high_glp_degree(upper, argname = "degree.max")
 
   candidates <- lapply(seq_len(ncon), function(j) seq.int(lower[j], upper[j]))
+  grid.size <- .np_degree_grid_size(candidates)
+  singleton <- identical(as.integer(grid.size), 1L)
 
-  list(lower = lower, upper = upper, candidates = candidates)
+  list(
+    lower = lower,
+    upper = upper,
+    candidates = candidates,
+    grid.size = grid.size,
+    singleton = singleton,
+    fixed.degree = if (singleton) vapply(candidates, `[`, integer(1L), 1L) else NULL
+  )
 }
 
 .np_degree_search_engine_controls <- function(search.engine) {
@@ -103,6 +112,67 @@
 
 .np_degree_grid_size <- function(candidates) {
   prod(vapply(candidates, length, integer(1)))
+}
+
+.np_degree_singleton_search_result <- function(degree.search,
+                                               eval_result,
+                                               direction = c("min", "max"),
+                                               objective_name = "objective") {
+  direction <- match.arg(direction)
+  fixed.degree <- as.integer(degree.search$fixed.degree)
+  objective <- as.numeric(eval_result$objective[1L])
+  num.feval <- if (is.null(eval_result$num.feval)) NA_real_ else as.numeric(eval_result$num.feval[1L])
+  rec <- list(
+    degree = fixed.degree,
+    objective = objective,
+    status = "ok",
+    cached = FALSE,
+    message = "singleton degree grid; fixed-degree bandwidth search",
+    elapsed = NA_real_,
+    num.feval = num.feval
+  )
+  trace <- data.frame(
+    trace_id = 1L,
+    eval_id = 1L,
+    degree = paste(fixed.degree, collapse = ","),
+    objective = objective,
+    status = "ok",
+    cached = FALSE,
+    message = rec$message,
+    elapsed = NA_real_,
+    num.feval = num.feval,
+    stringsAsFactors = FALSE
+  )
+  if (!identical(objective_name, "objective"))
+    names(trace)[names(trace) == "objective"] <- objective_name
+
+  list(
+    method = degree.search$engine,
+    direction = direction,
+    verify = FALSE,
+    completed = TRUE,
+    certified = TRUE,
+    interrupted = FALSE,
+    singleton = TRUE,
+    fixed.degree = fixed.degree,
+    baseline = rec,
+    best = rec,
+    best_payload = eval_result$payload,
+    nomad.time = NA_real_,
+    powell.time = if (!is.null(eval_result$payload$powell.time)) as.numeric(eval_result$payload$powell.time[1L]) else NA_real_,
+    optim.time = if (!is.null(eval_result$payload$total.time)) as.numeric(eval_result$payload$total.time[1L]) else NA_real_,
+    n.unique = 1L,
+    n.visits = 1L,
+    n.cached = 0L,
+    grid.size = 1L,
+    best.restart = NA_integer_,
+    restart.starts = NULL,
+    restart.degree.starts = fixed.degree,
+    restart.bandwidth.starts = NULL,
+    restart.start.info = NULL,
+    restart.results = NULL,
+    trace = trace
+  )
 }
 
 .np_degree_format_degree <- function(degree) {
@@ -1010,54 +1080,23 @@
   pmax(lower, pmin(upper, out))
 }
 
-.np_lp_nomad_dim_budget <- function(nobs) {
-  nobs <- as.integer(nobs[1L])
-  if (!is.finite(nobs) || is.na(nobs) || nobs <= 1L)
-    return(1L)
-  max(1L, as.integer(floor(0.25 * (nobs - 1L))))
-}
-
-.np_lp_nomad_proposal_upper <- function(lower, upper) {
-  q <- length(lower)
-  if (!q)
-    return(integer(0))
-
-  lower <- as.integer(lower)
-  upper <- as.integer(upper)
-  as.integer(pmin(
-    upper,
-    pmax(lower + 1L, ceiling(upper / max(1L, q)))
-  ))
-}
-
-.np_lp_nomad_reduce_degree_start <- function(degree,
-                                             lower,
-                                             basis = c("glp", "additive", "tensor"),
-                                             dim_budget = Inf) {
-  basis <- match.arg(basis)
-  out <- as.integer(degree)
-  lower <- as.integer(lower)
-
-  if (!is.finite(dim_budget))
-    return(out)
-
-  repeat {
-    current.dim <- tryCatch(
-      dim_basis(basis = basis, degree = out),
-      error = function(e) Inf
+.np_lp_nomad_degree_start_policy <- function(value = getOption("np.nomad.degree.start.policy", "low_first_full_random")) {
+  value <- as.character(value)[1L]
+  choices <- c(
+    "low_first_full_random",
+    "mid_first_full_random",
+    "anchor_then_random",
+    "spread_then_random",
+    "random_full_only"
+  )
+  if (is.na(value) || !nzchar(value) || !(value %in% choices)) {
+    stop(
+      "option 'np.nomad.degree.start.policy' must be one of: ",
+      paste(choices, collapse = ", "),
+      call. = FALSE
     )
-    if (is.finite(current.dim) && current.dim <= dim_budget)
-      break
-
-    idx <- which(out > lower)
-    if (!length(idx))
-      break
-
-    drop.idx <- idx[which.max(out[idx])][1L]
-    out[drop.idx] <- out[drop.idx] - 1L
   }
-
-  out
+  value
 }
 
 .np_lp_nomad_build_degree_starts <- function(initial,
@@ -1074,62 +1113,102 @@
   upper <- as.integer(upper)
   q <- length(lower)
   nstart <- npValidateNmulti(nmulti)
+  policy <- .np_lp_nomad_degree_start_policy()
 
   if (!q)
     return(matrix(integer(0), nrow = nstart, ncol = 0L))
+  if (any(upper < lower))
+    stop("invalid degree bounds in NOMAD degree-start policy", call. = FALSE)
 
-  starts <- matrix(0L, nrow = nstart, ncol = q)
-  dim_budget <- .np_lp_nomad_dim_budget(nobs)
-  proposal.upper <- .np_lp_nomad_proposal_upper(lower, upper)
+  starts <- matrix(NA_integer_, nrow = nstart, ncol = q)
+  midpoint <- as.integer(round((lower + upper) / 2))
+
+  draw_full <- function(nrow) {
+    if (nrow <= 0L)
+      return(matrix(integer(0), nrow = 0L, ncol = q))
+    t(vapply(seq_len(nrow), function(j) {
+      vapply(seq_len(q), function(i) {
+        sample.int(upper[i] - lower[i] + 1L, 1L) + lower[i] - 1L
+      }, integer(1L))
+    }, integer(q)))
+  }
+
+  add_unique <- function(pool, row) {
+    row <- as.integer(row)
+    if (!nrow(pool))
+      return(matrix(row, nrow = 1L))
+    key <- paste(row, collapse = ",")
+    keys <- apply(pool, 1L, paste, collapse = ",")
+    if (key %in% keys)
+      pool
+    else
+      rbind(pool, row)
+  }
+
+  anchor_pool <- function() {
+    if (nstart <= 1L)
+      return(matrix(lower, nrow = 1L))
+    if (nstart == 2L)
+      return(rbind(lower, upper))
+    rbind(lower, midpoint, upper)
+  }
+
+  spread_pool <- function() {
+    pool <- matrix(integer(0), nrow = 0L, ncol = q)
+    pool <- add_unique(pool, lower)
+    pool <- add_unique(pool, midpoint)
+    pool <- add_unique(pool, upper)
+    if (q > 1L) {
+      level.mat <- rbind(lower, midpoint, upper)
+      base.pattern <- c(3L, 2L, 1L)
+      for (j in seq_len(max(q, 3L))) {
+        idx <- base.pattern[((seq_len(q) + j - 2L) %% 3L) + 1L]
+        row <- vapply(seq_len(q), function(i) level.mat[idx[i], i], integer(1L))
+        pool <- add_unique(pool, row)
+      }
+    }
+    pool
+  }
 
   initial <- as.integer(pmax(lower, pmin(upper, initial)))
-  if (!isTRUE(user_supplied))
-    initial <- .np_lp_nomad_reduce_degree_start(
-      degree = initial,
-      lower = lower,
-      basis = basis,
-      dim_budget = dim_budget
-    )
-  starts[1L, ] <- initial
-
-  if (nstart <= 1L)
-    return(starts)
 
   seed.state <- .np_seed_enter(random.seed)
   on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
 
-  max.tries <- max(1L, as.integer(max.tries[1L]))
-  for (j in 2:nstart) {
-    accepted <- FALSE
-    fallback <- starts[1L, ]
-    for (k in seq_len(max.tries)) {
-      candidate <- vapply(
-        seq_len(q),
-        function(i) sample.int(proposal.upper[i] - lower[i] + 1L, 1L) + lower[i] - 1L,
-        integer(1L)
-      )
-      fallback <- candidate
-      candidate.dim <- tryCatch(
-        dim_basis(basis = basis, degree = candidate),
-        error = function(e) Inf
-      )
-      if (is.finite(candidate.dim) && candidate.dim <= dim_budget) {
-        starts[j, ] <- as.integer(candidate)
-        accepted <- TRUE
-        break
-      }
-    }
-
-    if (!accepted) {
-      starts[j, ] <- .np_lp_nomad_reduce_degree_start(
-        degree = fallback,
-        lower = lower,
-        basis = basis,
-        dim_budget = dim_budget
-      )
-    }
+  if (isTRUE(user_supplied)) {
+    starts[1L, ] <- initial
+    fill.from <- 2L
+  } else if (identical(policy, "low_first_full_random")) {
+    starts[1L, ] <- lower
+    fill.from <- 2L
+  } else if (identical(policy, "mid_first_full_random")) {
+    starts[1L, ] <- midpoint
+    fill.from <- 2L
+  } else if (identical(policy, "anchor_then_random")) {
+    anchors <- anchor_pool()
+    take <- min(nstart, nrow(anchors))
+    starts[seq_len(take), ] <- anchors[seq_len(take), , drop = FALSE]
+    fill.from <- take + 1L
+  } else if (identical(policy, "spread_then_random")) {
+    pool <- if (nstart <= 2L) anchor_pool() else spread_pool()
+    take <- min(nstart, nrow(pool))
+    starts[seq_len(take), ] <- pool[seq_len(take), , drop = FALSE]
+    fill.from <- take + 1L
+  } else if (identical(policy, "random_full_only")) {
+    fill.from <- 1L
+  } else {
+    stop(sprintf("unknown np.nomad.degree.start.policy: %s", policy), call. = FALSE)
   }
 
+  if (fill.from <= nstart)
+    starts[fill.from:nstart, ] <- draw_full(nstart - fill.from + 1L)
+
+  if (any(is.na(starts)) ||
+      any(t(t(starts) < lower)) ||
+      any(t(t(starts) > upper)))
+    stop("generated NOMAD degree start outside bounds", call. = FALSE)
+
+  storage.mode(starts) <- "integer"
   starts
 }
 
@@ -1139,21 +1218,36 @@
                                    ub,
                                    nmulti = 1L,
                                    random.seed = 42L,
-                                   degree_spec = NULL) {
+                                   degree_spec = NULL,
+                                   start.lower = NULL,
+                                   start.upper = NULL) {
   n <- length(lb)
   if (length(ub) != n || length(bbin) != n)
     stop("NOMAD start construction requires matching lengths for x0/bbin/lb/ub")
 
   nstart <- npValidateNmulti(nmulti)
   starts <- matrix(0, nrow = nstart, ncol = n)
+  normalize.start.bound <- function(value, fallback, name) {
+    if (is.null(value))
+      return(as.numeric(fallback))
+    value <- as.numeric(value)
+    if (length(value) == 1L)
+      value <- rep.int(value, n)
+    if (length(value) != n)
+      stop(sprintf("NOMAD start construction requires '%s' to have length 1 or %d", name, n),
+           call. = FALSE)
+    value
+  }
+  start.lower <- normalize.start.bound(start.lower, lb, "start.lower")
+  start.upper <- normalize.start.bound(start.upper, ub, "start.upper")
 
   seed.state <- .np_seed_enter(random.seed)
   on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
 
   for (j in seq_len(nstart)) {
     for (i in seq_len(n)) {
-      lo <- if (is.finite(lb[i])) lb[i] else -1
-      hi <- if (is.finite(ub[i])) ub[i] else 1
+      lo <- if (is.finite(start.lower[i])) start.lower[i] else if (is.finite(lb[i])) lb[i] else -1
+      hi <- if (is.finite(start.upper[i])) start.upper[i] else if (is.finite(ub[i])) ub[i] else 1
       if (hi < lo) {
         tmp <- lo
         lo <- hi
@@ -1231,6 +1325,115 @@
   }
 
   starts
+}
+
+.np_nomad_default_opts <- function(random.seed, nomad.opts = list()) {
+  base <- list(
+    SEED = as.integer(random.seed),
+    RNG_ALT_SEEDING = TRUE,
+    DIRECTION_TYPE = "ORTHO 2N",
+    QUAD_MODEL_SEARCH = "no",
+    NM_SEARCH = "no",
+    SPECULATIVE_SEARCH = "no",
+    EVAL_OPPORTUNISTIC = "no"
+  )
+  utils::modifyList(base, if (is.null(nomad.opts)) list() else nomad.opts)
+}
+
+.np_nomad_prepare_solver_opts <- function(random.seed,
+                                          nomad.opts = list(),
+                                          coordinate.roles = NULL,
+                                          expected.length = NULL,
+                                          geometry.policy = c("user-only",
+                                                              "generate-central"),
+                                          where = "NOMAD source geometry") {
+  geometry.policy <- match.arg(geometry.policy)
+  opts <- .np_nomad_default_opts(random.seed, nomad.opts)
+  if (!identical(geometry.policy, "generate-central"))
+    return(opts)
+
+  .np_nomad_apply_source_geometry(
+    opts,
+    user.opts = nomad.opts,
+    roles = coordinate.roles,
+    expected.length = expected.length,
+    where = where
+  )
+}
+
+.np_nomad_native_false_option <- function(value) {
+  if (is.logical(value))
+    return(length(value) >= 1L && !isTRUE(value[1L]))
+  token <- tolower(trimws(as.character(value[1L])))
+  token %in% c("false", "f", "no", "n", "0")
+}
+
+.np_nomad_native_reject_unsupported_options <- function(opts, route) {
+  if (is.null(opts) || !length(opts))
+    return(invisible(TRUE))
+  option.names <- names(opts)
+  if (is.null(option.names))
+    return(invisible(TRUE))
+  idx <- which(toupper(trimws(option.names)) == "EVAL_USE_CACHE")
+  if (length(idx) && any(vapply(opts[idx], .np_nomad_native_false_option, logical(1)))) {
+    stop(sprintf(
+      "%s requires EVAL_USE_CACHE = TRUE; cache-off native solves are not supported",
+      route
+    ), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+.np_nomad_native_route_uses_solver <- function(nomad = FALSE,
+                                               degree.select = NULL,
+                                               search.engine = NULL,
+                                               bwsolver = NULL) {
+  match_one <- function(value, choices, default) {
+    if (is.null(value))
+      return(default)
+    out <- tryCatch(match.arg(value, choices), error = function(e) NULL)
+    if (is.null(out) || !length(out))
+      return(default)
+    as.character(out[1L])
+  }
+
+  degree.value <- match_one(degree.select, c("manual", "coordinate", "exhaustive"), "manual")
+  engine.value <- match_one(search.engine, c("nomad+powell", "cell", "nomad"), "nomad+powell")
+  solver.value <- match_one(bwsolver, c("powell", "mads", "mads+powell"), "powell")
+
+  isTRUE(nomad) ||
+    (!identical(degree.value, "manual") && engine.value %in% c("nomad", "nomad+powell")) ||
+    solver.value %in% c("mads", "mads+powell")
+}
+
+.np_nomad_native_reject_unsupported_options_for_route <- function(opts,
+                                                                  route,
+                                                                  nomad = FALSE,
+                                                                  degree.select = NULL,
+                                                                  search.engine = NULL,
+                                                                  bwsolver = NULL) {
+  if (.np_nomad_native_route_uses_solver(
+    nomad = nomad,
+    degree.select = degree.select,
+    search.engine = search.engine,
+    bwsolver = bwsolver
+  )) {
+    .np_nomad_native_reject_unsupported_options(opts, route)
+  }
+  invisible(TRUE)
+}
+
+.np_nomad_native_reject_unsupported_options_from_dots <- function(dots, route) {
+  if (is.null(dots) || !length(dots) || !("nomad.opts" %in% names(dots)))
+    return(invisible(TRUE))
+  .np_nomad_native_reject_unsupported_options_for_route(
+    opts = dots$nomad.opts,
+    route = route,
+    nomad = if ("nomad" %in% names(dots)) dots$nomad else FALSE,
+    degree.select = if ("degree.select" %in% names(dots)) dots$degree.select else NULL,
+    search.engine = if ("search.engine" %in% names(dots)) dots$search.engine else NULL,
+    bwsolver = if ("bwsolver" %in% names(dots)) dots$bwsolver else NULL
+  )
 }
 
 .np_nomad_progress_detail <- function(current_degree,
@@ -1336,7 +1539,7 @@
     sprintf("%s %s...", state$pkg_prefix, state$label)
   }
 
-  state
+  .np_progress_show_now(state)
 }
 
 .np_nomad_progress_configure <- function(state,
@@ -1365,7 +1568,7 @@
     sprintf("%s %s...", state$pkg_prefix, state$label)
   }
 
-  state
+  .np_progress_show_now(state)
 }
 
 .np_nomad_baseline_note <- function(degree) {
@@ -1395,6 +1598,7 @@
   out <- opt.args
   out$nmulti <- .np_nomad_powell_hotstart_nmulti(strategy)
   out$powell.remin <- isTRUE(remin)
+  out$bwsolver <- "powell"
   out
 }
 
@@ -1517,6 +1721,335 @@
   value
 }
 
+.np_nomad_capture_solver_output <- function(expr, capture.output = TRUE) {
+  if (!isTRUE(capture.output)) {
+    return(list(value = force(expr), output = character()))
+  }
+
+  value <- NULL
+  output <- utils::capture.output(
+    value <- force(expr),
+    type = "output"
+  )
+
+  list(value = value, output = output)
+}
+
+.np_nomad_native_option_vectors <- function(opts) {
+  if (is.null(opts) || !length(opts))
+    return(list(names = character(), values = character()))
+
+  .np_nomad_native_reject_unsupported_options(opts, "native NOMAD route")
+
+  option.names <- names(opts)
+  if (is.null(option.names) || any(!nzchar(option.names)))
+    stop("native NOMAD route received unnamed NOMAD options", call. = FALSE)
+
+  option.values <- vapply(opts, function(value) {
+    if (is.logical(value)) {
+      if (isTRUE(value[1L])) "true" else "false"
+    } else if (length(value) > 1L) {
+      paste0("( ", paste(as.character(value), collapse = " "), " )")
+    } else {
+      as.character(value[1L])
+    }
+  }, character(1L))
+
+  list(names = as.character(option.names), values = option.values)
+}
+
+.np_native_nomad_field <- function(x, name, default = NA) {
+  if (!is.list(x) || is.null(names(x)) || !(name %in% names(x)))
+    return(default)
+  x[[name, exact = TRUE]]
+}
+
+.np_native_nomad_cache_diagnostics <- function(native) {
+  list(
+    cache.hits = as.integer(.np_native_nomad_field(native, "cache_hits", NA_integer_)[1L]),
+    cache.size = as.integer(.np_native_nomad_field(native, "cache_size", NA_integer_)[1L]),
+    total.evaluations = as.integer(.np_native_nomad_field(native, "total_evaluations", NA_integer_)[1L])
+  )
+}
+
+.np_nomad_native_r_callback_search <- function(eval.f,
+                                               x0,
+                                               bbin,
+                                               lb,
+                                               ub,
+                                               random.seed = 42L,
+                                               inner.start.count = 0L,
+                                               option.names = character(),
+                                               option.values = character(),
+                                               display.nomad.progress = FALSE) {
+  if (!is.function(eval.f))
+    stop("native NOMAD R callback route requires a function", call. = FALSE)
+
+  .np_nomad_capture_solver_output(.Call(
+    "C_np_nomad_r_callback_native_search",
+    eval.f,
+    environment(eval.f),
+    as.double(x0),
+    as.integer(bbin),
+    as.double(lb),
+    as.double(ub),
+    as.integer(random.seed),
+    as.integer(inner.start.count),
+    as.character(option.names),
+    as.character(option.values),
+    as.integer(if (isTRUE(display.nomad.progress)) 0L else 1L),
+    PACKAGE = "npRmpi"
+  ), capture.output = !isTRUE(display.nomad.progress))
+}
+
+.np_nomad_external_output_lines <- function(lines) {
+  lines <- as.character(lines)
+  lines <- trimws(lines)
+  lines <- lines[!is.na(lines) & nzchar(lines)]
+  unique(lines)
+}
+
+.np_nomad_render_external_output <- function(line, progress_state) {
+  if (is.null(progress_state) ||
+      !isTRUE(progress_state$enabled) ||
+      !isTRUE(progress_state$visible) ||
+      !identical(progress_state$renderer, "single_line")) {
+    return(FALSE)
+  }
+
+  line <- .np_io_prefix_text(paste0("NOMAD: ", line))
+  render_line <- .np_progress_ellipsize_middle(
+    line,
+    max_width = max(20L, getOption("width", 80L) - 1L)
+  )
+  snapshot <- .np_progress_make_snapshot(
+    state = progress_state,
+    line = line,
+    render_line = render_line,
+    event = "render",
+    now = .np_progress_now(),
+    done = progress_state$last_done,
+    detail = progress_state$last_emitted_detail
+  )
+  .np_progress_render_single_line(snapshot = snapshot, event = "render")
+
+  transient_state <- progress_state
+  transient_state$rendered <- TRUE
+  transient_state$last_render_width <- nchar(render_line, type = "width")
+  transient_state$last_line <- line
+  .np_progress_prepare_for_external_output(transient_state)
+  TRUE
+}
+
+.np_nomad_emit_external_output <- function(lines, progress_state, seen) {
+  lines <- .np_nomad_external_output_lines(lines)
+  lines <- lines[!(lines %in% seen)]
+  if (!length(lines) || !isTRUE(.np_progress_enabled())) {
+    return(list(progress_state = progress_state, seen = seen))
+  }
+
+  progress_state <- .np_progress_prepare_for_external_output(progress_state)
+  for (line in lines) {
+    if (!isTRUE(.np_nomad_render_external_output(line, progress_state))) {
+      .np_message("NOMAD: ", line)
+    }
+  }
+
+  list(progress_state = progress_state, seen = c(seen, lines))
+}
+
+.np_nomad_native_call_value <- function(native.call, seen = character()) {
+  progress_state <- .np_progress_runtime$bandwidth_state
+  if (!length(seen) && !is.null(progress_state$external_output_seen)) {
+    seen <- progress_state$external_output_seen
+  }
+  emitted <- .np_nomad_emit_external_output(
+    lines = native.call$output,
+    progress_state = progress_state,
+    seen = seen
+  )
+  if (!is.null(emitted$progress_state)) {
+    emitted$progress_state$external_output_seen <- emitted$seen
+  }
+  .np_progress_runtime$bandwidth_state <- emitted$progress_state
+  native.call$value
+}
+
+.np_nomad_native_progress_begin <- function(nmulti,
+                                            baseline_degree,
+                                            best_record) {
+  handle <- new.env(parent = emptyenv())
+  handle$old_state <- .np_progress_runtime$bandwidth_state
+  handle$closed <- FALSE
+  handle$state <- .np_nomad_progress_begin(
+    nmulti = nmulti,
+    baseline_degree = baseline_degree,
+    best_record = best_record
+  )
+  handle$state$nomad_native_progress <- TRUE
+  handle$state$nomad_eval_offset <- 0L
+  .np_progress_runtime$bandwidth_state <- handle$state
+  handle
+}
+
+.np_nomad_native_progress_state <- function(handle) {
+  if (is.null(handle) || isTRUE(handle$closed)) {
+    return(NULL)
+  }
+
+  state <- .np_progress_runtime$bandwidth_state
+  if (is.null(state)) {
+    state <- handle$state
+  }
+  state
+}
+
+.np_nomad_progress_best_record <- function(incumbent,
+                                           candidate,
+                                           direction = c("min", "max")) {
+  direction <- match.arg(direction)
+  if (is.null(candidate))
+    return(incumbent)
+  if (is.null(incumbent))
+    return(candidate)
+
+  candidate.objective <- suppressWarnings(as.numeric(candidate$objective)[1L])
+  incumbent.objective <- suppressWarnings(as.numeric(incumbent$objective)[1L])
+  if (.np_degree_better(candidate.objective, incumbent.objective, direction = direction))
+    return(candidate)
+
+  incumbent
+}
+
+.np_progress_nomad_native_step_from_c <- function(iteration,
+                                                  current.degree,
+                                                  best.degree = integer(),
+                                                  best.objective = NA_real_) {
+  state <- .np_progress_runtime$bandwidth_state
+  if (is.null(state) || !isTRUE(state$nomad_native_progress)) {
+    return(invisible(FALSE))
+  }
+
+  iteration <- suppressWarnings(as.integer(iteration)[1L])
+  if (is.na(iteration) || iteration < 1L) {
+    return(invisible(FALSE))
+  }
+
+  current.degree <- as.integer(current.degree)
+  if (length(current.degree) && !anyNA(current.degree)) {
+    state$nomad_current_degree <- current.degree
+  }
+
+  eval.offset <- suppressWarnings(as.integer(state$nomad_eval_offset)[1L])
+  if (is.na(eval.offset) || eval.offset < 0L) {
+    eval.offset <- 0L
+  }
+  state$nomad_eval_id <- eval.offset + iteration
+
+  best.degree <- as.integer(best.degree)
+  if (length(best.degree) && !anyNA(best.degree)) {
+    best.objective <- suppressWarnings(as.numeric(best.objective)[1L])
+    c_best_record <- list(
+      eval_id = state$nomad_eval_id,
+      degree = best.degree,
+      objective = best.objective,
+      status = "ok",
+      cached = FALSE
+    )
+    state$nomad_best_record <- .np_nomad_progress_best_record(
+      incumbent = state$nomad_best_record,
+      candidate = c_best_record,
+      direction = "min"
+    )
+  }
+
+  state <- .np_degree_progress_step(
+    state = state,
+    done = iteration,
+    detail = NULL
+  )
+  .np_progress_runtime$bandwidth_state <- state
+  invisible(TRUE)
+}
+
+.np_nomad_native_progress_restart <- function(handle,
+                                              restart_index,
+                                              degree,
+                                              best_record,
+                                              restart_durations = numeric(),
+                                              eval_offset = 0L) {
+  state <- .np_nomad_native_progress_state(handle)
+  if (is.null(state)) {
+    return(invisible(NULL))
+  }
+
+  state$nomad_current_degree <- as.integer(degree)
+  state$nomad_best_record <- .np_nomad_progress_best_record(
+    incumbent = state$nomad_best_record,
+    candidate = best_record,
+    direction = "min"
+  )
+  state$nomad_restart_index <- as.integer(restart_index)
+  state$nomad_restart_durations <- restart_durations
+  eval_offset <- suppressWarnings(as.integer(eval_offset)[1L])
+  if (is.na(eval_offset) || eval_offset < 0L) {
+    eval_offset <- 0L
+  }
+  state$nomad_eval_offset <- eval_offset
+  state$nomad_eval_id <- state$nomad_eval_offset
+  state$last_done <- NULL
+  state <- .np_degree_progress_step(
+    state = state,
+    done = NULL,
+    detail = NULL,
+    force = TRUE
+  )
+  handle$state <- state
+  .np_progress_runtime$bandwidth_state <- state
+  invisible(NULL)
+}
+
+.np_nomad_native_progress_end <- function(handle,
+                                          degree,
+                                          best_record,
+                                          interrupted = FALSE) {
+  if (is.null(handle) || isTRUE(handle$closed)) {
+    return(invisible(NULL))
+  }
+
+  state <- .np_nomad_native_progress_state(handle)
+  if (!is.null(state)) {
+    state$nomad_current_degree <- as.integer(degree)
+    state$nomad_best_record <- .np_nomad_progress_best_record(
+      incumbent = state$nomad_best_record,
+      candidate = best_record,
+      direction = "min"
+    )
+    state <- .np_degree_progress_end(
+      state = state,
+      detail = NULL,
+      interrupted = isTRUE(interrupted)
+    )
+  }
+  .np_progress_runtime$bandwidth_state <- handle$old_state
+  handle$closed <- TRUE
+  invisible(NULL)
+}
+
+.np_nomad_native_progress_abort <- function(handle, detail = NULL) {
+  if (is.null(handle) || isTRUE(handle$closed)) {
+    return(invisible(NULL))
+  }
+
+  state <- .np_nomad_native_progress_state(handle)
+  if (!is.null(state)) {
+    .np_progress_abort(state = state, detail = detail)
+  }
+  .np_progress_runtime$bandwidth_state <- handle$old_state
+  handle$closed <- TRUE
+  invisible(NULL)
+}
+
 .np_nomad_search <- function(engine = c("nomad", "nomad+powell"),
                              baseline_record,
                              start_degree = NULL,
@@ -1538,7 +2071,11 @@
                              handoff_before_build = FALSE,
                              remin = FALSE,
                              degree_spec = NULL,
-                             nomad.opts = list()) {
+                             start.lower = NULL,
+                             start.upper = NULL,
+                             coordinate.roles = NULL,
+                             nomad.opts = list(),
+                             native.r.bridge = TRUE) {
   engine <- match.arg(engine)
   direction <- match.arg(direction)
   .np_nomad_require_crs()
@@ -1566,6 +2103,8 @@
   state$best_restart_index <- NA_integer_
   state$restart_durations <- numeric()
   state$restart_eval_id <- 0L
+  state$external_output_seen <- character()
+  state$native.r.bridge <- isTRUE(native.r.bridge)
 
   set_progress_state <- function(value) {
     state$progress_state <- value
@@ -1585,7 +2124,14 @@
     ub = ub,
     nmulti = nomad.nmulti,
     random.seed = random.seed,
-    degree_spec = degree_spec
+    degree_spec = degree_spec,
+    start.lower = start.lower,
+    start.upper = start.upper
+  )
+  coordinate.roles <- .np_nomad_validate_coordinate_roles(
+    coordinate.roles,
+    ncol(start_matrix),
+    where = ".np_nomad_search"
   )
   state$restart_starts <- lapply(
     seq_len(nrow(start_matrix)),
@@ -1608,11 +2154,9 @@
     }
     state$restart_start_info <- list(
       basis = if (is.null(degree_spec$basis)) "glp" else degree_spec$basis,
-      dim_budget = .np_lp_nomad_dim_budget(degree_spec$nobs),
-      proposal.upper = .np_lp_nomad_proposal_upper(
-        lower = degree_spec$lower,
-        upper = degree_spec$upper
-      ),
+      degree.start.policy = .np_lp_nomad_degree_start_policy(),
+      lower = as.integer(degree_spec$lower),
+      upper = as.integer(degree_spec$upper),
       user_supplied_start = isTRUE(degree_spec$user_supplied)
     )
   } else {
@@ -1747,6 +2291,70 @@
     ))
   }
 
+  run_nomad_solver <- function(start) {
+    solver.opts <- .np_nomad_prepare_solver_opts(
+      random.seed = random.seed,
+      nomad.opts = nomad.opts,
+      coordinate.roles = coordinate.roles,
+      expected.length = length(start),
+      geometry.policy = if (is.null(coordinate.roles)) "user-only" else "generate-central",
+      where = ".np_nomad_search source geometry"
+    )
+    start <- as.numeric(start)
+
+    if (isTRUE(state$native.r.bridge)) {
+      native.eval <- function(point) {
+        value <- as.numeric(wrapped_eval(point)[1L])
+        if (!is.finite(value)) .Machine$double.xmax else value
+      }
+      native.option.vectors <- .np_nomad_native_option_vectors(solver.opts)
+      native.call <- .np_nomad_native_r_callback_search(
+        eval.f = native.eval,
+        x0 = start,
+        bbin = bbin,
+        lb = lb,
+        ub = ub,
+        random.seed = random.seed,
+        inner.start.count = nomad.inner.nmulti,
+        option.names = native.option.vectors$names,
+        option.values = native.option.vectors$values,
+        display.nomad.progress = display.nomad.progress
+      )
+      native.value <- native.call$value
+      native.status.raw <- if (!is.null(native.value$status)) native.value$status[1L] else 0L
+      native.status.integer <- suppressWarnings(as.integer(native.status.raw))
+      native.status.failed <- if (!is.na(native.status.integer)) {
+        !identical(native.status.integer, 0L)
+      } else {
+        !(tolower(as.character(native.status.raw)) %in% c("", "ok", "success"))
+      }
+      native.result.status <- if (!is.null(native.value$result_status)) {
+        suppressWarnings(as.integer(native.value$result_status[1L]))
+      } else {
+        0L
+      }
+      native.result.failed <- !is.na(native.result.status) && !identical(native.result.status, 0L)
+      if (native.status.failed || native.result.failed) {
+        native.message <- if (!is.null(native.value$message) &&
+                              nzchar(as.character(native.value$message[1L]))) {
+          as.character(native.value$message[1L])
+        } else {
+          "NOMAD rejected the supplied parameters"
+        }
+        stop(sprintf(
+          "native NOMAD R-callback route failed (status=%s, result_status=%s): %s",
+          as.character(native.status.raw),
+          native.result.status,
+          native.message
+        ), call. = FALSE)
+      }
+      return(native.call)
+    }
+
+    stop("legacy R-level NOMAD fallback is retired for npRmpi NOMAD routes; this route must use the native crs C API or fail earlier as unsupported",
+         call. = FALSE)
+  }
+
   restart_results <- vector("list", nomad.nmulti)
   best_solution <- NULL
   nomad.elapsed <- 0
@@ -1786,27 +2394,15 @@
     nomad.start <- proc.time()[3L]
     solution_i <- tryCatch(
       {
-        solver.opts <- utils::modifyList(
-          list(
-            SEED = as.integer(random.seed),
-            RNG_ALT_SEEDING = TRUE
-          ),
-          nomad.opts
+        nomad.call <- run_nomad_solver(as.numeric(start_matrix[i, ]))
+        emitted <- .np_nomad_emit_external_output(
+          lines = nomad.call$output,
+          progress_state = state$progress_state,
+          seen = state$external_output_seen
         )
-        crs::snomadr(
-          eval.f = wrapped_eval,
-          n = length(x0),
-          bbin = as.integer(bbin),
-          bbout = 0L,
-          x0 = as.numeric(start_matrix[i, ]),
-          lb = as.double(lb),
-          ub = as.double(ub),
-          nmulti = nomad.inner.nmulti,
-          random.seed = as.integer(random.seed),
-          opts = solver.opts,
-          display.nomad.progress = display.nomad.progress,
-          snomadr.environment = environment(wrapped_eval)
-        )
+        set_progress_state(emitted$progress_state)
+        state$external_output_seen <- emitted$seen
+        nomad.call$value
       },
       interrupt = function(e) {
         state$interrupted <- TRUE
@@ -1861,6 +2457,16 @@
 
     if (isTRUE(state$interrupted))
       break
+
+    if (is.null(solution_i) && !is.null(state$error)) {
+      if (!is.null(state$progress_state)) {
+        state$progress_state <- .np_progress_abort(
+          state = state$progress_state,
+          detail = state$error
+        )
+      }
+      stop(state$error, call. = FALSE)
+    }
 
     post_restart_best <- if (is.null(state$best_record) || is.null(state$best_record$objective)) {
       if (identical(direction, "min")) Inf else -Inf
@@ -1917,27 +2523,15 @@
     nomad.start <- proc.time()[3L]
     solution_i <- tryCatch(
       {
-        solver.opts <- utils::modifyList(
-          list(
-            SEED = as.integer(random.seed),
-            RNG_ALT_SEEDING = TRUE
-          ),
-          nomad.opts
+        nomad.call <- run_nomad_solver(remin.start)
+        emitted <- .np_nomad_emit_external_output(
+          lines = nomad.call$output,
+          progress_state = state$progress_state,
+          seen = state$external_output_seen
         )
-        crs::snomadr(
-          eval.f = wrapped_eval,
-          n = length(x0),
-          bbin = as.integer(bbin),
-          bbout = 0L,
-          x0 = remin.start,
-          lb = as.double(lb),
-          ub = as.double(ub),
-          nmulti = nomad.inner.nmulti,
-          random.seed = as.integer(random.seed),
-          opts = solver.opts,
-          display.nomad.progress = display.nomad.progress,
-          snomadr.environment = environment(wrapped_eval)
-        )
+        set_progress_state(emitted$progress_state)
+        state$external_output_seen <- emitted$seen
+        nomad.call$value
       },
       interrupt = function(e) {
         state$interrupted <- TRUE
@@ -1989,6 +2583,15 @@
         NULL
       }
     )
+    if (is.null(solution_i) && !is.null(state$error)) {
+      if (!is.null(state$progress_state)) {
+        state$progress_state <- .np_progress_abort(
+          state = state$progress_state,
+          detail = state$error
+        )
+      }
+      stop(state$error, call. = FALSE)
+    }
     post_restart_best <- if (is.null(state$best_record) || is.null(state$best_record$objective)) {
       if (identical(direction, "min")) Inf else -Inf
     } else {
@@ -2100,6 +2703,18 @@
     restart.bandwidth.starts = state$restart_bandwidth_starts,
     restart.start.info = state$restart_start_info,
     restart.results = state$restart_results,
-    trace = .np_degree_trace_to_frame(state$trace_records, objective_name = objective_name)
+    trace = .np_degree_trace_to_frame(state$trace_records, objective_name = objective_name),
+    native = isTRUE(state$native.r.bridge),
+    native.diagnostics = if (isTRUE(state$native.r.bridge)) {
+      c(list(
+        route_native = TRUE,
+        callback_mode = "R",
+        native_symbol = "C_np_nomad_r_callback_native_search",
+        crs.callback.evaluations = as.integer(.np_native_nomad_field(best_solution, "callback_evaluations", NA_integer_)[1L]),
+        blackbox.evaluations = as.integer(.np_native_nomad_field(best_solution, "bbe", NA_integer_)[1L])
+      ), .np_native_nomad_cache_diagnostics(best_solution))
+    } else {
+      NULL
+    }
   )
 }

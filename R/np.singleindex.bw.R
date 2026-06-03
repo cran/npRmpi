@@ -106,6 +106,10 @@ npindexbw.NULL <-
     } else {
       "nomad+powell"
     }
+    ichimura.lp.nomad.degree.search <- isTRUE(automatic.degree.search) &&
+      identical(method.value, "ichimura") &&
+      identical(regtype.value, "lp") &&
+      search.engine.value %in% c("nomad", "nomad+powell")
     .np_nomad_validate_inner_multistart(
       call_names = names(mc),
       dot.args = dots,
@@ -116,6 +120,7 @@ npindexbw.NULL <-
     if (.npRmpi_autodispatch_active() &&
         (!isTRUE(automatic.degree.search) ||
            isTRUE(collective.degree.search) ||
+           isTRUE(ichimura.lp.nomad.degree.search) ||
            .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
       return(.npRmpi_autodispatch_call(mc, parent.frame()))
 
@@ -173,8 +178,12 @@ npindexbw.NULL <-
 
   lower <- 2L
   upper <- max(1L, as.integer(nobs) - 1L)
+  hard.upper <- .Machine$integer.max / 2
   k <- .np_round_half_to_even(h)
-  list(ok = (k >= lower) && (k <= upper), value = as.double(k))
+  upper.ok <- (k <= upper) ||
+    (npExtendedNnEnabled() && (k <= hard.upper) &&
+       (as.character(bwtype)[1L] %in% c("generalized_nn", "adaptive_nn")))
+  list(ok = (k >= lower) && upper.ok, value = as.double(k))
 }
 
 .npindexbw_h_start_controls <- function(scale.factor.init.lower = 0.1,
@@ -222,6 +231,68 @@ npindexbw.NULL <-
   runif(1, min = 2, max = max(2L, upper))
 }
 
+.npindex_ols_beta_tail <- function(ols.fit) {
+  slopes <- as.double(coef(ols.fit)[-1L])
+  if (length(slopes) <= 1L)
+    return(numeric(0))
+
+  anchor <- slopes[1L]
+  tail <- slopes[-1L]
+  finite.slopes <- slopes[is.finite(slopes)]
+  scale <- if (length(finite.slopes)) max(1, max(abs(finite.slopes))) else 1
+  if (!is.finite(anchor) || abs(anchor) <= sqrt(.Machine$double.eps) * scale) {
+    tail[!is.finite(tail)] <- 0
+    return(tail)
+  }
+
+  out <- tail / anchor
+  out[!is.finite(out)] <- 0
+  out
+}
+
+.npindex_index_from_beta_tail <- function(xmat, beta.tail) {
+  xmat <- toMatrix(xmat)
+  beta.tail <- as.double(beta.tail)
+  beta <- c(1, beta.tail)
+  if (length(beta) != ncol(xmat))
+    stop("npindexbw: beta/index geometry length mismatch", call. = FALSE)
+  index <- as.double(xmat %*% beta)
+  index[!is.finite(index)] <- 0
+  index
+}
+
+.npindex_beta_coordinate_setup <- function(xmat) {
+  xmat <- toMatrix(xmat)
+  p <- ncol(xmat)
+  if (p <= 1L) {
+    factor <- numeric(0)
+  } else {
+    scales <- apply(xmat, 2L, stats::sd)
+    scales <- as.double(scales)
+    scales[!is.finite(scales) | scales <= 0] <- 1
+    anchor <- scales[1L]
+    if (!is.finite(anchor) || anchor <= 0)
+      anchor <- 1
+    factor <- scales[-1L] / anchor
+    factor[!is.finite(factor) | factor <= 0] <- 1
+  }
+  list(
+    factor = factor,
+    to_search = function(beta.tail) {
+      beta.tail <- as.double(beta.tail)
+      if (!length(beta.tail))
+        return(numeric(0))
+      beta.tail * factor
+    },
+    to_public = function(beta.search) {
+      beta.search <- as.double(beta.search)
+      if (!length(beta.search))
+        return(numeric(0))
+      beta.search / factor
+    }
+  )
+}
+
 .npindex_finalize_bandwidth <- function(h,
                                         bwtype,
                                         nobs,
@@ -231,6 +302,17 @@ npindexbw.NULL <-
   if (!candidate$ok) {
     if (identical(bwtype, "fixed")) {
       stop(sprintf("%s: bandwidth must be positive and finite", where), call. = FALSE)
+    }
+    upper <- max(2L, as.integer(nobs) - 1L)
+    if (!identical(bwtype, "fixed") && is.finite(h) && h > upper &&
+        !npExtendedNnEnabled()) {
+      stop(
+        sprintf(
+          "%s: nearest-neighbor bandwidth exceeds n-1; set options(np.extendednn = TRUE) to allow extended generalized_nn/adaptive_nn bandwidths",
+          where
+        ),
+        call. = FALSE
+      )
     }
     stop(
       sprintf(
@@ -254,12 +336,7 @@ npindexbw.NULL <-
                                            h.start.raw,
                                            nobs,
                                            start.controls = .npindexbw_h_start_controls()) {
-  scale <- .npindex_default_start_bandwidth(
-    fit = fit,
-    bwtype = "fixed",
-    nobs = nobs,
-    start.controls = start.controls
-  )
+  scale <- .npindex_start_bandwidth_scale(fit = fit, nobs = nobs)
   if (!is.finite(scale) || scale <= 0) {
     scale <- max(
       if (is.finite(h.start.raw)) abs(as.double(h.start.raw)) else 0,
@@ -283,12 +360,9 @@ npindexbw.NULL <-
   degree.col <- h.col + 1L
 
   ols.fit <- lm(ydat ~ xmat, x = TRUE)
-  fit.proxy <- as.double(fitted(ols.fit))
-  fit.proxy[!is.finite(fit.proxy)] <- mean(ydat[is.finite(ydat)])
-  fit.proxy[!is.finite(fit.proxy)] <- 0
 
   ols.beta <- if (length(beta.free)) {
-    as.double(coef(ols.fit)[3:ncol(ols.fit$x)])
+    .npindex_ols_beta_tail(ols.fit)
   } else {
     numeric(0)
   }
@@ -303,6 +377,7 @@ npindexbw.NULL <-
   }
   if (length(beta.start.raw))
     beta.start.raw[!is.finite(beta.start.raw)] <- 0
+  fit.proxy <- .npindex_index_from_beta_tail(xmat, beta.start.raw)
 
   if (isTRUE(all.equal(as.double(baseline.bws$bw[1L]), 0))) {
     h.start.raw <- .npindex_default_start_bandwidth(
@@ -394,14 +469,13 @@ npindexbw.NULL <-
 }
 
 .npindexbw_fast_eligible <- function(h, bws, eval.index) {
+  if (!npLogicalOption("np.largeh", TRUE))
+    return(FALSE)
+
   if (!identical(bws$type, "fixed"))
     return(FALSE)
 
-  fast_largeh_tol <- getOption("np.largeh.rel.tol", 1e-3)
-  if (!is.numeric(fast_largeh_tol) || length(fast_largeh_tol) != 1L ||
-      is.na(fast_largeh_tol) || !is.finite(fast_largeh_tol) ||
-      fast_largeh_tol <= 0 || fast_largeh_tol >= 0.1)
-    fast_largeh_tol <- 1e-3
+  fast_largeh_tol <- npLargehRelTol()
 
   cont_utol <- switch(
     bws$ckertype,
@@ -479,7 +553,8 @@ npindexbw.NULL <-
                                                   h,
                                                   bws,
                                                   spec,
-                                                  invalid.penalty) {
+                                                  invalid.penalty,
+                                                  localize = TRUE) {
   leaf <- .npindexbw_build_lp_regression_leaf(
     index = index,
     ydat = ydat,
@@ -489,16 +564,13 @@ npindexbw.NULL <-
   )
 
   out <- tryCatch(
-    ## This objective is evaluated inside each rank's optimizer loop under
-    ## autodispatch. Keep the inner regression evaluator local so independent
-    ## optimizer paths cannot enter nested MPI collectives in different orders.
     .npregbw_eval_only(
       xdat = leaf$xdat,
       ydat = ydat,
       bws = leaf$bws,
       invalid.penalty = "baseline",
       penalty.multiplier = 10,
-      localize = TRUE
+      localize = localize
     ),
     error = function(e) NULL
   )
@@ -510,6 +582,131 @@ npindexbw.NULL <-
     objective = as.numeric(out$objective[1L]),
     num.feval.fast = as.numeric(out$num.feval.fast[1L])
   )
+}
+
+.npindexbw_ichimura_lp_service_context <- function(bws,
+                                                   spec,
+                                                   bandwidth.compute = TRUE,
+                                                   comm = 1L,
+                                                   service_id = "npindex_ichimura_lp") {
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm)), error = function(e) 0L)
+  size <- tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) 1L)
+  if (!is.finite(rank)) rank <- 0L
+  if (!is.finite(size) || size < 1L) size <- 1L
+
+  in.context <- isTRUE(.npRmpi_autodispatch_in_context()) ||
+    isTRUE(.npRmpi_manual_bcast_in_context()) ||
+    isTRUE(.npRmpi_autodispatch_called_from_bcast())
+  pool.ok <- if (isTRUE(in.context)) {
+    size > 1L
+  } else {
+    isTRUE(.npRmpi_has_active_slave_pool(comm = comm))
+  }
+
+  active <- isTRUE(bandwidth.compute) &&
+    identical(as.character(bws$method[1L]), "ichimura") &&
+    !identical(as.character(spec$regtype.engine[1L]), "lc") &&
+    isTRUE(pool.ok) &&
+    !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
+    isTRUE(in.context)
+
+  list(
+    active = isTRUE(active) && size > 1L,
+    root = identical(rank, 0L),
+    rank = rank,
+    size = size,
+    comm = as.integer(comm),
+    service_id = as.character(service_id)[1L]
+  )
+}
+
+.npindexbw_ichimura_lp_service_worker_loop <- function(xmat,
+                                                       ydat,
+                                                       bws,
+                                                       spec,
+                                                       ctx) {
+  repeat {
+    task <- mpi.bcast.Robj(rank = 0L, comm = ctx$comm)
+    if (!is.list(task) || is.null(task$kind))
+      stop("malformed npindex Ichimura LP service task", call. = FALSE)
+
+    task.service <- if (is.null(task$service_id)) ctx$service_id else as.character(task$service_id)[1L]
+
+    if (identical(task$kind, "eval")) {
+      task.spec <- if (is.null(task$spec)) spec else task$spec
+      .npindexbw_eval_objective(
+        param = as.numeric(task$param),
+        xmat = xmat,
+        ydat = ydat,
+        bws = bws,
+        spec = task.spec,
+        localize = FALSE
+      )
+      next
+    }
+
+    if (!identical(task.service, ctx$service_id))
+      next
+
+    if (identical(task$kind, "result"))
+      return(task$value)
+    if (identical(task$kind, "error"))
+      stop(as.character(task$message)[1L], call. = FALSE)
+    if (identical(task$kind, "stop"))
+      return(invisible(NULL))
+
+    stop("unknown npindex Ichimura LP service task", call. = FALSE)
+  }
+}
+
+.npindexbw_ichimura_lp_service_eval <- function(param,
+                                                xmat,
+                                                ydat,
+                                                bws,
+                                                spec,
+                                                ctx,
+                                                eval_id = NA_integer_) {
+  mpi.bcast.Robj(
+    list(
+      kind = "eval",
+      service_id = ctx$service_id,
+      eval_id = eval_id,
+      param = as.numeric(param),
+      spec = spec
+    ),
+    rank = 0L,
+    comm = ctx$comm
+  )
+
+  .npindexbw_eval_objective(
+    param = as.numeric(param),
+    xmat = xmat,
+    ydat = ydat,
+    bws = bws,
+    spec = spec,
+    localize = FALSE
+  )
+}
+
+.npindexbw_ichimura_lp_service_result <- function(value, ctx) {
+  mpi.bcast.Robj(
+    list(kind = "result", service_id = ctx$service_id, value = value),
+    rank = 0L,
+    comm = ctx$comm
+  )
+  value
+}
+
+.npindexbw_ichimura_lp_service_error <- function(message, ctx) {
+  try(
+    mpi.bcast.Robj(
+      list(kind = "error", service_id = ctx$service_id, message = as.character(message)[1L]),
+      rank = 0L,
+      comm = ctx$comm
+    ),
+    silent = TRUE
+  )
+  invisible(NULL)
 }
 
 .npindex_lp_loo_fit_block <- function(idx,
@@ -845,7 +1042,8 @@ npindexbw.NULL <-
                                       xmat,
                                       ydat,
                                       bws,
-                                      spec) {
+                                      spec,
+                                      localize = TRUE) {
   p <- ncol(xmat)
   beta.idx <- if (p > 1L) seq_len(p - 1L) else integer(0)
   beta <- if (length(beta.idx)) as.double(param[beta.idx]) else numeric(0)
@@ -874,7 +1072,8 @@ npindexbw.NULL <-
       h = h,
       bws = bws,
       spec = spec,
-      invalid.penalty = invalid.penalty
+      invalid.penalty = invalid.penalty,
+      localize = localize
     ))
   }
 
@@ -983,9 +1182,10 @@ npindexbw.NULL <-
                                     reg.args,
                                     opt.args,
                                     degree.search,
-                                    nomad.inner.nmulti = 0L) {
-  if (isTRUE(degree.search$verify))
-    stop("automatic degree search with search.engine='nomad' does not support degree.verify")
+                                    nomad.inner.nmulti = 0L,
+                                    nomad.opts = list()) {
+  if (is.null(opt.args$nomad.opts) && length(nomad.opts))
+    opt.args$nomad.opts <- nomad.opts
 
   template.reg.args <- reg.args
   template.reg.args$regtype <- "lp"
@@ -1016,6 +1216,7 @@ npindexbw.NULL <-
     y.clean <- as.double(y.clean)
 
   p <- ncol(x.clean)
+  beta.coord <- .npindex_beta_coordinate_setup(x.clean)
   nomad.nmulti <- if (is.null(opt.args$nmulti)) npDefaultNmulti(ncol(xdat)) else npValidateNmulti(opt.args$nmulti[1L])
   scale.factor.search.lower <- npResolveScaleFactorLowerBound(opt.args$scale.factor.search.lower)
   h.start.controls <- .npindexbw_h_start_controls(
@@ -1045,6 +1246,7 @@ npindexbw.NULL <-
   } else {
     if (length(beta.free)) as.double(baseline.bws$beta[beta.free + 1L]) else numeric(0)
   }
+  beta.search.start <- beta.coord$to_search(beta.start)
   h.start.raw <- if (fixed.nomad) {
     as.double(fixed.setup$start_matrix.raw[1L, fixed.setup$h.col])
   } else {
@@ -1052,18 +1254,18 @@ npindexbw.NULL <-
   }
   beta.lower <- if (length(beta.start)) {
     if (fixed.nomad) {
-      pmin(0.5 * fixed.setup$ols.beta, 1.5 * fixed.setup$ols.beta)
+      beta.coord$to_search(pmin(0.5 * fixed.setup$ols.beta, 1.5 * fixed.setup$ols.beta))
     } else {
-      -pmax(10, 10 * abs(beta.start))
+      beta.coord$to_search(-pmax(10, 10 * abs(beta.start)))
     }
   } else {
     numeric(0)
   }
   beta.upper <- if (length(beta.start)) {
     if (fixed.nomad) {
-      pmax(0.5 * fixed.setup$ols.beta, 1.5 * fixed.setup$ols.beta)
+      beta.coord$to_search(pmax(0.5 * fixed.setup$ols.beta, 1.5 * fixed.setup$ols.beta))
     } else {
-      pmax(10, 10 * abs(beta.start))
+      beta.coord$to_search(pmax(10, 10 * abs(beta.start)))
     }
   } else {
     numeric(0)
@@ -1080,23 +1282,66 @@ npindexbw.NULL <-
     h.lower.raw
   }
   h.upper <- if (fixed.nomad) {
-    h.start.controls$scale.factor.init.upper
+    h.upper.raw / fixed.setup$h.scale
   } else {
     h.upper.raw
   }
   h.integer <- !identical(baseline.bws$type, "fixed")
+  coordinate.roles <- c(
+    rep.int("continuous_real", length(beta.lower)),
+    if (isTRUE(h.integer)) "continuous_nn_index" else "continuous_fixed_scale",
+    rep.int("degree", length(degree.search$lower))
+  )
 
   x0 <- if (fixed.nomad) {
-    as.numeric(fixed.setup$start_matrix.point[1L, ])
+    start <- as.numeric(fixed.setup$start_matrix.point[1L, ])
+    if (length(beta.free))
+      start[seq_along(beta.free)] <- beta.coord$to_search(start[seq_along(beta.free)])
+    start
   } else {
-    c(beta.start, h.start.raw, as.integer(degree.search$start.degree))
+    c(beta.search.start, h.start.raw, as.integer(degree.search$start.degree))
   }
   lb <- c(beta.lower, h.lower, degree.search$lower)
   ub <- c(beta.upper, h.upper, degree.search$upper)
+  start.lb <- lb
+  start.ub <- ub
+  if (fixed.nomad) {
+    h.idx <- length(beta.start) + 1L
+    start.lb[h.idx] <- max(start.lb[h.idx], h.start.controls$scale.factor.init.lower)
+    start.ub[h.idx] <- min(start.ub[h.idx], h.start.controls$scale.factor.init.upper)
+    if (start.ub[h.idx] < start.lb[h.idx]) {
+      stop("npindexbw: effective NOMAD fixed-bandwidth random-start interval is empty after applying search bounds",
+           call. = FALSE)
+    }
+  }
   bbin <- c(rep.int(0L, length(beta.start)), if (isTRUE(h.integer)) 1L else 0L, 1L)
   baseline.record <- NULL
   nomad.num.feval.total <- 0
   nomad.num.feval.fast.total <- 0
+  service.spec <- template.reg.args
+  service.ctx <- .npindexbw_ichimura_lp_service_context(
+    bws = baseline.bws,
+    spec = service.spec,
+    bandwidth.compute = TRUE,
+    comm = 1L,
+    service_id = "npindex_ichimura_lp_nomad"
+  )
+  if (isTRUE(service.ctx$active) && !isTRUE(service.ctx$root))
+    return(.npindexbw_ichimura_lp_service_worker_loop(
+      xmat = x.clean,
+      ydat = y.clean,
+      bws = baseline.bws,
+      spec = service.spec,
+      ctx = service.ctx
+    ))
+  service.eval.counter <- 0L
+  service.done <- FALSE
+  if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+    on.exit({
+      if (!isTRUE(service.done))
+        .npindexbw_ichimura_lp_service_error("npindex Ichimura LP NOMAD service stopped before returning a result", service.ctx)
+    }, add = TRUE)
+  }
 
   .np_nomad_baseline_note(degree.search$start.degree)
 
@@ -1107,6 +1352,8 @@ npindexbw.NULL <-
 
   point_to_public <- function(point) {
     point <- as.numeric(point)
+    if (length(beta.free))
+      point[seq_along(beta.free)] <- beta.coord$to_public(point[seq_along(beta.free)])
     if (length(point) >= (length(beta.free) + 1L))
       point[length(beta.free) + 1L] <- point_h_to_raw(point[length(beta.free) + 1L])
     point
@@ -1114,13 +1361,15 @@ npindexbw.NULL <-
 
   bandwidth_point_to_public <- function(point) {
     point <- as.numeric(point)
+    if (length(beta.free))
+      point[seq_along(beta.free)] <- beta.coord$to_public(point[seq_along(beta.free)])
     if (length(point))
       point[length(point)] <- point_h_to_raw(point[length(point)])
     point
   }
 
   point_to_param <- function(point) {
-    beta.tail <- if (length(beta.free)) as.double(point[seq_along(beta.free)]) else numeric(0)
+    beta.tail <- if (length(beta.free)) beta.coord$to_public(point[seq_along(beta.free)]) else numeric(0)
     h <- point_h_to_raw(point[length(beta.free) + 1L])
     h <- .npindex_finalize_bandwidth(
       h = h,
@@ -1150,13 +1399,26 @@ npindexbw.NULL <-
     eval.spec$degree.engine <- degree
     eval.spec$bernstein.basis.engine <- degree.search$bernstein.basis
     eval.spec$basis.engine <- reg.args$basis.engine
-    objective <- .npindexbw_eval_objective(
-      param = point_to_param(point),
-      xmat = x.clean,
-      ydat = y.clean,
-      bws = baseline.bws,
-      spec = eval.spec
-    )
+    service.eval.counter <<- service.eval.counter + 1L
+    objective <- if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+      .npindexbw_ichimura_lp_service_eval(
+        param = point_to_param(point),
+        xmat = x.clean,
+        ydat = y.clean,
+        bws = baseline.bws,
+        spec = eval.spec,
+        ctx = service.ctx,
+        eval_id = service.eval.counter
+      )
+    } else {
+      .npindexbw_eval_objective(
+        param = point_to_param(point),
+        xmat = x.clean,
+        ydat = y.clean,
+        bws = baseline.bws,
+        spec = eval.spec
+      )
+    }
     nomad.num.feval.total <<- nomad.num.feval.total + 1L
     nomad.num.feval.fast.total <<- nomad.num.feval.fast.total + as.numeric(objective$num.feval.fast[1L])
     list(
@@ -1221,6 +1483,7 @@ npindexbw.NULL <-
         strategy = "single_iteration",
         remin = isTRUE(opt.args$powell.remin)
       )
+      hot.opt.args$bwsolver <- NULL
       powell.start <- proc.time()[3L]
       hot.payload <- .np_nomad_with_powell_progress(
         degree = degree,
@@ -1267,6 +1530,11 @@ npindexbw.NULL <-
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = if (!is.null(opt.args$random.seed)) opt.args$random.seed else 42L,
     remin = isTRUE(opt.args$nomad.remin),
+    nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+    native.r.bridge = TRUE,
+    start.lower = start.lb,
+    start.upper = start.ub,
+    coordinate.roles = coordinate.roles,
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -1276,6 +1544,82 @@ npindexbw.NULL <-
       user_supplied = degree.search$start.user
     )
   )
+
+  if (isTRUE(degree.search$verify)) {
+    verify.started <- proc.time()[3L]
+    verify.records <- list()
+    verify.best <- search.result$best
+    verify.best.payload <- search.result$best_payload
+    verify.eval.id <- 0L
+
+    visit_degree <- function(degree.vec) {
+      verify.eval.id <<- verify.eval.id + 1L
+      verify.reg.args <- reg.args
+      verify.reg.args$regtype <- "lp"
+      verify.reg.args$degree <- as.integer(degree.vec)
+      verify.reg.args$bernstein.basis <- degree.search$bernstein.basis
+      verify.reg.args$regtype.engine <- "lp"
+      verify.reg.args$degree.engine <- as.integer(degree.vec)
+      verify.reg.args$bernstein.basis.engine <- degree.search$bernstein.basis
+
+      started <- proc.time()[3L]
+      payload <- tryCatch(
+        .npindexbw_run_fixed_degree(
+          xdat = xdat,
+          ydat = ydat,
+          bws = bws,
+          template = template,
+          reg.args = verify.reg.args,
+          opt.args = opt.args
+        ),
+        error = function(e) e
+      )
+      status <- if (inherits(payload, "error")) "error" else "ok"
+      objective <- if (identical(status, "ok")) as.numeric(payload$fval[1L]) else NA_real_
+      rec <- list(
+        eval_id = verify.eval.id,
+        degree = as.integer(degree.vec),
+        objective = objective,
+        status = status,
+        cached = FALSE,
+        message = if (inherits(payload, "error")) conditionMessage(payload) else NULL,
+        elapsed = proc.time()[3L] - started,
+        num.feval = if (identical(status, "ok") && !is.null(payload$num.feval)) {
+          as.numeric(payload$num.feval[1L])
+        } else {
+          NA_real_
+        },
+        phase = "verify"
+      )
+      verify.records[[length(verify.records) + 1L]] <<- rec
+      if (identical(status, "ok") &&
+          (is.null(verify.best) ||
+           .np_degree_better(objective, verify.best$objective, direction = "min"))) {
+        verify.best <<- rec
+        verify.best.payload <<- payload
+      }
+      TRUE
+    }
+
+    .np_degree_check_grid_budget(
+      candidates = degree.search$candidates,
+      method = "coordinate",
+      verify = TRUE
+    )
+    .np_degree_iterate_grid(degree.search$candidates, visit_degree)
+    verify.elapsed <- proc.time()[3L] - verify.started
+
+    search.result$verify <- TRUE
+    search.result$certified <- TRUE
+    search.result$verify.time <- verify.elapsed
+    search.result$verify.results <- verify.records
+    search.result$best <- verify.best
+    search.result$best_payload <- verify.best.payload
+    search.result$n.unique <- as.numeric(search.result$n.unique) + verify.eval.id
+    search.result$n.visits <- as.numeric(search.result$n.visits) + verify.eval.id
+    search.result$grid.size <- .np_degree_grid_size(degree.search$candidates)
+    search.result$optim.time <- sum(c(search.result$optim.time, verify.elapsed), na.rm = TRUE)
+  }
 
   if (fixed.nomad) {
     if (!is.null(search.result$restart.starts)) {
@@ -1296,6 +1640,11 @@ npindexbw.NULL <-
         rec
       })
     }
+  }
+
+  if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+    service.done <- TRUE
+    return(.npindexbw_ichimura_lp_service_result(search.result, service.ctx))
   }
 
   search.result
@@ -1359,6 +1708,9 @@ npindexbw.NULL <-
     candidates = bounds$candidates,
     lower = bounds$lower,
     upper = bounds$upper,
+    grid.size = bounds$grid.size,
+    singleton = bounds$singleton,
+    fixed.degree = bounds$fixed.degree,
     baseline.degree = as.integer(baseline.degree),
     start.degree = as.integer(start.degree),
     start.user = !is.null(degree.start),
@@ -1389,6 +1741,8 @@ npindexbw.NULL <-
     n.visits = search_result$n.visits,
     n.cached = search_result$n.cached,
     grid.size = search_result$grid.size,
+    singleton = isTRUE(search_result$singleton),
+    fixed.degree = search_result$fixed.degree,
     best.restart = search_result$best.restart,
     restart.starts = search_result$restart.starts,
     restart.degree.starts = search_result$restart.degree.starts,
@@ -1397,6 +1751,12 @@ npindexbw.NULL <-
     restart.results = search_result$restart.results,
     trace = search_result$trace
   )
+
+  if (isTRUE(search_result$native) &&
+      isTRUE(getOption("np.developer.native.nomad.diagnostics", FALSE)) &&
+      !is.null(search_result$native.diagnostics)) {
+    attr(bws, "native.nomad.diagnostics") <- search_result$native.diagnostics
+  }
 
   if (!is.null(search_result$nomad.time))
     bws$nomad.time <- as.numeric(search_result$nomad.time[1L])
@@ -1449,6 +1809,7 @@ npindexbw.default <-
     mc <- match.call(expand.dots = FALSE)
     search.mc.names <- names(mc)
     dots <- list(...)
+    npRejectUnsupportedBwsolver(dots, "npindexbw")
     dot.names <- names(dots)
     degree.select.value <- if (isTRUE(npValidateScalarLogical(nomad, "nomad"))) {
       "coordinate"
@@ -1465,9 +1826,27 @@ npindexbw.default <-
     }
     collective.degree.search <- isTRUE(automatic.degree.search) &&
       identical(method.value, "kleinspady")
+    nomad.requested <- isTRUE(npValidateScalarLogical(nomad, "nomad"))
+    regtype.value <- if ("regtype" %in% search.mc.names) {
+      match.arg(regtype, c("lc", "ll", "lp"))
+    } else if (isTRUE(nomad.requested)) {
+      "lp"
+    } else {
+      "lc"
+    }
+    search.engine.value <- if ("search.engine" %in% search.mc.names) {
+      match.arg(search.engine, c("nomad+powell", "cell", "nomad"))
+    } else {
+      "nomad+powell"
+    }
+    ichimura.lp.nomad.degree.search <- isTRUE(automatic.degree.search) &&
+      identical(method.value, "ichimura") &&
+      identical(regtype.value, "lp") &&
+      search.engine.value %in% c("nomad", "nomad+powell")
     if (.npRmpi_autodispatch_active() &&
         (!isTRUE(automatic.degree.search) ||
            isTRUE(collective.degree.search) ||
+           isTRUE(ichimura.lp.nomad.degree.search) ||
            .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
       return(.npRmpi_autodispatch_call(mc, parent.frame()))
 
@@ -1524,8 +1903,9 @@ npindexbw.default <-
           !identical(as.character(match.arg(nomad.shortcut$values$regtype, c("lc", "ll", "lp")))[1L], "lp"))
         stop("nomad=TRUE requires regtype='lp'")
       if ("bwtype" %in% dot.names &&
-          !identical(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L], "fixed"))
-        stop("nomad=TRUE currently requires bwtype='fixed'")
+          !(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L] %in%
+              c("fixed", "generalized_nn", "adaptive_nn")))
+        stop("nomad=TRUE requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
       if ("degree.select" %in% mc.names &&
           identical(as.character(match.arg(nomad.shortcut$values$degree.select, c("manual", "coordinate", "exhaustive")))[1L], "manual"))
         stop("nomad=TRUE requires automatic degree search; use degree.select='coordinate' or 'exhaustive'")
@@ -1533,13 +1913,6 @@ npindexbw.default <-
           !(as.character(match.arg(nomad.shortcut$values$search.engine, c("nomad+powell", "cell", "nomad")))[1L] %in%
               c("nomad", "nomad+powell")))
         stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'")
-      if ("bernstein.basis" %in% mc.names &&
-          !isTRUE(npValidateGlpBernstein(regtype = "lp",
-                                        bernstein.basis = nomad.shortcut$values$bernstein.basis)))
-        stop("nomad=TRUE currently requires bernstein.basis=TRUE")
-      if ("degree.verify" %in% mc.names &&
-          isTRUE(npValidateScalarLogical(nomad.shortcut$values$degree.verify, "degree.verify")))
-        stop("nomad=TRUE currently requires degree.verify=FALSE")
     }
 
     random.seed.value <- if ("random.seed" %in% mc.names) {
@@ -1582,8 +1955,12 @@ npindexbw.default <-
       degree.select = degree.select.value
     )
     scale.factor.search.lower <- npResolveScaleFactorLowerBound(scale.factor.search.lower)
+    spec.mc.names <- mc.names
+    if (isTRUE(nomad.shortcut$enabled))
+      spec.mc.names <- unique(c(spec.mc.names, "regtype", "bernstein.basis"))
+
     spec <- npResolveCanonicalConditionalRegSpec(
-      mc.names = mc.names,
+      mc.names = spec.mc.names,
       regtype = if (!is.null(nomad.shortcut$values$regtype)) nomad.shortcut$values$regtype else regtype,
       basis = basis,
       degree = degree.setup,
@@ -1594,6 +1971,31 @@ npindexbw.default <-
     if (!is.null(degree.search)) {
       spec$bernstein.basis <- degree.search$bernstein.basis
       spec$bernstein.basis.engine <- degree.search$bernstein.basis
+    }
+    initial.bwtype <- if (!is.null(nomad.shortcut$values$bwtype)) {
+      as.character(nomad.shortcut$values$bwtype)[1L]
+    } else if ("bwtype" %in% dot.names) {
+      as.character(dots$bwtype)[1L]
+    } else {
+      "fixed"
+    }
+    if (isTRUE(bandwidth.compute) &&
+        !is.null(degree.search) &&
+        initial.bwtype %in% c("generalized_nn", "adaptive_nn")) {
+      h.candidate <- .npindex_nn_candidate_bandwidth(
+        h = bws[p + 1L],
+        bwtype = initial.bwtype,
+        nobs = nrow(xdat)
+      )
+      bws[p + 1L] <- if (isTRUE(h.candidate$ok)) {
+        h.candidate$value
+      } else {
+        .npindex_default_start_bandwidth(
+          fit = NULL,
+          bwtype = initial.bwtype,
+          nobs = nrow(xdat)
+        )
+      }
     }
     tbw <- sibandwidth(beta = bws[seq_len(p)],
                        h = bws[p+1L], ...,
@@ -1614,6 +2016,7 @@ npindexbw.default <-
       stop("Klein and Spady's estimator requires binary ydat with 0/1 values only")
 
     margs <- c("nmulti", "nomad.remin", "powell.remin", "random.seed", "optim.method", "optim.maxattempts",
+               "nomad.opts",
                "optim.reltol", "optim.abstol", "optim.maxit", "only.optimize.beta",
                "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
                "scale.factor.search.lower")
@@ -1642,32 +2045,41 @@ npindexbw.default <-
         list(bandwidth.compute = bandwidth.compute),
         bwsel.args[setdiff(names(bwsel.args), c("xdat", "ydat", "bws"))]
       )
+      if ("nomad.opts" %in% names(dots))
+        opt.args$nomad.opts <- dots$nomad.opts
       opt.args$scale.factor.search.lower <- scale.factor.search.lower
 
-      if (identical(degree.search$engine, "cell")) {
-        eval_fun <- function(degree.vec) {
-          cell.reg.args <- reg.args
-          cell.reg.args$regtype <- "lp"
-          cell.reg.args$degree <- as.integer(degree.vec)
-          cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
-          cell.reg.args$regtype.engine <- "lp"
-          cell.reg.args$degree.engine <- as.integer(degree.vec)
-          cell.reg.args$bernstein.basis.engine <- degree.search$bernstein.basis
-          cell.bws <- .npindexbw_run_fixed_degree(
-            xdat = xdat,
-            ydat = ydat,
-            bws = bws,
-            template = tbw,
-            reg.args = cell.reg.args,
-            opt.args = opt.args
-          )
-          list(
-            objective = as.numeric(cell.bws$fval[1L]),
-            payload = cell.bws,
-            num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
-          )
-        }
+      eval_fun <- function(degree.vec) {
+        cell.reg.args <- reg.args
+        cell.reg.args$regtype <- "lp"
+        cell.reg.args$degree <- as.integer(degree.vec)
+        cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
+        cell.reg.args$regtype.engine <- "lp"
+        cell.reg.args$degree.engine <- as.integer(degree.vec)
+        cell.reg.args$bernstein.basis.engine <- degree.search$bernstein.basis
+        cell.bws <- .npindexbw_run_fixed_degree(
+          xdat = xdat,
+          ydat = ydat,
+          bws = bws,
+          template = tbw,
+          reg.args = cell.reg.args,
+          opt.args = opt.args
+        )
+        list(
+          objective = as.numeric(cell.bws$fval[1L]),
+          payload = cell.bws,
+          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
+        )
+      }
 
+      if (isTRUE(degree.search$singleton)) {
+        search.result <- .np_degree_singleton_search_result(
+          degree.search = degree.search,
+          eval_result = eval_fun(degree.search$fixed.degree),
+          direction = "min",
+          objective_name = "fval"
+        )
+      } else if (identical(degree.search$engine, "cell")) {
         search.result <- .np_degree_search(
           method = degree.search$method,
           candidates = degree.search$candidates,
@@ -1690,7 +2102,8 @@ npindexbw.default <-
           reg.args = reg.args,
           opt.args = utils::modifyList(opt.args, list(random.seed = random.seed.value)),
           degree.search = degree.search,
-          nomad.inner.nmulti = nomad.inner.nmulti
+          nomad.inner.nmulti = nomad.inner.nmulti,
+          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts
         )
       }
       tbw <- .npindexbw_attach_degree_search(
@@ -1730,9 +2143,14 @@ npindexbw.sibandwidth <-
            scale.factor.init = 0.5,
            scale.factor.search.lower = NULL,
            ...){
+
+    dots <- list(...)
+    npRejectUnsupportedBwsolver(dots, "npindexbw")
+
     ## Save seed prior to setting
 
     seed.state <- .np_seed_enter(random.seed)
+    on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
 
 
     xdat = toFrame(xdat)
@@ -1798,6 +2216,29 @@ npindexbw.sibandwidth <-
     beta.idx <- if (p > 1L) seq_len(p - 1L) else integer(0)
     nobs <- nrow(xdat)
     spec <- .npindex_resolve_spec(bws, where = "npindexbw")
+    service.ctx <- .npindexbw_ichimura_lp_service_context(
+      bws = bws,
+      spec = spec,
+      bandwidth.compute = bandwidth.compute,
+      comm = 1L,
+      service_id = "npindex_ichimura_lp_fixed"
+    )
+    if (isTRUE(service.ctx$active) && !isTRUE(service.ctx$root))
+      return(.npindexbw_ichimura_lp_service_worker_loop(
+        xmat = xdat,
+        ydat = ydat,
+        bws = bws,
+        spec = spec,
+        ctx = service.ctx
+      ))
+    service.eval.counter <- 0L
+    service.done <- FALSE
+    if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+      on.exit({
+        if (!isTRUE(service.done))
+          .npindexbw_ichimura_lp_service_error("npindex Ichimura LP fixed-degree service stopped before returning a result", service.ctx)
+      }, add = TRUE)
+    }
 
     total.time <-
       system.time({
@@ -1806,12 +2247,34 @@ npindexbw.sibandwidth <-
 
           ## Invariant objects used by objective evaluations.
           xmat <- xdat
+          beta.coord <- .npindex_beta_coordinate_setup(xmat)
           wmat <- cbind(ydat, 1.0)
           bandwidth_eval_count <- 0L
+          objective.cache.enabled <- npObjectiveCacheEnabled()
+          r.nn.cache.surface <- !isTRUE(only.optimize.beta) &&
+            identical(bws$type %in% c("generalized_nn", "adaptive_nn"), TRUE)
+          r.nn.cache.eligible <- r.nn.cache.surface &&
+            objective.cache.enabled
+          r.nn.cache <- if (r.nn.cache.surface) {
+            .np_r_nn_cache_new(r.nn.cache.eligible, key.length = length(beta.idx) + 1L)
+          } else {
+            NULL
+          }
 
           bandwidth_progress_step <- function() {
             bandwidth_eval_count <<- bandwidth_eval_count + 1L
             .np_progress_bandwidth_activity_step(done = bandwidth_eval_count)
+            invisible(NULL)
+          }
+          r_nn_cache_lookup <- function(beta, h) {
+            if (!is.environment(r.nn.cache) || !isTRUE(r.nn.cache$enabled))
+              return(list(hit = FALSE, token = NULL, value = NULL))
+            token <- .np_r_nn_cache_param_key(doubles = beta, integers = as.integer(h))
+            .np_r_nn_cache_get_token(r.nn.cache, token)
+          }
+          r_nn_cache_store <- function(token, value, penalty) {
+            if (is.finite(value) && value < penalty)
+              .np_r_nn_cache_put(r.nn.cache, token, value)
             invisible(NULL)
           }
           fixed.h.lower <- NULL
@@ -1841,6 +2304,11 @@ npindexbw.sibandwidth <-
             h <- h.candidate$value
             if (!is.null(fixed.h.lower) && h < fixed.h.lower)
               return(ichimuraMaxPenalty)
+            cache.hit <- r_nn_cache_lookup(beta, h)
+            if (isTRUE(cache.hit$hit)) {
+              num.feval.fast.overall <<- num.feval.fast.overall + 1L
+              return(cache.hit$value)
+            }
 
             ## Next we define the sum of squared leave-one-out residuals
 
@@ -1869,14 +2337,27 @@ npindexbw.sibandwidth <-
                 )$ksum
                 tww[1,2,]/NZD(tww[2,2,])
               } else {
-                objective <- .npindexbw_eval_ichimura_lp_via_npreg(
-                  index = index,
-                  ydat = ydat,
-                  h = h,
-                  bws = bws,
-                  spec = spec,
-                  invalid.penalty = ichimuraMaxPenalty
-                )
+                service.eval.counter <<- service.eval.counter + 1L
+                objective <- if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+                  .npindexbw_ichimura_lp_service_eval(
+                    param = c(beta, h),
+                    xmat = xmat,
+                    ydat = ydat,
+                    bws = bws,
+                    spec = spec,
+                    ctx = service.ctx,
+                    eval_id = service.eval.counter
+                  )
+                } else {
+                  .npindexbw_eval_ichimura_lp_via_npreg(
+                    index = index,
+                    ydat = ydat,
+                    h = h,
+                    bws = bws,
+                    spec = spec,
+                    invalid.penalty = ichimuraMaxPenalty
+                  )
+                }
                 num.feval.fast.overall <<- num.feval.fast.overall +
                   as.numeric(objective$num.feval.fast[1L])
                 return(as.numeric(objective$objective[1L]))
@@ -1893,7 +2374,9 @@ npindexbw.sibandwidth <-
             ## return an infinite penalty for negative h
 
             if(h > 0) {
-              return(sum.squares.leave.one.out(beta,h))
+              fv <- sum.squares.leave.one.out(beta,h)
+              r_nn_cache_store(cache.hit$token, fv, ichimuraMaxPenalty)
+              return(fv)
             } else {
               return(ichimuraMaxPenalty)
             }
@@ -1924,6 +2407,11 @@ npindexbw.sibandwidth <-
             h <- h.candidate$value
             if (!is.null(fixed.h.lower) && h < fixed.h.lower)
               return(sqrt(.Machine$double.xmax))
+            cache.hit <- r_nn_cache_lookup(beta, h)
+            if (isTRUE(cache.hit$hit)) {
+              num.feval.fast.overall <<- num.feval.fast.overall + 1L
+              return(cache.hit$value)
+            }
 
             ## Next we define the sum of logs
 
@@ -2014,7 +2502,9 @@ npindexbw.sibandwidth <-
             ## return an infinite penalty for negative h
 
             if(h > 0) {
-              return(sum.log.leave.one.out(beta,h))
+              fv <- sum.log.leave.one.out(beta,h)
+              r_nn_cache_store(cache.hit$token, fv, sqrt(.Machine$double.xmax))
+              return(fv)
             } else {
               ## No natural counterpart to var of y here, unlike Ichimura above...
               return(sqrt(.Machine$double.xmax))
@@ -2040,6 +2530,16 @@ npindexbw.sibandwidth <-
             optim.fn <- if(only.optimize.beta) kleinspady.nobw else  kleinspady
             optim.control <- list(reltol=optim.reltol,maxit=optim.maxit)
           }
+          optim.fn.search <- if (only.optimize.beta) {
+            function(param, h) optim.fn(beta.coord$to_public(param), h)
+          } else {
+            function(param) {
+              param <- as.double(param)
+              if (length(beta.idx))
+                param[beta.idx] <- beta.coord$to_public(param[beta.idx])
+              optim.fn(param)
+            }
+          }
 
           for (i in seq_len(nmulti)) {
             ## We use the nlm command to minimize the objective function using
@@ -2051,19 +2551,19 @@ npindexbw.sibandwidth <-
               ## Initial values taken from OLS fit with a constant used for
               ## multistart 1
               ols.fit <- lm(ydat~xdat,x=TRUE)
-              fit <- fitted(ols.fit)
+
+              if (p != 1L){
+                if (setequal(bws$beta[2:p], c(0)))
+                  beta <- .npindex_ols_beta_tail(ols.fit)
+                else
+                  beta = bws$beta[2:p]
+              } else { beta = numeric(0) }
+              fit <- .npindex_index_from_beta_tail(xmat, beta)
               fixed.h.lower <- if (identical(bws$type, "fixed")) {
                 h.start.controls$scale.factor.search.lower * .npindex_start_bandwidth_scale(fit = fit, nobs = nobs)
               } else {
                 NULL
               }
-
-              if (p != 1L){
-                if (setequal(bws$beta[2:p], c(0)))
-                  beta <- coef(ols.fit)[3:ncol(ols.fit$x)]
-                else
-                  beta = bws$beta[2:p]
-              } else { beta = numeric(0) }
 
               if (bws$bw == 0)
                 h <- .npindex_default_start_bandwidth(
@@ -2091,8 +2591,9 @@ npindexbw.sibandwidth <-
             } else {
               ## Random initialization used for remaining multistarts
 
-              beta.length <- length(coef(ols.fit)[3:ncol(ols.fit$x)])
-              beta <- runif(beta.length,min=0.5,max=1.5)*coef(ols.fit)[3:ncol(ols.fit$x)]
+              ols.beta <- .npindex_ols_beta_tail(ols.fit)
+              beta.length <- length(ols.beta)
+              beta <- runif(beta.length,min=0.5,max=1.5)*ols.beta
               if (!only.optimize.beta)
                 h <- .npindex_random_start_bandwidth(
                   fit = fit,
@@ -2102,11 +2603,12 @@ npindexbw.sibandwidth <-
                 )
             }
 
-            optim.parm <- if(only.optimize.beta) beta else c(beta,h)
+            beta.search <- beta.coord$to_search(beta)
+            optim.parm <- if(only.optimize.beta) beta.search else c(beta.search,h)
 
             optim.base.args <- list(
               par = optim.parm,
-              fn = optim.fn,
+              fn = optim.fn.search,
               gr = NULL,
               method = optim.method,
               control = optim.control
@@ -2120,8 +2622,9 @@ npindexbw.sibandwidth <-
             attempts <- 0
             while((optim.return$convergence != 0) && (attempts <= optim.maxattempts)) {
               attempts <- attempts + 1
-              beta.length <- length(coef(ols.fit)[3:ncol(ols.fit$x)])
-              beta <- runif(beta.length,min=0.5,max=1.5)*coef(ols.fit)[3:ncol(ols.fit$x)]
+              ols.beta <- .npindex_ols_beta_tail(ols.fit)
+              beta.length <- length(ols.beta)
+              beta <- runif(beta.length,min=0.5,max=1.5)*ols.beta
               if(!only.optimize.beta)
                 h <- .npindex_random_start_bandwidth(
                   fit = fit,
@@ -2143,7 +2646,8 @@ npindexbw.sibandwidth <-
                   optim.control$abstol <-  10.0*optim.control$abstol
               }
 
-              optim.parm <- if(only.optimize.beta) beta else c(beta,h)
+              beta.search <- beta.coord$to_search(beta)
+              optim.parm <- if(only.optimize.beta) beta.search else c(beta.search,h)
               optim.base.args$par <- optim.parm
               optim.base.args$control <- optim.control
               if (!only.optimize.beta && ("h" %in% names(optim.base.args))) {
@@ -2162,7 +2666,14 @@ npindexbw.sibandwidth <-
 
             fval.value[i] <- optim.return$value
             if(optim.return$value < fval.min) {
-              param <- if(only.optimize.beta) c(optim.return$par,h) else optim.return$par
+              param <- if(only.optimize.beta) {
+                c(beta.coord$to_public(optim.return$par), h)
+              } else {
+                out <- as.double(optim.return$par)
+                if (length(beta.idx))
+                  out[beta.idx] <- beta.coord$to_public(out[beta.idx])
+                out
+              }
               fval.min <- optim.return$value
               numimp <- numimp + 1
               best <- i
@@ -2184,6 +2695,7 @@ npindexbw.sibandwidth <-
           bws$ifval <- best
           bws$num.feval <- num.feval.overall
           bws$num.feval.fast <- num.feval.fast.overall
+          bws$nn.cache <- .np_r_nn_cache_stats(r.nn.cache)
           bws$numimp <- numimp
           bws$fval.vector <- fval.value
         }
@@ -2196,7 +2708,8 @@ npindexbw.sibandwidth <-
 
     ## Restore seed
 
-    .np_seed_exit(seed.state)
+    .np_seed_exit(seed.state, remove_if_absent = TRUE)
+    nn.cache <- bws$nn.cache
 
     bws <- sibandwidth(beta = bws$beta,
                        h = bws$bw,
@@ -2228,7 +2741,13 @@ npindexbw.sibandwidth <-
                        optim.method = optim.method,
                        only.optimize.beta = only.optimize.beta,
                        total.time = total.time)
+    bws$nn.cache <- nn.cache
     bws <- npSetScaleFactorSearchLower(bws, scale.factor.search.lower)
+
+    if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
+      service.done <- TRUE
+      return(.npindexbw_ichimura_lp_service_result(bws, service.ctx))
+    }
 
     bws
 

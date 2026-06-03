@@ -22,6 +22,8 @@ conbandwidth <-
            ifval = NA,
            num.feval = NA,
            num.feval.fast = NA,
+           num.feval.guarded = NA,
+           nn.cache = NULL,
            fval.history = NA,
            eval.history = NA,
            invalid.history = NA,
@@ -170,6 +172,8 @@ conbandwidth <-
     ifval = ifval,
     num.feval = num.feval,
     num.feval.fast = num.feval.fast,
+    num.feval.guarded = num.feval.guarded,
+    nn.cache = nn.cache,
     fval.history = fval.history,
     eval.history = eval.history,
     invalid.history = invalid.history,
@@ -304,7 +308,8 @@ summary.conbandwidth <- function(object, ...) {
   cat(genOmitStr(object))
   cat(genBwSelStr(object))
 
-  cat(paste("\n", genBwScaleStrs(object), sep=""))
+  cat("\n")
+  cat(genBwScaleStrs(object))
   cat(genBwKerStrs(object))
 
   cat(genTimingStr(object))

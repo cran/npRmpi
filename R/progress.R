@@ -1295,6 +1295,37 @@
   state
 }
 
+.np_progress_prepare_for_external_output <- function(state) {
+  if (is.null(state) ||
+      !isTRUE(state$enabled) ||
+      !isTRUE(state$visible) ||
+      !identical(state$renderer, "single_line") ||
+      !isTRUE(state$rendered)) {
+    return(state)
+  }
+
+  line <- state$last_line
+  if (is.null(line) || !is.character(line) || length(line) != 1L || is.na(line)) {
+    line <- state$start_note
+  }
+
+  snapshot <- .np_progress_make_snapshot(
+    state = state,
+    line = line,
+    render_line = "",
+    event = "finish",
+    now = .np_progress_now(),
+    done = state$last_done,
+    detail = state$last_emitted_detail
+  )
+  .np_progress_render_single_line(snapshot = snapshot, event = "finish")
+
+  state$rendered <- FALSE
+  state$last_render_width <- 0L
+  state$last_line <- NULL
+  state
+}
+
 .np_progress_show_now <- function(state, done = NULL, detail = NULL) {
   if (is.null(state) || !isTRUE(state$enabled) || !isTRUE(state$visible)) {
     return(state)
@@ -1604,7 +1635,7 @@
   state <- .np_progress_runtime$bandwidth_state
   total <- suppressWarnings(as.integer(total)[1L])
 
-  if (is.null(state) || is.na(total) || total <= 1L) {
+  if (is.null(state) || is.na(total) || total < 1L) {
     return(invisible(NULL))
   }
 
@@ -1615,10 +1646,18 @@
   }
 
   if (.np_progress_bandwidth_enhanced_state(state)) {
-    .np_progress_runtime$bandwidth_state <- .np_progress_bandwidth_register_nmulti(
+    state <- .np_progress_bandwidth_register_nmulti(
       state = state,
       total = total
     )
+    if (isTRUE(state$start_note_pending)) {
+      state$start_note_grace_sec <- 0
+      state <- .np_progress_maybe_emit_start_note(
+        state = state,
+        now = state$started
+      )
+    }
+    .np_progress_runtime$bandwidth_state <- state
     return(invisible(NULL))
   }
 
@@ -1747,6 +1786,10 @@
 
 .np_progress_bandwidth_activity_step <- function(done = NULL) {
   state <- .np_progress_runtime$bandwidth_state
+
+  if (isTRUE(state$nomad_native_progress)) {
+    return(invisible(NULL))
+  }
 
   if (.np_progress_bandwidth_enhanced_state(state)) {
     if (!is.null(done)) {

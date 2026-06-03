@@ -32,15 +32,72 @@
     number of mid-run plot/bootstrap heartbeat lines emitted between the
     initial start notice and final completion line. Default is \code{3}.
 
-    \item \code{np.tree} (logical): enables kd-tree acceleration when
-    supported by the selected kernel/operator combination. Default is
-    \code{FALSE}.
+    \item \code{np.tree} (logical or \code{"auto"}): controls kd-tree
+    acceleration for continuous variables. \code{TRUE} forces eligible tree
+    routes on, \code{FALSE} disables them, and \code{"auto"} enables trees
+    only when active continuous kernels are bounded support
+    (\code{"epanechnikov"} or \code{"uniform"}). Default is \code{"auto"}.
+
+    \item \code{np.categorical.compress} (logical): enables exact
+    unique-profile compression for eligible all-categorical routes. This is
+    distinct from \code{np.tree}: no continuous kd-tree is requested merely
+    because categorical compression is enabled. The default is \code{TRUE}.
+    Set \code{options(np.categorical.compress = FALSE, np.tree = FALSE)} to
+    force the historical dense categorical route for debugging or timing
+    comparisons.
+
+    \item \code{np.objective.cache} (logical): enables package-side objective
+    caching for repeated Powell bandwidth-search candidates. For all Powell
+    routes using the shared C optimizer wrapper, exact repeated raw candidate
+    vectors within one bandwidth solve reuse the previous objective value,
+    including repeated candidates reached by later Powell restarts. For
+    eligible continuous-only generalized/adaptive nearest-neighbor routes,
+    this also enables the existing integer nearest-neighbor objective cache.
+    Mixed continuous/categorical rows use only the exact full-candidate cache,
+    so categorical smoothing parameters remain part of the cache key. Default
+    is \code{TRUE}. Set \code{options(np.objective.cache = FALSE)} to force
+    repeated Powell candidates through the objective evaluator for diagnostic
+    timing comparisons. This option is synchronized to MPI workers in
+    autodispatch sessions. MADS/NOMAD solver caching is separate and is not
+    controlled by this option, and the saturated extended-NN distance cache is
+    governed by \code{np.extendednn}.
+
+    \item \code{np.nomad.degree.start.policy} (character): controls automatic
+    polynomial-degree starting values for NOMAD local-polynomial searches when
+    \code{degree.start} is not supplied. The default,
+    \code{"low_first_full_random"}, uses \code{degree.min} for the first start
+    and draws later starts over the full user-specified
+    \code{degree.min}/\code{degree.max} range. Other accepted values are
+    \code{"mid_first_full_random"}, \code{"anchor_then_random"},
+    \code{"spread_then_random"}, and \code{"random_full_only"}. Explicit
+    \code{degree.start} values remain the first start. The active option value
+    is synchronized to MPI workers in autodispatch sessions.
+
+    \item \code{np.largeh} (logical): enables continuous large-\eqn{h}
+    shortcut evaluations. Default is \code{TRUE}. Set
+    \code{options(np.largeh = FALSE)} to keep tree/dense routing unchanged
+    while forcing continuous large-bandwidth objective rows through the
+    ordinary kernel-summation machinery for diagnostic timing comparisons.
+
+    \item \code{np.extendednn} (logical): enables extended nearest-neighbor
+    bandwidth search and manually supplied nearest-neighbor bandwidths above
+    the ordinary \eqn{n-1} neighbor-count limit for eligible
+    generalized/adaptive nearest-neighbor routes. When \code{TRUE}, a
+    nearest-neighbor search parameter above \eqn{n-1} scales the saturated
+    nearest-neighbor bandwidth. Default is \code{TRUE}. This option is
+    synchronized to MPI workers in autodispatch sessions.
 
     \item \code{np.largeh.rel.tol} (numeric): relative tolerance used by the
     continuous large-\eqn{h} shortcut. When all standardized distances for a
     continuous predictor are sufficiently close to zero, the corresponding
     kernel factor is approximated by \eqn{K(0)} to reduce repeated kernel
     evaluations. Default is \code{1e-3}. Valid range is \code{(0, 0.1)}.
+
+    \item \code{np.largelambda} (logical): enables discrete near-upper
+    bandwidth shortcut evaluations. Default is \code{TRUE}. Set
+    \code{options(np.largelambda = FALSE)} to keep categorical routing
+    unchanged while forcing near-upper discrete bandwidth rows through the
+    ordinary category-comparison machinery for diagnostic timing comparisons.
 
     \item \code{np.disc.upper.rel.tol} (numeric): relative tolerance used by
     the discrete upper-bound shortcut for bandwidths near their feasible upper
@@ -80,7 +137,12 @@
 npRmpi.init(nslaves=1)
 
 old <- options(
-  np.tree = TRUE,
+  np.tree = "auto",
+  np.categorical.compress = TRUE,
+  np.objective.cache = TRUE,
+  np.largeh = TRUE,
+  np.extendednn = TRUE,
+  np.largelambda = TRUE,
   np.messages = FALSE,
   np.largeh.rel.tol = 1e-3,
   np.disc.upper.rel.tol = 1e-2

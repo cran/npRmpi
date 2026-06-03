@@ -68,11 +68,13 @@ npregbw(\dots)
         lbd.dir,
         lbd.init,
         nmulti,
+        nomad.opts = list(),
         okertype,
         penalty.multiplier = 10,
         regtype,
         nomad.remin = FALSE,
         powell.remin,
+        bwsolver = c("powell", "mads", "mads+powell"),
         scale.init.categorical.sample,
         scale.factor.search.lower = NULL,
         small,
@@ -103,8 +105,10 @@ npregbw(\dots)
         lbd.dir = 0.1,
         lbd.init = 0.1,
         nmulti,
+        nomad.opts = list(),
         penalty.multiplier = 10,
         powell.remin = TRUE,
+        bwsolver = c("powell", "mads", "mads+powell"),
         scale.init.categorical.sample = FALSE,
         scale.factor.search.lower = NULL,
         small = 1.490116e-05,
@@ -227,14 +231,15 @@ These arguments control regression type, local-polynomial specification, and opt
     backend when \code{regtype="lp"} and
     \code{degree.select != "manual"}. \code{"nomad+powell"} (default)
     performs direct joint mixed discrete/continuous search over fixed
-    bandwidths and the degree vector using \code{crs::snomadr()},
+    bandwidths and the degree vector using the native \pkg{crs} NOMAD C API,
     followed by one Powell hot start from the NOMAD solution.
     \code{"nomad"} performs the direct joint NOMAD search without the
     Powell refinement. \code{"cell"} uses the legacy profiled
     degree-grid search built from repeated fixed-degree bandwidth
-    solves. NOMAD-based search currently requires \code{bwtype="fixed"},
-    \code{degree.verify=FALSE}, and the suggested package
-    \pkg{crs} to be installed.
+    solves. NOMAD-based search supports \code{bwtype="fixed"},
+    \code{bwtype="generalized_nn"}, and \code{bwtype="adaptive_nn"};
+    it currently requires \code{degree.verify=FALSE} and the suggested
+    package \pkg{crs} to be installed.
   }
 
   \item{nomad}{
@@ -250,13 +255,13 @@ These arguments control regression type, local-polynomial specification, and opt
     \code{bwtype="fixed"}. Explicit incompatible settings error
     immediately; in particular, \code{nomad=TRUE} currently requires
     \code{regtype="lp"}, \code{bwtype="fixed"}, automatic degree
-    search, \code{bernstein.basis=TRUE}, no explicit \code{degree},
+    search, no explicit \code{degree},
     at least one continuous predictor, and
     \code{search.engine \%in\% c("nomad", "nomad+powell")}.
     This shortcut does not change the meaning of \code{nmulti} or
     \code{nomad.nmulti}: \code{nmulti} remains the outer restart count,
     while \code{nomad.nmulti} controls inner
-    \code{crs::snomadr()} multistarts within each outer restart.
+    native \pkg{crs} NOMAD API multistarts within each outer restart.
     Returned bandwidth objects retain this normalized preset metadata in
     \code{bw$nomad.shortcut} for a returned object \code{bw}; when
     available, \code{nomad.time} and \code{powell.time} record the
@@ -265,7 +270,7 @@ These arguments control regression type, local-polynomial specification, and opt
 
   \item{nomad.nmulti}{
     non-negative integer controlling the inner
-    \code{crs::snomadr()} multistart count used within each outer
+    the native \pkg{crs} NOMAD C API multistart count used within each outer
     NOMAD restart when \code{regtype="lp"} and automatic degree search
     uses \code{search.engine="nomad"} or \code{"nomad+powell"}.
     Defaults to \code{0L}, which preserves the current one-start-per-
@@ -457,6 +462,12 @@ These controls set numerical search starts, kernel choices, and support bounds.
     points. Defaults to \code{min(2,ncol(xdat))}.
   }
 
+  \item{nomad.opts}{
+    optional named list of native NOMAD parameters forwarded to the
+    \pkg{crs} NOMAD C API for MADS/NOMAD-backed bandwidth searches.
+    Unsupported cache-off callback settings are rejected before solver entry.
+  }
+
   \item{okertype}{
     character string used to specify the ordered categorical kernel type.
     Can be set as \code{wangvanryzin}, \code{liracine}, or \code{racineliyan}. Defaults to
@@ -474,6 +485,17 @@ These controls set numerical search starts, kernel choices, and support bounds.
     this controls only the final Powell bandwidth-polish step. The default
     is \code{TRUE} for ordinary Powell routes and \code{FALSE} for the
     Powell polish after NOMAD unless explicitly supplied.
+  }
+
+  \item{bwsolver}{
+    bandwidth optimizer for fixed-degree searches. The default
+    \code{"powell"} preserves the historical Powell route. \code{"mads"}
+    uses the native \pkg{crs} NOMAD C API over the bandwidth coordinates, and
+    \code{"mads+powell"} applies one Powell hot start from the MADS
+    solution. Use \code{search.engine} rather than \code{bwsolver} for
+    automatic degree search. Advanced native NOMAD parameters may be supplied
+    as \code{nomad.opts} through \code{...}; invalid or unsupported
+    parameters are rejected by NOMAD rather than silently ignored.
   }
 
   \item{scale.init.categorical.sample}{ a logical value that when set
@@ -656,7 +678,7 @@ The \code{scale.factor.*} controls are dimensionless search controls. The packag
   \code{search.engine="nomad"} or \code{"nomad+powell"}, the package
   instead evaluates the cross-validation criterion directly over the
   joint space of fixed bandwidths and polynomial degrees using
-  \code{crs::snomadr()}. \code{"nomad+powell"} then performs one Powell
+  the native \pkg{crs} NOMAD C API. \code{"nomad+powell"} then performs one Powell
   hot start from the NOMAD solution and retains the better of the
   direct NOMAD and polished solutions. This direct joint-search route
   follows the polynomial-adaptive cross-validation rationale of Hall
@@ -723,9 +745,14 @@ The \code{scale.factor.*} controls are dimensionless search controls. The packag
   user-selected semantics.
   When the direct NOMAD route is active, \code{nmulti} controls the
   package-level outer restart count while \code{nomad.nmulti}
-  controls the inner \code{crs::snomadr()} multistart count used within
+  controls the inner native \pkg{crs} NOMAD API multistart count used within
   each outer restart. The default \code{nomad.nmulti=0L} preserves the
-  current single-start inner NOMAD behavior.
+  current single-start inner NOMAD behavior. Advanced native NOMAD
+  parameters may be supplied through \code{nomad.opts} in \code{...};
+  invalid or unsupported parameters are rejected by NOMAD rather than
+  silently ignored. Routes that evaluate R callbacks require serial
+  callback evaluation and reject parallel callback settings such as
+  \code{NB_THREADS_PARALLEL_EVAL > 1}.
 
 }
 \value{

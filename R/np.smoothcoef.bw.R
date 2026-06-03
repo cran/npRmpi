@@ -10,14 +10,6 @@ npscoefbw <-
 
 npscoefbw.formula <-
   function(formula, data, subset, na.action, call, ...){
-    orig.ts <- if (missing(data))
-      .np_terms_ts_mask(terms_obj = terms(formula),
-                        data = environment(formula),
-                        eval_env = environment(formula))
-    else .np_terms_ts_mask(terms_obj = terms(formula, data = data),
-                           data = data,
-                           eval_env = environment(formula))
-
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
@@ -35,6 +27,22 @@ npscoefbw.formula <-
     chromoly <- explodePipe(formula.obj, env = environment(formula))
 
     bronze <- sapply(chromoly, paste, collapse = " + ")
+    formula.all <- if (missing(data)) {
+      terms(as.formula(paste(" ~ ", paste(bronze, collapse = " + ")),
+                       env = environment(formula)))
+    } else {
+      terms(as.formula(paste(" ~ ", paste(bronze, collapse = " + ")),
+                       env = environment(formula)), data = data)
+    }
+
+    orig.ts <- if (missing(data))
+      .np_terms_ts_mask(terms_obj = formula.all,
+                        data = environment(formula.all),
+                        eval_env = environment(formula.all))
+    else .np_terms_ts_mask(terms_obj = formula.all,
+                           data = data,
+                           eval_env = environment(formula.all))
+
     mf[["formula"]] <-
       as.formula(paste(bronze[1]," ~ ",
                        paste(bronze[2:length(bronze)],
@@ -281,17 +289,14 @@ npscoefbw.NULL <-
   tdati <- if (is.null(sbw$zdati)) sbw$xdati else sbw$zdati
   eval.zdat <- toFrame(eval.zdat)
 
-  fast_largeh_tol <- getOption("np.largeh.rel.tol", 1e-3)
-  if (!is.numeric(fast_largeh_tol) || length(fast_largeh_tol) != 1L ||
-      is.na(fast_largeh_tol) || !is.finite(fast_largeh_tol) ||
-      fast_largeh_tol <= 0 || fast_largeh_tol >= 0.1)
-    fast_largeh_tol <- 1e-3
+  if (any(tdati$icon) && !npLogicalOption("np.largeh", TRUE))
+    return(FALSE)
+  if ((any(tdati$iuno) || any(tdati$iord)) &&
+      !npLogicalOption("np.largelambda", TRUE))
+    return(FALSE)
 
-  fast_disc_tol <- getOption("np.disc.upper.rel.tol", 1e-2)
-  if (!is.numeric(fast_disc_tol) || length(fast_disc_tol) != 1L ||
-      is.na(fast_disc_tol) || !is.finite(fast_disc_tol) ||
-      fast_disc_tol <= 0 || fast_disc_tol >= 0.5)
-    fast_disc_tol <- 1e-2
+  fast_largeh_tol <- npLargehRelTol()
+  fast_disc_tol <- npDiscUpperRelTol()
 
   cont_utol <- switch(
     sbw$ckertype,
@@ -1052,9 +1057,12 @@ npscoefbw.NULL <-
                                     reg.args,
                                     opt.args,
                                     degree.search,
-                                    nomad.inner.nmulti = 0L) {
+                                    nomad.inner.nmulti = 0L,
+                                    nomad.opts = list()) {
   if (isTRUE(degree.search$verify))
     stop("automatic degree search with search.engine='nomad' does not support degree.verify")
+  if (is.null(opt.args$nomad.opts) && length(nomad.opts))
+    opt.args$nomad.opts <- nomad.opts
 
   if (!identical(opt.args$bandwidth.compute, TRUE))
     stop("automatic degree search with search.engine='nomad' requires bandwidth.compute=TRUE")
@@ -1065,43 +1073,64 @@ npscoefbw.NULL <-
   template.reg.args$regtype <- "lp"
   template.reg.args$degree <- as.integer(degree.search$start.degree)
   template.reg.args$bernstein.basis <- degree.search$bernstein.basis
+  template.type <- if (is.recursive(bws) && !is.null(bws$type) && length(bws$type)) {
+    as.character(bws$type[1L])
+  } else if (!is.null(template.reg.args$bwtype) && length(template.reg.args$bwtype)) {
+    as.character(template.reg.args$bwtype[1L])
+  } else {
+    "fixed"
+  }
+  template.bws <- bws
+  if (!identical(template.type, "fixed") &&
+      is.numeric(template.bws) &&
+      length(template.bws) > 0L &&
+      all(template.bws == 0)) {
+    nn.start <- max(2L, min(as.integer(NROW(eval.zdat)) - 1L, as.integer(round(sqrt(NROW(eval.zdat))))))
+    template.bws <- rep.int(as.double(nn.start), length(template.bws))
+  }
 
   template <- .npscoefbw_build_scbandwidth(
     xdat = xdat,
     ydat = ydat,
     zdat = zdat,
-    bws = bws,
+    bws = template.bws,
     bandwidth.compute = FALSE,
     reg.args = template.reg.args
   )
 
-  if (!identical(template$type, "fixed"))
-    stop("automatic degree search with search.engine='nomad' currently requires bwtype='fixed'")
-  setup <- .npregbw_nomad_bw_setup(xdat = eval.zdat, template = template)
+  if (!(template$type %in% c("fixed", "generalized_nn", "adaptive_nn")))
+    stop("automatic degree search with search.engine='nomad' requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
+  setup <- .npregbw_nomad_bw_setup(xdat = eval.zdat, template = template, allow.extended.nn = TRUE)
   ncon <- length(setup$cont_idx)
   ncat <- length(setup$cat_idx)
   ndeg <- length(degree.search$start.degree)
   nomad.nmulti <- if (is.null(opt.args$nmulti)) npDefaultNmulti(NCOL(eval.zdat)) else npValidateNmulti(opt.args$nmulti[1L])
 
-  cont_lower <- npGetScaleFactorSearchLower(
-    template,
-    argname = "template$scale.factor.search.lower"
+  bw_bounds <- .npregbw_nomad_bw_bounds(template = template, setup = setup)
+  opt.value <- function(name, default) {
+    if (is.null(opt.args[[name]])) default else opt.args[[name]]
+  }
+  bw_start_bounds <- .np_nomad_bw_restart_start_bounds(
+    bounds = bw_bounds,
+    setup = setup,
+    opt.value = opt.value,
+    where = "npscoefbw"
   )
-  bw_lower <- c(rep.int(cont_lower, ncon), rep.int(0, ncat))
-  bw_upper <- c(rep.int(1e6, ncon), setup$cat_upper * setup$bandwidth.scale.categorical)
 
   x0 <- c(
-    .np_nomad_complete_start_point(
+    .npregbw_nomad_complete_bw_start_point(
       point = if (all(template$bw == 0)) NULL else .npregbw_nomad_bw_to_point(template$bw, template = template, setup = setup),
-      lower = bw_lower,
-      upper = bw_upper,
-      ncont = ncon
+      bounds = bw_bounds,
+      setup = setup,
+      initial = bw_start_bounds$initial,
+      where = "npscoefbw"
     ),
     as.integer(degree.search$start.degree)
   )
-  lb <- c(bw_lower, degree.search$lower)
-  ub <- c(bw_upper, degree.search$upper)
-  bbin <- c(rep.int(0L, ncon + ncat), rep.int(1L, ndeg))
+  lb <- c(bw_bounds$lower, degree.search$lower)
+  ub <- c(bw_bounds$upper, degree.search$upper)
+  bbin <- c(bw_bounds$bbin, rep.int(1L, ndeg))
+  coordinate.roles <- .np_nomad_coordinate_roles(bw_bounds, degree.search)
   baseline.record <- NULL
   nomad.num.feval.total <- 0
   nomad.num.feval.fast.total <- 0
@@ -1129,6 +1158,7 @@ npscoefbw.NULL <-
     eval.reg.args$regtype <- "lp"
     eval.reg.args$degree <- degree
     eval.reg.args$bernstein.basis <- degree.search$bernstein.basis
+    eval.reg.args$bwtype <- template$type
 
     tbw <- .npscoefbw_build_scbandwidth(
       xdat = xdat,
@@ -1185,6 +1215,7 @@ npscoefbw.NULL <-
       final.reg.args$regtype <- "lp"
       final.reg.args$degree <- degree
       final.reg.args$bernstein.basis <- degree.search$bernstein.basis
+      final.reg.args$bwtype <- template$type
 
       tbw <- .npscoefbw_build_scbandwidth(
         xdat = xdat,
@@ -1221,11 +1252,13 @@ npscoefbw.NULL <-
       hot.reg.args$regtype <- "lp"
       hot.reg.args$degree <- degree
       hot.reg.args$bernstein.basis <- degree.search$bernstein.basis
+      hot.reg.args$bwtype <- template$type
       hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
         opt.args,
         strategy = "single_iteration",
         remin = isTRUE(opt.args$powell.remin)
       )
+      hot.opt.args$bwsolver <- NULL
       stop_pool_before_collective()
       powell.start <- proc.time()[3L]
       hot.payload <- .np_nomad_with_powell_progress(
@@ -1273,6 +1306,11 @@ npscoefbw.NULL <-
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = if (!is.null(opt.args$random.seed)) opt.args$random.seed else 42L,
     remin = isTRUE(opt.args$nomad.remin),
+    nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+    native.r.bridge = TRUE,
+    start.lower = c(bw_start_bounds$lower, degree.search$lower),
+    start.upper = c(bw_start_bounds$upper, degree.search$upper),
+    coordinate.roles = coordinate.roles,
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -1349,6 +1387,9 @@ npscoefbw.NULL <-
     candidates = bounds$candidates,
     lower = bounds$lower,
     upper = bounds$upper,
+    grid.size = bounds$grid.size,
+    singleton = bounds$singleton,
+    fixed.degree = bounds$fixed.degree,
     baseline.degree = baseline.degree,
     start.degree = start.degree,
     start.user = !is.null(degree.start),
@@ -1379,6 +1420,8 @@ npscoefbw.NULL <-
     n.visits = search_result$n.visits,
     n.cached = search_result$n.cached,
     grid.size = search_result$grid.size,
+    singleton = isTRUE(search_result$singleton),
+    fixed.degree = search_result$fixed.degree,
     best.restart = search_result$best.restart,
     restart.starts = search_result$restart.starts,
     restart.degree.starts = search_result$restart.degree.starts,
@@ -1387,6 +1430,12 @@ npscoefbw.NULL <-
     restart.results = search_result$restart.results,
     trace = search_result$trace
   )
+
+  if (isTRUE(search_result$native) &&
+      isTRUE(getOption("np.developer.native.nomad.diagnostics", FALSE)) &&
+      !is.null(search_result$native.diagnostics)) {
+    attr(bws, "native.nomad.diagnostics") <- search_result$native.diagnostics
+  }
 
   if (!is.null(search_result$nomad.time))
     bws$nomad.time <- as.numeric(search_result$nomad.time[1L])
@@ -1407,10 +1456,18 @@ npscoefbw.NULL <-
 
   lower <- 2L
   upper <- max(1L, as.integer(nobs) - 1L)
+  hard.upper <- .Machine$integer.max / 2
   vapply(param, function(h) {
     if (!is.finite(h))
       return(NA_real_)
-    as.double(max(lower, min(upper, .np_round_half_to_even(h))))
+    k <- .np_round_half_to_even(h)
+    if (k > upper &&
+        npExtendedNnEnabled() &&
+        bwtype %in% c("generalized_nn", "adaptive_nn") &&
+        k <= hard.upper) {
+      return(as.double(k))
+    }
+    as.double(max(lower, min(upper, k)))
   }, numeric(1))
 }
 
@@ -1503,10 +1560,19 @@ npscoefbw.NULL <-
       )
     ))
 
-  lower <- 2L
-  upper <- max(1L, as.integer(nobs) - 1L)
-  start <- max(lower, min(upper, .np_round_half_to_even(sqrt(nobs))))
-  rep.int(as.double(start), length(param))
+  start <- if (npExtendedNnEnabled() &&
+               bwtype %in% c("generalized_nn", "adaptive_nn") &&
+               is.finite(start.controls$scale.factor.init) &&
+               start.controls$scale.factor.init > max(1L, as.integer(nobs) - 1L)) {
+    start.controls$scale.factor.init
+  } else {
+    sqrt(nobs)
+  }
+  .npscoef_nn_candidate_bandwidth(
+    param = rep.int(as.double(start), length(param)),
+    bwtype = bwtype,
+    nobs = nobs
+  )
 }
 
 .npscoef_random_start_bandwidth <- function(param,
@@ -1620,9 +1686,14 @@ npscoefbw.scbandwidth <-
            dfac.init = 1.0,
            scale.factor.search.lower = NULL,
            ...){
+
+    dots <- list(...)
+    npRejectUnsupportedBwsolver(dots, "npscoefbw")
+
     ## Save seed prior to setting
 
     seed.state <- .np_seed_enter(random.seed)
+    on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
 
 
     miss.z <- missing(zdat)
@@ -1777,17 +1848,8 @@ npscoefbw.scbandwidth <-
       scbw
     }
 
-    fast_largeh_tol <- getOption("np.largeh.rel.tol", 1e-3)
-    if (!is.numeric(fast_largeh_tol) || length(fast_largeh_tol) != 1L ||
-        is.na(fast_largeh_tol) || !is.finite(fast_largeh_tol) ||
-        fast_largeh_tol <= 0 || fast_largeh_tol >= 0.1)
-      fast_largeh_tol <- 1e-3
-
-    fast_disc_tol <- getOption("np.disc.upper.rel.tol", 1e-2)
-    if (!is.numeric(fast_disc_tol) || length(fast_disc_tol) != 1L ||
-        is.na(fast_disc_tol) || !is.finite(fast_disc_tol) ||
-        fast_disc_tol <= 0 || fast_disc_tol >= 0.5)
-      fast_disc_tol <- 1e-2
+    fast_largeh_tol <- npLargehRelTol()
+    fast_disc_tol <- npDiscUpperRelTol()
 
     cont_utol <- switch(
       bws$ckertype,
@@ -1834,6 +1896,62 @@ npscoefbw.scbandwidth <-
     npscoef_fast_eligible <- function(sbw) {
       .npscoefbw_fast_eligible(sbw = sbw, eval.zdat = zdat.df)
     }
+    objective.cache.enabled <- npObjectiveCacheEnabled()
+    r.nn.cache.surface <- identical(bws$type %in% c("generalized_nn", "adaptive_nn"), TRUE) &&
+      isTRUE(bws$ncon > 0L) &&
+      isTRUE((bws$nuno + bws$nord) == 0L)
+    r.exact.cache.surface <- identical(bws$type, "fixed") &&
+      isTRUE(bws$ncon > 0L) &&
+      isTRUE((bws$nuno + bws$nord) == 0L)
+    r.objective.cache.kind <- if (isTRUE(r.nn.cache.surface)) {
+      "nn"
+    } else if (isTRUE(r.exact.cache.surface)) {
+      "exact"
+    } else {
+      "none"
+    }
+    r.objective.cache.surface <- !identical(r.objective.cache.kind, "none")
+    r.objective.cache.eligible <- isTRUE(bandwidth.compute) &&
+      objective.cache.enabled &&
+      r.objective.cache.surface
+    r.objective.cache.stats <- list()
+    r.objective.cache.disabled <- NULL
+    if (isTRUE(bandwidth.compute) &&
+        r.objective.cache.surface &&
+        !objective.cache.enabled) {
+      r.objective.cache.disabled <- .np_r_nn_cache_new(FALSE)
+    }
+    r_objective_cache_new <- function() {
+      if (!r.objective.cache.eligible && is.null(r.objective.cache.disabled))
+        return(NULL)
+      key.length <- if (identical(r.objective.cache.kind, "nn")) bws$ncon else bws$ndim
+      .np_r_nn_cache_new(r.objective.cache.eligible, key.length = key.length)
+    }
+    r_objective_cache_record <- function(cache) {
+      st <- .np_r_nn_cache_stats(cache)
+      if (!is.null(st))
+        r.objective.cache.stats[[length(r.objective.cache.stats) + 1L]] <<- st
+      invisible(NULL)
+    }
+    r_exact_cache_key <- function(x) {
+      paste(sprintf("%a", as.double(x)), collapse = "\r")
+    }
+    r_objective_cache_lookup <- function(cache, sbw) {
+      if (!is.environment(cache) || !isTRUE(cache$enabled))
+        return(list(hit = FALSE, token = NULL, value = NULL))
+      if (identical(r.objective.cache.kind, "nn"))
+        return(.np_r_nn_cache_get(cache, as.integer(sbw$bw[sbw$icon])))
+      if (identical(r.objective.cache.kind, "exact")) {
+        token <- r_exact_cache_key(sbw$bw)
+        return(.np_r_nn_cache_get_token(cache, token))
+      }
+      list(hit = FALSE, token = NULL, value = NULL)
+    }
+    r_objective_cache_store <- function(cache, token, value) {
+      if (is.finite(value) && value < maxPenalty)
+        .np_r_nn_cache_put(cache, token, value)
+      invisible(NULL)
+    }
 
     solve_cv_moment_system <- function(tyw, tww, W.eval.design, maxPenalty, Wz.eval = NULL) {
       neval <- ncol(tyw)
@@ -1876,6 +1994,190 @@ npscoefbw.scbandwidth <-
       }
 
       coef.out
+    }
+
+    cat.profile.cv <- NULL
+    on.exit({ cat.profile.cv <- NULL }, add = TRUE)
+    get_cat_profile_cv <- function() {
+      if (is.null(cat.profile.cv)) {
+        train.codes <- .np_cat_profile_code_matrix(zdat.df)
+        train.keys <- .np_cat_profile_keys(train.codes)
+        profile.keys <- unique(train.keys)
+        train.id <- match(train.keys, profile.keys)
+        train.rep <- match(profile.keys, train.keys)
+        train.profile.codes <- train.codes[train.rep, , drop = FALSE]
+        train.profile.dat <- zdat.df[train.rep, , drop = FALSE]
+        yW.local <- cbind(ydat, W)
+        p <- ncol(yW.local)
+        cross.profile <- matrix(0.0, nrow = length(profile.keys), ncol = p * p)
+        for (j in seq_len(p)) {
+          for (k in seq_len(p)) {
+            cross.profile[, (j - 1L) * p + k] <-
+              .np_cat_profile_rowsum(yW.local[, j] * yW.local[, k],
+                                     train.id, length(profile.keys))[, 1L]
+          }
+        }
+        profile.index <- split(seq_along(train.id), train.id)
+        profile.rows <- lapply(profile.index, function(idx) {
+          Wg <- W[idx, , drop = FALSE]
+          list(
+            idx = idx,
+            Wg = Wg,
+            Wgy = Wg * ydat[idx],
+            w1sq = Wg[, 1L] * Wg[, 1L]
+          )
+        })
+        cat.profile.cv <<- list(
+          train.id = train.id,
+          profile.index = profile.index,
+          profile.rows = profile.rows,
+          train.profile.codes = train.profile.codes,
+          train.profile.dat = train.profile.dat,
+          G = length(profile.keys),
+          yW = yW.local,
+          p = p,
+          cross.profile = cross.profile,
+          ridge.grid = npRidgeSequenceAdditive(n.train = n, cap = 1.0)
+        )
+      }
+      cat.profile.cv
+    }
+
+    lc_cat_profile_loo_mean <- function(sbw) {
+      cp <- get_cat_profile_cv()
+      train.id <- cp$train.id
+      profile.index <- cp$profile.index
+      profile.rows <- cp$profile.rows
+      train.profile.codes <- cp$train.profile.codes
+      train.profile.dat <- cp$train.profile.dat
+      G <- cp$G
+      yW.local <- cp$yW
+      p <- cp$p
+      cross.profile <- cp$cross.profile
+      ridge.grid <- cp$ridge.grid
+
+      L.profile <- .np_regression_cat_profile_kernel_matrix(
+        eval.codes = train.profile.codes,
+        train.codes = train.profile.codes,
+        xdat = train.profile.dat,
+        bws = sbw
+      )
+
+      flat.profile <- L.profile %*% cross.profile
+      self.weight.profile <- L.profile[cbind(seq_len(G), seq_len(G))]
+      mean.loo <- rep(maxPenalty, n)
+      nc <- ncol(W)
+
+      solve_one <- function(ii) {
+        gg <- train.id[ii]
+        mat.full <- matrix(flat.profile[gg, ], nrow = p, ncol = p)
+        mat.full <- mat.full - self.weight.profile[gg] *
+          tcrossprod(yW.local[ii, ])
+        tyw.ii <- mat.full[-1L, 1L]
+        tww.ii <- mat.full[-1L, -1L, drop = FALSE]
+
+        ridge.idx <- 1L
+        ridge <- ridge.grid[ridge.idx]
+        repeat {
+          ridge.val <- ridge * tyw.ii[1L] / NZD(tww.ii[1L, 1L])
+          beta.ii <- tryCatch(
+            solve(tww.ii + diag(rep(ridge, nc)),
+                  tyw.ii + c(ridge.val, rep(0, nc - 1L))),
+            error = function(e) e
+          )
+          if (!inherits(beta.ii, "error")) {
+            return(as.double(W[ii,, drop = FALSE] %*% beta.ii))
+          }
+          ridge.idx <- ridge.idx + 1L
+          if (ridge.idx > length(ridge.grid))
+            break
+          ridge <- ridge.grid[ridge.idx]
+        }
+        maxPenalty
+      }
+
+      ridge <- ridge.grid[1L]
+      for (gg in seq_len(G)) {
+        row.state <- profile.rows[[gg]]
+        idx <- row.state$idx
+        mat.full <- matrix(flat.profile[gg, ], nrow = p, ncol = p)
+        tyw.full <- mat.full[-1L, 1L]
+        tww.full <- mat.full[-1L, -1L, drop = FALSE]
+        inv.full <- tryCatch(
+          solve(tww.full + diag(rep(ridge, nc))),
+          error = function(e) e
+        )
+        if (inherits(inv.full, "error")) {
+          mean.loo[idx] <- vapply(idx, solve_one, numeric(1))
+          next
+        }
+
+        Wg <- row.state$Wg
+        sg <- self.weight.profile[gg]
+        rhs <- matrix(tyw.full, nrow = length(idx), ncol = nc, byrow = TRUE)
+        rhs <- rhs - sg * row.state$Wgy
+        tww11 <- tww.full[1L, 1L] - sg * row.state$w1sq
+        rhs[, 1L] <- rhs[, 1L] + ridge * rhs[, 1L] / NZD(tww11)
+
+        u <- Wg %*% inv.full
+        denom <- 1.0 - sg * rowSums(u * Wg)
+        base <- rhs %*% inv.full
+        alpha <- rowSums(u * rhs)
+        beta <- base + (sg * alpha / denom) * u
+        pred <- rowSums(Wg * beta)
+        bad <- !is.finite(pred) | !is.finite(denom) |
+          abs(denom) < sqrt(.Machine$double.eps)
+        if (any(bad))
+          pred[bad] <- vapply(idx[bad], solve_one, numeric(1))
+        mean.loo[idx] <- pred
+      }
+
+      mean.loo
+    }
+
+    lc_cat_profile_partial_sums <- function(wj, partial.y) {
+      cp <- get_cat_profile_cv()
+      list(
+        num.profile = .np_cat_profile_rowsum(partial.y * wj, cp$train.id, cp$G)[, 1L],
+        den.profile = .np_cat_profile_rowsum(wj * wj, cp$train.id, cp$G)[, 1L]
+      )
+    }
+
+    lc_cat_profile_partial_loo <- function(sbw, wj, partial.y, profile.sums = NULL) {
+      cp <- get_cat_profile_cv()
+      train.id <- cp$train.id
+      train.profile.codes <- cp$train.profile.codes
+      train.profile.dat <- cp$train.profile.dat
+      G <- cp$G
+
+      L.profile <- .np_regression_cat_profile_kernel_matrix(
+        eval.codes = train.profile.codes,
+        train.codes = train.profile.codes,
+        xdat = train.profile.dat,
+        bws = sbw
+      )
+
+      if (is.null(profile.sums))
+        profile.sums <- lc_cat_profile_partial_sums(wj = wj, partial.y = partial.y)
+      num.profile <- profile.sums$num.profile
+      den.profile <- profile.sums$den.profile
+      num <- as.vector(L.profile %*% num.profile)[train.id]
+      den <- as.vector(L.profile %*% den.profile)[train.id]
+      self.weight <- L.profile[cbind(seq_len(G), seq_len(G))][train.id]
+      num <- num - self.weight * partial.y * wj
+      den <- den - self.weight * wj * wj
+
+      wj * num / NZD(den)
+    }
+
+    use_cat_profile_cv_lc <- function(sbw) {
+      identical(reg.engine, "lc") &&
+        identical(sbw$type, "fixed") &&
+        npUseCategoricalCompress(ncon = sbw$ncon,
+                                 ncat = sbw$nuno + sbw$nord) &&
+        !miss.z &&
+        isTRUE(sbw$ncon == 0L) &&
+        isTRUE((sbw$nuno + sbw$nord) > 0L)
     }
 
     lp_full_coef <- function(sbw, leave.one.out.eval) {
@@ -2060,6 +2362,7 @@ npscoefbw.scbandwidth <-
             invisible(NULL)
           }
 
+          overall.cache <- NULL
           overall.cv.ls <- function(param) {
             cv_state$objective_fast <- FALSE
             sbw <- apply_bw_to_scbw(bws, param)
@@ -2067,39 +2370,50 @@ npscoefbw.scbandwidth <-
                 (!is.null(fixed.lower) && any(param < fixed.lower)) ||
                 ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
               return(maxPenalty)
-            cv_state$objective_fast <- npscoef_fast_eligible(sbw)
+            cache.hit <- r_objective_cache_lookup(overall.cache, sbw)
+            if (isTRUE(cache.hit$hit)) {
+              cv_progress_step()
+              cv_state$fast_total <- cv_state$fast_total + 1L
+              return(cache.hit$value)
+            }
+            cv_state$objective_fast <- npscoef_fast_eligible(sbw) ||
+              use_cat_profile_cv_lc(sbw)
 
             if (identical(reg.engine, "lc")) {
-              tww <- npksum(txdat = zdat, tydat = yW, weights = yW, bws = sbw,
-                            leave.one.out = TRUE)$ksum
+              if (use_cat_profile_cv_lc(sbw)) {
+                mean.loo <- lc_cat_profile_loo_mean(sbw)
+              } else {
+                tww <- npksum(txdat = zdat, tydat = yW, weights = yW, bws = sbw,
+                              leave.one.out = TRUE)$ksum
 
-              mean.loo <- rep(maxPenalty,n)
-              ridge.grid <- npRidgeSequenceAdditive(n.train = n, cap = 1.0)
-              ridge <- rep.int(ridge.grid[1L], n)
-              ridge.idx <- rep.int(1L, n)
-              doridge <- rep.int(TRUE, n)
+                mean.loo <- rep(maxPenalty,n)
+                ridge.grid <- npRidgeSequenceAdditive(n.train = n, cap = 1.0)
+                ridge <- rep.int(ridge.grid[1L], n)
+                ridge.idx <- rep.int(1L, n)
+                doridge <- rep.int(TRUE, n)
 
-              nc <- ncol(tww[-1,-1,1])
+                nc <- ncol(tww[-1,-1,1])
 
-              while(any(doridge)){
-                iloo <- which(doridge)
-                for (ii in iloo) {
-                  doridge[ii] <- FALSE
-                  ridge.val <- ridge[ii]*tww[-1,1,ii][1]/NZD(tww[-1,-1,ii][1,1])
-                  beta.ii <- tryCatch(
-                    solve(tww[-1,-1,ii] + diag(rep(ridge[ii], nc)),
-                          tww[-1,1,ii] + c(ridge.val, rep(0, nc - 1))),
-                    error = function(e) e
-                  )
-                  if (inherits(beta.ii, "error")) {
-                    ridge.idx[ii] <- ridge.idx[ii] + 1L
-                    if (ridge.idx[ii] <= length(ridge.grid)) {
-                      ridge[ii] <- ridge.grid[ridge.idx[ii]]
-                      doridge[ii] <- TRUE
+                while(any(doridge)){
+                  iloo <- which(doridge)
+                  for (ii in iloo) {
+                    doridge[ii] <- FALSE
+                    ridge.val <- ridge[ii]*tww[-1,1,ii][1]/NZD(tww[-1,-1,ii][1,1])
+                    beta.ii <- tryCatch(
+                      solve(tww[-1,-1,ii] + diag(rep(ridge[ii], nc)),
+                            tww[-1,1,ii] + c(ridge.val, rep(0, nc - 1))),
+                      error = function(e) e
+                    )
+                    if (inherits(beta.ii, "error")) {
+                      ridge.idx[ii] <- ridge.idx[ii] + 1L
+                      if (ridge.idx[ii] <= length(ridge.grid)) {
+                        ridge[ii] <- ridge.grid[ridge.idx[ii]]
+                        doridge[ii] <- TRUE
+                      }
+                      beta.ii <- rep(maxPenalty, nc)
                     }
-                    beta.ii <- rep(maxPenalty, nc)
+                    mean.loo[ii] <- W[ii,, drop = FALSE] %*% beta.ii
                   }
-                  mean.loo[ii] <- W[ii,, drop = FALSE] %*% beta.ii
                 }
               }
             } else {
@@ -2119,6 +2433,7 @@ npscoefbw.scbandwidth <-
 
             if (isTRUE(cv_state$objective_fast))
               cv_state$fast_total <- cv_state$fast_total + 1L
+            r_objective_cache_store(overall.cache, cache.hit$token, fv)
 
             return((if (is.finite(fv)) fv else maxPenalty))
 
@@ -2134,6 +2449,9 @@ npscoefbw.scbandwidth <-
           if (!miss.z)
             scoef.loo.args$tzdat <- zdat
 
+          current.partial.profile <- NULL
+          current.partial.cache <- NULL
+
           partial.cv.ls <- function(param, partial.index) {
             cv_state$objective_fast <- FALSE
             sbw <- apply_bw_to_scbw(bws, param)
@@ -2142,7 +2460,14 @@ npscoefbw.scbandwidth <-
                 (!is.null(fixed.lower) && any(param < fixed.lower)) ||
                 ((bws$nord+bws$nuno > 0) && any(param[!bws$icon] > 2.0*x.scale[!bws$icon])))
               return(maxPenalty)
-            cv_state$objective_fast <- npscoef_fast_eligible(sbw)
+            cache.hit <- r_objective_cache_lookup(current.partial.cache, sbw)
+            if (isTRUE(cache.hit$hit)) {
+              cv_state$fast_total <- cv_state$fast_total + 1L
+              partial_progress_step(fv = cache.hit$value)
+              return(cache.hit$value)
+            }
+            cv_state$objective_fast <- npscoef_fast_eligible(sbw) ||
+              use_cat_profile_cv_lc(sbw)
 
             if (backfit.iterate){
               bws$bw.fitted[,partial.index] <- param
@@ -2151,13 +2476,22 @@ npscoefbw.scbandwidth <-
             } else {
               wj <- W[,partial.index]
               if (identical(reg.engine, "lc")) {
-                tww <- npksum(txdat=zdat,
-                              tydat=cbind(partial.orig * wj, wj * wj),
-                              weights=cbind(partial.orig * wj, 1),
-                              bws=sbw,
-                              leave.one.out=TRUE)$ksum
+                if (use_cat_profile_cv_lc(sbw)) {
+                  partial.loo <- lc_cat_profile_partial_loo(
+                    sbw = sbw,
+                    wj = wj,
+                    partial.y = partial.orig,
+                    profile.sums = current.partial.profile
+                  )
+                } else {
+                  tww <- npksum(txdat=zdat,
+                                tydat=cbind(partial.orig * wj, wj * wj),
+                                weights=cbind(partial.orig * wj, 1),
+                                bws=sbw,
+                                leave.one.out=TRUE)$ksum
 
-                partial.loo <- wj * tww[1,2,]/NZD(tww[2,2,])
+                  partial.loo <- wj * tww[1,2,]/NZD(tww[2,2,])
+                }
               } else {
                 partial.loo <- wj * lp_partial_coef(
                   sbw = sbw,
@@ -2173,6 +2507,7 @@ npscoefbw.scbandwidth <-
 
             if (isTRUE(cv_state$objective_fast))
               cv_state$fast_total <- cv_state$fast_total + 1L
+            r_objective_cache_store(current.partial.cache, cache.hit$token, fv)
 
             partial_progress_step(fv = fv)
             return((if (is.finite(fv)) fv else maxPenalty))
@@ -2185,6 +2520,7 @@ npscoefbw.scbandwidth <-
           numimp <- 0
           value.overall <- numeric(nmulti)
           num.feval.overall <- 0
+          overall.cache <- r_objective_cache_new()
 
           x.scale <- sapply(seq_len(bws$ndim), function(i){
             if (dati$icon[i]){
@@ -2301,6 +2637,7 @@ npscoefbw.scbandwidth <-
 
             .np_progress_bandwidth_multistart_step(done = i, total = nmulti)
           }
+          r_objective_cache_record(overall.cache)
 
           if (!have_best) {
             if (identical(bws$type, "fixed")) {
@@ -2352,7 +2689,18 @@ npscoefbw.scbandwidth <-
               for (j in seq_len(n.part)) {
                 ## estimate partial residuals
                 partial.orig <- W[,j] * scoef$beta[,j] + resid.full
+                current.partial.profile <- if (identical(reg.engine, "lc") &&
+                    npUseCategoricalCompress(ncon = bws$ncon,
+                                             ncat = bws$nuno + bws$nord) &&
+                    !miss.z &&
+                    isTRUE(bws$ncon == 0L) &&
+                    isTRUE((bws$nuno + bws$nord) > 0L)) {
+                  lc_cat_profile_partial_sums(wj = W[, j], partial.y = partial.orig)
+                } else {
+                  NULL
+                }
                 partial_progress_begin(iteration = i, partial.index = j)
+                current.partial.cache <- r_objective_cache_new()
 
                 ## minimise
                 suppressWarnings(optim.return <-
@@ -2362,6 +2710,9 @@ npscoefbw.scbandwidth <-
                 if(!is.null(optim.return$counts) && length(optim.return$counts) > 0)
                   num.feval.overall <- num.feval.overall + optim.return$counts[1]
                 partial_progress_finish(fv = optim.return$value)
+                r_objective_cache_record(current.partial.cache)
+                current.partial.cache <- NULL
+                current.partial.profile <- NULL
 
                 ## grab parameter
                 bws$bw.fitted[,j] <- optim.return$par
@@ -2424,6 +2775,11 @@ npscoefbw.scbandwidth <-
           bws$ifval = best.overall
           bws$num.feval = num.feval.overall
           bws$num.feval.fast = cv_state$fast_total
+          if (length(r.objective.cache.stats)) {
+            bws$nn.cache <- .np_r_nn_cache_combine_stats(r.objective.cache.stats)
+          } else {
+            bws$nn.cache <- .np_r_nn_cache_stats(r.objective.cache.disabled)
+          }
           bws$numimp = numimp.overall
           bws$fval.vector = value.overall
         }
@@ -2454,7 +2810,8 @@ npscoefbw.scbandwidth <-
 
     ## Restore seed
 
-    .np_seed_exit(seed.state)
+    .np_seed_exit(seed.state, remove_if_absent = TRUE)
+    nn.cache <- bws$nn.cache
 
     bws <- scbandwidth(bw = bws$bw,
                        regtype = regtype,
@@ -2490,6 +2847,7 @@ npscoefbw.scbandwidth <-
                        bandwidth.compute = bandwidth.compute,
                        optim.method = optim.method,
                        total.time = total.time)
+    bws$nn.cache <- nn.cache
     bws <- npSetScaleFactorSearchLower(bws, scale.factor.search.lower)
 
     bws
@@ -2548,6 +2906,9 @@ npscoefbw.default <-
            scale.factor.search.lower = NULL,
            ...){
     .npRmpi_require_active_slave_pool(where = "npscoefbw()")
+    dots <- list(...)
+    npRejectUnsupportedBwsolver(dots, "npscoefbw")
+
     if (!missing(bwmethod) && identical(match.arg(bwmethod, c("cv.ls", "manual")), "manual") &&
         missing(bws))
       stop("bwmethod='manual' requires argument 'bws'")
@@ -2563,7 +2924,6 @@ npscoefbw.default <-
 
     mc <- match.call(expand.dots = FALSE)
     mc.names <- names(mc)
-    dots <- list(...)
     nomad.shortcut <- .np_prepare_nomad_shortcut(
       nomad = nomad,
       call_names = mc.names,
@@ -2598,8 +2958,9 @@ npscoefbw.default <-
           !identical(as.character(match.arg(nomad.shortcut$values$regtype, c("lc", "ll", "lp")))[1L], "lp"))
         stop("nomad=TRUE requires regtype='lp'")
       if ("bwtype" %in% mc.names &&
-          !identical(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L], "fixed"))
-        stop("nomad=TRUE currently requires bwtype='fixed'")
+          !(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L] %in%
+              c("fixed", "generalized_nn", "adaptive_nn")))
+        stop("nomad=TRUE requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
       if ("degree.select" %in% mc.names &&
           identical(as.character(match.arg(nomad.shortcut$values$degree.select, c("manual", "coordinate", "exhaustive")))[1L], "manual"))
         stop("nomad=TRUE requires automatic degree search; use degree.select='coordinate' or 'exhaustive'")
@@ -2607,10 +2968,6 @@ npscoefbw.default <-
           !(as.character(match.arg(nomad.shortcut$values$search.engine, c("nomad+powell", "cell", "nomad")))[1L] %in%
               c("nomad", "nomad+powell")))
         stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'")
-      if ("bernstein.basis" %in% mc.names &&
-          !isTRUE(npValidateGlpBernstein(regtype = "lp",
-                                        bernstein.basis = nomad.shortcut$values$bernstein.basis)))
-        stop("nomad=TRUE currently requires bernstein.basis=TRUE")
       if ("degree.verify" %in% mc.names &&
           isTRUE(npValidateScalarLogical(nomad.shortcut$values$degree.verify, "degree.verify")))
         stop("nomad=TRUE currently requires degree.verify=FALSE")
@@ -2701,6 +3058,7 @@ npscoefbw.default <-
                "nomad.remin",
                "powell.remin",
                "random.seed",
+               "nomad.opts",
                "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
                "lbd.init", "hbd.init", "dfac.init",
                "scale.factor.search.lower",
@@ -2721,31 +3079,40 @@ npscoefbw.default <-
       opt.args <- list()
     }
     opt.args <- c(list(bandwidth.compute = bandwidth.compute), opt.args)
+    if ("nomad.opts" %in% names(dots))
+      opt.args$nomad.opts <- dots$nomad.opts
     reg.args$scale.factor.search.lower <- scale.factor.search.lower
     opt.args$scale.factor.search.lower <- scale.factor.search.lower
 
     if (!is.null(degree.search)) {
-      if (identical(degree.search$engine, "cell")) {
-        eval_fun <- function(degree.vec) {
-          cell.reg.args <- reg.args
-          cell.reg.args$regtype <- "lp"
-          cell.reg.args$degree <- as.integer(degree.vec)
-          cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
-          cell.bws <- .npscoefbw_run_fixed_degree(
-            xdat = xdat,
-            ydat = ydat,
-            zdat = if (miss.z) NULL else zdat,
-            bws = bws,
-            reg.args = cell.reg.args,
-            opt.args = opt.args
-          )
-          list(
-            objective = as.numeric(cell.bws$fval[1L]),
-            payload = cell.bws,
-            num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
-          )
-        }
+      eval_fun <- function(degree.vec) {
+        cell.reg.args <- reg.args
+        cell.reg.args$regtype <- "lp"
+        cell.reg.args$degree <- as.integer(degree.vec)
+        cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
+        cell.bws <- .npscoefbw_run_fixed_degree(
+          xdat = xdat,
+          ydat = ydat,
+          zdat = if (miss.z) NULL else zdat,
+          bws = bws,
+          reg.args = cell.reg.args,
+          opt.args = opt.args
+        )
+        list(
+          objective = as.numeric(cell.bws$fval[1L]),
+          payload = cell.bws,
+          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
+        )
+      }
 
+      if (isTRUE(degree.search$singleton)) {
+        search.result <- .np_degree_singleton_search_result(
+          degree.search = degree.search,
+          eval_result = eval_fun(degree.search$fixed.degree),
+          direction = "min",
+          objective_name = "fval"
+        )
+      } else if (identical(degree.search$engine, "cell")) {
         search.result <- .np_degree_search(
           method = degree.search$method,
           candidates = degree.search$candidates,
@@ -2768,7 +3135,8 @@ npscoefbw.default <-
           reg.args = reg.args,
           opt.args = opt.args,
           degree.search = degree.search,
-          nomad.inner.nmulti = nomad.inner.nmulti
+          nomad.inner.nmulti = nomad.inner.nmulti,
+          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts
         )
       }
       tbw <- .npscoefbw_attach_degree_search(

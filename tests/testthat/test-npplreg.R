@@ -43,6 +43,45 @@ test_that("npplreg direct-fit objects expose canonical and compatibility bandwid
   expect_equal(model$bw$fval, model$bws$fval)
 })
 
+test_that("npplreg all-categorical z profile route preserves fitted values", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  old <- options(np.messages = FALSE, np.tree = FALSE,
+                 np.categorical.compress = FALSE)
+  on.exit(options(old), add = TRUE)
+
+  set.seed(20261018L)
+  n <- 320L
+  dat <- data.frame(
+    y = rnorm(n),
+    x1 = rnorm(n),
+    x2 = rnorm(n),
+    z1 = factor(sample(letters[1:3], n, TRUE)),
+    z2 = ordered(sample(1:4, n, TRUE)),
+    z3 = factor(sample(c("a", "b"), n, TRUE))
+  )
+  dat$y <- 1 + 0.4 * dat$x1 - 0.2 * dat$x2 +
+    as.numeric(dat$z1) + 0.3 * as.numeric(dat$z2) +
+    rnorm(n, sd = 0.15)
+  bw <- npplregbw(
+    y ~ x1 + x2 | z1 + z2 + z3,
+    data = dat,
+    bws = matrix(c(0.15, 0.25, 0.3,
+                   0.45, 0.35, 0.4,
+                   0.4, 0.45, 0.2),
+                 nrow = 3L, byrow = TRUE),
+    bandwidth.compute = FALSE
+  )
+
+  options(np.tree = FALSE, np.categorical.compress = FALSE)
+  dense <- npplreg(bws = bw)
+  options(np.tree = FALSE, np.categorical.compress = TRUE)
+  profile <- npplreg(bws = bw)
+
+  expect_equal(coef(profile), coef(dense), tolerance = 1e-8)
+  expect_equal(fitted(profile), fitted(dense), tolerance = 1e-7)
+  expect_equal(vcov(profile), vcov(dense), tolerance = 1e-10)
+})
+
 test_that("plregression methods remain compatible with legacy objects lacking bws", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
 
@@ -236,4 +275,39 @@ test_that("npplreg residuals stay training-length when evaluation x/z are suppli
   expect_equal(length(eval.fit.ey$resid), length(y), tolerance = 0)
   expect_equal(as.numeric(eval.fit.noey$resid), as.numeric(train.fit$resid), tolerance = 0)
   expect_equal(as.numeric(eval.fit.ey$resid), as.numeric(train.fit$resid), tolerance = 0)
+})
+
+test_that("npplreg uses categorical compression for all-categorical z", {
+  skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
+  options(npRmpi.autodispatch = FALSE)
+  on.exit(close_mpi_slaves(), add = TRUE)
+  old <- options(np.messages = FALSE, np.tree = FALSE,
+                 np.categorical.compress = FALSE)
+  on.exit(options(old), add = TRUE)
+
+  set.seed(20260916L)
+  n <- 80L
+  xdat <- data.frame(x = rnorm(n))
+  zdat <- data.frame(
+    z = factor(sample(letters[1:3], n, TRUE)),
+    o = ordered(sample(1:4, n, TRUE))
+  )
+  ydat <- 1 + 1.5 * xdat$x + as.numeric(zdat$z) +
+    0.4 * as.numeric(zdat$o) + rnorm(n, sd = 0.3)
+  bw <- npplregbw(
+    xdat = xdat,
+    zdat = zdat,
+    ydat = ydat,
+    bws = matrix(c(0.25, 0.25, 0.3, 0.3), nrow = 2L, ncol = 2L),
+    bandwidth.compute = FALSE,
+    regtype = "lc"
+  )
+
+  options(np.tree = FALSE, np.categorical.compress = TRUE)
+  compressed <- npplreg(bws = bw, txdat = xdat, tzdat = zdat, tydat = ydat)
+  options(np.tree = TRUE, np.categorical.compress = TRUE)
+  legacy.tree <- npplreg(bws = bw, txdat = xdat, tzdat = zdat, tydat = ydat)
+
+  expect_equal(compressed$mean, legacy.tree$mean, tolerance = 1e-8)
+  expect_equal(coef(compressed), coef(legacy.tree), tolerance = 1e-8)
 })

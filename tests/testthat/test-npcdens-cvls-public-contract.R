@@ -161,7 +161,7 @@ test_that("public npcdensbw cv.ls fixed LP tree and serial evaluators agree at f
 
   old_opt <- getOption("np.tree")
   on.exit(options(np.tree = old_opt), add = TRUE)
-  options(np.tree = TRUE)
+  options(np.tree = FALSE, np.categorical.compress = TRUE)
 
   bw.tree <- npcdensbw(
     xdat = x,
@@ -173,16 +173,59 @@ test_that("public npcdensbw cv.ls fixed LP tree and serial evaluators agree at f
     nmulti = 1
   )
 
-  options(np.tree = FALSE)
+  options(np.tree = FALSE, np.categorical.compress = FALSE)
   serial.at.serial <- npRmpi:::.npcdensbw_eval_only(x, y$y1, bw.serial)$objective
   serial.at.tree <- npRmpi:::.npcdensbw_eval_only(x, y$y1, bw.tree)$objective
 
-  options(np.tree = TRUE)
+  options(np.tree = FALSE, np.categorical.compress = TRUE)
   tree.at.serial <- npRmpi:::.npcdensbw_eval_only(x, y$y1, bw.serial)$objective
   tree.at.tree <- npRmpi:::.npcdensbw_eval_only(x, y$y1, bw.tree)$objective
 
   expect_equal(tree.at.serial, serial.at.serial, tolerance = 2e-2)
   expect_equal(tree.at.tree, serial.at.tree, tolerance = 2e-2)
+})
+
+test_that("npcdensbw cv.ls fixed continuous stream does not route through legacy tree rows", {
+  skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  old_dispatch <- options(npRmpi.autodispatch = FALSE)
+  on.exit(options(old_dispatch), add = TRUE)
+
+  set.seed(145)
+  n <- 36L
+  x <- data.frame(x1 = runif(n), x2 = runif(n))
+  y <- data.frame(y1 = rnorm(n))
+
+  bw <- npcdensbw(
+    xdat = x,
+    ydat = y,
+    regtype = "lc",
+    bwmethod = "cv.ls",
+    bws = c(0.5, 0.6, 0.7),
+    bandwidth.compute = FALSE
+  )
+
+  old_opts <- options(np.tree = TRUE, np.categorical.compress = FALSE)
+  on.exit(options(old_opts), add = TRUE)
+
+  expect_equal(
+    npRmpi:::.npcdensbw_tree_code(
+      bw,
+      ncon = bw$yncon + bw$xncon,
+      ncat = bw$ynuno + bw$ynord + bw$xnuno + bw$xnord
+    ),
+    npRmpi:::DO_TREE_NO
+  )
+
+  options(np.tree = FALSE)
+  expect_equal(
+    npRmpi:::.npcdensbw_tree_code(
+      bw,
+      ncon = bw$yncon + bw$xncon,
+      ncat = bw$ynuno + bw$ynord + bw$xnuno + bw$xnord
+    ),
+    npRmpi:::DO_TREE_NO
+  )
 })
 
 test_that("public npcdensbw cv.ls generalized-nn LP route activates with ll == lp parity", {

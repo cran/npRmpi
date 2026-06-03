@@ -510,6 +510,23 @@ npValidateNmulti <- function(value, argname = "nmulti") {
   npValidatePositiveInteger(value, argname)
 }
 
+npValidateBwsolver <- function(value, argname = "bwsolver") {
+  match.arg(value, c("powell", "mads", "mads+powell"))
+}
+
+npBwsolverUsesMads <- function(value) {
+  npValidateBwsolver(value) %in% c("mads", "mads+powell")
+}
+
+npRejectUnsupportedBwsolver <- function(dots, where) {
+  if (!is.list(dots) || !("bwsolver" %in% names(dots)))
+    return(invisible(FALSE))
+  stop(sprintf(
+    "bwsolver is not supported by %s; use that family's documented optimizer controls",
+    where
+  ), call. = FALSE)
+}
+
 npValidatePositiveFiniteNumeric <- function(value, argname) {
   if (!is.numeric(value) || length(value) != 1L || is.na(value) ||
       !is.finite(value) || value <= 0)
@@ -541,6 +558,31 @@ npRejectRenamedScaleFactorSearchArgs <- function(arg.names,
                       old,
                       unname(npScaleFactorSearchNewNames[old]))
   stop(sprintf("%s: %s", where, paste(messages, collapse = "; ")),
+       call. = FALSE)
+}
+
+npRejectUnsupportedLpDegreeSearchArgs <- function(arg.names,
+                                                  where = "bandwidth search") {
+  if (is.null(arg.names) || !length(arg.names))
+    return(invisible(NULL))
+
+  unsupported <- c(
+    "nomad", "nomad.nmulti", "nomad.remin",
+    "search.engine",
+    "degree", "degree.select", "degree.min", "degree.max", "degree.start",
+    "degree.restarts", "degree.max.cycles", "degree.verify",
+    "random.seed",
+    "regtype", "basis", "bernstein.basis"
+  )
+  bad <- intersect(unsupported, arg.names[nzchar(arg.names)])
+  if (!length(bad))
+    return(invisible(NULL))
+
+  labels <- paste(sprintf("'%s'", bad), collapse = ", ")
+  stop(sprintf("unused argument%s in %s: %s",
+               if (length(bad) == 1L) "" else "s",
+               where,
+               labels),
        call. = FALSE)
 }
 
@@ -716,6 +758,18 @@ npValidateGlpGradientOrder <- function(regtype,
     stop(sprintf("%s must contain integers in [1,%d]", argname, degree.max))
 
   as.integer(gradient.order)
+}
+
+npGlpDegree0FirstDerivativeLcOk <- function(regtype.engine,
+                                            degree.engine,
+                                            gradient.order,
+                                            ncon) {
+  identical(regtype.engine, "lp") &&
+    ncon > 0L &&
+    length(degree.engine) == ncon &&
+    all(degree.engine == 0L) &&
+    length(gradient.order) == ncon &&
+    all(gradient.order == 1L)
 }
 
 npConditionalRegEngineSpec <- function(bws, where = "conditional estimator") {
@@ -1205,8 +1259,19 @@ nptgauss <- function(b){
 }
 
 numNotIn <- function(x){
-  while(is.element(num <- rnorm(1),x)){}
-  num
+  x <- unique(as.numeric(x))
+  x <- x[is.finite(x)]
+  if (!length(x) || !(0 %in% x))
+    return(0)
+
+  n.unique <- length(x)
+  if (n.unique >= .Machine$integer.max)
+    stop("too many category codes to construct a deterministic padding value", call. = FALSE)
+
+  candidate.max <- as.integer(n.unique + 1)
+  candidates <- c(seq_len(candidate.max), -seq_len(candidate.max))
+  # The candidate set is larger than the finite unique set, so one value is absent.
+  candidates[match(FALSE, candidates %in% x)]
 }
 
 dlev <- function(x){
@@ -1633,6 +1698,320 @@ npRegressionNnLowerBound <- function(bws) {
   2L
 }
 
+npExtendedNnEnabled <- function() {
+  npLogicalOption("np.extendednn", FALSE)
+}
+
+npContinuousExtendedNnNomadUpper <- function(traindat,
+                                          bwtype,
+                                          ckertype,
+                                          cont.idx,
+                                          evaldat = NULL,
+                                          safety.margin = 1.5,
+                                          hard.upper = .Machine$integer.max / 4) {
+  ncon <- length(cont.idx)
+  nobs <- NROW(traindat)
+  base.k <- as.integer(nobs) - 1L
+  fallback <- rep.int(as.double(base.k), ncon)
+  bwtype <- as.character(bwtype)[1L]
+
+  if (!npExtendedNnEnabled() ||
+      ncon < 1L ||
+      !(bwtype %in% c("generalized_nn", "adaptive_nn")) ||
+      base.k < 1L) {
+    return(fallback)
+  }
+
+  rel.tol <- npLargehRelTol()
+
+  kern <- as.character(ckertype)[1L]
+  utol <- switch(kern,
+    gaussian = sqrt(-2.0 * log(1.0 - rel.tol)),
+    epanechnikov = sqrt(rel.tol),
+    uniform = 1.0 - 32.0 * .Machine$double.eps,
+    "truncated gaussian" = sqrt(-2.0 * log(1.0 - rel.tol)),
+    0.0
+  )
+
+  if (!is.finite(utol) || utol <= 0)
+    return(fallback)
+
+  traindat <- toFrame(traindat)
+  evaldat <- if (is.null(evaldat)) traindat else toFrame(evaldat)
+  upper <- fallback
+
+  for (j in seq_along(cont.idx)) {
+    train.vals <- as.double(traindat[[cont.idx[j]]])
+    train.vals <- train.vals[is.finite(train.vals)]
+    eval.vals <- as.double(evaldat[[cont.idx[j]]])
+    eval.vals <- eval.vals[is.finite(eval.vals)]
+    if (length(train.vals) < 2L || length(eval.vals) < 1L)
+      next
+
+    xmin <- min(train.vals)
+    xmax <- max(train.vals)
+    train.range <- xmax - xmin
+    if (!is.finite(train.range) || train.range <= 0)
+      next
+
+    eval.saturated <- pmax(abs(eval.vals - xmin), abs(xmax - eval.vals))
+    saturated <- if (identical(bwtype, "adaptive_nn")) {
+      pmax(abs(train.vals - xmin), abs(xmax - train.vals))
+    } else {
+      eval.saturated
+    }
+    base.h.min <- min(saturated[is.finite(saturated) & saturated > 0])
+    if (!is.finite(base.h.min) || base.h.min <= 0)
+      next
+
+    h.large <- max(eval.saturated[is.finite(eval.saturated)], train.range) / utol
+    if (!is.finite(h.large) || h.large <= base.h.min)
+      next
+
+    k.upper <- ceiling(as.double(base.k) * h.large / base.h.min * safety.margin)
+    if (is.finite(k.upper))
+      upper[j] <- min(hard.upper, max(as.double(base.k), k.upper))
+  }
+
+  upper
+}
+
+npRegressionExtendedNnNomadUpper <- function(xdat,
+                                          template,
+                                          cont.idx,
+                                          safety.margin = 1.5,
+                                          hard.upper = .Machine$integer.max / 4) {
+  if (!inherits(template, "rbandwidth"))
+    return(rep.int(as.double(as.integer(NROW(xdat)) - 1L), length(cont.idx)))
+
+  npContinuousExtendedNnNomadUpper(
+    traindat = xdat,
+    bwtype = template$type,
+    ckertype = template$ckertype,
+    cont.idx = cont.idx,
+    safety.margin = safety.margin,
+    hard.upper = hard.upper
+  )
+}
+
+npRegressionHasExtendedNn <- function(bws) {
+  if (is.null(bws))
+    return(FALSE)
+
+  if (!is.null(bws$reg.bws) && npRegressionHasExtendedNn(bws$reg.bws))
+    return(TRUE)
+
+  if (!is.null(bws$tau.bws) && is.list(bws$tau.bws)) {
+    if (any(vapply(bws$tau.bws, npRegressionHasExtendedNn, logical(1L))))
+      return(TRUE)
+  }
+
+  if (!is.null(bws$bw) && is.list(bws$bw) && !is.data.frame(bws$bw)) {
+    child.is.bw <- vapply(
+      bws$bw,
+      function(x) any(c("rbandwidth", "plbandwidth", "scbandwidth", "sibandwidth") %in% class(x)),
+      logical(1L)
+    )
+    if (any(child.is.bw) &&
+        any(vapply(bws$bw[child.is.bw], npRegressionHasExtendedNn, logical(1L))))
+      return(TRUE)
+    if (any(child.is.bw))
+      return(FALSE)
+  }
+
+  if (is.null(bws$type) ||
+      !(as.character(bws$type)[1L] %in% c("generalized_nn", "adaptive_nn")) ||
+      is.null(bws$nobs)) {
+    return(FALSE)
+  }
+
+  upper <- as.double(as.integer(bws$nobs) - 1L)
+  if (!is.finite(upper) || upper < 1)
+    return(FALSE)
+
+  if (!is.null(bws$bw) && !is.null(bws$icon) && any(bws$icon)) {
+    bw <- suppressWarnings(as.double(unlist(bws$bw, use.names = FALSE)))
+    icon <- as.logical(bws$icon)
+    if (length(bw) >= length(icon) && any(is.finite(bw[icon]) & bw[icon] > upper))
+      return(TRUE)
+  }
+
+  if (!is.null(bws$bw) && is.null(bws$icon) &&
+      !is.null(bws$ncon) && isTRUE(as.integer(bws$ncon)[1L] > 0L)) {
+    bw <- suppressWarnings(as.double(unlist(bws$bw, use.names = FALSE)))
+    ncon <- as.integer(bws$ncon)[1L]
+    if (length(bw) >= ncon && any(is.finite(bw[seq_len(ncon)]) & bw[seq_len(ncon)] > upper))
+      return(TRUE)
+  }
+
+  if (!is.null(bws$xbw) && !is.null(bws$ixcon) && any(bws$ixcon)) {
+    xbw <- suppressWarnings(as.double(bws$xbw))
+    ixcon <- as.logical(bws$ixcon)
+    if (length(xbw) >= length(ixcon) && any(is.finite(xbw[ixcon]) & xbw[ixcon] > upper))
+      return(TRUE)
+  }
+
+  if (!is.null(bws$ybw) && !is.null(bws$iycon) && any(bws$iycon)) {
+    ybw <- suppressWarnings(as.double(bws$ybw))
+    iycon <- as.logical(bws$iycon)
+    if (length(ybw) >= length(iycon) && any(is.finite(ybw[iycon]) & ybw[iycon] > upper))
+      return(TRUE)
+  }
+
+  FALSE
+}
+
+npValidateExtendedNnContinuousBandwidth <- function(bws,
+                                                 where,
+                                                 nobs = NULL) {
+  if (is.null(bws$type) ||
+      identical(as.character(bws$type)[1L], "fixed") ||
+      is.null(bws$icon) ||
+      !any(bws$icon)) {
+    return(invisible(bws))
+  }
+
+  nobs <- if (is.null(nobs)) bws$nobs else nobs
+  if (is.null(nobs))
+    return(invisible(bws))
+
+  upper <- as.integer(nobs) - 1L
+  if (!is.finite(upper) || upper < 1L)
+    return(invisible(bws))
+
+  bw <- as.double(bws$bw)
+  icon <- which(as.logical(bws$icon))
+  offenders <- is.finite(bw[icon]) & bw[icon] > upper
+  if (!any(offenders))
+    return(invisible(bws))
+
+  bwtype <- as.character(bws$type)[1L]
+  if (!(bwtype %in% c("generalized_nn", "adaptive_nn"))) {
+    stop(
+      sprintf(
+        "%s: extended nearest-neighbor bandwidths above n-1 are not enabled for bwtype='%s'",
+        where,
+        bwtype
+      ),
+      call. = FALSE
+    )
+  }
+
+  if (!npExtendedNnEnabled()) {
+    stop(
+      sprintf(
+        "%s: nearest-neighbor bandwidth exceeds n-1; set options(np.extendednn = TRUE) to allow extended generalized_nn/adaptive_nn bandwidths",
+        where
+      ),
+      call. = FALSE
+    )
+  }
+
+  invisible(bws)
+}
+
+npValidateConditionalExtendedNn <- function(bws,
+                                         where,
+                                         nobs = NULL) {
+  if (is.null(bws$type) ||
+      identical(as.character(bws$type)[1L], "fixed") ||
+      is.null(bws$ixcon) ||
+      is.null(bws$iycon)) {
+    return(invisible(bws))
+  }
+
+  nobs <- if (is.null(nobs)) bws$nobs else nobs
+  if (is.null(nobs))
+    return(invisible(bws))
+
+  upper <- as.integer(nobs) - 1L
+  if (!is.finite(upper) || upper < 1L)
+    return(invisible(bws))
+
+  xbw <- as.double(bws$xbw)
+  ybw <- as.double(bws$ybw)
+  xicon <- which(as.logical(bws$ixcon))
+  yicon <- which(as.logical(bws$iycon))
+  offenders <- FALSE
+  if (length(xicon))
+    offenders <- offenders || any(is.finite(xbw[xicon]) & xbw[xicon] > upper)
+  if (length(yicon))
+    offenders <- offenders || any(is.finite(ybw[yicon]) & ybw[yicon] > upper)
+
+  if (!isTRUE(offenders))
+    return(invisible(bws))
+
+  bwtype <- as.character(bws$type)[1L]
+  if (!(bwtype %in% c("generalized_nn", "adaptive_nn"))) {
+    stop(
+      sprintf(
+        "%s: extended nearest-neighbor bandwidths above n-1 are not enabled for bwtype='%s'",
+        where,
+        bwtype
+      ),
+      call. = FALSE
+    )
+  }
+
+  if (!npExtendedNnEnabled()) {
+    stop(
+      sprintf(
+        "%s: nearest-neighbor bandwidth exceeds n-1; set options(np.extendednn = TRUE) to allow extended generalized_nn/adaptive_nn bandwidths",
+        where
+      ),
+      call. = FALSE
+    )
+  }
+
+  invisible(bws)
+}
+
+npValidateRegressionExtendedNn <- function(bws,
+                                        where,
+                                        bandwidth.compute = FALSE) {
+  if (!inherits(bws, "rbandwidth") ||
+      is.null(bws$type) ||
+      identical(as.character(bws$type)[1L], "fixed") ||
+      is.null(bws$icon) ||
+      !any(bws$icon) ||
+      is.null(bws$nobs)) {
+    return(invisible(bws))
+  }
+
+  upper <- as.integer(bws$nobs) - 1L
+  if (!is.finite(upper) || upper < 1L)
+    return(invisible(bws))
+
+  bw <- as.double(bws$bw)
+  icon <- which(as.logical(bws$icon))
+  offenders <- is.finite(bw[icon]) & bw[icon] > upper
+  if (!any(offenders))
+    return(invisible(bws))
+
+  bwtype <- as.character(bws$type)[1L]
+  if (!(bwtype %in% c("generalized_nn", "adaptive_nn"))) {
+    stop(
+      sprintf(
+        "%s: extended nearest-neighbor bandwidths above n-1 are not enabled for bwtype='%s'",
+        where,
+        bwtype
+      ),
+      call. = FALSE
+    )
+  }
+
+  if (!npExtendedNnEnabled()) {
+    stop(
+      sprintf(
+        "%s: nearest-neighbor bandwidth exceeds n-1; set options(np.extendednn = TRUE) to allow extended generalized_nn/adaptive_nn bandwidths",
+        where
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(bws)
+}
+
 npValidateRegressionNnLowerBound <- function(bws,
                                              where,
                                              allow.zero.placeholder = FALSE) {
@@ -1664,16 +2043,43 @@ npValidateRegressionNnLowerBound <- function(bws,
 }
 
 
+.np_formula_quote_name_if_needed <- function(x) {
+  reserved <- c("if", "else", "repeat", "while", "function", "for", "in",
+                "next", "break", "TRUE", "FALSE", "NULL", "Inf", "NaN", "NA",
+                "NA_integer_", "NA_real_", "NA_complex_", "NA_character_")
+  vapply(x, function(term) {
+    if (make.names(term) == term && !(term %in% reserved))
+      return(term)
+
+    paste0("`", gsub("`", "\\\\`", term), "`")
+  }, character(1), USE.NAMES = FALSE)
+}
+
 explodeFormula <- function(formula, data=NULL){
-  if(any(grepl("\\.",deparse(formula)))) {
-      if(is.null(data)) stop("'.' in formula and no 'data' argument")
-      formula <- terms(formula, data=data)
-  }
-  res <- strsplit(strsplit(paste(deparse(formula), collapse=""),
-                           " *[~] *")[[1]], " *[+] *")
+  formula.terms <- if (is.null(data)) terms(formula) else terms(formula, data = data)
+  response <- if (length(formula) == 3L) all.vars(formula[[2L]]) else character(0)
+  term.labels.raw <- attr(formula.terms, "term.labels")
+  term.labels <- ifelse(grepl("^`[^`]+`$", term.labels.raw),
+                        substring(term.labels.raw, 2L, nchar(term.labels.raw) - 1L),
+                        term.labels.raw)
+  res <- list(response, term.labels)
   stopifnot(all(sapply(res,length) > 0))
   names(res) <- c("response","terms")
+  attr(res, "formula.labels") <- list(
+    response = if (length(formula) == 3L) .np_formula_quote_name_if_needed(response) else character(0),
+    terms = term.labels.raw
+  )
   res
+}
+
+.np_formula_quote_if_needed <- function(x) {
+  vapply(x, function(term) {
+    parsed <- try(parse(text = term), silent = TRUE)
+    if (!inherits(parsed, "try-error"))
+      return(term)
+
+    paste0("`", gsub("`", "\\\\`", term), "`")
+  }, character(1), USE.NAMES = FALSE)
 }
 
 
@@ -1967,6 +2373,7 @@ genTimingStr <- function(x){
   if (is.null(x$total.time) || is.na(x$total.time))
     return("")
 
+  x_bws <- if (is.list(x)) x[["bws", exact = TRUE]] else NULL
   nomad.time <- if (!is.null(x$nomad.time) && !is.na(x$nomad.time))
     as.double(x$nomad.time) else NA_real_
   powell.time <- if (!is.null(x$powell.time) && !is.na(x$powell.time))
@@ -1974,13 +2381,13 @@ genTimingStr <- function(x){
   fit.time <- if (!is.null(x$fit.time) && !is.na(x$fit.time))
     as.double(x$fit.time) else NA_real_
   if ((!is.finite(nomad.time) || !is.finite(powell.time)) &&
-      is.list(x$bws)) {
+      is.list(x_bws)) {
     if (!is.finite(nomad.time) &&
-        !is.null(x$bws$nomad.time) && !is.na(x$bws$nomad.time))
-      nomad.time <- as.double(x$bws$nomad.time)
+        !is.null(x_bws$nomad.time) && !is.na(x_bws$nomad.time))
+      nomad.time <- as.double(x_bws$nomad.time)
     if (!is.finite(powell.time) &&
-        !is.null(x$bws$powell.time) && !is.na(x$bws$powell.time))
-      powell.time <- as.double(x$bws$powell.time)
+        !is.null(x_bws$powell.time) && !is.na(x_bws$powell.time))
+      powell.time <- as.double(x_bws$powell.time)
   }
 
   .npRmpiTimingProfileRecord <- function() {
@@ -1988,9 +2395,9 @@ genTimingStr <- function(x){
 
     if (is.list(x) && is.list(x$timing.profile) && !is.null(x$timing.profile$where)) {
       rec <- x$timing.profile
-    } else if (is.list(x) && is.list(x$bws) && is.list(x$bws$timing.profile) &&
-               !is.null(x$bws$timing.profile$where)) {
-      rec <- x$bws$timing.profile
+    } else if (is.list(x_bws) && is.list(x_bws$timing.profile) &&
+               !is.null(x_bws$timing.profile$where)) {
+      rec <- x_bws$timing.profile
     }
 
     if (!is.list(rec) || is.null(rec$where))
@@ -2159,6 +2566,7 @@ genTimingStr <- function(x){
   bws$nomad.restart.starts <- search_result$restart.starts
   bws$nomad.restart.degree.starts <- search_result$restart.degree.starts
   bws$nomad.restart.bandwidth.starts <- search_result$restart.bandwidth.starts
+  bws$nomad.restart.start.info <- search_result$restart.start.info
   bws$nomad.remin <- isTRUE(search_result$nomad.remin)
   bws$nomad.remin.index <- search_result$nomad.remin.index
   bws$nomad.remin.roundtrip <- search_result$nomad.remin.roundtrip
@@ -2215,13 +2623,18 @@ genDenEstStr <- function(x){
 }
 
 genRegEstStr <- function(x){
-  regtype <- if (!is.null(x$regtype)) x$regtype else if (!is.null(x$bws)) x$bws$regtype else NULL
-  basis <- if (!is.null(x$basis)) x$basis else if (!is.null(x$bws)) x$bws$basis else NULL
-  bern <- if (!is.null(x$bernstein.basis)) x$bernstein.basis else if (!is.null(x$bws)) x$bws$bernstein.basis else NULL
+  x_bws <- if (is.list(x)) x[["bws", exact = TRUE]] else NULL
+  regtype <- if (!is.null(x$regtype)) x$regtype else if (!is.null(x_bws)) x_bws$regtype else NULL
+  basis <- if (!is.null(x$basis)) x$basis else if (!is.null(x_bws)) x_bws$basis else NULL
+  bern <- if (!is.null(x$bernstein.basis)) x$bernstein.basis else if (!is.null(x_bws)) x_bws$bernstein.basis else NULL
   est.label <- if (identical(regtype, "lp")) npFormatRegressionType(x) else x$pregtype
   basis.family <- if (identical(regtype, "lp")) npLpBasisFamilyLabel(basis) else NULL
   basis.rep <- if (identical(regtype, "lp")) npLpBasisRepresentationLabel(bern) else NULL
-  est.label.str <- if (is.null(est.label)) "" else paste("\nKernel Regression Estimator:", est.label)
+  est.prefix <- if (!is.null(x_bws) && npUsesPolynomialSummaryLabel(x_bws))
+    "Polynomial Type"
+  else
+    "Kernel Regression Estimator"
+  est.label.str <- if (is.null(est.label)) "" else paste("\n", est.prefix, ": ", est.label, sep = "")
   basis.family.str <- if (is.null(basis.family)) "" else paste("\nLP Basis Family:", basis.family)
   basis.rep.str <- if (is.null(basis.rep)) "" else paste("\nLP Basis Representation:", basis.rep)
   ptype.str <- if (is.null(x$ptype)) "" else paste("\nBandwidth Type:", x$ptype)
@@ -2254,18 +2667,19 @@ npLpBasisNcol <- function(basis = "glp", degree){
 }
 
 npFormatRegressionType <- function(x){
+  x_bws <- if (is.list(x)) x[["bws", exact = TRUE]] else NULL
   regtype <- if (!is.null(x$regtype)) {
     x$regtype
-  } else if (!is.null(x$bws) && !is.null(x$bws$regtype)) {
-    x$bws$regtype
+  } else if (!is.null(x_bws) && !is.null(x_bws$regtype)) {
+    x_bws$regtype
   } else {
     NULL
   }
 
   pregtype <- if (!is.null(x$pregtype)) {
     x$pregtype
-  } else if (!is.null(x$bws) && !is.null(x$bws$pregtype)) {
-    x$bws$pregtype
+  } else if (!is.null(x_bws) && !is.null(x_bws$pregtype)) {
+    x_bws$pregtype
   } else {
     NULL
   }
@@ -2275,8 +2689,8 @@ npFormatRegressionType <- function(x){
 
   degree <- if (!is.null(x$degree)) {
     x$degree
-  } else if (!is.null(x$bws) && !is.null(x$bws$degree)) {
-    x$bws$degree
+  } else if (!is.null(x_bws) && !is.null(x_bws$degree)) {
+    x_bws$degree
   } else {
     NULL
   }
@@ -2286,8 +2700,8 @@ npFormatRegressionType <- function(x){
 
   basis <- if (!is.null(x$basis)) {
     x$basis
-  } else if (!is.null(x$bws) && !is.null(x$bws$basis)) {
-    x$bws$basis
+  } else if (!is.null(x_bws) && !is.null(x_bws$basis)) {
+    x_bws$basis
   } else {
     "glp"
   }
@@ -2308,7 +2722,170 @@ npBandwidthSummaryLabel <- function(bwtype, bwscaling = FALSE){
   if (identical(bwtype, "fixed"))
     return("Bandwidth(s)")
 
-  "Bandwidth Nearest Neighbor(s)"
+  "NN Index(s)"
+}
+
+.np_search_param_type <- function(bwtype, is.continuous) {
+  if (isTRUE(is.continuous)) {
+    if (identical(as.character(bwtype)[1L], "fixed")) "Bandwidth" else "NN Index"
+  } else {
+    "Lambda"
+  }
+}
+
+.np_nn_sample_max <- function(bws) {
+  if (is.null(bws) || is.null(bws$nobs))
+    return(NA_real_)
+  out <- suppressWarnings(as.double(as.integer(bws$nobs)[1L] - 1L))
+  if (is.finite(out) && out >= 1) out else NA_real_
+}
+
+.np_search_param_format <- function(x) {
+  trimws(format(sapply(x, format), trim = TRUE), which = "both")
+}
+
+.np_text_lpad <- function(x, width) {
+  x <- as.character(x)
+  paste0(blank(pmax(0L, width - nchar(x))), x)
+}
+
+.np_text_rpad <- function(x, width) {
+  x <- as.character(x)
+  paste0(x, blank(pmax(0L, width - nchar(x))))
+}
+
+.np_search_param_table_lines <- function(mat) {
+  mat <- as.matrix(mat)
+  col.widths <- vapply(seq_len(ncol(mat)), function(j) {
+    max(nchar(c(colnames(mat)[j], mat[, j])), na.rm = TRUE)
+  }, numeric(1L))
+  row.labels <- rownames(mat)
+  row.width <- max(nchar(row.labels), na.rm = TRUE)
+
+  out <- paste0(blank(row.width), " ",
+                paste(.np_text_lpad(colnames(mat), col.widths),
+                      collapse = "  "))
+  rows <- vapply(seq_len(nrow(mat)), function(i) {
+    paste0(.np_text_rpad(row.labels[i], row.width), " ",
+           paste(.np_text_lpad(mat[i, ], col.widths), collapse = "  "))
+  }, character(1L))
+  c(out, rows)
+}
+
+.np_search_param_table_fits <- function(out, width = getOption("width", 80L)) {
+  if (!length(out))
+    return(TRUE)
+  max(nchar(out), na.rm = TRUE) <= width
+}
+
+printSearchParameterSummary <- function(values,
+                                        varnames,
+                                        bws,
+                                        vari = "x",
+                                        role = NULL,
+                                        fallback.label = NULL,
+                                        digits = NULL) {
+  if (is.null(bws) || is.null(values) || is.null(varnames)) {
+    print(matrix(values, ncol = length(values),
+                 dimnames = list(fallback.label, varnames)))
+    return(invisible(NULL))
+  }
+
+  dat <- if (!is.null(bws$dati) && !is.null(bws$dati[[vari]])) {
+    bws$dati[[vari]]
+  } else if (identical(vari, "x") && !is.null(bws$xdati)) {
+    bws$xdati
+  } else if (identical(vari, "y") && !is.null(bws$ydati)) {
+    bws$ydati
+  } else {
+    NULL
+  }
+
+  if (is.null(dat) || is.null(dat$icon) || length(dat$icon) != length(values)) {
+    print(matrix(values, ncol = length(values),
+                 dimnames = list(fallback.label, varnames)))
+    return(invisible(NULL))
+  }
+
+  values <- as.double(values)
+  varnames <- as.character(varnames)
+  is.cont <- as.logical(dat$icon)
+  types <- vapply(is.cont, function(z) .np_search_param_type(bws$type, z), character(1L))
+
+  # Preserve the compact historical display when all entries are plain
+  # continuous fixed bandwidths.
+  if (all(types == "Bandwidth")) {
+    print(matrix(values, ncol = length(values),
+                 dimnames = list(fallback.label, varnames)))
+    return(invisible(NULL))
+  }
+
+  max.values <- rep(NA_real_, length(values))
+  sample.max <- .np_nn_sample_max(bws)
+  nn.idx <- which(types == "NN Index")
+  if (length(nn.idx) && is.finite(sample.max))
+    max.values[nn.idx] <- sample.max
+
+  sum.num <- if (!is.null(bws$sumNum) && !is.null(bws$sumNum[[vari]])) {
+    suppressWarnings(as.double(bws$sumNum[[vari]]))
+  } else {
+    rep(NA_real_, length(values))
+  }
+  if (length(sum.num) == length(values)) {
+    lambda.idx <- which(types == "Lambda")
+    max.values[lambda.idx] <- sum.num[lambda.idx]
+  }
+
+  value.chr <- .np_search_param_format(values)
+  max.chr <- ifelse(is.finite(max.values), .np_search_param_format(max.values), "--")
+  extended <- rep(FALSE, length(values))
+  if (length(nn.idx) && is.finite(sample.max))
+    extended[nn.idx] <- is.finite(values[nn.idx]) & values[nn.idx] > sample.max
+
+  mat <- rbind(Type = types, Value = value.chr)
+  if (any(is.finite(max.values)))
+    mat <- rbind(mat, Max = max.chr)
+  if (any(extended))
+    mat <- rbind(mat, Extended = ifelse(extended, "yes", "--"))
+  colnames(mat) <- varnames
+
+  title <- if (is.null(role) || !nzchar(role)) {
+    "Search Parameter(s):"
+  } else {
+    paste0(role, " Search Parameter(s):")
+  }
+  out <- .np_search_param_table_lines(mat)
+  if (.np_search_param_table_fits(out)) {
+    cat(title, "\n", paste(out, collapse = "\n"), "\n", sep = "")
+    return(invisible(NULL))
+  }
+
+  cat(title)
+  for (i in seq_along(values)) {
+    pieces <- c(
+      paste0("Type: ", types[i]),
+      paste0("Value: ", value.chr[i])
+    )
+    if (is.finite(max.values[i]))
+      pieces <- c(pieces, paste0("Max: ", max.chr[i]))
+    if (isTRUE(extended[i]))
+      pieces <- c(pieces, "Extended: yes")
+    cat("\n", varnames[i], " ", paste(pieces, collapse = " "), sep = "")
+  }
+  cat("\n")
+  invisible(NULL)
+}
+
+npPolynomialSummaryLabel <- function(x){
+  if (npUsesPolynomialSummaryLabel(x))
+    "Polynomial Type"
+  else
+    "Regression Type"
+}
+
+npUsesPolynomialSummaryLabel <- function(x){
+  density.classes <- c("bandwidth", "dbandwidth", "conbandwidth", "condbandwidth")
+  any(class(x) %in% density.classes)
 }
 
 
@@ -2328,22 +2905,34 @@ genBwSelStr <- function(x){
   nfe.str <- ""
   if(!(is.null(x$num.feval) || (length(x$num.feval) == 1L && is.na(x$num.feval)))){
     nfe.str <- paste("\nNumber of Function Evaluations: ", format(x$num.feval), sep="")
+    nfe.parts <- character()
     if(!(is.null(x$num.feval.fast) || (length(x$num.feval.fast) == 1L && is.na(x$num.feval.fast)))){
-      nfe.str <- paste(nfe.str, " (fast = ", format(x$num.feval.fast), ")", sep="")
+      nfe.parts <- c(nfe.parts, paste("fast = ", format(x$num.feval.fast), sep = ""))
     }
+    if(!(is.null(x$num.feval.guarded) || (length(x$num.feval.guarded) == 1L && is.na(x$num.feval.guarded)))){
+      nfe.parts <- c(nfe.parts, paste("guarded = ", format(x$num.feval.guarded), sep = ""))
+    }
+    if(length(nfe.parts) > 0L)
+      nfe.str <- paste(nfe.str, " (", paste(nfe.parts, collapse = ", "), ")", sep="")
   }
 
   pregtype <- npFormatRegressionType(x)
 
-  pregtype.str <- if (is.null(pregtype)) "" else paste("\nRegression Type:", pregtype)
+  pregtype.str <- if (is.null(pregtype)) "" else paste("\n", npPolynomialSummaryLabel(x), ": ", pregtype, sep = "")
   pmethod.str <- if (is.null(x$pmethod)) "" else paste("\nBandwidth Selection Method:", x$pmethod)
   formula.str <- if (!identical(x$formula, NULL)) paste("\nFormula:", paste(deparse(x$formula), collapse = "\n")) else ""
   ptype.str <- if (is.null(x$ptype)) "" else paste("\nBandwidth Type: ", x$ptype, sep = "")
+  extendednn.str <- if (npRegressionHasExtendedNn(x)) {
+    "\nExtended NN: K above n-1 scales the saturated nearest-neighbor bandwidth"
+  } else {
+    ""
+  }
 
   paste(pregtype.str,
         pmethod.str,
         formula.str,
         ptype.str,
+        extendednn.str,
         fval.str,
         nfe.str,
         sep = "")
@@ -2366,18 +2955,40 @@ genBwScaleStrs <- function(x){
 
   sumText <- lapply(seq_along(flat_varnames), function(i) {
     if (isTRUE(flat_icon[[i]])) {
-      if (x$type == "fixed") "Scale Factor:" else ""
+      if (x$type == "fixed") "Scale Factor:" else "NN Max:"
     } else {
       "Lambda Max:"
     }
   })
 
-  maxNameLen <- max(nchar(unlist(sumText)))
-  print.sumText <- lapply(sumText, '!=', "")
-
-  sumText <- lapply(seq_along(sumText), function(i){
-    paste(blank(maxNameLen - nchar(sumText[[i]])), sumText[[i]], sep="")
+  valueText <- lapply(seq_along(flat_varnames), function(i) {
+    if (isTRUE(flat_icon[[i]])) {
+      if (x$type == "fixed") "Bandwidth:" else "NN Index:"
+    } else {
+      "Lambda:"
+    }
   })
+
+  nn.sample.max <- .np_nn_sample_max(x)
+  flat_sum_display <- flat_sum
+  if (!identical(x$type, "fixed") && is.finite(nn.sample.max)) {
+    for (i in seq_along(flat_sum_display)) {
+      if (isTRUE(flat_icon[[i]]))
+        flat_sum_display[[i]] <- nn.sample.max
+    }
+  }
+
+  print.sumText <- lapply(seq_along(sumText), function(i) {
+    nzchar(sumText[[i]]) &&
+      !(isTRUE(flat_icon[[i]]) && !identical(x$type, "fixed") && !is.finite(nn.sample.max))
+  })
+
+  bandwidth.display <- trimws(npFormat(flat_bandwidth), which = "both")
+  sum.display <- trimws(npFormat(flat_sum_display), which = "both")
+  value.label.width <- max(nchar(unlist(valueText)), na.rm = TRUE)
+  sum.label.width <- max(nchar(unlist(sumText)), na.rm = TRUE)
+  value.width <- max(nchar(bandwidth.display), na.rm = TRUE)
+  sum.width <- max(nchar(sum.display), na.rm = TRUE)
 
   t.nchar <- lapply(flat_varnames, nchar)
                     
@@ -2394,9 +3005,21 @@ genBwScaleStrs <- function(x){
   return(sapply(seq_along(t.nchar), function(j){
     sum.str <- ""
     if (isTRUE(print.sumText[[j]]))
-      sum.str <- paste(sumText[[j]], " ", npFormat(flat_sum[[j]]), sep = "")
-    paste(vatText[[j]], " Bandwidth: ", npFormat(flat_bandwidth[[j]]), " ",
-          sum.str, sep = "", collapse = "")
+      sum.str <- paste(.np_text_rpad(sumText[[j]], sum.label.width),
+                       .np_text_lpad(sum.display[[j]], sum.width),
+                       sep = " ")
+    if (isTRUE(flat_icon[[j]]) &&
+        !identical(x$type, "fixed") &&
+        is.finite(nn.sample.max) &&
+        is.finite(flat_bandwidth[[j]]) &&
+        flat_bandwidth[[j]] > nn.sample.max)
+      sum.str <- paste(sum.str, " Extended: yes", sep = "")
+    value.str <- paste(.np_text_rpad(valueText[[j]], value.label.width),
+                       .np_text_lpad(bandwidth.display[[j]], value.width),
+                       sep = " ")
+    paste(vatText[[j]], " ", value.str,
+          if (nzchar(sum.str)) paste0("  ", sum.str) else "",
+          sep = "", collapse = "")
   }))
 }
 
@@ -3106,4 +3729,174 @@ QFAC <- qnorm(.25,lower.tail=FALSE)*2
   if (inherits(val$error, "error"))
     stop(conditionMessage(val$error), call. = FALSE)
   stop(sprintf("unable to evaluate call argument '%s'", arg), call. = FALSE)
+}
+
+.np_nn_cache_stats <- function(x) {
+  if (is.null(x))
+    return(NULL)
+  x <- as.numeric(x)
+  nms <- c("enabled", "key.length", "visits", "unique", "repeats",
+           "raw.evals", "hits", "allocation.failed",
+           "objective.enabled", "objective.key.length", "objective.visits",
+           "objective.unique", "objective.repeats", "objective.raw.evals",
+           "objective.hits", "objective.allocation.failed")
+  names(x) <- nms[seq_along(x)]
+  x
+}
+
+.np_r_nn_cache_new <- function(enabled, key.length = 0L) {
+  cache <- new.env(parent = emptyenv(), hash = FALSE)
+  cache$enabled <- isTRUE(enabled)
+  cache$key.length <- if (isTRUE(cache$enabled)) as.integer(key.length) else 0L
+  cache$store <- new.env(parent = emptyenv(), hash = TRUE)
+  cache$visits <- 0
+  cache$unique <- 0
+  cache$repeats <- 0
+  cache$raw.evals <- 0
+  cache$hits <- 0
+  cache$allocation.failed <- 0
+  cache
+}
+
+.np_r_nn_cache_key <- function(key) {
+  paste(as.integer(key), collapse = "\r")
+}
+
+.np_r_nn_cache_param_key <- function(doubles = numeric(0), integers = integer(0)) {
+  paste(c(sprintf("%.17g", as.double(doubles)), as.integer(integers)), collapse = "\r")
+}
+
+.np_r_nn_cache_get_token <- function(cache, token) {
+  if (!is.environment(cache) || !isTRUE(cache$enabled))
+    return(list(hit = FALSE, token = NULL, value = NULL))
+  cache$visits <- cache$visits + 1
+  if (exists(token, envir = cache$store, inherits = FALSE)) {
+    cache$repeats <- cache$repeats + 1
+    cache$hits <- cache$hits + 1
+    return(list(
+      hit = TRUE,
+      token = token,
+      value = get(token, envir = cache$store, inherits = FALSE)
+    ))
+  }
+  cache$unique <- cache$unique + 1
+  list(hit = FALSE, token = token, value = NULL)
+}
+
+.np_r_nn_cache_get <- function(cache, key) {
+  .np_r_nn_cache_get_token(cache, .np_r_nn_cache_key(key))
+}
+
+.np_r_nn_cache_put <- function(cache, token, value) {
+  if (!is.environment(cache) || !isTRUE(cache$enabled) || is.null(token))
+    return(invisible(FALSE))
+  if (!is.numeric(value) || length(value) != 1L || !is.finite(value))
+    return(invisible(FALSE))
+  assign(token, as.numeric(value), envir = cache$store)
+  cache$raw.evals <- cache$raw.evals + 1
+  invisible(TRUE)
+}
+
+.np_r_nn_cache_stats <- function(cache) {
+  if (!is.environment(cache))
+    return(NULL)
+  c(
+    enabled = if (isTRUE(cache$enabled)) 1 else 0,
+    key.length = as.numeric(cache$key.length),
+    visits = cache$visits,
+    unique = cache$unique,
+    repeats = cache$repeats,
+    raw.evals = cache$raw.evals,
+    hits = cache$hits,
+    allocation.failed = cache$allocation.failed
+  )
+}
+
+.np_r_nn_cache_combine_stats <- function(stats) {
+  stats <- Filter(Negate(is.null), stats)
+  if (!length(stats))
+    return(NULL)
+  nms <- c("enabled", "key.length", "visits", "unique", "repeats",
+           "raw.evals", "hits", "allocation.failed",
+           "objective.enabled", "objective.key.length", "objective.visits",
+           "objective.unique", "objective.repeats", "objective.raw.evals",
+           "objective.hits", "objective.allocation.failed")
+  mat <- do.call(rbind, lapply(stats, function(x) {
+    x <- as.numeric(x)
+    names(x) <- nms[seq_along(x)]
+    x[nms]
+  }))
+  out <- colSums(mat, na.rm = TRUE)
+  out["enabled"] <- as.numeric(any(mat[, "enabled"] > 0))
+  out["key.length"] <- if (all(is.na(mat[, "key.length"]))) {
+    0
+  } else {
+    max(mat[, "key.length"], na.rm = TRUE)
+  }
+  if ("objective.enabled" %in% names(out))
+    out["objective.enabled"] <- as.numeric(any(mat[, "objective.enabled"] > 0, na.rm = TRUE))
+  if ("objective.key.length" %in% names(out))
+    out["objective.key.length"] <- if (all(is.na(mat[, "objective.key.length"]))) {
+      0
+    } else {
+      max(mat[, "objective.key.length"], na.rm = TRUE)
+    }
+  out
+}
+
+.np_objective_exact_cache_key <- function(x) {
+  paste(sprintf("%a", as.double(x)), collapse = "\r")
+}
+
+.np_objective_exact_cache_new <- function(enabled) {
+  cache <- new.env(parent = emptyenv(), hash = FALSE)
+  cache$enabled <- isTRUE(enabled)
+  cache$store <- new.env(parent = emptyenv(), hash = TRUE)
+  cache$visits <- 0
+  cache$unique <- 0
+  cache$repeats <- 0
+  cache$raw.evals <- 0
+  cache$hits <- 0
+  cache
+}
+
+.np_objective_exact_cache_get <- function(cache, x) {
+  if (!is.environment(cache) || !isTRUE(cache$enabled))
+    return(list(hit = FALSE, token = NULL, value = NULL))
+  token <- .np_objective_exact_cache_key(x)
+  cache$visits <- cache$visits + 1
+  if (exists(token, envir = cache$store, inherits = FALSE)) {
+    cache$repeats <- cache$repeats + 1
+    cache$hits <- cache$hits + 1
+    return(list(
+      hit = TRUE,
+      token = token,
+      value = get(token, envir = cache$store, inherits = FALSE)
+    ))
+  }
+  cache$unique <- cache$unique + 1
+  list(hit = FALSE, token = token, value = NULL)
+}
+
+.np_objective_exact_cache_put <- function(cache, token, value) {
+  if (!is.environment(cache) || !isTRUE(cache$enabled) || is.null(token))
+    return(invisible(FALSE))
+  if (!is.numeric(value) || length(value) != 1L || !is.finite(value))
+    return(invisible(FALSE))
+  assign(token, as.numeric(value), envir = cache$store)
+  cache$raw.evals <- cache$raw.evals + 1
+  invisible(TRUE)
+}
+
+.np_objective_exact_cache_stats <- function(cache) {
+  if (!is.environment(cache))
+    return(NULL)
+  c(
+    enabled = if (isTRUE(cache$enabled)) 1 else 0,
+    visits = cache$visits,
+    unique = cache$unique,
+    repeats = cache$repeats,
+    raw.evals = cache$raw.evals,
+    hits = cache$hits
+  )
 }

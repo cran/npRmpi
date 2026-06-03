@@ -463,13 +463,14 @@ npplregbw.plbandwidth =
   )
   optimizer.arg.names <- c(
     "ftol", "itmax", "nmulti", "nomad.remin", "powell.remin", "small", "tol",
-    "scale.factor.search.lower"
+    "scale.factor.search.lower",
+    "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
+    "lbd.init", "hbd.init", "dfac.init",
+    "scale.init.categorical.sample", "transform.bounds", "nomad.opts"
   )
-  child.args <- c(
-    list(
-      xdat = zdat,
-      ydat = response,
-      bws = bw.start,
+  child.base.args <- list(
+    xdat = zdat,
+    ydat = response,
       bandwidth.compute = TRUE,
       regtype = "lp",
       nomad = TRUE,
@@ -484,7 +485,12 @@ npplregbw.plbandwidth =
       degree.verify = degree.search$verify,
       nomad.nmulti = nomad.inner.nmulti,
       random.seed = random.seed
-    ),
+  )
+  if (!all(as.numeric(bw.start) == 0)) {
+    child.base.args$bws <- bw.start
+  }
+  child.args <- c(
+    child.base.args,
     reg.args[intersect(names(reg.args), kernel.arg.names)],
     opt.args[intersect(names(opt.args), optimizer.arg.names)]
   )
@@ -791,15 +797,15 @@ npplregbw.plbandwidth =
   child.templates <- template$bw
   if (!length(child.templates))
     stop("automatic degree search with search.engine='nomad' could not initialize child bandwidth templates")
-  if (any(vapply(child.templates, function(tb) !identical(tb$type, "fixed"), logical(1))))
-    stop("automatic degree search with search.engine='nomad' currently requires bwtype='fixed'")
+  if (any(vapply(child.templates, function(tb) !(tb$type %in% c("fixed", "generalized_nn", "adaptive_nn")), logical(1))))
+    stop("automatic degree search with search.engine='nomad' requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
 
   child.responses <- .npplregbw_child_responses(
     xdat = xdat,
     ydat = ydat,
     yname = template$ynames
   )
-  child.setup <- lapply(child.templates, function(tb) .npregbw_nomad_bw_setup(xdat = zdat, template = tb))
+  child.setup <- lapply(child.templates, function(tb) .npregbw_nomad_bw_setup(xdat = zdat, template = tb, allow.extended.nn = TRUE))
   child.point.length <- vapply(seq_along(child.templates), function(i) {
     length(.npregbw_nomad_bw_to_point(child.templates[[i]]$bw, template = child.templates[[i]], setup = child.setup[[i]]))
   }, integer(1L))
@@ -858,6 +864,7 @@ npplregbw.plbandwidth =
     child.reg.args$degree <- as.integer(degree)
     child.reg.args$bernstein.basis <- degree.search$bernstein.basis
     child.reg.args$bandwidth.compute <- NULL
+    child.reg.args$bwtype <- child.templates[[i]]$type
     resp <- child.responses[[i]]
     tbw <- .npregbw_build_rbandwidth(
       xdat = zdat,
@@ -1093,6 +1100,9 @@ npRmpiNomadShadowSearchPlreg <- function(zdat,
                                          bbin,
                                          lb,
                                          ub,
+                                         start.lower = NULL,
+                                         start.upper = NULL,
+                                         coordinate.roles = NULL,
                                          nomad.nmulti = 1L,
                                          nomad.inner.nmulti = 0L,
                                          random.seed = 42L,
@@ -1107,7 +1117,8 @@ npRmpiNomadShadowSearchPlreg <- function(zdat,
   on.exit(options(np.messages = old.messages), add = TRUE)
   on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
 
-  set.seed(as.integer(random.seed))
+  seed.state <- .np_seed_enter(random.seed)
+  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
   if (isTRUE(rank == 0L))
     .np_nomad_baseline_note(degree.search$start.degree)
 
@@ -1183,13 +1194,9 @@ npRmpiNomadShadowSearchPlreg <- function(zdat,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
     remin = isTRUE(remin),
-    nomad.opts = list(
-      DIRECTION_TYPE = "ORTHO 2N",
-      QUAD_MODEL_SEARCH = "no",
-      NM_SEARCH = "no",
-      SPECULATIVE_SEARCH = "no",
-      EVAL_OPPORTUNISTIC = "no"
-    ),
+    start.lower = start.lower,
+    start.upper = start.upper,
+    coordinate.roles = coordinate.roles,
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -1220,6 +1227,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
                                            bbin,
                                            lb,
                                            ub,
+                                           start.lower = NULL,
+                                           start.upper = NULL,
+                                           coordinate.roles = NULL,
                                            nomad.nmulti = 1L,
                                            nomad.inner.nmulti = 0L,
                                            random.seed = 42L,
@@ -1257,6 +1267,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
       bbin = bbin,
       lb = lb,
       ub = ub,
+      start.lower = start.lower,
+      start.upper = start.upper,
+      coordinate.roles = coordinate.roles,
       nomad.nmulti = nomad.nmulti,
       nomad.inner.nmulti = nomad.inner.nmulti,
       random.seed = random.seed,
@@ -1504,7 +1517,8 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
     return(receive_final())
   }
 
-  set.seed(as.integer(random.seed))
+  seed.state <- .np_seed_enter(random.seed)
+  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
   .np_nomad_baseline_note(degree.search$start.degree)
 
   nomad.num.feval.total <- 0
@@ -1693,13 +1707,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
       nomad.inner.nmulti = nomad.inner.nmulti,
       random.seed = random.seed,
       remin = isTRUE(remin),
-      nomad.opts = list(
-        DIRECTION_TYPE = "ORTHO 2N",
-        QUAD_MODEL_SEARCH = "no",
-        NM_SEARCH = "no",
-        SPECULATIVE_SEARCH = "no",
-        EVAL_OPPORTUNISTIC = "no"
-      ),
+      start.lower = start.lower,
+      start.upper = start.upper,
+      coordinate.roles = coordinate.roles,
       degree_spec = list(
         initial = degree.search$start.degree,
         lower = degree.search$lower,
@@ -1759,29 +1769,37 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
   child.setup <- search.state$child.setup
   child.point.length <- search.state$child.point.length
 
-  child_cont_lower <- function(i) {
-    npGetScaleFactorSearchLower(
-      child.templates[[i]],
-      argname = "child scale.factor.search.lower"
-    )
+  child.bounds <- lapply(seq_along(child.templates), function(i) {
+    .npregbw_nomad_bw_bounds(template = child.templates[[i]], setup = child.setup[[i]])
+  })
+  opt.value <- function(name, default) {
+    if (is.null(opt.args[[name]])) default else opt.args[[name]]
   }
-
-  child.lower <- unlist(lapply(seq_along(child.setup), function(i) {
-    c(rep.int(child_cont_lower(i), length(child.setup[[i]]$cont_idx)),
-      rep.int(0, length(child.setup[[i]]$cat_idx)))
-  }), use.names = FALSE)
-  child.upper <- unlist(lapply(child.setup, function(setup) {
-    c(rep.int(1e6, length(setup$cont_idx)), setup$cat_upper * setup$bandwidth.scale.categorical)
-  }), use.names = FALSE)
+  child.start.bounds <- lapply(seq_along(child.templates), function(i) {
+    .np_nomad_bw_restart_start_bounds(
+      bounds = child.bounds[[i]],
+      setup = child.setup[[i]],
+      opt.value = opt.value,
+      where = "npplregbw"
+    )
+  })
+  child.lower <- unlist(lapply(child.bounds, `[[`, "lower"), use.names = FALSE)
+  child.upper <- unlist(lapply(child.bounds, `[[`, "upper"), use.names = FALSE)
+  child.bbin <- unlist(lapply(child.bounds, `[[`, "bbin"), use.names = FALSE)
+  child.coordinate.roles <- unlist(lapply(child.bounds, .np_nomad_coordinate_roles),
+                                   use.names = FALSE)
+  child.start.lower <- unlist(lapply(child.start.bounds, `[[`, "lower"), use.names = FALSE)
+  child.start.upper <- unlist(lapply(child.start.bounds, `[[`, "upper"), use.names = FALSE)
   child.start <- unlist(lapply(seq_along(child.templates), function(i) {
     raw <- child.templates[[i]]$bw
-    point.start <- if (all(raw == 0)) NULL else .npregbw_nomad_bw_to_point(raw, template = child.templates[[i]], setup = child.setup[[i]])
-    .np_nomad_complete_start_point(
+    explicit.start <- !all(as.numeric(bws[i, ]) == 0)
+    point.start <- if (!explicit.start || all(raw == 0)) NULL else .npregbw_nomad_bw_to_point(raw, template = child.templates[[i]], setup = child.setup[[i]])
+    .npregbw_nomad_complete_bw_start_point(
       point = point.start,
-      lower = c(rep.int(child_cont_lower(i), length(child.setup[[i]]$cont_idx)),
-                rep.int(0, length(child.setup[[i]]$cat_idx))),
-      upper = c(rep.int(1e6, length(child.setup[[i]]$cont_idx)), child.setup[[i]]$cat_upper * child.setup[[i]]$bandwidth.scale.categorical),
-      ncont = length(child.setup[[i]]$cont_idx)
+      bounds = child.bounds[[i]],
+      setup = child.setup[[i]],
+      initial = child.start.bounds[[i]]$initial,
+      where = "npplregbw"
     )
   }), use.names = FALSE)
   bwdim <- length(child.start)
@@ -1791,7 +1809,8 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
   x0 <- c(child.start, as.integer(degree.search$start.degree))
   lb <- c(child.lower, degree.search$lower)
   ub <- c(child.upper, degree.search$upper)
-  bbin <- c(rep.int(0L, bwdim), rep.int(1L, ndeg))
+  bbin <- c(child.bbin, rep.int(1L, ndeg))
+  coordinate.roles <- c(child.coordinate.roles, rep.int("degree", ndeg))
   baseline.record <- NULL
   nomad.num.feval.total <- 0
   nomad.num.feval.fast.total <- 0
@@ -1973,6 +1992,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
         BBIN,
         LB,
         UB,
+        STARTLOWER,
+        STARTUPPER,
+        COORDINATEROLES,
         NOMADNMULTI,
         INNERNMULTI,
         RSEED,
@@ -1989,6 +2011,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
         BBIN = bbin,
         LB = lb,
         UB = ub,
+        STARTLOWER = c(child.start.lower, degree.search$lower),
+        STARTUPPER = c(child.start.upper, degree.search$upper),
+        COORDINATEROLES = coordinate.roles,
         NOMADNMULTI = nomad.nmulti,
         INNERNMULTI = nomad.inner.nmulti,
         RSEED = random.seed,
@@ -2063,13 +2088,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
     remin = isTRUE(opt.args$nomad.remin),
-    nomad.opts = list(
-      DIRECTION_TYPE = "ORTHO 2N",
-      QUAD_MODEL_SEARCH = "no",
-      NM_SEARCH = "no",
-      SPECULATIVE_SEARCH = "no",
-      EVAL_OPPORTUNISTIC = "no"
-    ),
+    start.lower = c(child.start.lower, degree.search$lower),
+    start.upper = c(child.start.upper, degree.search$upper),
+    coordinate.roles = coordinate.roles,
     degree_spec = list(
       initial = degree.search$start.degree,
       lower = degree.search$lower,
@@ -2143,6 +2164,9 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
     candidates = bounds$candidates,
     lower = bounds$lower,
     upper = bounds$upper,
+    grid.size = bounds$grid.size,
+    singleton = bounds$singleton,
+    fixed.degree = bounds$fixed.degree,
     baseline.degree = baseline.degree,
     start.degree = start.degree,
     start.user = !is.null(degree.start),
@@ -2173,6 +2197,8 @@ npRmpiNomadSessionServicePlreg <- function(zdat,
     n.visits = search_result$n.visits,
     n.cached = search_result$n.cached,
     grid.size = search_result$grid.size,
+    singleton = isTRUE(search_result$singleton),
+    fixed.degree = search_result$fixed.degree,
     best.restart = search_result$best.restart,
     restart.starts = search_result$restart.starts,
     restart.degree.starts = search_result$restart.degree.starts,
@@ -2225,6 +2251,7 @@ npplregbw.default =
     zdat <- toFrame(zdat)
 
     dots <- list(...)
+    npRejectUnsupportedBwsolver(dots, "npplregbw")
     dot.names <- names(dots)
     mc <- match.call(expand.dots = FALSE)
     mc.names <- names(mc)
@@ -2262,8 +2289,9 @@ npplregbw.default =
           !identical(as.character(match.arg(nomad.shortcut$values$regtype, c("lc", "ll", "lp")))[1L], "lp"))
         stop("nomad=TRUE requires regtype='lp'")
       if ("bwtype" %in% dot.names &&
-          !identical(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L], "fixed"))
-        stop("nomad=TRUE currently requires bwtype='fixed'")
+          !(as.character(match.arg(nomad.shortcut$values$bwtype, c("fixed", "generalized_nn", "adaptive_nn")))[1L] %in%
+              c("fixed", "generalized_nn", "adaptive_nn")))
+        stop("nomad=TRUE requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
       if ("degree.select" %in% mc.names &&
           identical(as.character(match.arg(nomad.shortcut$values$degree.select, c("manual", "coordinate", "exhaustive")))[1L], "manual"))
         stop("nomad=TRUE requires automatic degree search; use degree.select='coordinate' or 'exhaustive'")
@@ -2271,10 +2299,6 @@ npplregbw.default =
           !(as.character(match.arg(nomad.shortcut$values$search.engine, c("nomad+powell", "cell", "nomad")))[1L] %in%
               c("nomad", "nomad+powell")))
         stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'")
-      if ("bernstein.basis" %in% dot.names &&
-          !isTRUE(npValidateGlpBernstein(regtype = "lp",
-                                        bernstein.basis = nomad.shortcut$values$bernstein.basis)))
-        stop("nomad=TRUE currently requires bernstein.basis=TRUE")
       if ("degree.verify" %in% mc.names &&
           isTRUE(npValidateScalarLogical(nomad.shortcut$values$degree.verify, "degree.verify")))
         stop("nomad=TRUE currently requires degree.verify=FALSE")
@@ -2381,6 +2405,9 @@ npplregbw.default =
                "bwmethod", "bwscaling", "bwtype", "ckertype", "ckerorder",
                "ckerbound", "ckerlb", "ckerub", "ukertype", "okertype",
                "scale.factor.search.lower",
+               "scale.factor.init.lower", "scale.factor.init.upper", "scale.factor.init",
+               "lbd.init", "hbd.init", "dfac.init",
+               "scale.init.categorical.sample", "transform.bounds", "nomad.opts",
                "ftol", "itmax", "nmulti", "nomad.remin", "powell.remin", "small", "tol")
     m <- match(margs, mc.names, nomatch = 0)
     any.m <- any(m != 0)
@@ -2397,35 +2424,51 @@ npplregbw.default =
         nms <- mc.names[m]
         opt.args[nms] <- mget(nms, envir = environment(), inherits = FALSE)
       }
+      dotted.opt.names <- intersect(
+        c("scale.factor.init.lower", "scale.factor.init.upper",
+          "scale.factor.init", "lbd.init", "hbd.init", "dfac.init",
+          "scale.init.categorical.sample", "transform.bounds", "nomad.opts"),
+        dot.names
+      )
+      if (length(dotted.opt.names)) {
+        opt.args[dotted.opt.names] <- dots[dotted.opt.names]
+      }
       opt.args$scale.factor.search.lower <- scale.factor.search.lower
 
       if (!is.null(degree.search)) {
-        if (identical(degree.search$engine, "cell")) {
-          eval_fun <- function(degree.vec) {
-            cell.reg.args <- reg.args
-            cell.reg.args$regtype <- "lp"
-            cell.reg.args$degree <- as.integer(degree.vec)
-            cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
-            cell.outer.args <- outer.args
-            cell.outer.args$regtype <- "lp"
-            cell.outer.args$degree <- as.integer(degree.vec)
-            cell.outer.args$bernstein.basis <- degree.search$bernstein.basis
-            cell.bws <- .npplregbw_run_fixed_degree(
-              xdat = xdat,
-              ydat = ydat,
-              zdat = zdat,
-              bws = bws,
-              reg.args = cell.reg.args,
-              outer.args = cell.outer.args,
-              opt.args = opt.args
-            )
-            list(
-              objective = as.numeric(cell.bws$fval[1L]),
-              payload = cell.bws,
-              num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
-            )
-          }
+        eval_fun <- function(degree.vec) {
+          cell.reg.args <- reg.args
+          cell.reg.args$regtype <- "lp"
+          cell.reg.args$degree <- as.integer(degree.vec)
+          cell.reg.args$bernstein.basis <- degree.search$bernstein.basis
+          cell.outer.args <- outer.args
+          cell.outer.args$regtype <- "lp"
+          cell.outer.args$degree <- as.integer(degree.vec)
+          cell.outer.args$bernstein.basis <- degree.search$bernstein.basis
+          cell.bws <- .npplregbw_run_fixed_degree(
+            xdat = xdat,
+            ydat = ydat,
+            zdat = zdat,
+            bws = bws,
+            reg.args = cell.reg.args,
+            outer.args = cell.outer.args,
+            opt.args = opt.args
+          )
+          list(
+            objective = as.numeric(cell.bws$fval[1L]),
+            payload = cell.bws,
+            num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
+          )
+        }
 
+        if (isTRUE(degree.search$singleton)) {
+          search.result <- .np_degree_singleton_search_result(
+            degree.search = degree.search,
+            eval_result = eval_fun(degree.search$fixed.degree),
+            direction = "min",
+            objective_name = "fval"
+          )
+        } else if (identical(degree.search$engine, "cell")) {
           search.result <- .np_degree_search(
             method = degree.search$method,
             candidates = degree.search$candidates,

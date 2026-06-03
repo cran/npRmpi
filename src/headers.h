@@ -44,6 +44,17 @@ static inline double NZD(const double a){
 static inline double NZD_POS(const double a){
   return (a > DBL_EPSILON) ? a : DBL_EPSILON;
 }
+void np_guarded_cvml_hits_reset(void);
+void np_guarded_cvml_hit(void);
+double np_guarded_cvml_hits_get(void);
+static inline double np_guarded_cvml_contribution(const double fit){
+  if(fit > DBL_MIN)
+    return -log(fit);
+  np_guarded_cvml_hit();
+  if(fit < -DBL_MIN)
+    return log(-fit) - 2.0*log(DBL_MIN);
+  return -log(DBL_MIN);
+}
 void np_fastcv_alllarge_hits_reset(void);
 double np_fastcv_alllarge_hits_get(void);
 int np_mpi_local_regression_active(void);
@@ -53,6 +64,7 @@ void np_progress_fit_set_offset(const int offset);
 void np_progress_fit_step(const int done);
 void np_progress_fit_loop_step(const int done, const int natural_total);
 int np_progress_fit_is_active(void);
+void np_progress_bandwidth_loop_step(void);
 
 double **alloc_matd(int nrows, int ncols);
 double **alloc_tmatd(int nrows, int ncols);
@@ -77,6 +89,7 @@ double cv_func_con_distribution_categorical_ls(double *vector_scale_factor);
 double cv_func_distribution_categorical_ls(double *vector_scale_factor);
 /* double cv_func_np_density_categorical_ml(double *vector_scale_factor); */
 double cv_func_regression_categorical_ls(double *vector_scale_factor);
+double cv_func_lsqregression_categorical_check(double *vector_scale_factor);
 
 /*double erfun(double x, double small, int itmax);*/
 double erfun(double x);
@@ -101,6 +114,7 @@ double meand(int n, double *vector);
 double ran3(int *idum);
 double gasdev(int *idum);
 double chidev(int *idum, int df);
+void np_reset_nr_rng_state(void);
 
 double standerrd(int n, double *vector);
 
@@ -167,6 +181,7 @@ int kernel_estimate_regression_categorical_leave_one_out(int int_ll, int KERNEL_
 double np_kernel_estimate_regression_categorical_ls_aic(int int_ll, int bwm, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories);
 int np_glp_cv_prepare_extern(const int int_ll, const int num_obs, const int ncon, double **matrix_X_continuous_train);
 void np_glp_cv_clear_extern(void);
+int np_glp_cv_degree_admissible_extern(const int num_obs, const int ncon, const int *degree, const int basis_mode);
 void np_reg_cv_core_clear_extern(void);
 int np_shadow_cv_con_density_ml(double *vector_scale_factor, double *cv);
 int np_shadow_cv_con_density_ls(double *vector_scale_factor, double *cv);
@@ -276,7 +291,7 @@ double max_unordered_bw(int num_categories,
                         int kernel);
 
 // some general np and R-c interface related defines
-#define safe_free(x) if((x) != NULL) free((x))
+#define safe_free(x) do { if((x) != NULL) free((x)); } while(0)
 
 #define SF_NORMAL 0
 #define SF_ARB    1
@@ -347,6 +362,7 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 
 #define RBWM_CVAIC 0
 #define RBWM_CVLS 1
+#define RBWM_CVCHECK 2
 
 #define RBW_NOBSI   0
 #define RBW_IMULTII 1

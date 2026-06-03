@@ -1,3 +1,158 @@
+# npRmpi 0.70-3
+
+- Added MPI-aware `nplsqreg()`/`nplsqregbw()` support for location-scale
+  quantile regression, including formula/data and bandwidth-object workflows,
+  scalar/vector `tau`, prediction, residual extraction, summaries, and plot
+  routes built on the shared quantile plotting engine.
+- Supported MPI MADS/NOMAD-backed bandwidth-search routes now use the final
+  native `crs` NOMAD C API rather than the retired legacy `snomadr()`
+  fallback. The runtime dependency on `crs` is now declared in `Imports`,
+  while `LinkingTo` remains for the native header.
+- Native NOMAD routes now preserve progress best-record reporting, expose
+  cache/evaluation diagnostics, honor explicit start and option controls, and
+  reject unsupported or indeterminate cache-off settings before solver entry.
+  Inadmissible GLP degree candidates are guarded before expensive evaluator
+  work in serial-equivalent and MPI-dispatched routes.
+- `npindexbw(..., method = "ichimura", regtype = c("ll", "lp"))` now reuses
+  the established local-polynomial regression objective evaluator, and MPI
+  autodispatch uses a rank-0-driven objective service for the fixed-degree and
+  NOMAD degree-search Ichimura local-polynomial routes. Focused sentinel runs
+  preserved payloads while restoring useful scaling for the formerly flat
+  local-linear and local-polynomial single-index rows.
+- MPI fanout coverage has been extended for computationally heavy bootstrap
+  workloads in specification, dependence, distribution-equality, quantile, and
+  symmetry tests, and plot-bootstrap RNG streams now restore the
+  serial-equivalent final state after MPI fanout.
+- The shipped `npplreg` attach-mode demo now explicitly finalizes the master
+  rank after successful attach shutdown, hardening release-sentinel teardown
+  without changing estimator or runtime defaults.
+- MPI auto-dispatch for `nplsqreg()` now materializes named method-level
+  `...` arguments before worker fanout, preserving user-supplied `scale` and
+  option values that arrive through S3 `..n` placeholders.
+- `options(np.tree = "auto")` is now the default tree mode. In auto mode,
+  continuous kd-tree routes are enabled only for bounded-support continuous
+  kernels (`"epanechnikov"` and `"uniform"`); `np.tree = TRUE` remains the
+  explicit force-on override and `np.tree = FALSE` remains the force-off
+  diagnostic path.
+- Powell bandwidth searches now expose package-side repeated-candidate
+  objective caching through `options(np.objective.cache = TRUE/FALSE)`. The
+  cache remains enabled by default and is scoped to one bandwidth solve, so it
+  can reuse exact candidates across Powell restarts without carrying state
+  across datasets or later calls. Continuous-only generalized/adaptive
+  nearest-neighbor routes also retain their integer nearest-neighbor objective
+  cache under the same switch. The option is synchronized to MPI workers in
+  autodispatch sessions; NOMAD solver caching and extended-NN distance reuse
+  remain separate mechanisms.
+- Continuous large-bandwidth shortcut evaluations can now be disabled with
+  `options(np.largeh = FALSE)`, and discrete near-upper-bandwidth shortcut
+  evaluations can now be disabled with `options(np.largelambda = FALSE)`.
+  Both remain enabled by default and are synchronized to MPI workers in
+  autodispatch sessions. These switches are intended for diagnostic timing and
+  reproducibility studies that need to separate tree effects from
+  large-bandwidth and large-lambda fast paths without changing the canonical
+  dense/tree objective machinery.
+- Local-polynomial regression cross-validation now uses a leaner hot
+  symmetric weighted-sum loop. Fixed-bandwidth `npregbw(..., regtype = "lp",
+  bwmethod = "cv.ls")` objective probes in active MPI sessions match serial
+  `np` objective values to numerical precision while substantially reducing
+  local-polynomial CV evaluation time.
+- Shared weighted outer-product accumulation in `npksum()` now uses a guarded
+  BLAS `dgemm` route when the operation is dense, non-permuted, and
+  memory-bounded. Focused fixed-bandwidth probes preserve serial/MPI objective
+  parity while substantially accelerating high-basis local-polynomial
+  regression and smooth-coefficient objective rows; small and scalar routes
+  remain on the established loop path.
+- Unconditional density least-squares cross-validation now uses a leaner
+  fixed-bandwidth Gaussian convolution loop. Fixed-bandwidth
+  `npudensbw(..., bwmethod = "cv.ls")` objective probes preserve objective
+  values exactly in the focused validation rows while materially reducing the
+  convolution portion of the objective calculation. Conditional-density
+  least-squares objective probes inherit the same fixed-bandwidth Gaussian
+  convolution improvement.
+- Non-Gaussian scalar-bandwidth convolution helpers now hoist the response
+  bandwidth power outside the inner loop, improving fixed-bandwidth
+  least-squares density cross-validation with compact-support kernels while
+  preserving objective values exactly in focused probes.
+- Continuous-kernel vector helpers now reuse the loop-invariant signed inverse
+  bandwidth scale inside their inner loops. Focused density, conditional
+  density, and regression objective probes preserve serial/MPI objective
+  parity while reducing repeated scaling work in shared C hot paths.
+- Conditional density and conditional distribution least-squares
+  cross-validation now use a size-aware row-block policy for local-polynomial
+  objective evaluation. The accepted route keeps the bounded-quadrature cap
+  unchanged, bounds transient memory by sample size, and preserves objective
+  values to numerical precision while materially reducing evaluator overhead
+  for fixed-bandwidth CVLS probes in serial and MPI sessions.
+- Local-polynomial conditional density maximum-likelihood cross-validation now
+  uses the same bounded-memory block machinery for fixed and generalized
+  nearest-neighbor bandwidths. Focused `npcdensbw(..., bwmethod = "cv.ml",
+  regtype = "lp")` probes preserve objective values and selected bandwidths to
+  numerical precision in serial and MPI sessions while reducing objective and
+  full-search runtime.
+- Large-sample categorical-only regression now uses the MPI-safe
+  profile-compressed route under `options(np.categorical.compress = TRUE)`,
+  which is enabled by default. This categorical route is independent of
+  `options(np.tree)`. Repeated predictor profiles are compressed before
+  bandwidth search, fitting, prediction/evaluation, standard errors,
+  hat-helper use, and plot bootstrap helpers, preserving the established
+  dense-route numerical contract while reducing repeated work.
+- Categorical-only unconditional density routes now use the same
+  profile-compression idea when `options(np.categorical.compress = TRUE)` is
+  enabled. The fixed-bandwidth fit/evaluation route preserves dense-route
+  fitted/evaluation values while avoiding repeated computation over identical
+  categorical profiles, and the bandwidth-search route now uses the same
+  compressed support representation for all-categorical data. As with other
+  flat categorical search surfaces, selected smoothing parameters may drift by
+  optimizer-path amounts while preserving the objective scale. Very fast
+  compressed routes may remain overhead-floor limited, so MPI acceleration is
+  most useful once the uncompressed work would be genuinely long-running.
+- Categorical-only conditional density and conditional distribution bandwidth
+  searches now honor `options(np.categorical.compress = TRUE)`. The promoted
+  route preserves the objective value to numerical precision while allowing
+  harmless optimizer-path drift in selected smoothing parameters, especially
+  near upper-bound or large-bandwidth regions where the objective is flat.
+- Ordered-only unconditional distribution bandwidth search and fit/evaluation
+  routes also use profile compression when
+  `options(np.categorical.compress = TRUE)` is enabled. The bandwidth-search
+  route preserves the objective value to numerical precision while allowing
+  harmless optimizer-path drift in selected smoothing parameters; fitted
+  distribution values and standard errors are preserved while avoiding repeated
+  computation over identical ordered profiles.
+- Fixed-bandwidth local-constant `npscoef()` fits now use categorical-profile
+  compression when all `Z` variables are categorical and
+  `options(np.categorical.compress = TRUE)` is enabled. The route preserves
+  fitted means, coefficient surfaces, asymptotic mean standard errors, and
+  coefficient/gradient standard errors for training and evaluation fits while
+  avoiding repeated work over duplicate `Z` profiles. The corresponding
+  `npscoefhat(output = "apply")` path and count-based plot-bootstrap helper
+  use the same profile compression without changing the explicit full-matrix
+  `output = "matrix"` contract.
+- Internal categorical-profile and large-bandwidth caches are now cleared at
+  the relevant top-level density, distribution, conditional-density,
+  conditional-distribution, and regression cleanup points. These caches are
+  keyed by call-local row pointers, so clearing them per `.Call` prevents stale
+  same-process state from leaking across unrelated data sets or MPI dispatch
+  modes.
+- Fixed `npcdens()` and `npcdist()` formula calls with explicit numeric
+  smoothing parameters, such as `npcdist(y ~ x, data = dat, bws = c(.25,.25))`,
+  so `npRmpi` preserves the established formula-to-bandwidth-object rewrite
+  before MPI autodispatch.
+- Hardened the `npudist()` formula route so formula calls are handled before
+  MPI autodispatch.
+- `npplreg()` now activates the already validated categorical regression
+  compression path for its internal all-categorical `Z` regressions when
+  `options(np.categorical.compress = TRUE)` is enabled, without requiring users
+  to request continuous kd-tree acceleration through `options(np.tree)`.
+- Formula variables whose names contain dots, such as `y.irr ~ x`, are no
+  longer mistaken for the formula wildcard `.` in conditional density and
+  conditional distribution bandwidth routes. The conditional-density bandwidth
+  formula route also now expands the actual wildcard form `y ~ .` using the
+  supplied `data` frame, matching the conditional-distribution route.
+- Fixed MPI conditional-density and conditional-distribution NOMAD degree-search
+  routes so Powell refinement and promoted wrappers such as `npconmode()` reach
+  the intended bandwidth-object construction path rather than the pre-search
+  autodispatch preflight used by non-degree-search routes.
+
 # npRmpi 0.70-2
 
 - `npqreg()` is now a fully fledged MPI-aware quantile-regression front

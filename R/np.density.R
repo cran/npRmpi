@@ -101,6 +101,8 @@ npudens.bandwidth <-
        !all(vapply(as.data.frame(tdat[, bws$iuno]), inherits, logical(1), "factor"))))
     stop("supplied bandwidths do not match 'tdat' in type")
 
+  npValidateExtendedNnContinuousBandwidth(bws, where = "npudens")
+
   tdat <- na.omit(tdat)
   rows.omit <- unclass(na.action(tdat))
 
@@ -179,7 +181,7 @@ npudens.bandwidth <-
     mcv.numRow = attr(bws$xmcv, "num.row"),
       densOrDist = NP_DO_DENS,
       old.dens = FALSE,
-      int_do_tree = if (isTRUE(getOption("np.tree"))) DO_TREE_YES else DO_TREE_NO)
+      int_do_tree = npDoTreeOrCategoricalCompress(ncon = bws$ncon, ncat = bws$nuno + bws$nord, bws = bws))
   cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
   myout <- .np_with_compiled_fit_progress(
@@ -222,14 +224,12 @@ npudens.bandwidth <-
 
 npudens.default <- function(bws, tdat, ...){
   .npRmpi_require_active_slave_pool(where = "npudens()")
-  if (.npRmpi_autodispatch_active())
+  bws.formula.early <- (!missing(bws)) && inherits(bws, "formula")
+  tdat.formula.early <- (!missing(tdat)) && inherits(tdat, "formula")
+  if (.npRmpi_autodispatch_active() &&
+      !bws.formula.early &&
+      !tdat.formula.early)
     return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
-
-  if (!missing(bws) && inherits(bws, "formula")) {
-    dots <- list(...)
-    tbw <- do.call(npudensbw, c(list(formula = bws), dots))
-    return(npudens(bws = tbw, ...))
-  }
 
   sc <- sys.call()
   sc.names <- names(sc)
@@ -244,15 +244,23 @@ npudens.default <- function(bws, tdat, ...){
   no.bws <- missing(bws)
   no.tdat <- missing(tdat)
   has.explicit.bws <- (!no.bws) && isa(bws, "bandwidth")
+  bws.formula <- bws.formula.early
+
+  if (bws.named && no.tdat && bws.formula) {
+    sc$`bws` <- NULL
+    sc$formula <- bws
+    sc.bw <- sc
+    sc.bw[[1]] <- quote(npudensbw)
+    bws.named <- FALSE
+  } else {
+    sc.bw <- sc
+    sc.bw[[1]] <- quote(npudensbw)
+  }
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
   if(tdat.named)
     tdat <- toFrame(tdat)
-
-  sc.bw <- sc
-  
-  sc.bw[[1]] <- quote(npudensbw)
 
   if(bws.named){
     sc.bw$bandwidth.compute <- FALSE

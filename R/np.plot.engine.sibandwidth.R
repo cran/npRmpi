@@ -34,6 +34,7 @@
            plot.errors.bar = c("|","I"),
            plot.errors.bar.num = NULL,
            plot.par.mfrow = TRUE,
+           plot.data.overlay = TRUE,
            plot.rug = FALSE,
            ...,
            random.seed){
@@ -92,6 +93,12 @@
     plot.errors = (plot.errors.method != "none")
     first.render <- .np_plot_first_render_state()
     on.exit(.np_plot_activity_end(first.render$activity), add = TRUE)
+    overlay.ok <- .np_plot_overlay_enabled(
+      plot.data.overlay = plot.data.overlay,
+      plot.behavior = plot.behavior,
+      gradients = gradients,
+      plot.data.overlay.missing = missing(plot.data.overlay)
+    )
     plot.rug <- .np_plot_validate_rug_request(
       plot.rug = plot.rug,
       route = "plot.sibandwidth()",
@@ -113,7 +120,11 @@
     dots <- list(...)
     plot.legend <- if (!is.null(dots$legend)) dots$legend else TRUE
     plot.user.args <- .np_plot_user_args(dots, "plot")
+    points.user.args <- .np_plot_user_args(dots, "points")
     bxp.user.args <- .np_plot_user_args(dots, "bxp")
+    if (!is.null(dots$cex) && is.null(points.user.args$cex))
+      points.user.args$cex <- dots$cex
+    overlay.points.args <- points.user.args
     bxp.args <- bxp.user.args
     if (!is.null(col)) bxp.args$col <- col
     if (!is.null(lty)) bxp.args$lty <- lty
@@ -204,6 +215,7 @@
     }
 
     i.sort = sort(tobj$index, index.return=TRUE)$ix
+    train.index <- as.numeric(as.matrix(xdat) %*% as.numeric(bws$beta))
 
     if (!gradients){
       if(!is.null(ylim)){
@@ -224,6 +236,11 @@
           } else {
             ymin <- min(c(temp.mean, temp.err[,3]))
             ymax <- max(c(temp.mean, temp.err[,3]))
+          }
+          if (overlay.ok) {
+            overlay.range <- .np_plot_overlay_range(c(ymin, ymax), ydat)
+            ymin <- overlay.range[1L]
+            ymax <- overlay.range[2L]
           }
         }
       }
@@ -252,8 +269,11 @@
           .np_plot_first_render_begin(first.render)
           do.call(plot, plot.args)
           .np_plot_first_render_end(first.render)
+          if (overlay.ok)
+            do.call(.np_plot_overlay_points_1d,
+                    c(list(x = train.index, y = ydat), overlay.points.args))
           if (plot.rug)
-            .np_plot_draw_rug_1d(tobj$index)
+            .np_plot_draw_rug_1d(train.index)
           if (plot.errors.type == "all") {
             sorted.all.err <- lapply(temp.all.err, function(err) {
               if (is.null(err)) return(NULL)
@@ -266,7 +286,7 @@
               plot.errors.style = plot.errors.style,
               plot.errors.bar = plot.errors.bar,
               plot.errors.bar.num = plot.errors.bar.num,
-              lty = 2,
+              lty = .np_plot_lty("interval"),
               legend = plot.legend)
           } else if (plot.errors.center == "estimate") {
             draw.errors(ex = na.omit(tobj$index[i.sort]),
@@ -275,16 +295,16 @@
                         plot.errors.style = plot.errors.style,
                         plot.errors.bar = plot.errors.bar,
                         plot.errors.bar.num = plot.errors.bar.num,
-                        lty = 2)
+                        lty = .np_plot_lty("interval"))
           } else if (plot.errors.center == "bias-corrected") {
-            lines(na.omit(tobj$index[i.sort]), na.omit(temp.err[i.sort,3]), lty = 3)
+            lines(na.omit(tobj$index[i.sort]), na.omit(temp.err[i.sort,3]), lty = .np_plot_lty("center"))
             draw.errors(ex = na.omit(tobj$index[i.sort]),
                         ely = na.omit(temp.err[i.sort,3] - temp.err[i.sort,1]),
                         ehy = na.omit(temp.err[i.sort,3] + temp.err[i.sort,2]),
                         plot.errors.style  = plot.errors.style,
                         plot.errors.bar = plot.errors.bar,
                         plot.errors.bar.num = plot.errors.bar.num,
-                        lty = 2)
+                        lty = .np_plot_lty("interval"))
           }
         } else {
           plot.args <- list(x = tobj$index[i.sort],
@@ -301,14 +321,17 @@
                             main = main,
                             sub = sub,
                             xlim = xlim,
-                            ylim = ylim,
+                            ylim = if (!is.null(ylim)) ylim else if (overlay.ok) c(ymin, ymax) else ylim,
                             lwd = scalar_default(lwd, par()$lwd))
           plot.args <- .np_plot_merge_user_args(plot.args, plot.user.args)
           .np_plot_first_render_begin(first.render)
           do.call(plot, plot.args)
           .np_plot_first_render_end(first.render)
+          if (overlay.ok)
+            do.call(.np_plot_overlay_points_1d,
+                    c(list(x = train.index, y = ydat), overlay.points.args))
           if (plot.rug)
-            .np_plot_draw_rug_1d(tobj$index)
+            .np_plot_draw_rug_1d(train.index)
         }
       }
 
@@ -419,7 +442,7 @@
             do.call(plot, plot.args)
             .np_plot_first_render_end(first.render)
             if (plot.rug)
-              .np_plot_draw_rug_1d(tobj$index)
+              .np_plot_draw_rug_1d(train.index)
             
             if (plot.errors){
               if (plot.errors.type == "all") {
@@ -434,7 +457,7 @@
                   plot.errors.style = plot.errors.style,
                   plot.errors.bar = plot.errors.bar,
                   plot.errors.bar.num = plot.errors.bar.num,
-                  lty = 2,
+                  lty = .np_plot_lty("interval"),
                   legend = plot.legend)
               } else if (plot.errors.center == "estimate") {
                 lo.i <- bws$beta[i] * (temp.mean[i.sort] - temp.err[i.sort,1])
@@ -445,18 +468,18 @@
                             plot.errors.style = plot.errors.style,
                             plot.errors.bar = plot.errors.bar,
                             plot.errors.bar.num = plot.errors.bar.num,
-                            lty = 2)
+                            lty = .np_plot_lty("interval"))
               } else if (plot.errors.center == "bias-corrected") {
                 lo.i <- bws$beta[i] * (temp.err[i.sort,3] - temp.err[i.sort,1])
                 hi.i <- bws$beta[i] * (temp.err[i.sort,3] + temp.err[i.sort,2])
-                lines(na.omit(tobj$index[i.sort]), na.omit(bws$beta[i] * temp.err[i.sort,3]), lty = 3)
+                lines(na.omit(tobj$index[i.sort]), na.omit(bws$beta[i] * temp.err[i.sort,3]), lty = .np_plot_lty("center"))
                 draw.errors(ex = na.omit(tobj$index[i.sort]),
                             ely = na.omit(pmin(lo.i, hi.i)),
                             ehy = na.omit(pmax(lo.i, hi.i)),
                             plot.errors.style  = plot.errors.style,
                             plot.errors.bar = plot.errors.bar,
                             plot.errors.bar.num = plot.errors.bar.num,
-                            lty = 2)
+                            lty = .np_plot_lty("interval"))
               }
             }
           }

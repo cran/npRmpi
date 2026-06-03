@@ -546,12 +546,12 @@ np_render_control <- function(style = c("band", "bar"),
   }
 
   if (!is.null(dots$plot.data.overlay) &&
-      !any(c("rbandwidth", "plbandwidth", "scbandwidth") %in% cls) &&
+      !any(c("rbandwidth", "plbandwidth", "scbandwidth", "sibandwidth") %in% cls) &&
       !("condbandwidth" %in% cls && isTRUE(dots$quantreg))) {
     dots$plot.data.overlay <- .np_plot_match_flag(dots$plot.data.overlay,
                                                   "plot.data.overlay")
     if (isTRUE(dots$plot.data.overlay)) {
-      stop("plot.data.overlay=TRUE is available only for regression, quantile regression, partially linear, and smooth coefficient plot surfaces.",
+      stop("plot.data.overlay=TRUE is available only for regression, quantile regression, single-index, partially linear, and smooth coefficient plot surfaces.",
            call. = FALSE)
     }
     dots$plot.data.overlay <- NULL
@@ -694,6 +694,9 @@ np_render_control <- function(style = c("band", "bar"),
     bws = object$bws,
     context = "plot.npdensity"
   )
+  if ("plot.rug" %in% .np_plot_dot_names(.plot_dots_call))
+    stop("unused plot argument: plot.rug; did you mean data_rug?",
+         call. = FALSE)
   dots <- list(...)
   dots <- .np_plot_normalize_public_dots(dots, context = "plot.npdensity")
   plot.rug <- FALSE
@@ -742,6 +745,8 @@ np_render_control <- function(style = c("band", "bar"),
     }
   }
 
+  if (isTRUE(plot.rug))
+    dots$plot.rug <- TRUE
   do.call(.np_plot_from_slot, c(list(object = object, slot = "bws"), dots))
 }
 .np_plot_condensity <- function(object, ..., .plot_dots_call = NULL) {
@@ -1568,7 +1573,7 @@ np_render_control <- function(style = c("band", "bar"),
   xlab <- .np_plot_scalar_default(dots$xlab, vars[1L])
   ylab <- .np_plot_scalar_default(dots$ylab, vars[2L])
   zlab <- .np_plot_scalar_default(dots$zlab, "Probability")
-  border <- .np_plot_scalar_default(dots$border, "black")
+  border <- .np_plot_scalar_default(dots$border, .np_plot_color("surface_border"))
 
   if (identical(renderer, "rgl")) {
     rgl.view <- .np_plot_rgl_view_angles(theta = theta, phi = phi)
@@ -1690,10 +1695,10 @@ np_render_control <- function(style = c("band", "bar"),
     if (any(good)) {
       if (is.factor(x) && !is.ordered(x)) {
         graphics::segments(xord[good], lower[good], xord[good], upper[good],
-                           col = "gray45", lty = 2)
+                           col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
       } else {
-        graphics::lines(xord[good], lower[good], col = "gray45", lty = 2)
-        graphics::lines(xord[good], upper[good], col = "gray45", lty = 2)
+        graphics::lines(xord[good], lower[good], col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
+        graphics::lines(xord[good], upper[good], col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
       }
     }
   }
@@ -1726,6 +1731,7 @@ np_render_control <- function(style = c("band", "bar"),
   grid.supplied <- intersect(dot.names[nzchar(dot.names)], grid.args)
   rgl.prefixed.args <- dot.names[startsWith(dot.names, "rgl.")]
   allowed <- unique(c("gradients", "level", "output", "data_rug",
+                      "random.seed",
                       "layout", "legend", grid.args, surface.args,
                       interval.args, rgl.prefixed.args,
                       .np_plot_graphics_arg_names()))
@@ -1752,6 +1758,9 @@ np_render_control <- function(style = c("band", "bar"),
     layout <- dots$plot.par.mfrow
     dots$plot.par.mfrow <- NULL
   }
+  random.seed <- if (!is.null(dots$random.seed)) dots$random.seed else 42L
+  dots$random.seed <- NULL
+  npValidateNonNegativeInteger(random.seed, "random.seed")
   errors <- if (is.null(dots$plot.errors.method)) "none" else
     .np_plot_scalar_match(dots$plot.errors.method,
                           c("none", "bootstrap", "asymptotic"),
@@ -1862,48 +1871,50 @@ np_render_control <- function(style = c("band", "bar"),
   if (!is.null(dots$type))
     line.user.args$type <- dots$type
 
-  plot.data <- if (isTRUE(perspective)) {
-    .np_plot_conmode_surface_data(
-      object,
-      level = level,
-      neval = neval,
-      xtrim = xtrim,
-      xq = xq,
-      plot.vars = dots$plot.vars,
-      errors = errors,
-      alpha = alpha,
-      band = band
-    )
-  } else if (identical(view, "fixed")) {
-    .np_plot_conmode_grid_data(
-      object,
-      gradients = gradients,
-      level = level,
-      neval = neval,
-      xtrim = xtrim,
-      xq = xq,
-      errors = errors,
-      alpha = alpha,
-      band = band,
-      center = center,
-      bootstrap = bootstrap,
-      B = B,
-      blocklen = boot.blocklen
-    )
-  } else {
-    .np_plot_conmode_data(
-      object,
-      gradients = gradients,
-      level = level,
-      errors = errors,
-      alpha = alpha,
-      band = band,
-      center = center,
-      bootstrap = bootstrap,
-      B = B,
-      blocklen = boot.blocklen
-    )
-  }
+  plot.data <- .np_with_seed(random.seed, {
+    if (isTRUE(perspective)) {
+      .np_plot_conmode_surface_data(
+        object,
+        level = level,
+        neval = neval,
+        xtrim = xtrim,
+        xq = xq,
+        plot.vars = dots$plot.vars,
+        errors = errors,
+        alpha = alpha,
+        band = band
+      )
+    } else if (identical(view, "fixed")) {
+      .np_plot_conmode_grid_data(
+        object,
+        gradients = gradients,
+        level = level,
+        neval = neval,
+        xtrim = xtrim,
+        xq = xq,
+        errors = errors,
+        alpha = alpha,
+        band = band,
+        center = center,
+        bootstrap = bootstrap,
+        B = B,
+        blocklen = boot.blocklen
+      )
+    } else {
+      .np_plot_conmode_data(
+        object,
+        gradients = gradients,
+        level = level,
+        errors = errors,
+        alpha = alpha,
+        band = band,
+        center = center,
+        bootstrap = bootstrap,
+        B = B,
+        blocklen = boot.blocklen
+      )
+    }
+  })
 
   if (isTRUE(perspective)) {
     if (identical(output, "data"))

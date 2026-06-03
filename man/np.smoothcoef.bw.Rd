@@ -479,12 +479,12 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     \code{bwtype="fixed"}. Explicit incompatible settings error
     immediately; in particular, \code{nomad=TRUE} currently requires
     \code{regtype="lp"}, \code{bwtype="fixed"}, automatic degree
-    search, \code{bernstein.basis=TRUE}, no explicit \code{degree},
+    search, no explicit \code{degree},
     and \code{search.engine \%in\% c("nomad", "nomad+powell")}.
     This shortcut does not change the meaning of \code{nmulti} or
     \code{nomad.nmulti}: \code{nmulti} remains the outer restart count,
     while \code{nomad.nmulti} controls inner
-    \code{crs::snomadr()} multistarts within each outer restart.
+    native \pkg{crs} NOMAD API multistarts within each outer restart.
     Returned bandwidth objects retain this normalized preset metadata in
     \code{bw$nomad.shortcut} for a returned object \code{bw}; when
     available, \code{nomad.time} and \code{powell.time} record the
@@ -493,13 +493,18 @@ These arguments control the optional NOMAD direct-search route for local-polynom
 
   \item{nomad.nmulti}{
     non-negative integer controlling the inner
-    \code{crs::snomadr()} multistart count used within each outer
+    the native \pkg{crs} NOMAD C API multistart count used within each outer
     NOMAD restart when \code{regtype="lp"} and automatic degree search
     uses \code{search.engine="nomad"} or \code{"nomad+powell"}.
     Defaults to \code{0L}, which preserves the current one-start-per-
     restart behavior. This does not replace \code{nmulti}:
     \code{nmulti} controls outer restarts, while \code{nomad.nmulti}
-    controls inner NOMAD multistarts within each outer restart.
+    controls inner NOMAD multistarts within each outer restart. Advanced
+    native NOMAD parameters may be supplied as \code{nomad.opts} through
+    \code{...}; invalid or unsupported parameters are rejected by NOMAD
+    rather than silently ignored. Routes that evaluate R callbacks require
+    serial callback evaluation and reject parallel callback settings such as
+    \code{NB_THREADS_PARALLEL_EVAL > 1}.
   }
 
   \item{nomad.remin}{
@@ -517,13 +522,14 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     \code{degree.select != "manual"}. \code{"nomad+powell"} (default)
     performs direct joint search over the \code{zdat}-side continuous
     bandwidth coordinates and degree vector using
-    \code{crs::snomadr()}, then applies one Powell hot start from the
+    the native \pkg{crs} NOMAD C API, then applies one Powell hot start from the
     NOMAD solution. \code{"nomad"} omits the Powell refinement.
     \code{"cell"} profiles the criterion over the admissible degree
     grid using repeated fixed-degree bandwidth solves. NOMAD-based
-    search currently requires \code{bwtype="fixed"},
-    \code{degree.verify=FALSE}, and the suggested package \pkg{crs} to
-    be installed.
+    search supports \code{bwtype="fixed"},
+    \code{bwtype="generalized_nn"}, and \code{bwtype="adaptive_nn"};
+    it currently requires \code{degree.verify=FALSE} and the suggested
+    package \pkg{crs} to be installed.
   }
 
 
@@ -728,7 +734,7 @@ or standard-deviation factors.
   coordinate-wise or exhaustive search together with repeated
   fixed-degree bandwidth solves. With \code{search.engine="nomad"} or
   \code{"nomad+powell"}, the criterion is optimized directly over the
-  joint degree/bandwidth space using \code{crs::snomadr()};
+  joint degree/bandwidth space using the native \pkg{crs} NOMAD C API;
   \code{"nomad+powell"} then performs one Powell hot start from the
   NOMAD solution and keeps the better of the direct NOMAD and polished
   answers. This polynomial-adaptive joint-search route is motivated by

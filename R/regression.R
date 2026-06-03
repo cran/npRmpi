@@ -67,7 +67,9 @@ print.npregression <- function(x, digits=NULL, ...){
                                       sep=""),
       " in ",x$ndim," variable(s)\n",sep="")
 
-  print(matrix(x$bw,ncol=x$ndim,dimnames=list(paste(x$pscaling,":",sep=""),x$xnames)))
+  printSearchParameterSummary(x$bw, x$xnames, x$bws, vari = "x",
+                              fallback.label = paste(x$pscaling, ":", sep = ""),
+                              digits = digits)
   
   cat(genRegEstStr(x))
   cat(genBwKerStrs(x$bws))
@@ -129,12 +131,20 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
   gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$icon)
   if (length(cont.idx)) {
+    lp.degree0.lc.gradient <- npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = x$bws$regtype,
+      degree.engine = x$bws$degree,
+      gradient.order = gorder,
+      ncon = x$bws$ncon
+    )
     keep.cont <- (gorder <= x$bws$degree)
+    if (lp.degree0.lc.gradient)
+      keep.cont[] <- TRUE
     if (any(keep.cont)) {
       keep.idx <- cont.idx[keep.cont]
       gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]
     }
-    if (any(gorder > x$bws$degree))
+    if (any(gorder > x$bws$degree) && !lp.degree0.lc.gradient)
       .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
   }
   gout.masked
@@ -172,7 +182,8 @@ summary.npregression <- function(object, ...) {
 
   cat(genOmitStr(object))
 
-  print(matrix(object$bw,ncol=object$ndim,dimnames=list(paste(object$pscaling,":",sep=""),object$xnames)))
+  printSearchParameterSummary(object$bw, object$xnames, object$bws, vari = "x",
+                              fallback.label = paste(object$pscaling, ":", sep = ""))
 
   cat(genRegEstStr(object))
   cat(genGofStr(object))
