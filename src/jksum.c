@@ -10,6 +10,10 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(NP_USE_ACCELERATE_GAUSS) && defined(__APPLE__) && defined(__arm64__)
+#include <dlfcn.h>
+#endif
+
 #include <R.h>
 #include <R_ext/Applic.h>
 #include <R_ext/BLAS.h>
@@ -28,6 +32,40 @@
 #include <assert.h>
 
 #include <inttypes.h>
+
+#if defined(NP_USE_ACCELERATE_GAUSS) && defined(__APPLE__) && defined(__arm64__)
+#define NP_ACCEL_GAUSS_COMPILED 1
+typedef long np_vDSP_Stride;
+typedef unsigned long np_vDSP_Length;
+typedef void (*np_vDSP_vsmsaD_fn)(const double *, np_vDSP_Stride,
+                                  const double *, const double *,
+                                  double *, np_vDSP_Stride,
+                                  np_vDSP_Length);
+typedef void (*np_vDSP_vsqD_fn)(const double *, np_vDSP_Stride,
+                                double *, np_vDSP_Stride,
+                                np_vDSP_Length);
+typedef void (*np_vDSP_vsmulD_fn)(const double *, np_vDSP_Stride,
+                                  const double *, double *,
+                                  np_vDSP_Stride, np_vDSP_Length);
+typedef void (*np_vDSP_vmulD_fn)(const double *, np_vDSP_Stride,
+                                 const double *, np_vDSP_Stride,
+                                 double *, np_vDSP_Stride,
+                                 np_vDSP_Length);
+typedef void (*np_vDSP_sveD_fn)(const double *, np_vDSP_Stride, double *,
+                                np_vDSP_Length);
+typedef void (*np_vDSP_dotprD_fn)(const double *, np_vDSP_Stride,
+                                  const double *, np_vDSP_Stride,
+                                  double *, np_vDSP_Length);
+typedef void (*np_vDSP_vaddD_fn)(const double *, np_vDSP_Stride,
+                                 const double *, np_vDSP_Stride,
+                                 double *, np_vDSP_Stride,
+                                 np_vDSP_Length);
+typedef void (*np_vvexp_fn)(double *, const double *, const int *);
+typedef void (*np_vvfabs_fn)(double *, const double *, const int *);
+typedef void (*np_vvrec_fn)(double *, const double *, const int *);
+#else
+#define NP_ACCEL_GAUSS_COMPILED 0
+#endif
 #ifdef MPI2
 
 #include "mpi.h"
@@ -313,6 +351,30 @@ static double np_blas_ddot_int(const int n, const double *x, const double *y){
   return F77_CALL(ddot)(&n, x, &inc, y, &inc);
 }
 
+static double np_blas_ddot_i64_stride(const int64_t n,
+                                      const double *x,
+                                      const int64_t incx,
+                                      const double *y,
+                                      const int64_t incy){
+  if((n <= 0) || (x == NULL) || (y == NULL) || (incx <= 0) || (incy <= 0))
+    return 0.0;
+  if((n <= INT_MAX) && (incx <= INT_MAX) && (incy <= INT_MAX)){
+    const int ni = (int)n;
+    const int ixi = (int)incx;
+    const int iyi = (int)incy;
+    return F77_CALL(ddot)(&ni, x, &ixi, y, &iyi);
+  }
+
+  double acc = 0.0;
+  for(int64_t i = 0; i < n; i++)
+    acc += x[i*incx]*y[i*incy];
+  return acc;
+}
+
+static double np_blas_ddot_i64(const int64_t n, const double *x, const double *y){
+  return np_blas_ddot_i64_stride(n, x, 1, y, 1);
+}
+
 static void np_blas_dgemm_tn_int(const int m,
                                  const int n,
                                  const int k,
@@ -343,6 +405,12 @@ static void np_blas_dgemm_tn_int(const int m,
                   FCONE FCONE);
 }
 
+#define NP_FAST_REDUCTION_STAGE_MAX 64
+
+static int np_fast_reduction_finite(const double x){
+  return isfinite(x);
+}
+
 static int np_outer_weighted_sum_blas_eligible(const int max_A,
                                                const int max_B,
                                                const int num_weights,
@@ -350,8 +418,14 @@ static int np_outer_weighted_sum_blas_eligible(const int max_A,
                                                size_t * const nA_out,
                                                size_t * const nB_out,
                                                size_t * const nC_out){
-  if((num_weights < 64) || (max_A <= 1) || (max_B <= 1) ||
-     ((size_t)max_A*(size_t)max_B < 16))
+  const size_t nprod = (size_t)max_A*(size_t)max_B;
+
+  if((num_weights < 64) || (max_A <= 1) || (max_B <= 1))
+    return 0;
+
+  if((nprod < 16) &&
+     (((nprod < 9) && (num_weights < 8192)) ||
+      ((nprod >= 9) && (num_weights < 512))))
     return 0;
 
   if(symmetric && (max_A != max_B))
@@ -372,6 +446,82 @@ static int np_outer_weighted_sum_blas_eligible(const int max_A,
   if(nC_out != NULL) *nC_out = nC;
 
   return 1;
+}
+
+static int np_outer_weighted_sum_blas_scalar_unit_try(double * const * const pmat_A,
+                                                      const int have_A,
+                                                      double * const * const pmat_B,
+                                                      const int have_B,
+                                                      const double * const weights,
+                                                      const int num_weights,
+                                                      const double db,
+                                                      double * const result){
+  if((num_weights < 512) || (pmat_A == NULL) || (pmat_B == NULL) ||
+     (weights == NULL) || (result == NULL))
+    return 0;
+
+  if(have_A && !have_B){
+    const double contrib = np_blas_ddot_int(num_weights, pmat_A[0], weights)/db;
+    if(!np_fast_reduction_finite(contrib))
+      return 0;
+    result[0] += contrib;
+    return 1;
+  }
+
+  if(!have_A && have_B){
+    const double contrib = np_blas_ddot_int(num_weights, pmat_B[0], weights)/db;
+    if(!np_fast_reduction_finite(contrib))
+      return 0;
+    result[0] += contrib;
+    return 1;
+  }
+
+  return 0;
+}
+
+static int np_outer_weighted_sum_blas_thin_unit_try(double * const * const pmat_A,
+                                                    const int have_A,
+                                                    const int max_A,
+                                                    double * const * const pmat_B,
+                                                    const int have_B,
+                                                    const int max_B,
+                                                    const double * const weights,
+                                                    const int num_weights,
+                                                    const double db,
+                                                    double * const result){
+  if((num_weights < 512) || (pmat_A == NULL) || (pmat_B == NULL) ||
+     (weights == NULL) || (result == NULL))
+    return 0;
+
+  if((max_A > NP_FAST_REDUCTION_STAGE_MAX) ||
+     (max_B > NP_FAST_REDUCTION_STAGE_MAX))
+    return 0;
+
+  if((max_A > 1) && (max_B == 1) && !have_B){
+    double staged[NP_FAST_REDUCTION_STAGE_MAX];
+    for(int j = 0; j < max_A; j++)
+      staged[j] = np_blas_ddot_int(num_weights, pmat_A[j], weights)/db;
+    for(int j = 0; j < max_A; j++)
+      if(!np_fast_reduction_finite(staged[j]))
+        return 0;
+    for(int j = 0; j < max_A; j++)
+      result[j] += staged[j];
+    return 1;
+  }
+
+  if((max_A == 1) && (max_B > 1) && !have_A){
+    double staged[NP_FAST_REDUCTION_STAGE_MAX];
+    for(int i = 0; i < max_B; i++)
+      staged[i] = np_blas_ddot_int(num_weights, pmat_B[i], weights)/db;
+    for(int i = 0; i < max_B; i++)
+      if(!np_fast_reduction_finite(staged[i]))
+        return 0;
+    for(int i = 0; i < max_B; i++)
+      result[i] += staged[i];
+    return 1;
+  }
+
+  return 0;
 }
 
 static double *np_outer_weighted_sum_pack_A(double * const * const pmat_A,
@@ -456,6 +606,15 @@ static int np_outer_weighted_sum_blas(double * const * const pmat_A,
   }
 
   np_blas_dgemm_tn_int(max_A, max_B, num_weights, Ause, Bpack, C);
+
+  for(size_t i = 0; i < nC; i++){
+    if(!np_fast_reduction_finite(C[i])){
+      free(Apack);
+      free(Bpack);
+      free(C);
+      return 0;
+    }
+  }
 
   if(!symmetric){
     for(int j = 0; j < max_A; j++)
@@ -2343,6 +2502,7 @@ static uint64_t np_guarded_cvml_hits = 0;
 static int np_runtime_tol_cache_ready = 0;
 static int np_largeh_enabled_cache = 1;
 static int np_largelambda_enabled_cache = 1;
+static int np_mseries_accelerate_enabled_cache = 0;
 static double np_largeh_rel_tol_cache = 1e-3;
 static double np_disc_rel_tol_cache = 1e-2;
 /*
@@ -2527,6 +2687,45 @@ static inline int np_get_option_logical(const char * const name, const int fallb
 
   error("option '%s' must be TRUE or FALSE", name);
   return fallback;
+}
+
+static int np_option_string_is_auto(const char * const s)
+{
+  return (s != NULL) &&
+    (s[0] == 'a' || s[0] == 'A') &&
+    (s[1] == 'u' || s[1] == 'U') &&
+    (s[2] == 't' || s[2] == 'T') &&
+    (s[3] == 'o' || s[3] == 'O') &&
+    (s[4] == '\0');
+}
+
+static int np_get_option_auto_logical(const char * const name, const int auto_value)
+{
+  const SEXP sym = Rf_install(name);
+  const SEXP val = Rf_GetOption1(sym);
+
+  if(val == R_NilValue)
+    return auto_value;
+
+  if(TYPEOF(val) == LGLSXP && XLENGTH(val) == 1 && LOGICAL(val)[0] != NA_LOGICAL)
+    return LOGICAL(val)[0] != 0;
+
+  if(TYPEOF(val) == STRSXP && XLENGTH(val) == 1) {
+    const char *s = CHAR(STRING_ELT(val, 0));
+    if(np_option_string_is_auto(s))
+      return auto_value;
+  }
+
+  error("option '%s' must be TRUE, FALSE, or \"auto\"", name);
+  return auto_value;
+}
+
+static inline void np_refresh_mseries_accelerate_option(void)
+{
+  np_mseries_accelerate_enabled_cache =
+    NP_ACCEL_GAUSS_COMPILED ?
+    np_get_option_auto_logical("np.macMseries.accelerate", 1) :
+    0;
 }
 
 static inline void np_refresh_runtime_tolerances(void);
@@ -2804,6 +3003,7 @@ static inline void np_refresh_runtime_tolerances(void){
   const double largeh_optv = np_get_option_double("np.largeh.rel.tol", largeh_dflt);
   np_largeh_enabled_cache = np_get_option_logical("np.largeh", 1);
   np_largelambda_enabled_cache = np_get_option_logical("np.largelambda", 1);
+  np_refresh_mseries_accelerate_option();
   if(isfinite(largeh_optv) && largeh_optv > 0.0 && largeh_optv < 0.1) {
     np_largeh_rel_tol_cache = largeh_optv;
   } else {
@@ -4804,6 +5004,28 @@ double cksup[OP_NCFUN][2] = { {-DBL_MAX, DBL_MAX}, {-DBL_MAX, DBL_MAX}, {-DBL_MA
 /* xt = training data */
 /* xw = x weights */
 
+#if NP_ACCEL_GAUSS_COMPILED
+static int np_p_ckernelv_accel_gauss2_deriv_try(const int KERNEL,
+                                                const int P_KERNEL,
+                                                const int P_IDX,
+                                                const int P_NIDX,
+                                                const double * const xt,
+                                                const int num_xt,
+                                                const int bin_do_xw,
+                                                const double x,
+                                                const double zscale,
+                                                double * const xw,
+                                                double * const result,
+                                                double * const p_result,
+                                                const XL * const xl,
+                                                const XL * const p_xl,
+                                                const int do_perm,
+                                                const int do_score,
+                                                double * const kbuf,
+                                                const double invnorm,
+                                                const double p_invnorm);
+#endif
+
 void np_p_ckernelv(const int KERNEL, 
                    const int P_KERNEL,
                    const int P_IDX,
@@ -4902,6 +5124,33 @@ void np_p_ckernelv(const int KERNEL,
     return;
   }
 
+#if NP_ACCEL_GAUSS_COMPILED
+  if(np_mseries_accelerate_enabled_cache &&
+     np_p_ckernelv_accel_gauss2_deriv_try(KERNEL,
+                                          P_KERNEL,
+                                          P_IDX,
+                                          P_NIDX,
+                                          xt,
+                                          num_xt,
+                                          bin_do_xw,
+                                          x,
+                                          zscale,
+                                          xw,
+                                          result,
+                                          p_result,
+                                          xl,
+                                          p_xl,
+                                          do_perm,
+                                          do_score,
+                                          kbuf,
+                                          invnorm,
+                                          p_invnorm)) {
+    if(own_kbuf)
+      free(kbuf);
+    return;
+  }
+#endif
+
   if(xl == NULL){
     for (i = 0, j = 0; i < num_xt; i++, j += bin_do_xw){
       const double kn = invnorm*k[KERNEL]((x-xt[i])*zscale);
@@ -4960,6 +5209,732 @@ void np_p_ckernelv(const int KERNEL,
     free(kbuf);
 }
 
+#if NP_ACCEL_GAUSS_COMPILED
+static double *np_accel_gauss_tmp = NULL;
+static double *np_accel_gauss_arg = NULL;
+static double *np_accel_gauss_work = NULL;
+static double *np_accel_gauss_val = NULL;
+static double *np_accel_gauss_poly = NULL;
+static int np_accel_gauss_capacity = 0;
+static void *np_accel_gauss_handle = NULL;
+static int np_accel_gauss_available_cache = -1;
+static np_vDSP_vsmsaD_fn np_accel_vsmsaD = NULL;
+static np_vDSP_vsqD_fn np_accel_vsqD = NULL;
+static np_vDSP_vsmulD_fn np_accel_vsmulD = NULL;
+static np_vDSP_vmulD_fn np_accel_vmulD = NULL;
+static np_vDSP_sveD_fn np_accel_sveD = NULL;
+static np_vDSP_dotprD_fn np_accel_dotprD = NULL;
+static np_vDSP_vaddD_fn np_accel_vaddD = NULL;
+static np_vvexp_fn np_accel_vvexp = NULL;
+static np_vvfabs_fn np_accel_vvfabs = NULL;
+static np_vvrec_fn np_accel_vvrec = NULL;
+
+static int np_accel_gauss_resolve(void)
+{
+  if(np_accel_gauss_available_cache >= 0)
+    return np_accel_gauss_available_cache;
+
+  np_accel_gauss_handle =
+    dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate",
+           RTLD_LAZY | RTLD_LOCAL);
+
+  if(np_accel_gauss_handle == NULL) {
+    np_accel_gauss_available_cache = 0;
+    return 0;
+  }
+
+  np_accel_vsmsaD =
+    (np_vDSP_vsmsaD_fn)dlsym(np_accel_gauss_handle, "vDSP_vsmsaD");
+  np_accel_vsqD =
+    (np_vDSP_vsqD_fn)dlsym(np_accel_gauss_handle, "vDSP_vsqD");
+  np_accel_vsmulD =
+    (np_vDSP_vsmulD_fn)dlsym(np_accel_gauss_handle, "vDSP_vsmulD");
+  np_accel_vmulD =
+    (np_vDSP_vmulD_fn)dlsym(np_accel_gauss_handle, "vDSP_vmulD");
+  np_accel_sveD =
+    (np_vDSP_sveD_fn)dlsym(np_accel_gauss_handle, "vDSP_sveD");
+  np_accel_dotprD =
+    (np_vDSP_dotprD_fn)dlsym(np_accel_gauss_handle, "vDSP_dotprD");
+  np_accel_vaddD =
+    (np_vDSP_vaddD_fn)dlsym(np_accel_gauss_handle, "vDSP_vaddD");
+  np_accel_vvexp =
+    (np_vvexp_fn)dlsym(np_accel_gauss_handle, "vvexp");
+  np_accel_vvfabs =
+    (np_vvfabs_fn)dlsym(np_accel_gauss_handle, "vvfabs");
+  np_accel_vvrec =
+    (np_vvrec_fn)dlsym(np_accel_gauss_handle, "vvrec");
+
+  if(np_accel_vsmsaD == NULL ||
+     np_accel_vsqD == NULL ||
+     np_accel_vsmulD == NULL ||
+     np_accel_vmulD == NULL ||
+     np_accel_sveD == NULL ||
+     np_accel_dotprD == NULL ||
+     np_accel_vaddD == NULL ||
+     np_accel_vvexp == NULL ||
+     np_accel_vvfabs == NULL ||
+     np_accel_vvrec == NULL) {
+    dlclose(np_accel_gauss_handle);
+    np_accel_gauss_handle = NULL;
+    np_accel_vsmsaD = NULL;
+    np_accel_vsqD = NULL;
+    np_accel_vsmulD = NULL;
+    np_accel_vmulD = NULL;
+    np_accel_sveD = NULL;
+    np_accel_dotprD = NULL;
+    np_accel_vaddD = NULL;
+    np_accel_vvexp = NULL;
+    np_accel_vvfabs = NULL;
+    np_accel_vvrec = NULL;
+    np_accel_gauss_available_cache = 0;
+    return 0;
+  }
+
+  np_accel_gauss_available_cache = 1;
+  return 1;
+}
+
+static int np_accel_gauss_scratch_ensure(const int n)
+{
+  double *tmp = NULL;
+  double *arg = NULL;
+  double *work = NULL;
+  double *val = NULL;
+  double *poly = NULL;
+
+  if(n <= np_accel_gauss_capacity)
+    return 1;
+
+  tmp = (double *)realloc(np_accel_gauss_tmp, (size_t)n*sizeof(double));
+  if(tmp == NULL)
+    return 0;
+  np_accel_gauss_tmp = tmp;
+
+  arg = (double *)realloc(np_accel_gauss_arg, (size_t)n*sizeof(double));
+  if(arg == NULL)
+    return 0;
+  np_accel_gauss_arg = arg;
+
+  work = (double *)realloc(np_accel_gauss_work, (size_t)n*sizeof(double));
+  if(work == NULL)
+    return 0;
+  np_accel_gauss_work = work;
+
+  val = (double *)realloc(np_accel_gauss_val, (size_t)n*sizeof(double));
+  if(val == NULL)
+    return 0;
+  np_accel_gauss_val = val;
+
+  poly = (double *)realloc(np_accel_gauss_poly, (size_t)n*sizeof(double));
+  if(poly == NULL)
+    return 0;
+  np_accel_gauss_poly = poly;
+
+  np_accel_gauss_capacity = n;
+  return 1;
+}
+
+static int np_accel_gauss_has_zero_weight(const double * const w, const int n)
+{
+  for(int i = 0; i < n; i++)
+    if(w[i] == 0.0)
+      return 1;
+  return 0;
+}
+
+static void np_accel_copy_vector(const double * const src,
+                                 double * const dst,
+                                 const int n)
+{
+  memcpy(dst, src, (size_t)n*sizeof(double));
+}
+
+static void np_accel_gauss_vector(const int KERNEL,
+                                  const double * const xt,
+                                  const int n,
+                                  const double x,
+                                  const double zscale,
+                                  const double coef,
+                                  double * const out)
+{
+  const double one = 1.0;
+  const double minus_one = -1.0;
+  const double minus_half = -0.5;
+  const double zero = 0.0;
+  const int ni = n;
+
+  np_accel_vsmsaD(xt, 1, &minus_one, &x,
+                  np_accel_gauss_tmp, 1, (np_vDSP_Length)n);
+  np_accel_vsmulD(np_accel_gauss_tmp, 1, &zscale,
+                  np_accel_gauss_tmp, 1, (np_vDSP_Length)n);
+  np_accel_vsqD(np_accel_gauss_tmp, 1,
+                np_accel_gauss_tmp, 1, (np_vDSP_Length)n);
+  np_accel_vsmsaD(np_accel_gauss_tmp, 1, &minus_half, &zero,
+                  np_accel_gauss_arg, 1, (np_vDSP_Length)n);
+  np_accel_vvexp(out, np_accel_gauss_arg, &ni);
+
+  switch(KERNEL) {
+    case 1: {
+      const double c0 = 1.5;
+      np_accel_vsmsaD(np_accel_gauss_tmp, 1, &minus_half, &c0,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(out, 1, np_accel_gauss_work, 1,
+                     out, 1, (np_vDSP_Length)n);
+      break;
+    }
+    case 2: {
+      const double c2 = 0.125;
+      const double c1 = -1.25;
+      const double c0 = 1.875;
+      np_accel_vsmsaD(np_accel_gauss_tmp, 1, &c2, &c1,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(np_accel_gauss_work, 1, np_accel_gauss_tmp, 1,
+                     np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vsmsaD(np_accel_gauss_work, 1, &one, &c0,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(out, 1, np_accel_gauss_work, 1,
+                     out, 1, (np_vDSP_Length)n);
+      break;
+    }
+    case 3: {
+      const double c3 = -0.02083333333;
+      const double c2 = 0.4375;
+      const double c1 = -2.1875;
+      const double c0 = 2.1875;
+      np_accel_vsmsaD(np_accel_gauss_tmp, 1, &c3, &c2,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(np_accel_gauss_work, 1, np_accel_gauss_tmp, 1,
+                     np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vsmsaD(np_accel_gauss_work, 1, &one, &c1,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(np_accel_gauss_work, 1, np_accel_gauss_tmp, 1,
+                     np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vsmsaD(np_accel_gauss_work, 1, &one, &c0,
+                      np_accel_gauss_work, 1, (np_vDSP_Length)n);
+      np_accel_vmulD(out, 1, np_accel_gauss_work, 1,
+                     out, 1, (np_vDSP_Length)n);
+      break;
+    }
+  }
+
+  np_accel_vsmulD(out, 1, &coef, out, 1, (np_vDSP_Length)n);
+}
+
+static void np_accel_erfun_np_vector(const double * const in,
+                                     const int n,
+                                     double * const out,
+                                     double * const absbuf,
+                                     double * const tbuf,
+                                     double * const polybuf,
+                                     double * const argbuf)
+{
+  const double half = 0.5;
+  const double one = 1.0;
+  const double minus_one = -1.0;
+  const double c_arg = -1.26551223;
+  const int ni = n;
+
+  np_accel_vvfabs(absbuf, in, &ni);
+  np_accel_vsmsaD(absbuf, 1, &half, &one,
+                  tbuf, 1, (np_vDSP_Length)n);
+  np_accel_vvrec(tbuf, tbuf, &ni);
+
+  {
+    const double c8 = 0.17087277;
+    const double c7 = -0.82215223;
+    const double c6 = 1.48851587;
+    const double c5 = -1.13520398;
+    const double c4 = 0.27886807;
+    const double c3 = -0.18628806;
+    const double c2 = 0.09678418;
+    const double c1 = 0.37409196;
+    const double c0 = 1.00002368;
+
+    np_accel_vsmsaD(tbuf, 1, &c8, &c7,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c6,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c5,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c4,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c3,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c2,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c1,
+                    polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vmulD(polybuf, 1, tbuf, 1,
+                   polybuf, 1, (np_vDSP_Length)n);
+    np_accel_vsmsaD(polybuf, 1, &one, &c0,
+                    polybuf, 1, (np_vDSP_Length)n);
+  }
+
+  np_accel_vsqD(absbuf, 1, argbuf, 1, (np_vDSP_Length)n);
+  np_accel_vsmsaD(argbuf, 1, &minus_one, &c_arg,
+                  argbuf, 1, (np_vDSP_Length)n);
+  np_accel_vmulD(polybuf, 1, tbuf, 1,
+                 polybuf, 1, (np_vDSP_Length)n);
+  np_accel_vaddD(argbuf, 1, polybuf, 1,
+                 argbuf, 1, (np_vDSP_Length)n);
+  np_accel_vvexp(out, argbuf, &ni);
+  np_accel_vmulD(out, 1, tbuf, 1,
+                 out, 1, (np_vDSP_Length)n);
+
+  for(int i = 0; i < n; i++)
+    out[i] = (in[i] >= 0.0) ? (1.0 - out[i]) : (out[i] - 1.0);
+}
+
+static void np_accel_gauss_cdf2_vector(const double * const xt,
+                                       const int n,
+                                       const double x,
+                                       const double zscale,
+                                       const double coef,
+                                       double * const out)
+{
+  const double minus_one = -1.0;
+  const double sqrt_half = 0.7071067810;
+  const double half = 0.5;
+  const double offset = 0.5;
+  const double zcoef = sqrt_half*zscale;
+
+  np_accel_vsmsaD(xt, 1, &minus_one, &x,
+                  np_accel_gauss_tmp, 1, (np_vDSP_Length)n);
+  np_accel_vsmulD(np_accel_gauss_tmp, 1, &zcoef,
+                  np_accel_gauss_tmp, 1, (np_vDSP_Length)n);
+  np_accel_erfun_np_vector(np_accel_gauss_tmp, n, out,
+                           np_accel_gauss_arg,
+                           np_accel_gauss_work,
+                           np_accel_gauss_poly,
+                           np_accel_gauss_val);
+  np_accel_vsmsaD(out, 1, &half, &offset,
+                  out, 1, (np_vDSP_Length)n);
+  np_accel_vsmulD(out, 1, &coef,
+                  out, 1, (np_vDSP_Length)n);
+}
+
+static int np_p_ckernelv_accel_gauss2_deriv_try(const int KERNEL,
+                                                const int P_KERNEL,
+                                                const int P_IDX,
+                                                const int P_NIDX,
+                                                const double * const xt,
+                                                const int num_xt,
+                                                const int bin_do_xw,
+                                                const double x,
+                                                const double zscale,
+                                                double * const xw,
+                                                double * const result,
+                                                double * const p_result,
+                                                const XL * const xl,
+                                                const XL * const p_xl,
+                                                const int do_perm,
+                                                const int do_score,
+                                                double * const kbuf,
+                                                const double invnorm,
+                                                const double p_invnorm)
+{
+  const double minus_one = -1.0;
+  const double minus_half = -0.5;
+  const double zero = 0.0;
+  const int ni = num_xt;
+
+  if(KERNEL != 0 ||
+     P_KERNEL != 20 ||
+     xl != NULL ||
+     p_xl != NULL ||
+     p_result == NULL ||
+     kbuf == NULL ||
+     num_xt < 256 ||
+     !np_accel_gauss_resolve() ||
+     !np_accel_gauss_scratch_ensure(num_xt))
+    return 0;
+
+  np_accel_vsmsaD(xt, 1, &minus_one, &x,
+                  np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+  np_accel_vsmulD(np_accel_gauss_tmp, 1, &zscale,
+                  np_accel_gauss_arg, 1, (np_vDSP_Length)num_xt);
+  np_accel_vsqD(np_accel_gauss_arg, 1,
+                np_accel_gauss_work, 1, (np_vDSP_Length)num_xt);
+  np_accel_vsmsaD(np_accel_gauss_work, 1, &minus_half, &zero,
+                  np_accel_gauss_val, 1, (np_vDSP_Length)num_xt);
+  np_accel_vvexp(np_accel_gauss_val, np_accel_gauss_val, &ni);
+
+  {
+    const double base_scale = invnorm*ONE_OVER_SQRT_TWO_PI;
+    np_accel_vsmulD(np_accel_gauss_val, 1, &base_scale,
+                    kbuf, 1, (np_vDSP_Length)num_xt);
+  }
+
+  if(bin_do_xw)
+    np_accel_vmulD(kbuf, 1, xw, 1, result, 1, (np_vDSP_Length)num_xt);
+  else
+    np_accel_copy_vector(kbuf, result, num_xt);
+
+  if(do_perm) {
+    const int poff = P_IDX*num_xt;
+    if(do_score) {
+      const double p_scale = p_invnorm*ONE_OVER_SQRT_TWO_PI;
+      np_accel_vmulD(np_accel_gauss_work, 1, np_accel_gauss_val, 1,
+                     np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+      np_accel_vsmulD(np_accel_gauss_tmp, 1, &p_scale,
+                      np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+    } else {
+      const double p_scale = -p_invnorm*ONE_OVER_SQRT_TWO_PI;
+      np_accel_vmulD(np_accel_gauss_arg, 1, np_accel_gauss_val, 1,
+                     np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+      np_accel_vsmulD(np_accel_gauss_tmp, 1, &p_scale,
+                      np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+    }
+
+    if(bin_do_xw)
+      np_accel_vmulD(np_accel_gauss_tmp, 1, p_result + poff, 1,
+                     p_result + poff, 1, (np_vDSP_Length)num_xt);
+    else
+      np_accel_copy_vector(np_accel_gauss_tmp, p_result + poff, num_xt);
+  }
+
+  for(int l = 0; l < P_NIDX; l++) {
+    if((l == P_IDX) && do_perm)
+      continue;
+    if(bin_do_xw)
+      np_accel_vmulD(kbuf, 1, p_result + l*num_xt, 1,
+                     p_result + l*num_xt, 1, (np_vDSP_Length)num_xt);
+    else
+      np_accel_copy_vector(kbuf, p_result + l*num_xt, num_xt);
+  }
+
+  return 1;
+}
+#endif
+
+static int np_outer_weighted_sum_accel_try(
+  double * const * const pmat_A,
+  const int have_A,
+  double * const * const pmat_B,
+  const int have_B,
+  const double * const weights,
+  const int num_weights,
+  const double db,
+  double * const result)
+{
+#if NP_ACCEL_GAUSS_COMPILED
+  double acc = 0.0;
+
+  if(!np_mseries_accelerate_enabled_cache ||
+     pmat_A == NULL ||
+     pmat_B == NULL ||
+     weights == NULL ||
+     result == NULL ||
+     num_weights < 256 ||
+     !np_accel_gauss_resolve())
+    return 0;
+
+  if(!have_A && !have_B) {
+    np_accel_sveD(weights, 1, &acc, (np_vDSP_Length)num_weights);
+  } else if(have_A && !have_B) {
+    np_accel_dotprD(pmat_A[0], 1, weights, 1, &acc,
+                    (np_vDSP_Length)num_weights);
+  } else if(!have_A && have_B) {
+    np_accel_dotprD(pmat_B[0], 1, weights, 1, &acc,
+                    (np_vDSP_Length)num_weights);
+  } else {
+    if(!np_accel_gauss_scratch_ensure(num_weights))
+      return 0;
+    np_accel_vmulD(pmat_A[0], 1, pmat_B[0], 1, np_accel_gauss_tmp, 1,
+                   (np_vDSP_Length)num_weights);
+    np_accel_dotprD(np_accel_gauss_tmp, 1, weights, 1, &acc,
+                    (np_vDSP_Length)num_weights);
+  }
+
+  const double contrib = acc/db;
+  if(!np_fast_reduction_finite(contrib))
+    return 0;
+  result[0] += contrib;
+  return 1;
+#else
+  (void)pmat_A;
+  (void)have_A;
+  (void)pmat_B;
+  (void)have_B;
+  (void)weights;
+  (void)num_weights;
+  (void)db;
+  (void)result;
+  return 0;
+#endif
+}
+
+static int np_outer_weighted_sum_accel_thin_try(
+  double * const * const pmat_A,
+  const int have_A,
+  const int max_A,
+  double * const * const pmat_B,
+  const int have_B,
+  const int max_B,
+  const double * const weights,
+  const int num_weights,
+  const double db,
+  double * const result)
+{
+#if NP_ACCEL_GAUSS_COMPILED
+  const int max_AB = max_A*max_B;
+  double acc = 0.0;
+  double staged[NP_FAST_REDUCTION_STAGE_MAX];
+
+  if(!np_mseries_accelerate_enabled_cache ||
+     pmat_A == NULL ||
+     pmat_B == NULL ||
+     weights == NULL ||
+     result == NULL ||
+     num_weights < 256 ||
+     max_A < 1 ||
+     max_B < 1 ||
+     max_AB > NP_FAST_REDUCTION_STAGE_MAX ||
+     max_AB < 2 ||
+     (max_A > 1 && max_B > 1) ||
+     !np_accel_gauss_resolve())
+    return 0;
+
+  if(max_B == 1) {
+    if(!have_B) {
+      for(int j = 0; j < max_A; j++) {
+        np_accel_dotprD(pmat_A[j], 1, weights, 1, &acc,
+                        (np_vDSP_Length)num_weights);
+        staged[j] = acc/db;
+      }
+      for(int j = 0; j < max_A; j++)
+        if(!np_fast_reduction_finite(staged[j]))
+          return 0;
+      for(int j = 0; j < max_A; j++)
+        result[j] += staged[j];
+    } else {
+      if(!np_accel_gauss_scratch_ensure(num_weights))
+        return 0;
+      np_accel_vmulD(pmat_B[0], 1, weights, 1, np_accel_gauss_tmp, 1,
+                     (np_vDSP_Length)num_weights);
+      if(have_A) {
+        for(int j = 0; j < max_A; j++) {
+          np_accel_dotprD(pmat_A[j], 1, np_accel_gauss_tmp, 1, &acc,
+                          (np_vDSP_Length)num_weights);
+          staged[j] = acc/db;
+        }
+        for(int j = 0; j < max_A; j++)
+          if(!np_fast_reduction_finite(staged[j]))
+            return 0;
+        for(int j = 0; j < max_A; j++)
+          result[j] += staged[j];
+      } else {
+        np_accel_sveD(np_accel_gauss_tmp, 1, &acc,
+                      (np_vDSP_Length)num_weights);
+        staged[0] = acc/db;
+        if(!np_fast_reduction_finite(staged[0]))
+          return 0;
+        result[0] += staged[0];
+      }
+    }
+  } else {
+    if(!have_A) {
+      for(int i = 0; i < max_B; i++) {
+        np_accel_dotprD(pmat_B[i], 1, weights, 1, &acc,
+                        (np_vDSP_Length)num_weights);
+        staged[i] = acc/db;
+      }
+      for(int i = 0; i < max_B; i++)
+        if(!np_fast_reduction_finite(staged[i]))
+          return 0;
+      for(int i = 0; i < max_B; i++)
+        result[i] += staged[i];
+    } else {
+      if(!np_accel_gauss_scratch_ensure(num_weights))
+        return 0;
+      np_accel_vmulD(pmat_A[0], 1, weights, 1, np_accel_gauss_tmp, 1,
+                     (np_vDSP_Length)num_weights);
+      for(int i = 0; i < max_B; i++) {
+        np_accel_dotprD(pmat_B[i], 1, np_accel_gauss_tmp, 1, &acc,
+                        (np_vDSP_Length)num_weights);
+        staged[i] = acc/db;
+      }
+      for(int i = 0; i < max_B; i++)
+        if(!np_fast_reduction_finite(staged[i]))
+          return 0;
+      for(int i = 0; i < max_B; i++)
+        result[i] += staged[i];
+    }
+  }
+
+  return 1;
+#else
+  (void)pmat_A;
+  (void)have_A;
+  (void)max_A;
+  (void)pmat_B;
+  (void)have_B;
+  (void)max_B;
+  (void)weights;
+  (void)num_weights;
+  (void)db;
+  (void)result;
+  return 0;
+#endif
+}
+
+static int np_outer_weighted_sum_accel_smallmat_try(
+  double * const * const pmat_A,
+  const int have_A,
+  const int max_A,
+  double * const * const pmat_B,
+  const int have_B,
+  const int max_B,
+  const double * const weights,
+  const int num_weights,
+  const double db,
+  double * const result)
+{
+#if NP_ACCEL_GAUSS_COMPILED
+  const int max_AB = max_A*max_B;
+  double acc = 0.0;
+  double staged[16];
+
+  if(!np_mseries_accelerate_enabled_cache ||
+     pmat_A == NULL ||
+     pmat_B == NULL ||
+     weights == NULL ||
+     result == NULL ||
+     !have_A ||
+     !have_B ||
+     max_A <= 1 ||
+     max_B <= 1 ||
+     max_AB >= 16 ||
+     num_weights < 256 ||
+     !np_accel_gauss_resolve())
+    return 0;
+
+  if(!np_accel_gauss_scratch_ensure(num_weights))
+    return 0;
+
+  for(int i = 0; i < max_B; i++) {
+    np_accel_vmulD(pmat_B[i], 1, weights, 1, np_accel_gauss_tmp, 1,
+                   (np_vDSP_Length)num_weights);
+    for(int j = 0; j < max_A; j++) {
+      np_accel_dotprD(pmat_A[j], 1, np_accel_gauss_tmp, 1, &acc,
+                      (np_vDSP_Length)num_weights);
+      staged[j*max_B+i] = acc/db;
+    }
+  }
+
+  for(int i = 0; i < max_AB; i++)
+    if(!np_fast_reduction_finite(staged[i]))
+      return 0;
+
+  for(int i = 0; i < max_B; i++)
+    for(int j = 0; j < max_A; j++)
+      result[j*max_B+i] += staged[j*max_B+i];
+
+  return 1;
+#else
+  (void)pmat_A;
+  (void)have_A;
+  (void)max_A;
+  (void)pmat_B;
+  (void)have_B;
+  (void)max_B;
+  (void)weights;
+  (void)num_weights;
+  (void)db;
+  (void)result;
+  return 0;
+#endif
+}
+
+void np_accel_gauss_release_buffers(void)
+{
+#if NP_ACCEL_GAUSS_COMPILED
+  free(np_accel_gauss_tmp);
+  free(np_accel_gauss_arg);
+  free(np_accel_gauss_work);
+  free(np_accel_gauss_val);
+  free(np_accel_gauss_poly);
+  np_accel_gauss_tmp = NULL;
+  np_accel_gauss_arg = NULL;
+  np_accel_gauss_work = NULL;
+  np_accel_gauss_val = NULL;
+  np_accel_gauss_poly = NULL;
+  np_accel_gauss_capacity = 0;
+  if(np_accel_gauss_handle != NULL)
+    dlclose(np_accel_gauss_handle);
+  np_accel_gauss_handle = NULL;
+  np_accel_gauss_available_cache = -1;
+  np_accel_vsmsaD = NULL;
+  np_accel_vsqD = NULL;
+  np_accel_vsmulD = NULL;
+  np_accel_vmulD = NULL;
+  np_accel_sveD = NULL;
+  np_accel_dotprD = NULL;
+  np_accel_vaddD = NULL;
+  np_accel_vvexp = NULL;
+  np_accel_vvfabs = NULL;
+  np_accel_vvrec = NULL;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define NP_NOINLINE __attribute__((noinline))
+#else
+#define NP_NOINLINE
+#endif
+
+static int NP_NOINLINE np_ckernelv_accel_try(const int KERNEL,
+                                             const double * const xt,
+                                             const int num_xt,
+                                             const int bin_do_xw,
+                                             const double x,
+                                             const double zscale,
+                                             const double invnorm,
+                                             double * const xw,
+                                             double * const result,
+                                             const XL * const xl)
+{
+#if NP_ACCEL_GAUSS_COMPILED
+  if(np_mseries_accelerate_enabled_cache &&
+     ((KERNEL >= 0 && KERNEL <= 3) || KERNEL == 30) &&
+     xl == NULL &&
+     num_xt >= 256 &&
+     (KERNEL != 30 || num_xt <= 8192) &&
+     np_accel_gauss_resolve() &&
+     np_accel_gauss_scratch_ensure(num_xt)) {
+    const double coef = (KERNEL == 30) ? invnorm : invnorm*ONE_OVER_SQRT_TWO_PI;
+    if(!bin_do_xw) {
+      if(KERNEL == 30)
+        np_accel_gauss_cdf2_vector(xt, num_xt, x, zscale, coef, result);
+      else
+        np_accel_gauss_vector(KERNEL, xt, num_xt, x, zscale, coef, result);
+      return 1;
+    }
+    if(!np_accel_gauss_has_zero_weight(xw, num_xt)) {
+      if(KERNEL == 30)
+        np_accel_gauss_cdf2_vector(xt, num_xt, x, zscale, coef, np_accel_gauss_val);
+      else
+        np_accel_gauss_vector(KERNEL, xt, num_xt, x, zscale, coef, np_accel_gauss_val);
+      np_accel_vmulD(np_accel_gauss_val, 1, xw, 1, result, 1, (np_vDSP_Length)num_xt);
+      return 1;
+    }
+  }
+#endif
+  return 0;
+}
+
 void np_ckernelv(const int KERNEL, 
                  const double * const xt, const int num_xt, 
                  const int do_xw,
@@ -4987,6 +5962,10 @@ void np_ckernelv(const int KERNEL,
     np_ckernelv_mul_const(np_cont_largeh_k0(KERNEL)*invnorm, num_xt, do_xw, result, xl);
     return;
   }
+
+  if(np_ckernelv_accel_try(KERNEL, xt, num_xt, bin_do_xw, x, zscale,
+                           invnorm, xw, result, xl))
+    return;
 
   /*
     Hot path: avoid indirect function-pointer calls and avoid branching on
@@ -5192,6 +6171,37 @@ void np_convol_ckernelv(const int KERNEL,
     const double coef = 0.3989422803*h*hy;
     const double expo = -0.5/h2;
     const double hy_power = ipow(hy, power);
+
+#if NP_ACCEL_GAUSS_COMPILED
+    if(np_mseries_accelerate_enabled_cache &&
+       num_xt >= 256 &&
+       np_accel_gauss_resolve() &&
+       np_accel_gauss_scratch_ensure(num_xt) &&
+       (!bin_do_xw || !np_accel_gauss_has_zero_weight(xw, num_xt))) {
+      const double minus_one = -1.0;
+      const double scale = coef/(sqrt_h2*hy_power);
+      const int ni = num_xt;
+
+      np_accel_vsmsaD(xt, 1, &minus_one, &x,
+                      np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+      np_accel_vsqD(np_accel_gauss_tmp, 1,
+                    np_accel_gauss_tmp, 1, (np_vDSP_Length)num_xt);
+      np_accel_vsmulD(np_accel_gauss_tmp, 1, &expo,
+                      np_accel_gauss_arg, 1, (np_vDSP_Length)num_xt);
+      if(!bin_do_xw) {
+        np_accel_vvexp(result, np_accel_gauss_arg, &ni);
+        np_accel_vsmulD(result, 1, &scale, result, 1,
+                        (np_vDSP_Length)num_xt);
+      } else {
+        np_accel_vvexp(np_accel_gauss_val, np_accel_gauss_arg, &ni);
+        np_accel_vsmulD(np_accel_gauss_val, 1, &scale,
+                        np_accel_gauss_val, 1, (np_vDSP_Length)num_xt);
+        np_accel_vmulD(np_accel_gauss_val, 1, xw, 1,
+                       result, 1, (np_vDSP_Length)num_xt);
+      }
+      return;
+    }
+#endif
 
     for(i = 0, j = 0; i < num_xt; i++, j += bin_do_xw){
       double kval;
@@ -5890,17 +6900,155 @@ void np_outer_weighted_sum(double * const * const mat_A, double * const sgn_A, c
       wbuf[which_k] = 0.0;
   }
 
+  if(do_leave_one_out &&
+     !have_sgn &&
+     !symmetric &&
+     (kpow == 1) &&
+     (xl == NULL) &&
+     !parallel_sum &&
+     !gather_scatter){
+    int accel_ok = 0;
+
+    if((max_A == 1) && (max_B == 1)){
+      accel_ok = np_outer_weighted_sum_accel_try(pmat_A, have_A,
+                                                 pmat_B, have_B,
+                                                 weights, num_weights,
+                                                 db, result);
+    } else if((max_A == 1) || (max_B == 1)){
+      accel_ok = np_outer_weighted_sum_accel_thin_try(pmat_A, have_A, max_A,
+                                                      pmat_B, have_B, max_B,
+                                                      weights, num_weights,
+                                                      db, result);
+    } else if((max_A > 1) && (max_B > 1) && (max_A*max_B < 16)){
+      accel_ok = np_outer_weighted_sum_accel_smallmat_try(pmat_A, have_A, max_A,
+                                                          pmat_B, have_B, max_B,
+                                                          weights, num_weights,
+                                                          db, result);
+    }
+
+    if(accel_ok){
+      weights[which_k] = temp;
+      return;
+    }
+  }
+
+  if(use_wpow &&
+     !have_sgn &&
+     !symmetric &&
+     (xl == NULL) &&
+     !parallel_sum &&
+     !gather_scatter){
+    int accel_ok = 0;
+
+    if((max_A == 1) && (max_B == 1)){
+      accel_ok = np_outer_weighted_sum_accel_try(pmat_A, have_A,
+                                                 pmat_B, have_B,
+                                                 wbuf, num_weights,
+                                                 unit_weight, result);
+    } else if((max_A == 1) || (max_B == 1)){
+      accel_ok = np_outer_weighted_sum_accel_thin_try(pmat_A, have_A, max_A,
+                                                      pmat_B, have_B, max_B,
+                                                      wbuf, num_weights,
+                                                      unit_weight, result);
+    } else if((max_A > 1) && (max_B > 1) && (max_A*max_B < 16)){
+      accel_ok = np_outer_weighted_sum_accel_smallmat_try(pmat_A, have_A, max_A,
+                                                          pmat_B, have_B, max_B,
+                                                          wbuf, num_weights,
+                                                          unit_weight, result);
+    }
+
+    if(accel_ok){
+      if(do_leave_one_out)
+        weights[which_k] = temp;
+      safe_free(wbuf);
+      return;
+    }
+  }
+
+  if(!have_sgn &&
+     !symmetric &&
+     (kpow == 1) &&
+     (xl == NULL) &&
+     !parallel_sum &&
+     !do_leave_one_out &&
+     !gather_scatter &&
+     ((max_A == 1) || (max_B == 1)) &&
+     np_outer_weighted_sum_accel_thin_try(pmat_A, have_A, max_A,
+                                          pmat_B, have_B, max_B,
+                                          weights, num_weights, db, result)){
+    return;
+  }
+
+  if(!have_sgn &&
+     !symmetric &&
+     (kpow == 1) &&
+     (xl == NULL) &&
+     !parallel_sum &&
+     !do_leave_one_out &&
+     !gather_scatter &&
+     (max_A > 1) &&
+     (max_B > 1) &&
+     (max_A*max_B < 16) &&
+     np_outer_weighted_sum_accel_smallmat_try(pmat_A, have_A, max_A,
+                                              pmat_B, have_B, max_B,
+                                              weights, num_weights, db, result)){
+    return;
+  }
+
+  if(!have_sgn &&
+     !symmetric &&
+     (xl == NULL) &&
+     !parallel_sum &&
+     !gather_scatter){
+    const double * const bw = use_wpow ? wbuf : weights;
+    const double bdb = use_wpow ? unit_weight : db;
+    int blas_ok = 0;
+
+    if((max_A == 1) && (max_B == 1)){
+      blas_ok = np_outer_weighted_sum_blas_scalar_unit_try(pmat_A, have_A,
+                                                           pmat_B, have_B,
+                                                           bw, num_weights,
+                                                           bdb, result);
+    } else if((max_A == 1) || (max_B == 1)){
+      blas_ok = np_outer_weighted_sum_blas_thin_unit_try(pmat_A, have_A, max_A,
+                                                         pmat_B, have_B, max_B,
+                                                         bw, num_weights,
+                                                         bdb, result);
+    }
+
+    if(blas_ok){
+      if(do_leave_one_out)
+        weights[which_k] = temp;
+
+      safe_free(wbuf);
+
+      return;
+    }
+  }
+
   if(scalar_sum_fast){
     if(xl == NULL){
       if(!parallel_sum){
-        double acc = 0.0;
+        if(!do_leave_one_out &&
+           !gather_scatter &&
+           np_outer_weighted_sum_accel_try(pmat_A, have_A, pmat_B, have_B,
+                                           weights, num_weights, db, result)){
+          if(do_leave_one_out)
+            weights[which_k] = temp;
 
-        for(k = 0; k < num_weights; k++){
-          if(weights[k] == 0.0) continue;
-          acc += pmat_A[0][k*have_A]*pmat_B[0][k*have_B]*weights[k]/db;
+          return;
         }
 
-        result[0] += acc;
+        {
+          double acc = 0.0;
+
+          for(k = 0; k < num_weights; k++){
+            if(weights[k] == 0.0) continue;
+            acc += pmat_A[0][k*have_A]*pmat_B[0][k*have_B]*weights[k]/db;
+          }
+
+          result[0] += acc;
+        }
       } else {
         l = which_l;
         for(k = 0; k < num_weights; k++){
@@ -6329,6 +7477,7 @@ const int keep_kw_owner_local){
 
   if(!np_runtime_tol_cache_ready)
     np_refresh_runtime_tolerances();
+  np_refresh_mseries_accelerate_option();
 
   if(no_bpso){
     bpso = (int *)malloc((num_reg_unordered + num_reg_ordered + num_reg_continuous)*sizeof(int));
@@ -14533,8 +15682,9 @@ double *cv){
               if(BANDWIDTH_den != BW_ADAP_NN){
                 // leave-one-out joint density
 
-                for(l = 0; l < num_obs_train; l++)
-                  xyj += kwy[jo*num_obs_train+l]*kwx[io*num_obs_train+l];
+                xyj = np_blas_ddot_i64(num_obs_train,
+                                        kwy + jo*num_obs_train,
+                                        kwx + io*num_obs_train);
                 xyj -= kwy[jo*num_obs_train+i]*kwx[io*num_obs_train+i];
 
                 const double tvd = (indy - xyj/(mean[io] - kwx[io*num_obs_train+i] + DBL_MIN));
@@ -14542,8 +15692,11 @@ double *cv){
               } else {
                 // leave-one-out joint density
 
-                for(l = 0; l < num_obs_train; l++)
-                  xyj += kwy[l*dwy+jo]*kwx[l*dwx+io];
+                xyj = np_blas_ddot_i64_stride(num_obs_train,
+                                               kwy + jo,
+                                               dwy,
+                                               kwx + io,
+                                               dwx);
                 xyj -= kwy[i*dwy+jo]*kwx[i*dwx+io];
 
                 const double tvd = (indy - xyj/(mean[io] - kwx[i*dwx + io] + DBL_MIN));
@@ -20122,6 +21275,83 @@ static int np_conditional_xrow_full_from_ctx(NPConditionalXRowCtx *ctx,
   return np_conditional_xrow_from_ctx_impl(ctx, eval_idx, 0, row_out);
 }
 
+static int np_conditional_x_weight_block_full_stream_core_suppress(double *vector_scale_factor,
+                                                                   int eval_start,
+                                                                   int block_rows,
+                                                                   int suppress_nn_parallel,
+                                                                   double **rows_out);
+
+static int np_regression_lp_apply_hatblock_matrix(double *vector_scale_factor,
+                                                  double **rhs_cols,
+                                                  int n_rhs,
+                                                  double *fitted_out,
+                                                  int block_size){
+  const int num_train = num_obs_train_extern;
+  const int num_eval = num_obs_eval_extern;
+  double *rows_data = NULL;
+  double **rows_out = NULL;
+  int start, i;
+  int status = 1;
+
+  if((vector_scale_factor == NULL) || (rhs_cols == NULL) ||
+     (rhs_cols[0] == NULL) || (fitted_out == NULL))
+    return 1;
+  if((num_train <= 0) || (num_eval <= 0) || (num_train != num_eval) ||
+     (n_rhs <= 0))
+    return 1;
+
+  block_size = MAX(1, MIN(block_size, num_eval));
+  rows_data = (double *)malloc((size_t)block_size*(size_t)num_train*sizeof(double));
+  rows_out = (double **)malloc((size_t)block_size*sizeof(double *));
+  if((rows_data == NULL) || (rows_out == NULL))
+    goto cleanup_hatblock_apply;
+
+  for(i = 0; i < block_size; i++)
+    rows_out[i] = rows_data + (size_t)i*(size_t)num_train;
+
+  for(start = 0; start < num_eval; start += block_size){
+    const int block_rows = MIN(block_size, num_eval - start);
+    const char transa = 'T';
+    const char transb = 'N';
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    const int m = block_rows;
+    const int n = n_rhs;
+    const int k = num_train;
+    const int lda = num_train;
+    const int ldb = num_train;
+    const int ldc = num_eval;
+
+    if(np_conditional_x_weight_block_full_stream_core_suppress(vector_scale_factor,
+                                                               start,
+                                                               block_rows,
+                                                               0,
+                                                               rows_out) != 0)
+      goto cleanup_hatblock_apply;
+
+    F77_CALL(dgemm)(&transa,
+                    &transb,
+                    &m,
+                    &n,
+                    &k,
+                    &alpha,
+                    rows_data,
+                    &lda,
+                    rhs_cols[0],
+                    &ldb,
+                    &beta,
+                    fitted_out + start,
+                    &ldc FCONE FCONE);
+  }
+
+  status = 0;
+
+cleanup_hatblock_apply:
+  if(rows_data != NULL) free(rows_data);
+  if(rows_out != NULL) free(rows_out);
+  return status;
+}
+
 int np_regression_lp_apply_matrix(double *vector_scale_factor,
                                   double **rhs_cols,
                                   int n_rhs,
@@ -20243,6 +21473,19 @@ int np_regression_lp_apply_matrix(double *vector_scale_factor,
 
   if((np_glp_cv_cache.nterms <= 0) || (np_glp_cv_cache.basis == NULL) || (np_glp_cv_cache.terms == NULL))
     goto cleanup_lp_apply;
+
+  if((target_deriv < 0) &&
+     (num_eval == num_train) &&
+     (n_rhs > 16) &&
+     (BANDWIDTH_den_extern == BW_FIXED) &&
+     (np_regression_lp_apply_hatblock_matrix(vector_scale_factor,
+                                             rhs_cols,
+                                             n_rhs,
+                                             fitted_out,
+                                             256) == 0)){
+    status = 0;
+    goto cleanup_lp_apply;
+  }
 
   KWM = mat_creat(np_glp_cv_cache.nterms, np_glp_cv_cache.nterms, UNDEFINED);
   XTKY = mat_creat(np_glp_cv_cache.nterms, n_rhs, UNDEFINED);
@@ -24926,7 +26169,7 @@ static int np_conditional_distribution_cvls_lp_row_stream(double *vector_scale_f
   double *xrow = NULL, *yint = NULL;
   NPConditionalXRowCtx xctx = {0};
   NPConditionalYRowCtx yintctx = {0};
-  int i, j, l;
+  int i, j;
   int status = 1;
 
   if((cv == NULL) || (vector_scale_factor == NULL) || (num_train <= 0) || (num_eval <= 0))
@@ -25009,8 +26252,7 @@ static int np_conditional_distribution_cvls_lp_row_stream(double *vector_scale_f
       if(cdfontrain_extern && (i == j))
         continue;
 
-      for(l = 0; l < num_train; l++)
-        fit += xrow[l]*yint[l];
+      fit = np_blas_ddot_int(num_train, xrow, yint);
 
       {
         const double tvd = ((double)indy) - fit;

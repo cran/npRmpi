@@ -40,7 +40,7 @@
            plot.errors.boot.nonfixed = c("exact", "frozen"),
            plot.errors.boot.wild = c("rademacher", "mammen"),
            plot.errors.boot.blocklen = NULL,
-           plot.errors.center = c("estimate","bias-corrected"),
+           plot.errors.center = c("estimate", "bias-corrected"),
            plot.errors.type = c("pmzsd","pointwise","bonferroni","simultaneous","all"),
            plot.errors.alpha = 0.05,
            plot.errors.style = c("band","bar"),
@@ -198,20 +198,28 @@
       as.vector(do.call(npreghat.rbandwidth, hat.args))
     }
     plot.gradient.order.label <- rep.int(1L, bws$ndim)
+    if (gradients && identical(bws$regtype, "lc")) {
+      npValidateLcGradientOrder(
+        regtype = bws$regtype,
+        gradient.order = gradient.order,
+        ncon = bws$ncon,
+        argname = "gradient_order",
+        where = "plot.rbandwidth()"
+      )
+    }
     if (gradients && identical(bws$regtype, "lp")) {
       go <- npValidateGlpGradientOrder(regtype = bws$regtype,
                                        gradient.order = gradient.order,
                                        ncon = bws$ncon)
       if (length(go))
         plot.gradient.order.label[which(bws$icon)] <- go
-      if (any(go > bws$degree) &&
-          !npGlpDegree0FirstDerivativeLcOk(
-            regtype.engine = bws$regtype,
-            degree.engine = bws$degree,
-            gradient.order = go,
-            ncon = bws$ncon
-          ))
-        .np_warning("some requested glp derivatives exceed polynomial degree; plotting NA for those components")
+      npValidateGlpGradientDegree(
+        regtype.engine = bws$regtype,
+        degree.engine = bws$degree,
+        gradient.order = go,
+        ncon = bws$ncon,
+        where = "plot.rbandwidth()"
+      )
     }
 
     surface.supported <- isTRUE((bws$ncon + bws$nord == 2) &&
@@ -367,7 +375,7 @@
         terr <- terr.obj[["boot.err"]]
         terr.all <- terr.obj[["boot.all.err"]]
 
-        pc = (plot.errors.center == "bias-corrected")
+        pc = (.np_plot_center_is_bias_corrected(plot.errors.center))
         center.val <- if(pc) terr[,3] else tobj$mean
 
         lerr = matrix(data = center.val - terr[,1],
@@ -428,9 +436,10 @@
           merr = terr[,1:2],
           ntrain = dim(xdat)[1])
           r1$bias = NA
+          r1$bias.corrected = NA
 
-        if (plot.errors.center == "bias-corrected")
-          r1$bias = terr[,3] - treg
+        if (.np_plot_center_is_bias_corrected(plot.errors.center))
+          r1 <- .np_plot_add_bias_fields(r1, as.double(treg), terr[,3])
 
         if (plot.behavior == "data")
           return ( list(r1 = r1) )
@@ -736,7 +745,13 @@
           )
         }
 
-        temp.mean[seq_len(xi.neval)] = if(gradients) tr$grad[,i] else tr$mean
+        temp.mean[seq_len(xi.neval)] = if (gradients && xi.factor) {
+          .np_plot_factor_contrast_vector(tr$mean)
+        } else if (gradients) {
+          tr$grad[, i]
+        } else {
+          tr$mean
+        }
 
         if (plot.errors){
           if (plot.errors.method == "asymptotic") {
@@ -808,13 +823,18 @@
             plot.args$y <- temp.mean
           panel.ylim <- NULL
           if (plot.errors)
-            panel.ylim <- if (plot.errors.type == "all")
-              compute.all.error.range(if (plotOnEstimate) temp.mean else temp.err[,3], temp.all.err)
-            else
-              c(min(na.omit(c(temp.mean - temp.err[,1], temp.err[,3] - temp.err[,1]))),
-                max(na.omit(c(temp.mean + temp.err[,2], temp.err[,3] + temp.err[,2]))))
+            panel.ylim <- .np_plot_panel_error_range(
+              estimate = temp.mean,
+              err = temp.err,
+              all.err = temp.all.err,
+              plot.errors.type = plot.errors.type,
+              plotOnEstimate = plotOnEstimate
+            )
+          else
+            panel.ylim <- range(temp.mean, finite = TRUE)
           if (overlay.ok)
             panel.ylim <- .np_plot_overlay_range(panel.ylim, ydat)
+          panel.ylim <- .np_plot_resolve_requested_ylim(panel.ylim, ylim)
           if (!is.null(panel.ylim))
             plot.args$ylim <- panel.ylim
           plot.args$xlab <- scalar_default(xlab, gen.label(bws$xnames[i], paste("X", i, sep = "")))
@@ -914,7 +934,10 @@
               lines(x = l.f, y = l.y, lty = .np_plot_lty("interval"))
               point.args <- list(x = ei, y = temp.mean)
               if (!is.null(col)) point.args$col <- col
-              if (!is.null(points.user.args$pch)) point.args$pch <- points.user.args$pch
+              if (!is.null(points.user.args$pch))
+                point.args$pch <- points.user.args$pch
+              else
+                point.args$pch <- .np_plot_pch("factor_estimate")
               if (!is.null(points.user.args$cex)) point.args$cex <- points.user.args$cex
               if (!is.null(points.user.args$bg)) point.args$bg <- points.user.args$bg
               do.call(points, point.args)
@@ -929,8 +952,17 @@
 
           ## error plotting evaluation
           if (plot.errors && !(xi.factor && plot.bootstrap && plot.bxp)){
-            if (!xi.factor && !plotOnEstimate)
-              lines(na.omit(ei), na.omit(temp.err[,3]), lty = .np_plot_lty("center"))
+            drew.bias.center <- .np_plot_draw_bias_center_1d(
+              x = ei,
+              center = temp.err[,3],
+              xi.factor = xi.factor,
+              plotOnEstimate = plotOnEstimate,
+              legend = plot.legend,
+              estimate.col = plot.args$col,
+              estimate.lty = plot.args$lty,
+              estimate.lwd = plot.args$lwd,
+              draw.legend = FALSE
+            )
 
             if (plot.errors.type == "all") {
               draw.all.error.types(
@@ -942,7 +974,8 @@
                 plot.errors.bar.num = plot.errors.bar.num,
                 lty = .np_plot_lty("interval"),
                 add.legend = TRUE,
-                legend = plot.legend)
+                legend = plot.legend,
+                xi.factor = xi.factor)
             } else {
               draw.args <- list(
                 ex = as.numeric(na.omit(ei)),
@@ -955,6 +988,14 @@
               )
               do.call(draw.errors, draw.args)
             }
+            if (isTRUE(drew.bias.center))
+              .np_plot_draw_bias_center_legend(
+                legend = plot.legend,
+                estimate.col = plot.args$col,
+                estimate.lty = plot.args$lty,
+                estimate.lwd = plot.args$lwd,
+                factor.panel = xi.factor
+              )
           }
                             
         }
@@ -972,7 +1013,11 @@
                              temp.err[,2])),
                            gradient.order = gradient.order,
                            ntrain = dim(xdat)[1])
-            plot.out[[i]]$gbias = na.omit(temp.mean - temp.err[,3])
+            plot.out[[i]] <- .np_plot_add_gradient_bias_fields(
+              plot.out[[i]],
+              temp.mean,
+              temp.err[,3]
+            )
           } else {
             plot.out[[i]] =
               npregression(bws = bws,
@@ -981,7 +1026,14 @@
                            merr = na.omit(cbind(-temp.err[,1],
                              temp.err[,2])),
                            ntrain = dim(xdat)[1])
-            plot.out[[i]]$bias = na.omit(temp.mean - temp.err[,3])
+            plot.out[[i]]$bias = NA
+            plot.out[[i]]$bias.corrected = NA
+            if (.np_plot_center_is_bias_corrected(plot.errors.center))
+              plot.out[[i]] <- .np_plot_add_bias_fields(
+                plot.out[[i]],
+                temp.mean,
+                temp.err[,3]
+              )
           }
           plot.out[[i]]$bxp = temp.boot
         }
@@ -990,17 +1042,18 @@
       if (common.scale && (plot.behavior != "data")){
         jj = seq_len(bws$ndim)*3
 
-        if (plot.errors && plot.errors.type == "all") {
+        if (plot.errors) {
           y.min <- Inf
           y.max <- -Inf
           for (k in seq_len(bws$ndim)) {
-            if (is.null(data.err.all[[k]])) next
-            nkeep.k <- nrow(data.err.all[[k]]$pointwise)
-            center.k <- if (plot.errors.center == "estimate")
-              data.eval[seq_len(nkeep.k),k]
-            else
-              data.err[seq_len(nkeep.k),3*k]
-            range.k <- compute.all.error.range(center.k, data.err.all[[k]])
+            err.k <- data.err[, c(3*k - 2L, 3*k - 1L, 3*k), drop = FALSE]
+            range.k <- .np_plot_panel_error_range(
+              estimate = data.eval[, k],
+              err = err.k,
+              all.err = data.err.all[[k]],
+              plot.errors.type = plot.errors.type,
+              plotOnEstimate = plotOnEstimate
+            )
             y.min <- min(y.min, range.k[1], na.rm = TRUE)
             y.max <- max(y.max, range.k[2], na.rm = TRUE)
           }
@@ -1013,18 +1066,11 @@
               y.min = min(na.omit(as.double(data.err[,jj] - data.err[,jj-2])))
             }
           }
-        } else if (plot.errors.center == "estimate" || !plot.errors) {
+        } else {
           y.max = max(na.omit(as.double(data.eval)) +
-            if (plot.errors) na.omit(as.double(data.err[,jj-1]))
-            else 0
-            )
+            0)
           y.min = min(na.omit(as.double(data.eval)) -
-            if (plot.errors) na.omit(as.double(data.err[,jj-2]))
-            else 0
-            )
-        } else if (plot.errors.center == "bias-corrected") {
-          y.max = max(na.omit(as.double(data.err[,jj] + data.err[,jj-1])))
-          y.min = min(na.omit(as.double(data.err[,jj] - data.err[,jj-2])))
+            0)
         }
 
         if (overlay.ok) {
@@ -1034,8 +1080,9 @@
         }
 
         if(!is.null(ylim)){
-          y.min = ylim[1]
-          y.max = ylim[2]
+          y.range <- .np_plot_resolve_requested_ylim(c(y.min, y.max), ylim)
+          y.min = y.range[1]
+          y.max = y.range[2]
         }
         
         for (i in seq_len(bws$ndim)){
@@ -1153,7 +1200,10 @@
               lines(x = l.f, y = l.y, lty = .np_plot_lty("interval"))
               point.args <- list(x = allei[,i], y = data.eval[,i])
               if (!is.null(col)) point.args$col <- col
-              if (!is.null(points.user.args$pch)) point.args$pch <- points.user.args$pch
+              if (!is.null(points.user.args$pch))
+                point.args$pch <- points.user.args$pch
+              else
+                point.args$pch <- .np_plot_pch("factor_estimate")
               if (!is.null(points.user.args$cex)) point.args$cex <- points.user.args$cex
               if (!is.null(points.user.args$bg)) point.args$bg <- points.user.args$bg
               do.call(points, point.args)
@@ -1168,8 +1218,17 @@
 
           ## error plotting evaluation
           if (plot.errors && !(xi.factor && plot.bootstrap && plot.bxp)){
-            if (!xi.factor && !plotOnEstimate)
-              lines(na.omit(allei[,i]), na.omit(data.err[,3*i]), lty = .np_plot_lty("center"))
+            drew.bias.center <- .np_plot_draw_bias_center_1d(
+              x = allei[,i],
+              center = data.err[,3*i],
+              xi.factor = xi.factor,
+              plotOnEstimate = plotOnEstimate,
+              legend = plot.legend,
+              estimate.col = plot.args$col,
+              estimate.lty = plot.args$lty,
+              estimate.lwd = plot.args$lwd,
+              draw.legend = FALSE
+            )
             
             if (plot.errors.type == "all") {
               draw.all.error.types(
@@ -1181,7 +1240,8 @@
                 plot.errors.bar.num = plot.errors.bar.num,
                 lty = .np_plot_lty("interval"),
                 add.legend = TRUE,
-                legend = plot.legend)
+                legend = plot.legend,
+                xi.factor = xi.factor)
             } else {
               draw.args <- list(
                 ex = as.numeric(na.omit(allei[,i])),
@@ -1194,6 +1254,14 @@
               )
               do.call(draw.errors, draw.args)
             }
+            if (isTRUE(drew.bias.center))
+              .np_plot_draw_bias_center_legend(
+                legend = plot.legend,
+                estimate.col = plot.args$col,
+                estimate.lty = plot.args$lty,
+                estimate.lwd = plot.args$lwd,
+                factor.panel = xi.factor
+              )
           }
         }
       }

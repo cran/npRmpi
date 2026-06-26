@@ -100,6 +100,36 @@ npcdens.conbandwidth <- function(bws,
   )
   .npRmpi_require_active_slave_pool(where = "npcdens()")
   .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npcdens()")
+  reg.spec.preflight <- npConditionalRegEngineSpec(bws, where = "npcdens")
+  glp.gradient.order.preflight <- npConditionalGradientOrder(
+    bws = bws,
+    reg.engine = reg.spec.preflight$reg.engine,
+    gradient.order = gradient.order,
+    where = "npcdens"
+  )
+  lp.degree0.lc.gradient.preflight <- isTRUE(gradients) &&
+    npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = reg.spec.preflight$reg.engine,
+      degree.engine = reg.spec.preflight$degree.engine,
+      gradient.order = glp.gradient.order.preflight,
+      ncon = bws$xncon
+    )
+  if (isTRUE(gradients) &&
+      identical(reg.spec.preflight$reg.engine, "lp") &&
+      (bws$xncon > 0L) &&
+      !lp.degree0.lc.gradient.preflight &&
+      all(reg.spec.preflight$degree.engine == 0L)) {
+    stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
+  }
+  if (isTRUE(gradients) && identical(reg.spec.preflight$reg.engine, "lp")) {
+    npValidateGlpGradientDegree(
+      regtype.engine = reg.spec.preflight$reg.engine,
+      degree.engine = reg.spec.preflight$degree.engine,
+      gradient.order = glp.gradient.order.preflight,
+      ncon = bws$xncon,
+      where = "npcdens"
+    )
+  }
   if (.npRmpi_autodispatch_active() &&
       !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
       !.npRmpi_session_has_active_pool(comm = 1L)) {
@@ -288,6 +318,15 @@ npcdens.conbandwidth <- function(bws,
       all(degree.engine == 0L)) {
     stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
   }
+  if (isTRUE(gradients) && identical(reg.engine, "lp")) {
+    npValidateGlpGradientDegree(
+      regtype.engine = reg.engine,
+      degree.engine = degree.engine,
+      gradient.order = glp.gradient.order,
+      ncon = bws$xncon,
+      where = "npcdens"
+    )
+  }
 
   reg.c <- npRegtypeToC(
     regtype = if (identical(reg.engine, "lp") && !lp.degree0.lc.gradient) "lp" else "lc",
@@ -393,14 +432,7 @@ npcdens.conbandwidth <- function(bws,
 
     if (identical(reg.engine, "lp") && bws$xncon > 0L && !lp.degree0.lc.gradient) {
       cont.idx <- which(bws$ixcon)
-      invalid.order <- glp.gradient.order > degree.engine
-      if (any(invalid.order)) {
-        myout$congrad[, cont.idx[invalid.order]] <- NA_real_
-        myout$congerr[, cont.idx[invalid.order]] <- NA_real_
-        .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
-      }
-
-      higher.order <- (glp.gradient.order > 1L) & !invalid.order
+      higher.order <- glp.gradient.order > 1L
       if (any(higher.order)) {
         rhs <- rep.int(1.0, nrow(proper.slice.context$txdat))
         for (jj in which(higher.order)) {
@@ -444,6 +476,8 @@ npcdens.conbandwidth <- function(bws,
                     rows.omit = rows.omit,
                     timing = bws$timing, total.time = total.time,
                     optim.time = optim.time, fit.time = fit.elapsed)
+  out$nomad.time <- if (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) as.double(bws$nomad.time) else NA_real_
+  out$powell.time <- if (!is.null(bws$powell.time) && is.finite(bws$powell.time)) as.double(bws$powell.time) else NA_real_
 
   .np_condens_finalize_proper_object(
     object = out,
@@ -460,7 +494,7 @@ npcdens.conbandwidth <- function(bws,
 npcdens.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   .npRmpi_require_active_slave_pool(where = "npcdens()")
   .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npcdens()")
-  nomad <- npValidateScalarLogical(nomad, "nomad")
+  nomad <- npValidateNomadControl(nomad, "nomad")
   sc <- sys.call()
   sc.names <- names(sc)
 
@@ -514,7 +548,7 @@ npcdens.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   }
   if (has.explicit.bws &&
       .npRmpi_autodispatch_active() &&
-      !isTRUE(nomad) &&
+      !npNomadControlRequested(nomad) &&
       !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
       !.npRmpi_session_has_active_pool(comm = 1L)) {
     return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
@@ -531,7 +565,7 @@ npcdens.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
       bernstein.basis = bernstein.request
     )
   if (.npRmpi_autodispatch_active() &&
-      !isTRUE(nomad) &&
+      !npNomadControlRequested(nomad) &&
       !keep_local_shadow_nn &&
       !keep_local_raw_degree1_cvls &&
       !bws.formula &&

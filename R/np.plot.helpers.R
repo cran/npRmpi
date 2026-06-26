@@ -365,7 +365,7 @@
 
     err <- bootstrap_raw[["boot.err"]]
     all.err <- bootstrap_raw[["boot.all.err"]]
-    center <- if (identical(plot.errors.center, "bias-corrected")) err[,3] else estimate
+    center <- if (.np_plot_center_is_bias_corrected(plot.errors.center)) err[,3] else estimate
     bxp <- bootstrap_raw[["bxp"]]
   } else if (identical(plot.errors.method, "asymptotic")) {
     asym.obj <- .np_plot_asymptotic_error_from_se(
@@ -386,6 +386,47 @@
   )
 }
 
+.np_plot_add_bias_fields <- function(object, estimate, bias.corrected) {
+  .np_plot_add_named_bias_fields(
+    object = object,
+    estimate = estimate,
+    bias.corrected = bias.corrected,
+    bias.name = "bias",
+    corrected.name = "bias.corrected"
+  )
+}
+
+.np_plot_add_gradient_bias_fields <- function(object, gradient, gradient.bias.corrected) {
+  .np_plot_add_named_bias_fields(
+    object = object,
+    estimate = gradient,
+    bias.corrected = gradient.bias.corrected,
+    bias.name = "gbias",
+    corrected.name = "gradient.bias.corrected"
+  )
+}
+
+.np_plot_add_named_bias_fields <- function(object,
+                                           estimate,
+                                           bias.corrected,
+                                           bias.name = "bias",
+                                           corrected.name = "bias.corrected") {
+  estimate <- as.numeric(estimate)
+  bias.corrected <- as.numeric(bias.corrected)
+  n <- min(length(estimate), length(bias.corrected))
+  if (!n) {
+    object[[bias.name]] <- numeric()
+    object[[corrected.name]] <- numeric()
+    return(object)
+  }
+  estimate <- estimate[seq_len(n)]
+  bias.corrected <- bias.corrected[seq_len(n)]
+  keep <- is.finite(estimate) & is.finite(bias.corrected)
+  object[[bias.name]] <- estimate[keep] - bias.corrected[keep]
+  object[[corrected.name]] <- bias.corrected[keep]
+  object
+}
+
 .np_plot_layout_begin <- function(plot.behavior, plot.par.mfrow, mfrow) {
   list(
     pending = isTRUE(plot.behavior != "data" && plot.par.mfrow),
@@ -398,7 +439,7 @@
     return(state)
   }
 
-  par(mfrow = state$mfrow, cex = par()$cex)
+  graphics::par(mfrow = state$mfrow)
   state$pending <- FALSE
   state
 }
@@ -510,6 +551,14 @@
   }
 
   if (isTRUE(gradients) && !is.na(gradient.index) && gradient.index > 0L) {
+    gradient.index <- tryCatch(
+      .np_plot_resolve_conditional_gradient_index(
+        bws = bws,
+        gradient.index = gradient.index,
+        where = "conditional bootstrap progress label"
+      ),
+      error = function(e) gradient.index
+    )
     grad_name <- .np_plot_progress_target_name(
       if (!is.null(bws$xnames) && length(bws$xnames) >= gradient.index) bws$xnames[[gradient.index]] else NULL,
       sprintf("x%d", gradient.index)
@@ -690,6 +739,27 @@
   match.arg(wild, c("mammen", "rademacher"))
 }
 
+.np_plot_wild_apply_operator_enabled <- function(ntrain, neval, bwtype = "fixed") {
+  if (!identical(as.character(bwtype)[1L], "fixed"))
+    return(FALSE)
+  threshold <- getOption("np.plot.wild.apply.operator.threshold.bytes",
+                         128 * 1024^2)
+  threshold <- suppressWarnings(as.numeric(threshold)[1L])
+  if (!is.finite(threshold) || is.na(threshold) || threshold < 0)
+    threshold <- 128 * 1024^2
+  as.double(ntrain) * as.double(neval) * 8.0 >= threshold
+}
+
+.np_plot_wild_hat_block_rows <- function(ntrain, neval) {
+  target <- getOption("np.plot.wild.hat.block.bytes", 4 * 1024^2)
+  target <- suppressWarnings(as.numeric(target)[1L])
+  if (!is.finite(target) || is.na(target) || target <= 0)
+    target <- 4 * 1024^2
+  rows <- as.integer(floor(target / (8 * max(1L, as.integer(ntrain)))))
+  rows <- max(1L, min(as.integer(neval), rows))
+  rows
+}
+
 .np_plot_boot_from_hat_wild <- function(H, ydat, fit.mean, B, wild,
                                         progress.label = NULL,
                                         prefer.local.single_worker = FALSE) {
@@ -708,6 +778,118 @@
   )
 }
 
+.np_plot_boot_from_hat_wild_residuals <- function(H,
+                                                  ydat,
+                                                  fit.center,
+                                                  residuals,
+                                                  B,
+                                                  wild,
+                                                  progress.label = NULL,
+                                                  prefer.local.single_worker = FALSE) {
+  fit.center <- as.vector(fit.center)
+  residuals <- as.vector(residuals)
+  if (length(fit.center) != length(residuals))
+    stop("length mismatch between wild bootstrap center and residuals")
+  list(
+    t = .np_wild_boot_t(
+      H = H,
+      fit.mean = fit.center,
+      residuals = as.double(residuals),
+      B = as.integer(B),
+      wild = wild,
+      progress.label = progress.label,
+      prefer.local.single_worker = prefer.local.single_worker
+    ),
+    t0 = as.vector(H %*% as.double(ydat))
+  )
+}
+
+.np_plot_boot_from_hat_blocks_wild <- function(hat.block.fun,
+                                               neval,
+                                               ntrain,
+                                               ydat,
+                                               fit.mean,
+                                               B,
+                                               wild,
+                                               progress.label = NULL) {
+  fit.mean <- as.vector(fit.mean)
+  neval <- as.integer(neval)
+  ntrain <- as.integer(ntrain)
+  B <- as.integer(B)
+  if (B < 1L)
+    stop("B must be a positive integer")
+  if (neval < 1L || ntrain < 1L)
+    stop("invalid wild bootstrap block dimensions")
+
+  fit.mean <- as.double(fit.mean)
+  residuals <- as.double(ydat - fit.mean)
+  wild <- .np_plot_normalize_wild(wild)
+  draw.fun <- if (identical(wild, "mammen")) .np_mammen_draws else .np_rademacher_draws
+  draws <- draw.fun(n = ntrain, B = B)
+  ystar <- residuals * draws
+  ystar <- ystar + fit.mean
+
+  t0 <- numeric(neval)
+  tmat <- matrix(NA_real_, nrow = B, ncol = neval)
+  block.rows <- .np_plot_wild_hat_block_rows(ntrain = ntrain, neval = neval)
+  nblocks <- as.integer(ceiling(neval / block.rows))
+  progress <- .np_plot_bootstrap_progress_begin(total = nblocks, label = progress.label)
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+
+  done <- 0L
+  start <- 1L
+  while (start <= neval) {
+    stopi <- min(neval, start + block.rows - 1L)
+    H <- hat.block.fun(start, stopi)
+    t0[start:stopi] <- as.vector(H %*% as.double(ydat))
+    tmat[, start:stopi] <- t(H %*% ystar)
+    done <- done + 1L
+    progress <- .np_plot_progress_tick(state = progress, done = done)
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
+}
+
+.np_plot_factor_contrast_vector <- function(x, ref = 1L) {
+  x <- as.double(x)
+  ref <- as.integer(ref)[1L]
+  if (length(x) < 1L)
+    return(x)
+  if (is.na(ref) || ref < 1L || ref > length(x))
+    stop("invalid categorical reference index for plot contrast", call. = FALSE)
+  x - x[ref]
+}
+
+.np_plot_factor_contrast_matrix <- function(x, ref = 1L) {
+  x <- as.matrix(x)
+  ref <- as.integer(ref)[1L]
+  if (ncol(x) < 1L)
+    return(x)
+  if (is.na(ref) || ref < 1L || ref > ncol(x))
+    stop("invalid categorical reference index for plot contrast", call. = FALSE)
+  sweep(x, 1L, x[, ref], "-", check.margin = FALSE)
+}
+
+.np_plot_factor_contrast_boot <- function(boot, ref = 1L) {
+  if (is.null(boot))
+    return(boot)
+  if (!is.list(boot))
+    stop("bootstrap contrast payload must be a list", call. = FALSE)
+  if (isTRUE(attr(boot, "np.factor.contrast")))
+    return(boot)
+  if (!is.null(boot$t))
+    boot$t <- .np_plot_factor_contrast_matrix(boot$t, ref = ref)
+  if (!is.null(boot$t0))
+    boot$t0 <- .np_plot_factor_contrast_vector(boot$t0, ref = ref)
+  if (!is.null(boot$center))
+    boot$center <- .np_plot_factor_contrast_vector(boot$center, ref = ref)
+  attr(boot, "np.factor.contrast") <- TRUE
+  boot
+}
+
 .np_plot_boot_from_hat_wild_factor_effects <- function(H, ydat, fit.mean, B, wild,
                                                        progress.label = NULL,
                                                        prefer.local.single_worker = FALSE) {
@@ -722,9 +904,7 @@
   )
   if (ncol(out$t) < 1L)
     return(out)
-  out$t <- sweep(out$t, 1L, out$t[, 1L], "-", check.margin = FALSE)
-  out$t0 <- out$t0 - out$t0[1L]
-  out
+  .np_plot_factor_contrast_boot(out)
 }
 
 .np_plot_inid_fastpath_enabled <- function() {
@@ -1954,6 +2134,79 @@
         as.integer(inds)[seq_len(n.sim)]
       }
       out[, jj] <- tabulate(inds, nbins = n)
+    }
+
+    out
+  }
+}
+
+.np_block_indices_drawer <- function(n,
+                                     B,
+                                     blocklen,
+                                     sim = c("fixed", "geom"),
+                                     n.sim = n,
+                                     endcorr = TRUE) {
+  sim <- match.arg(sim)
+  n <- as.integer(n)
+  B <- as.integer(B)
+  n.sim <- as.integer(n.sim)
+  blocklen <- as.integer(blocklen)
+
+  if (n < 1L || B < 1L || n.sim < 1L)
+    stop("invalid block bootstrap dimensions")
+  if (length(blocklen) != 1L || is.na(blocklen) || blocklen < 1L || blocklen > n)
+    stop("invalid block length for block bootstrap")
+
+  if (identical(blocklen, 1L)) {
+    return(function(start, stopi) {
+      start <- as.integer(start)
+      stopi <- as.integer(stopi)
+      if (start < 1L || stopi < start || stopi > B)
+        stop("invalid block bootstrap chunk bounds")
+      matrix(
+        sample.int(n = n, size = n.sim * (stopi - start + 1L), replace = TRUE),
+        nrow = n.sim
+      )
+    })
+  }
+
+  ts.array <- utils::getFromNamespace("ts.array", "boot")
+  make.ends <- utils::getFromNamespace("make.ends", "boot")
+
+  function(start, stopi) {
+    start <- as.integer(start)
+    stopi <- as.integer(stopi)
+    if (start < 1L || stopi < start || stopi > B)
+      stop("invalid block bootstrap chunk bounds")
+
+    bsz <- stopi - start + 1L
+    ts.draws <- ts.array(
+      n = n,
+      n.sim = n.sim,
+      R = bsz,
+      l = blocklen,
+      sim = sim,
+      endcorr = isTRUE(endcorr)
+    )
+
+    starts <- as.matrix(ts.draws$starts)
+    lengths <- ts.draws$lengths
+    out <- matrix(NA_integer_, nrow = n.sim, ncol = bsz)
+
+    for (rr in seq_len(bsz)) {
+      ends <- if (identical(sim, "geom")) {
+        cbind(starts[rr, ], lengths[rr, ])
+      } else {
+        cbind(starts[rr, ], lengths)
+      }
+
+      inds <- apply(ends, 1L, make.ends, n)
+      inds <- if (is.list(inds)) {
+        as.integer(unlist(inds)[seq_len(n.sim)])
+      } else {
+        as.integer(inds)[seq_len(n.sim)]
+      }
+      out[, rr] <- inds
     }
 
     out
@@ -3641,6 +3894,9 @@
     stop("length of ydat must match training rows in exact regression bootstrap helper")
   if (n < 1L || neval < 1L || B < 1L)
     stop("invalid exact regression bootstrap dimensions")
+  xi.factor <- isTRUE(slice.index > 0L) &&
+    !is.null(bws$xdati) &&
+    (isTRUE(bws$xdati$iord[slice.index]) || isTRUE(bws$xdati$iuno[slice.index]))
 
   # Exact plot bootstrap repeatedly refits on resamples; keep direct regression
   # evaluations local so plot-owned bootstrap work cannot re-enter pooled MPI.
@@ -3656,6 +3912,8 @@
       gradient.order = gradient.order,
       local.mode = use.local.direct
     )
+    if (isTRUE(gradients) && isTRUE(xi.factor))
+      return(.np_plot_factor_contrast_vector(fit$mean))
     if (isTRUE(gradients))
       as.vector(fit$grad[, slice.index])
     else
@@ -3816,6 +4074,142 @@
 
   if (any(!is.finite(t0)) || any(!is.finite(tmat)))
     stop("inid regression exact helper path produced non-finite values")
+
+  list(t = tmat, t0 = t0)
+}
+
+.np_wild_boot_from_regression_exact <- function(xdat,
+                                                exdat,
+                                                bws,
+                                                ydat,
+                                                B,
+                                                wild = c("rademacher", "mammen"),
+                                                fit.mean.train = NULL,
+                                                gradients = FALSE,
+                                                gradient.order = 1L,
+                                                slice.index = 1L,
+                                                progress.label = NULL,
+                                                prefer.local.single_worker = FALSE,
+                                                master_local_chunk = TRUE) {
+  xdat <- toFrame(xdat)
+  exdat <- toFrame(exdat)
+  ydat <- as.double(ydat)
+  B <- as.integer(B)
+
+  n <- nrow(xdat)
+  neval <- nrow(exdat)
+  if (length(ydat) != n)
+    stop("length of ydat must match training rows in exact wild regression bootstrap helper")
+  if (n < 1L || neval < 1L || B < 1L)
+    stop("invalid exact wild regression bootstrap dimensions")
+  xi.factor <- isTRUE(slice.index > 0L) &&
+    !is.null(bws$xdati) &&
+    (isTRUE(bws$xdati$iord[slice.index]) || isTRUE(bws$xdati$iuno[slice.index]))
+
+  use.local.direct <- TRUE
+
+  if (is.null(fit.mean.train)) {
+    fit.mean.train <- as.vector(.np_regression_direct(
+      bws = bws,
+      txdat = xdat,
+      tydat = ydat,
+      exdat = xdat,
+      gradients = FALSE,
+      gradient.order = gradient.order,
+      local.mode = use.local.direct
+    )$mean)
+  } else {
+    fit.mean.train <- as.double(fit.mean.train)
+  }
+  if (length(fit.mean.train) != n || any(!is.finite(fit.mean.train)))
+    stop("internal fit.mean.train payload is invalid for exact wild regression bootstrap", call. = FALSE)
+
+  fit_hat <- function(y.train) {
+    fit <- .np_regression_direct(
+      bws = bws,
+      txdat = xdat,
+      tydat = y.train,
+      exdat = exdat,
+      gradients = isTRUE(gradients),
+      gradient.order = gradient.order,
+      local.mode = use.local.direct
+    )
+    if (isTRUE(gradients) && isTRUE(xi.factor))
+      return(.np_plot_factor_contrast_vector(fit$mean))
+    if (isTRUE(gradients))
+      as.vector(fit$grad[, slice.index])
+    else
+      as.vector(fit$mean)
+  }
+
+  t0 <- fit_hat(ydat)
+  nout <- length(t0)
+  residuals <- as.double(ydat - fit.mean.train)
+  wild <- .np_plot_normalize_wild(wild)
+  draw.fun <- if (identical(wild, "mammen")) .np_mammen_draws else .np_rademacher_draws
+  draws <- draw.fun(n = n, B = B)
+  tmat <- matrix(NA_real_, nrow = B, ncol = nout)
+
+  compute_draw_chunk <- function(draws.chunk) {
+    draws.chunk <- as.matrix(draws.chunk)
+    bsz <- ncol(draws.chunk)
+    out <- matrix(NA_real_, nrow = bsz, ncol = nout)
+    for (jj in seq_len(bsz)) {
+      ystar <- fit.mean.train + residuals * draws.chunk[, jj]
+      out[jj, ] <- fit_hat(ystar)
+    }
+    out
+  }
+
+  chunk.size <- .npRmpi_bootstrap_tune_chunk_size(
+    B = B,
+    chunk.size = .np_wild_chunk_size(n = n, B = B),
+    comm = 1L,
+    include.master = TRUE
+  )
+
+  if (.npRmpi_bootstrap_fanout_enabled(
+        comm = 1L,
+        n = n,
+        B = B,
+        chunk.size = chunk.size,
+        what = "wild-regression-exact"
+      )) {
+    tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+    worker <- function(task) {
+      start <- as.integer(task$start)
+      stopi <- start + as.integer(task$bsz) - 1L
+      compute_draw_chunk(draws.chunk = draws[, start:stopi, drop = FALSE])
+    }
+    tmat <- .npRmpi_bootstrap_run_fanout(
+      tasks = tasks,
+      worker = worker,
+      ncol.out = nout,
+      what = "wild-regression-exact",
+      progress.label = progress.label,
+      profile.where = "mpi.applyLB:wild-regression-exact",
+      comm = 1L,
+      prefer.local.single_worker = prefer.local.single_worker,
+      master_local_chunk = master_local_chunk,
+      required.bindings = list(
+        draws = draws,
+        compute_draw_chunk = compute_draw_chunk
+      )
+    )
+  } else {
+    progress.label <- if (is.null(progress.label)) "Plot bootstrap wild" else progress.label
+    progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+    on.exit({
+      .np_plot_progress_end(progress)
+    }, add = TRUE)
+    for (bb in seq_len(B)) {
+      tmat[bb, ] <- compute_draw_chunk(draws.chunk = draws[, bb, drop = FALSE])
+      progress <- .np_plot_progress_tick(state = progress, done = bb)
+    }
+  }
+
+  if (any(!is.finite(t0)) || any(!is.finite(tmat)))
+    stop("wild regression exact helper path produced non-finite values")
 
   list(t = tmat, t0 = t0)
 }
@@ -4229,7 +4623,59 @@
   }
 
   if (isTRUE(gradients)) {
+    if (identical(regtype, "lc")) {
+      npValidateLcGradientOrder(
+        regtype = regtype,
+        gradient.order = gradient.order,
+        ncon = bws$ncon,
+        where = ".np_inid_boot_from_regression"
+      )
+    }
+    xi.factor <- isTRUE(slice.index > 0L) &&
+      !is.null(bws$xdati) &&
+      (isTRUE(bws$xdati$iord[slice.index]) || isTRUE(bws$xdati$iuno[slice.index]))
+    if (isTRUE(xi.factor)) {
+      return(.np_inid_boot_from_regression_exact(
+        xdat = xdat,
+        exdat = exdat,
+        bws = bws,
+        ydat = ydat,
+        B = B,
+        counts = counts,
+        counts.drawer = counts.drawer,
+        gradients = TRUE,
+        gradient.order = gradient.order,
+        slice.index = slice.index,
+        prefer.local.single_worker = prefer.local.single_worker,
+        master_local_chunk = master_local_chunk,
+        progress.label = progress.label
+      ))
+    }
     if (!identical(regtype, "lc")) {
+      use.exact.degree0.derivative <- .np_plot_regression_exact_lc_derivative_requested(
+        bws = bws,
+        regtype = regtype,
+        gradient.order = gradient.order
+      )
+
+      if (isTRUE(use.exact.degree0.derivative)) {
+        return(.np_inid_boot_from_regression_exact(
+          xdat = xdat,
+          exdat = exdat,
+          bws = bws,
+          ydat = ydat,
+          B = B,
+          counts = counts,
+          counts.drawer = counts.drawer,
+          gradients = TRUE,
+          gradient.order = gradient.order,
+          slice.index = slice.index,
+          prefer.local.single_worker = prefer.local.single_worker,
+          master_local_chunk = master_local_chunk,
+          progress.label = progress.label
+        ))
+      }
+
       return(.np_inid_boot_from_regression_localpoly_fixed(
         xdat = xdat,
         exdat = exdat,
@@ -5065,6 +5511,22 @@
   list(t = tmat, t0 = t0)
 }
 
+.np_scoef_bootstrap_target <- function(fit,
+                                        target = c("mean", "grad"),
+                                        gradient.index = 1L) {
+  target <- match.arg(target)
+  if (identical(target, "mean"))
+    return(as.vector(fit$mean))
+
+  gradient.index <- as.integer(gradient.index)[1L]
+  if (!is.finite(gradient.index) || is.na(gradient.index) || gradient.index < 1L)
+    stop("invalid smooth coefficient gradient index", call. = FALSE)
+  grad <- fit$grad
+  if (is.null(grad) || !is.matrix(grad) || ncol(grad) < gradient.index)
+    stop("smooth coefficient fit did not return the requested gradient target", call. = FALSE)
+  as.vector(grad[, gradient.index])
+}
+
 .np_inid_boot_from_scoef_exact <- function(txdat,
                                            ydat,
                                            tzdat,
@@ -5075,7 +5537,10 @@
                                            counts = NULL,
                                            counts.drawer = NULL,
                                            leave.one.out = FALSE,
-                                           progress.label = NULL) {
+                                           progress.label = NULL,
+                                           target = c("mean", "grad"),
+                                           gradient.index = 1L) {
+  target <- match.arg(target)
   txdat <- toFrame(txdat)
   exdat <- toFrame(exdat)
   B <- as.integer(B)
@@ -5114,9 +5579,13 @@
       fit.args$tzdat <- tz.train
       fit.args$ezdat <- ezdat
     }
-    as.vector(.np_plot_with_local_compiled_eval(
-      do.call(.np_scoef_fit_internal, fit.args)
-    )$mean)
+    .np_scoef_bootstrap_target(
+      fit = .np_plot_with_local_compiled_eval(
+        do.call(.np_scoef_fit_internal, fit.args)
+      ),
+      target = target,
+      gradient.index = gradient.index
+    )
   }
 
   t0 <- fit.fun(tx.train = txdat, y.train = ydat, tz.train = tzdat)
@@ -5267,6 +5736,111 @@
   list(t = tmat, t0 = t0)
 }
 
+.np_wild_boot_from_scoef_exact <- function(txdat,
+                                           ydat,
+                                           tzdat,
+                                           exdat,
+                                           ezdat,
+                                           bws,
+                                           B,
+                                           wild = c("rademacher", "mammen"),
+                                           leave.one.out = FALSE,
+                                           progress.label = NULL,
+                                           target = c("mean", "grad"),
+                                           gradient.index = 1L) {
+  target <- match.arg(target)
+  txdat <- toFrame(txdat)
+  exdat <- toFrame(exdat)
+  ydat <- as.double(ydat)
+  B <- as.integer(B)
+
+  miss.z <- missing(tzdat) || is.null(tzdat)
+  if (miss.z) {
+    tzdat <- txdat
+    ezdat <- exdat
+  } else {
+    tzdat <- toFrame(tzdat)
+    ezdat <- toFrame(ezdat)
+  }
+
+  n <- nrow(txdat)
+  if (length(ydat) != n)
+    stop("length of ydat must match training rows in exact wild smooth coefficient bootstrap helper")
+  if (n < 1L || nrow(exdat) < 1L || B < 1L)
+    stop("invalid exact wild smooth coefficient bootstrap dimensions")
+
+  fit.fun <- function(tx.eval, y.train, tz.eval, target.eval = target) {
+    fit.args <- list(
+      bws = bws,
+      txdat = txdat,
+      tydat = y.train,
+      exdat = tx.eval,
+      iterate = FALSE,
+      errors = FALSE,
+      leave.one.out = leave.one.out
+    )
+    if (!miss.z) {
+      fit.args$tzdat <- tzdat
+      fit.args$ezdat <- tz.eval
+    }
+    .np_scoef_bootstrap_target(
+      fit = .np_plot_with_local_compiled_eval(
+        do.call(.np_scoef_fit_internal, fit.args)
+      ),
+      target = target.eval,
+      gradient.index = gradient.index
+    )
+  }
+
+  fit.mean.train <- fit.fun(
+    tx.eval = txdat,
+    y.train = ydat,
+    tz.eval = tzdat,
+    target.eval = "mean"
+  )
+  if (length(fit.mean.train) != n || any(!is.finite(fit.mean.train)))
+    stop("internal fit.mean.train payload is invalid for exact wild smooth coefficient bootstrap", call. = FALSE)
+
+  t0 <- fit.fun(tx.eval = exdat, y.train = ydat, tz.eval = ezdat)
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(t0))
+  residuals <- ydat - fit.mean.train
+  wild <- .np_plot_normalize_wild(wild)
+  draw.fun <- if (identical(wild, "mammen")) .np_mammen_draws else .np_rademacher_draws
+
+  progress.label <- if (is.null(progress.label)) "Plot bootstrap wild" else progress.label
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.size <- .np_wild_chunk_size(n = n, B = B)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size, progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    draws <- draw.fun(n = n, B = bsz)
+    for (jj in seq_len(bsz)) {
+      ystar <- fit.mean.train + residuals * draws[, jj]
+      tmat[start + jj - 1L, ] <- fit.fun(
+        tx.eval = exdat,
+        y.train = ystar,
+        tz.eval = ezdat
+      )
+    }
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
+}
+
 .np_inid_boot_from_scoef <- function(txdat,
                                      ydat,
                                      tzdat,
@@ -5278,8 +5852,11 @@
                                      counts.drawer = NULL,
                                      leave.one.out = FALSE,
                                      progress.label = NULL,
-                                     mode = c("exact", "frozen")) {
+                                     mode = c("exact", "frozen"),
+                                     target = c("mean", "grad"),
+                                     gradient.index = 1L) {
   mode <- match.arg(mode)
+  target <- match.arg(target)
 
   z.source <- if (missing(tzdat) || is.null(tzdat)) txdat else tzdat
   spec <- .npscoef_canonical_spec(
@@ -5287,6 +5864,24 @@
     zdat = z.source,
     where = "smooth coefficient inid helper"
   )
+
+  if (identical(target, "grad")) {
+    return(.np_inid_boot_from_scoef_exact(
+      txdat = txdat,
+      ydat = ydat,
+      tzdat = tzdat,
+      exdat = exdat,
+      ezdat = ezdat,
+      bws = bws,
+      B = B,
+      counts = counts,
+      counts.drawer = counts.drawer,
+      leave.one.out = leave.one.out,
+      progress.label = progress.label,
+      target = target,
+      gradient.index = gradient.index
+    ))
+  }
 
   if (!identical(spec$regtype.engine, "lc") &&
       (identical(mode, "frozen") || identical(bws$type, "fixed"))) {
@@ -5332,7 +5927,9 @@
     counts = counts,
     counts.drawer = counts.drawer,
     leave.one.out = leave.one.out,
-    progress.label = progress.label
+    progress.label = progress.label,
+    target = target,
+    gradient.index = gradient.index
   )
 }
 
@@ -10206,6 +10803,7 @@ draw.all.error.types <- function(ex, center, all.err,
            lty = .np_plot_lty("interval"),
            col = unname(band.cols[c("pointwise", "simultaneous", "bonferroni")]),
            lwd = .np_plot_lwd("band_all_1d"),
+           cex = .np_plot_cex("legend"),
            bty = "n"),
       legend = legend.value,
       context = "legend"
@@ -10219,6 +10817,7 @@ plotFactor <- function(f, y, ...){
   dot.args <- list(...)
   dot.names <- names(dot.args)
   has.user.lty <- !is.null(dot.names) && any(dot.names == "lty")
+  has.user.pch <- !is.null(dot.names) && any(dot.names == "pch")
   is.fac <- is.factor(f) || is.ordered(f)
   has.user.xaxt <- !is.null(dot.names) && any(dot.names == "xaxt")
   has.user.xlim <- !is.null(dot.names) && any(dot.names == "xlim")
@@ -10232,6 +10831,8 @@ plotFactor <- function(f, y, ...){
     base.args$xlim <- c(0.5, length(levels(f)) + 0.5)
   if (!has.user.lty)
     base.args$lty <- "blank"
+  if (is.fac && !has.user.pch)
+    base.args$pch <- .np_plot_pch("factor_estimate")
   do.call(graphics::plot.default, base.args)
   if (add.axis)
     axis(1, at = seq_along(levels(f)), labels = levels(f))
@@ -10249,7 +10850,11 @@ plotFactor <- function(f, y, ...){
 
   point.args <- list(x = f, y = y)
   if (!is.null(dot.args$col)) point.args$col <- dot.args$col
-  if (!is.null(dot.args$pch)) point.args$pch <- dot.args$pch
+  if (!is.null(dot.args$pch)) {
+    point.args$pch <- dot.args$pch
+  } else if (is.fac) {
+    point.args$pch <- .np_plot_pch("factor_estimate")
+  }
   if (!is.null(dot.args$cex)) point.args$cex <- dot.args$cex
   if (!is.null(dot.args$bg)) point.args$bg <- dot.args$bg
   do.call(points, point.args)
@@ -10374,6 +10979,15 @@ plotFactor <- function(f, y, ...){
       gradient.order = glp.gradient.order,
       ncon = bws$xncon
     )
+  if (isTRUE(gradients) && identical(reg.engine, "lp")) {
+    npValidateGlpGradientDegree(
+      regtype.engine = reg.engine,
+      degree.engine = degree.engine,
+      gradient.order = glp.gradient.order,
+      ncon = bws$xncon,
+      where = "plot conditional"
+    )
+  }
 
   reg.c <- npRegtypeToC(
     regtype = if (identical(reg.engine, "lp") && !lp.degree0.lc.gradient) "lp" else "lc",
@@ -10491,14 +11105,7 @@ plotFactor <- function(f, y, ...){
 
     if (identical(reg.engine, "lp") && bws$xncon > 0L && !lp.degree0.lc.gradient) {
       cont.idx <- which(bws$ixcon)
-      invalid.order <- glp.gradient.order > degree.engine
-      if (any(invalid.order)) {
-        myout$congrad[, cont.idx[invalid.order]] <- NA_real_
-        myout$congerr[, cont.idx[invalid.order]] <- NA_real_
-        .np_warning("some requested glp derivatives exceed polynomial degree; returning NA for those components")
-      }
-
-      higher.order <- (glp.gradient.order > 1L) & !invalid.order
+      higher.order <- glp.gradient.order > 1L
       if (any(higher.order)) {
         rhs <- rep.int(1.0, nrow(hat.context$xdat))
         hat.fun <- if (isTRUE(cdf)) npcdisthat else npcdenshat
@@ -11160,6 +11767,8 @@ plotFactor <- function(f, y, ...){
   switch(
     role,
     data_overlay = 20L,
+    factor_estimate = 16L,
+    bias_center = 1L,
     stop("unknown plot point-character role: ", role, call. = FALSE)
   )
 }
@@ -11671,11 +12280,11 @@ plotFactor <- function(f, y, ...){
 
   base.names <- names(base.args)
   user.names <- names(user.args)
-  dup <- intersect(user.names[!(is.na(user.names) | user.names == "")],
-                   base.names[!(is.na(base.names) | base.names == "")])
+  dup <- intersect(base.names[!(is.na(base.names) | base.names == "")],
+                   user.names[!(is.na(user.names) | user.names == "")])
   if (length(dup)) {
-    keep <- is.na(user.names) | user.names == "" | !(user.names %in% dup)
-    user.args <- user.args[keep]
+    keep <- is.na(base.names) | base.names == "" | !(base.names %in% dup)
+    base.args <- base.args[keep]
   }
   c(base.args, user.args)
 }
@@ -11732,6 +12341,7 @@ plotFactor <- function(f, y, ...){
          lty = lty,
          col = unname(band.cols[c("pointwise", "simultaneous", "bonferroni")]),
          lwd = lwd,
+         cex = .np_plot_cex("legend"),
          bty = bty),
     legend = legend.value,
     context = "legend"
@@ -11739,6 +12349,127 @@ plotFactor <- function(f, y, ...){
   if (!is.null(legend.args))
     do.call(graphics::legend, legend.args)
   invisible(NULL)
+}
+
+.np_plot_draw_bias_center_legend <- function(legend = TRUE,
+                                             estimate.col = par()$col,
+                                             estimate.lty = par()$lty,
+                                             estimate.lwd = par()$lwd,
+                                             center.col = par()$col,
+                                             center.lwd = estimate.lwd,
+                                             legend.loc = "topright",
+                                             factor.panel = FALSE) {
+  if (is.null(estimate.col) || !length(estimate.col))
+    estimate.col <- par()$col
+  if (is.null(center.col) || !length(center.col))
+    center.col <- par()$col
+  if (is.null(estimate.lwd) || !length(estimate.lwd))
+    estimate.lwd <- par()$lwd
+  if (is.null(center.lwd) || !length(center.lwd))
+    center.lwd <- estimate.lwd
+  normalize_lty <- function(value) {
+    if (is.null(value) || !length(value))
+      return(.np_plot_lty("solid"))
+    value <- value[1L]
+    if (is.character(value)) {
+      if (identical(value, "solid"))
+        return(.np_plot_lty("solid"))
+      if (identical(value, "dashed"))
+        return(.np_plot_lty("interval"))
+      if (identical(value, "dotted"))
+        return(.np_plot_lty("center"))
+    }
+    value
+  }
+
+  estimate.lty <- normalize_lty(estimate.lty)
+  legend.value <- if (is.list(legend) && any(names(legend) %in% c("tau", "bands", "center"))) {
+    if (!is.null(legend$center)) legend$center else TRUE
+  } else {
+    legend
+  }
+  legend.defaults <- if (isTRUE(factor.panel)) {
+    list(x = legend.loc,
+         legend = c("Estimate", "Bias-corrected estimate"),
+         col = c(estimate.col, center.col),
+         pch = c(.np_plot_pch("factor_estimate"),
+                 .np_plot_pch("bias_center")),
+         lty = c(0L, 0L),
+         cex = .np_plot_cex("legend"),
+         bty = "n")
+  } else {
+    list(x = legend.loc,
+         legend = c("Estimate", "Bias-corrected estimate"),
+         col = c(estimate.col, center.col),
+         lty = c(estimate.lty, .np_plot_lty("center")),
+         lwd = c(estimate.lwd, center.lwd),
+         cex = .np_plot_cex("legend"),
+         bty = "n")
+  }
+  legend.args <- .np_plot_legend_args(
+    legend.defaults,
+    legend = legend.value,
+    context = "legend"
+  )
+  if (!is.null(legend.args))
+    do.call(graphics::legend, legend.args)
+  invisible(NULL)
+}
+
+.np_plot_draw_bias_center_1d <- function(x,
+                                         center,
+                                         xi.factor = FALSE,
+                                         plotOnEstimate = TRUE,
+                                         legend = TRUE,
+                                         estimate.col = par()$col,
+                                         estimate.lty = par()$lty,
+                                         estimate.lwd = par()$lwd,
+                                         center.col = par()$col,
+                                         center.lwd = estimate.lwd,
+                                         draw.legend = TRUE) {
+  if (isTRUE(plotOnEstimate))
+    return(invisible(FALSE))
+
+  center <- as.numeric(center)
+  n <- if (isTRUE(xi.factor)) length(center) else min(length(x), length(center))
+  if (!n)
+    return(invisible(FALSE))
+
+  idx <- seq_len(n)
+  x <- if (isTRUE(xi.factor)) idx else as.numeric(x)[idx]
+  keep <- is.finite(x) & is.finite(center[idx])
+  if (!any(keep))
+    return(invisible(FALSE))
+
+  if (isTRUE(xi.factor)) {
+    half.width <- 0.06
+    graphics::segments(x0 = x[keep] - half.width,
+                       y0 = center[idx][keep],
+                       x1 = x[keep] + half.width,
+                       y1 = center[idx][keep],
+                       lty = .np_plot_lty("center"),
+                       col = center.col,
+                       lwd = center.lwd)
+    graphics::points(x[keep], center[idx][keep],
+                     col = center.col,
+                     pch = .np_plot_pch("bias_center"))
+  } else {
+    graphics::lines(x[keep], center[idx][keep],
+                    lty = .np_plot_lty("center"),
+                    col = center.col,
+                    lwd = center.lwd)
+  }
+  if (isTRUE(draw.legend))
+    .np_plot_draw_bias_center_legend(
+      legend = legend,
+      estimate.col = estimate.col,
+      estimate.lty = estimate.lty,
+      estimate.lwd = estimate.lwd,
+      center.col = center.col,
+      center.lwd = center.lwd,
+      factor.panel = isTRUE(xi.factor)
+    )
+  invisible(TRUE)
 }
 
 .np_plot_legend_role <- function(legend, role) {
@@ -11974,7 +12705,8 @@ plotFactor <- function(f, y, ...){
   }
   tau.legend.args <- .np_plot_legend_args(
     list(x = "topright", legend = tau.labels, col = curve.col,
-         lty = curve.lty, lwd = curve.lwd, bty = "n"),
+         lty = curve.lty, lwd = curve.lwd, cex = .np_plot_cex("legend"),
+         bty = "n"),
     legend = .np_plot_legend_role(legend, "tau"),
     context = "legend"
   )
@@ -11986,6 +12718,7 @@ plotFactor <- function(f, y, ...){
            legend = c("Pointwise", "Simultaneous", "Bonferroni"),
            lty = c(.np_plot_lty("pointwise"), .np_plot_lty("simultaneous"), .np_plot_lty("bonferroni")),
            col = graphics::par("col"),
+           cex = .np_plot_cex("legend"),
            bty = "n"),
       legend = .np_plot_legend_role(legend, "bands"),
       context = "legend"
@@ -12456,6 +13189,74 @@ plotFactor <- function(f, y, ...){
   )
 }
 
+.np_plot_resolve_conditional_gradient_index <- function(bws,
+                                                        gradient.index,
+                                                        where) {
+  xicon <- bws$xdati$icon
+  gradient.index <- as.integer(gradient.index)[1L]
+  if (is.null(xicon) || !length(xicon) || is.na(gradient.index) ||
+      gradient.index < 1L) {
+    stop(sprintf("%s requested an invalid conditional gradient coordinate",
+                 where),
+         call. = FALSE)
+  }
+  xicon <- as.logical(xicon)
+  cont.index <- which(xicon)
+  if (!length(cont.index)) {
+    stop(sprintf("%s can compute bootstrap gradient bias correction only for continuous conditioning variables",
+                 where),
+         call. = FALSE)
+  }
+  if (gradient.index <= length(xicon) && isTRUE(xicon[gradient.index])) {
+    return(gradient.index)
+  }
+  if (gradient.index <= length(cont.index)) {
+    return(cont.index[[gradient.index]])
+  }
+  if (gradient.index <= length(xicon) && length(cont.index) == 1L) {
+    return(cont.index[[1L]])
+  }
+  stop(sprintf("%s requested an invalid conditional gradient coordinate",
+               where),
+       call. = FALSE)
+}
+
+.np_plot_validate_conditional_gradient_target <- function(bws,
+                                                          gradient.index,
+                                                          where) {
+  gradient.index <- .np_plot_resolve_conditional_gradient_index(
+    bws = bws,
+    gradient.index = gradient.index,
+    where = where
+  )
+  xicon <- as.logical(bws$xdati$icon)
+  if (!isTRUE(xicon[gradient.index])) {
+    stop(sprintf("%s can compute bootstrap gradient bias correction only for continuous conditioning variables",
+                 where),
+         call. = FALSE)
+  }
+  invisible(gradient.index)
+}
+
+.np_plot_extract_conditional_gradient <- function(fit,
+                                                  gradient.index,
+                                                  neval,
+                                                  where) {
+  congrad <- fit$congrad
+  if (is.null(congrad)) {
+    stop(sprintf("%s did not return conditional gradient estimates", where),
+         call. = FALSE)
+  }
+  congrad <- as.matrix(congrad)
+  if (nrow(congrad) != neval ||
+      ncol(congrad) < gradient.index) {
+    stop(sprintf("%s returned conditional gradient estimates with unexpected dimensions",
+                 where),
+         call. = FALSE)
+  }
+  as.vector(congrad[, gradient.index, drop = TRUE])
+}
+
 .np_inid_boot_from_conditional_gradient_local <- function(xdat,
                                                           ydat,
                                                           exdat,
@@ -12480,8 +13281,20 @@ plotFactor <- function(f, y, ...){
   if (n < 1L || B < 1L)
     stop("invalid conditional gradient bootstrap dimensions")
 
+  where <- if (isTRUE(cdf)) {
+    "conditional distribution gradient bootstrap"
+  } else {
+    "conditional density gradient bootstrap"
+  }
+  gradient.index <- .np_plot_validate_conditional_gradient_target(
+    bws = bws,
+    gradient.index = gradient.index,
+    where = where
+  )
+  neval <- nrow(exdat)
+
   fit.fun <- function(x.train, y.train) {
-    as.vector(.np_plot_conditional_eval(
+    fit <- .np_plot_conditional_eval(
       bws = bws,
       xdat = x.train,
       ydat = y.train,
@@ -12490,7 +13303,13 @@ plotFactor <- function(f, y, ...){
       cdf = cdf,
       gradients = TRUE,
       gradient.order = gradient.order
-    )$congrad[, gradient.index, drop = TRUE])
+    )
+    .np_plot_extract_conditional_gradient(
+      fit = fit,
+      gradient.index = gradient.index,
+      neval = neval,
+      where = where
+    )
   }
 
   t0 <- fit.fun(x.train = xdat, y.train = ydat)
@@ -12859,6 +13678,12 @@ plotFactor <- function(f, y, ...){
           counts.mode = counts.mode,
           .np_inid_boot_from_conditional_gradient_local =
             .np_inid_boot_from_conditional_gradient_local,
+          .np_plot_resolve_conditional_gradient_index =
+            .np_plot_resolve_conditional_gradient_index,
+          .np_plot_validate_conditional_gradient_target =
+            .np_plot_validate_conditional_gradient_target,
+          .np_plot_extract_conditional_gradient =
+            .np_plot_extract_conditional_gradient,
           .np_inid_counts_matrix = .np_inid_counts_matrix,
           .npRmpi_with_local_bootstrap = .npRmpi_with_local_bootstrap
         ),
@@ -13850,9 +14675,13 @@ compute.bootstrap.quantile.bounds <- function(boot.t,
                                                 t0,
                                                 alpha,
                                                 band.type,
-                                                progress.label = NULL) {
+                                                progress.label = NULL,
+                                                reference = t0) {
   if (!(band.type %in% c("pointwise", "bonferroni", "simultaneous", "all")))
     stop("'band.type' must be one of pointwise, bonferroni, simultaneous, all")
+  reference <- as.numeric(reference)
+  if (length(reference) != length(t0))
+    stop("bootstrap interval reference has incompatible length", call. = FALSE)
 
   neval <- max(1L, ncol(boot.t))
   progress.total <- switch(
@@ -13883,7 +14712,7 @@ compute.bootstrap.quantile.bounds <- function(boot.t,
     )
     bounds <- all.bounds$pointwise
     all.err <- lapply(all.bounds, function(bb) {
-      cbind(t0 - bb[, 1L], bb[, 2L] - t0)
+      cbind(reference - bb[, 1L], bb[, 2L] - reference)
     })
   } else {
     bounds <- compute.bootstrap.quantile.bounds(
@@ -13896,12 +14725,54 @@ compute.bootstrap.quantile.bounds <- function(boot.t,
   }
 
   list(
-    err = cbind(t0 - bounds[, 1L], bounds[, 2L] - t0),
+    err = cbind(reference - bounds[, 1L], bounds[, 2L] - reference),
     all.err = all.err
   )
 }
 
+.np_plot_bootstrap_centered_interval_payload <- function(boot.t,
+                                                         t0,
+                                                         alpha,
+                                                         band.type,
+                                                         center,
+                                                         oversmooth.boot = NULL,
+                                                         progress.label = NULL) {
+  if (!(band.type %in% c("pointwise", "bonferroni", "simultaneous", "all")))
+    stop("'band.type' must be one of pointwise, bonferroni, simultaneous, all")
+
+  selected.center <- .np_plot_bootstrap_center(
+    center = center,
+    t0 = t0,
+    boot.t = boot.t,
+    oversmooth.boot = oversmooth.boot
+  )
+
+  interval.reference <- if (.np_plot_center_is_bias_corrected(center)) {
+    colMeans(as.matrix(boot.t))
+  } else {
+    t0
+  }
+
+  interval.summary <- .np_plot_bootstrap_interval_summary(
+    boot.t = boot.t,
+    t0 = t0,
+    alpha = alpha,
+    band.type = band.type,
+    progress.label = progress.label,
+    reference = interval.reference
+  )
+
+  list(
+    center = selected.center,
+    reference = interval.reference,
+    err = interval.summary$err,
+    all.err = interval.summary$all.err,
+    bias = t0 - selected.center
+  )
+}
+
 .np_plot_bootstrap_quantile_tau_payload <- function(boot.out,
+                                                    oversmooth.boot = NULL,
                                                     neval,
                                                     tau,
                                                     alpha,
@@ -13948,19 +14819,51 @@ compute.bootstrap.quantile.bounds <- function(boot.t,
       boot.err[, 1:2, kk] <- qnorm(alpha / 2, lower.tail = FALSE) * boot.sd
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     } else {
-      interval.summary <- .np_plot_bootstrap_interval_summary(
+      oversmooth.k <- NULL
+      if (!is.null(oversmooth.boot)) {
+        if (is.null(oversmooth.boot$t))
+          stop("oversmoothed bootstrap center was requested but no oversmoothed quantile bootstrap matrix is available", call. = FALSE)
+        if (ncol(oversmooth.boot$t) != expected) {
+          stop("vector tau oversmoothed quantile bootstrap helper returned an incompatible payload", call. = FALSE)
+        }
+        oversmooth.k <- list(
+          t = oversmooth.boot$t[, idx, drop = FALSE],
+          center = if (!is.null(oversmooth.boot$center)) oversmooth.boot$center[idx] else NULL
+        )
+      }
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.t.k,
         t0 = t0.k,
         alpha = alpha,
         band.type = band.type,
+        center = center,
+        oversmooth.boot = oversmooth.k,
         progress.label = label.k
       )
-      boot.err[, 1:2, kk] <- interval.summary$err
-      boot.all.err[[kk]] <- interval.summary$all.err
+      boot.err[, 1:2, kk] <- interval.payload$err
+      boot.err[, 3L, kk] <- interval.payload$center
+      boot.all.err[[kk]] <- interval.payload$all.err
     }
 
-    if (identical(center, "bias-corrected")) {
-      boot.err[, 3L, kk] <- 2 * t0.k - colMeans(boot.t.k)
+    if (identical(center, "bias-corrected") && identical(band.type, "pmzsd")) {
+      oversmooth.k <- NULL
+      if (!is.null(oversmooth.boot)) {
+        if (is.null(oversmooth.boot$t))
+          stop("oversmoothed bootstrap center was requested but no oversmoothed quantile bootstrap matrix is available", call. = FALSE)
+        if (ncol(oversmooth.boot$t) != expected) {
+          stop("vector tau oversmoothed quantile bootstrap helper returned an incompatible payload", call. = FALSE)
+        }
+        oversmooth.k <- list(
+          t = oversmooth.boot$t[, idx, drop = FALSE],
+          center = if (!is.null(oversmooth.boot$center)) oversmooth.boot$center[idx] else NULL
+        )
+      }
+      boot.err[, 3L, kk] <- .np_plot_bootstrap_center(
+        center = center,
+        t0 = t0.k,
+        boot.t = boot.t.k,
+        oversmooth.boot = oversmooth.k
+      )
     }
   }
 
@@ -14050,6 +14953,93 @@ compute.default.error.range <- function(center, err) {
   range(center, finite = TRUE)
 }
 
+.np_plot_error_center <- function(estimate, err = NULL, plotOnEstimate = TRUE) {
+  estimate <- as.double(estimate)
+  center <- estimate
+  if (!isTRUE(plotOnEstimate) && !is.null(err) && NCOL(err) >= 3L) {
+    corrected <- as.double(err[, 3L])
+    n <- min(length(center), length(corrected))
+    if (n) {
+      idx <- seq_len(n)
+      keep <- is.finite(corrected[idx])
+      center[idx[keep]] <- corrected[idx[keep]]
+    }
+  }
+  center
+}
+
+.np_plot_error_bounds <- function(estimate, err, plotOnEstimate = TRUE) {
+  center <- .np_plot_error_center(estimate, err, plotOnEstimate)
+  lower <- upper <- rep(NA_real_, length(center))
+  if (is.null(err) || NCOL(err) < 2L)
+    return(list(center = center, lower = lower, upper = upper))
+  n <- min(length(center), NROW(err))
+  if (!n)
+    return(list(center = center, lower = lower, upper = upper))
+  idx <- seq_len(n)
+  list(
+    center = center,
+    lower = {
+      lower[idx] <- center[idx] - as.double(err[idx, 1L])
+      lower
+    },
+    upper = {
+      upper[idx] <- center[idx] + as.double(err[idx, 2L])
+      upper
+    }
+  )
+}
+
+.np_plot_error_draw_vectors <- function(x, estimate, err, plotOnEstimate = TRUE) {
+  x <- as.double(x)
+  bounds <- .np_plot_error_bounds(estimate, err, plotOnEstimate)
+  n <- min(length(x), length(bounds$lower), length(bounds$upper))
+  if (!n)
+    return(list(x = numeric(), lower = numeric(), upper = numeric()))
+
+  idx <- seq_len(n)
+  keep <- is.finite(x[idx]) & is.finite(bounds$lower[idx]) & is.finite(bounds$upper[idx])
+  list(
+    x = x[idx][keep],
+    lower = bounds$lower[idx][keep],
+    upper = bounds$upper[idx][keep]
+  )
+}
+
+.np_plot_panel_error_range <- function(estimate,
+                                       err = NULL,
+                                       all.err = NULL,
+                                       plot.errors.type = NULL,
+                                       plotOnEstimate = TRUE) {
+  estimate <- as.double(estimate)
+  center <- .np_plot_error_center(estimate, err, plotOnEstimate)
+  vals <- c(estimate, center)
+  if (!is.null(err) && NCOL(err) >= 2L) {
+    if (identical(plot.errors.type, "all") && !is.null(all.err)) {
+      vals <- c(vals, compute.all.error.range(center, all.err))
+    } else {
+      bounds <- .np_plot_error_bounds(estimate, err, plotOnEstimate)
+      vals <- c(vals,
+                bounds$lower,
+                bounds$upper)
+    }
+  }
+
+  rng <- range(vals, finite = TRUE)
+  if (length(rng) == 2L && all(is.finite(rng)))
+    return(rng)
+  c(NA_real_, NA_real_)
+}
+
+.np_plot_resolve_requested_ylim <- function(panel.ylim, ylim = NULL) {
+  if (is.null(ylim))
+    return(panel.ylim)
+  out <- as.numeric(ylim)
+  if (length(out) != 2L || anyNA(out) || !all(is.finite(out)) || out[1L] == out[2L])
+    stop("ylim must be a finite numeric vector of length two with distinct values")
+  out
+}
+
 .np_plot_normalize_common_options <- function(plot.behavior,
                                              plot.errors.method,
                                              plot.errors.boot.method,
@@ -14131,7 +15121,7 @@ compute.default.error.range <- function(center, err) {
     if (plot.errors.type == "all")
       .np_warning("asymptotic simultaneous confidence bands are unavailable here; 'all' returns pointwise/bonferroni and NA simultaneous")
 
-    if (plot.errors.center == "bias-corrected") {
+    if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
       .np_warning("no bias corrections can be calculated with asymptotics, centering on estimate")
       plot.errors.center <- "estimate"
     }
@@ -14156,6 +15146,1298 @@ compute.default.error.range <- function(center, err) {
     common.scale = common.scale,
     plot.errors = (plot.errors.method != "none")
   )
+}
+
+.np_plot_center_is_bias_corrected <- function(center) {
+  identical(center, "bias-corrected")
+}
+
+.np_plot_center_is_oversmoothed <- function(center, plot.errors.boot.method = NULL) {
+  identical(center, "bias-corrected") &&
+    is.element(plot.errors.boot.method, c("inid", "fixed", "geom"))
+}
+
+.np_plot_bias_center_engine <- function(center, plot.errors.boot.method = NULL) {
+  if (identical(center, "estimate"))
+    return("none")
+  if (!identical(center, "bias-corrected"))
+    stop("unknown bootstrap center", call. = FALSE)
+  if (.np_plot_center_is_oversmoothed(center, plot.errors.boot.method))
+    return("oversmoothed-pilot")
+  "wild-standard"
+}
+
+.np_plot_regression_exact_lc_derivative_requested <- function(bws, regtype, gradient.order) {
+  ncon <- bws$ncon
+  if (is.null(ncon) || ncon < 1L)
+    return(FALSE)
+
+  if (identical(regtype, "lc")) {
+    gradient.order <- npValidateLcGradientOrder(
+      regtype = regtype,
+      gradient.order = gradient.order,
+      ncon = ncon,
+      where = ".np_plot_regression_exact_lc_derivative_requested"
+    )
+    return(length(gradient.order) == ncon && all(gradient.order == 1L))
+  }
+
+  identical(regtype, "lp") &&
+    npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = regtype,
+      degree.engine = npValidateGlpDegree(
+        regtype = "lp",
+        degree = bws$degree,
+        ncon = ncon
+      ),
+      gradient.order = npValidateGlpGradientOrder(
+        regtype = "lp",
+        gradient.order = gradient.order,
+        ncon = ncon
+      ),
+      ncon = ncon
+    )
+}
+
+.np_plot_oversmooth_exponent <- function(p.continuous, kernel.order,
+                                         family = c("density", "distribution",
+                                                    "density-sqrt", "distribution-sqrt")) {
+  family <- match.arg(family)
+  p.continuous <- as.integer(p.continuous[1L])
+  kernel.order <- as.numeric(kernel.order[1L])
+  if (!is.finite(p.continuous) || p.continuous < 1L ||
+      !is.finite(kernel.order) || kernel.order <= 0) {
+    stop("cannot compute oversmoothed bootstrap pilot rate from invalid dimension/order", call. = FALSE)
+  }
+  density.full <- (2 * kernel.order) / ((p.continuous + 2 * kernel.order) *
+                                          (p.continuous + 4 * kernel.order))
+  distribution.full <- kernel.order / ((p.continuous + kernel.order) *
+                                         (p.continuous + 2 * kernel.order))
+  switch(family,
+         density = density.full,
+         distribution = distribution.full,
+         `density-sqrt` = density.full / 2,
+         `distribution-sqrt` = distribution.full / 2)
+}
+
+.np_plot_oversmooth_factor <- function(nobs, p.continuous, kernel.order,
+                                       family = c("density", "distribution",
+                                                  "density-sqrt", "distribution-sqrt")) {
+  family <- match.arg(family)
+  exponent <- .np_plot_oversmooth_exponent(
+    p.continuous = p.continuous,
+    kernel.order = kernel.order,
+    family = family
+  )
+  factor <- as.numeric(nobs)^exponent
+  if (!is.finite(factor) || factor <= 0)
+    stop("invalid oversmoothed bootstrap pilot factor", call. = FALSE)
+  list(factor = factor, exponent = exponent)
+}
+
+.np_plot_mark_oversmoothed_bws <- function(bws, factor, exponent, family) {
+  attr(bws, "np.oversmooth.factor") <- factor
+  attr(bws, "np.oversmooth.exponent") <- exponent
+  attr(bws, "np.oversmooth.family") <- family
+  bws
+}
+
+.np_plot_cat_upper_from_metadata <- function(dati, index, kernel) {
+  if (identical(kernel, "aitchisonaitken")) {
+    nlev <- NA_integer_
+    if (!is.null(dati$all.nlev) && length(dati$all.nlev) >= index)
+      nlev <- suppressWarnings(as.integer(dati$all.nlev[[index]][1L]))
+    if ((!is.finite(nlev) || nlev < 2L) &&
+        !is.null(dati$all.lev) && length(dati$all.lev) >= index)
+      nlev <- length(dati$all.lev[[index]])
+    if (is.finite(nlev) && nlev > 1L)
+      return((nlev - 1) / nlev)
+  }
+  1
+}
+
+.np_plot_cat_lambda_pilot <- function(lambda, upper, factor) {
+  lambda <- as.numeric(lambda)
+  upper <- as.numeric(upper)
+  factor <- as.numeric(factor[1L])
+  if (!is.finite(lambda) || !is.finite(upper) ||
+      !is.finite(factor) || factor < 1)
+    return(lambda)
+  upper <- max(lambda, upper)
+  lambda + (upper - lambda) * (1 - 1 / factor)
+}
+
+.np_plot_apply_cat_lambda_pilot <- function(bws, side = "x", icon, dati,
+                                            ukernel = NULL, okernel = NULL,
+                                            factor) {
+  if (is.null(icon) || !length(icon) || !any(!icon))
+    return(bws)
+  side <- match.arg(side, c("x", "y"))
+  cat.idx <- which(!icon)
+  if (!length(cat.idx))
+    return(bws)
+  if (is.null(dati))
+    return(bws)
+
+  if (side == "x") {
+    raw.field <- if (!is.null(bws$xbw)) "xbw" else "bw"
+    current <- if (!is.null(bws$bandwidth$x)) bws$bandwidth$x else bws[[raw.field]]
+  } else {
+    raw.field <- if (!is.null(bws$ybw)) "ybw" else "bw"
+    current <- if (!is.null(bws$bandwidth$y)) bws$bandwidth$y else bws[[raw.field]]
+  }
+  if (!is.numeric(current) || length(current) < max(cat.idx))
+    return(bws)
+
+  iuno <- if (!is.null(dati$iuno)) as.logical(dati$iuno) else rep(FALSE, length(icon))
+  iord <- if (!is.null(dati$iord)) as.logical(dati$iord) else rep(FALSE, length(icon))
+  new.values <- current
+  for (j in cat.idx) {
+    kernel <- if (isTRUE(iuno[j])) ukernel else if (isTRUE(iord[j])) okernel else NULL
+    upper <- .np_plot_cat_upper_from_metadata(dati = dati, index = j, kernel = kernel)
+    new.values[j] <- .np_plot_cat_lambda_pilot(current[j], upper, factor)
+  }
+
+  if (!is.null(bws[[raw.field]]) && length(bws[[raw.field]]) >= max(cat.idx))
+    bws[[raw.field]][cat.idx] <- new.values[cat.idx]
+  if (side == "x") {
+    if (!is.null(bws$bandwidth$x) && length(bws$bandwidth$x) >= max(cat.idx))
+      bws$bandwidth$x[cat.idx] <- new.values[cat.idx]
+    if (!is.null(bws$sfactor$x) && length(bws$sfactor$x) >= max(cat.idx) &&
+        !is.null(bws$ncatfac) && is.finite(bws$ncatfac) && bws$ncatfac > 0)
+      bws$sfactor$x[cat.idx] <- new.values[cat.idx] / bws$ncatfac
+  } else {
+    if (!is.null(bws$bandwidth$y) && length(bws$bandwidth$y) >= max(cat.idx))
+      bws$bandwidth$y[cat.idx] <- new.values[cat.idx]
+    if (!is.null(bws$sfactor$y) && length(bws$sfactor$y) >= max(cat.idx) &&
+        !is.null(bws$ncatfac) && is.finite(bws$ncatfac) && bws$ncatfac > 0)
+      bws$sfactor$y[cat.idx] <- new.values[cat.idx] / bws$ncatfac
+  }
+  bws
+}
+
+.np_plot_kernel_perturbation_policy <- function(ckertype, ckerorder = 2L,
+                                                context = "smooth bootstrap perturbation") {
+  raw.type <- as.character(ckertype)[1L]
+  if (is.na(raw.type) || !nzchar(raw.type))
+    stop(sprintf("%s requires a valid continuous kernel type", context), call. = FALSE)
+
+  type <- tolower(gsub("[[:space:]_-]+", "", raw.type))
+  order <- suppressWarnings(as.numeric(ckerorder[1L]))
+  if (!is.finite(order))
+    order <- 2
+
+  if (identical(type, "uniform")) {
+    return(list(family = "uniform", order = 2L))
+  }
+
+  if (identical(type, "gaussian")) {
+    if (!isTRUE(all(as.numeric(ckerorder) == 2))) {
+      stop(sprintf(
+        "%s supports ordinary second-order Gaussian perturbations only; higher-order Gaussian kernels are signed estimation kernels and do not define ordinary smooth-bootstrap random perturbations",
+        context
+      ), call. = FALSE)
+    }
+    return(list(family = "gaussian", order = 2L))
+  }
+
+  if (identical(type, "epanechnikov")) {
+    if (!isTRUE(all(as.numeric(ckerorder) == 2))) {
+      stop(sprintf(
+        "%s supports second-order Epanechnikov perturbations only; higher-order Epanechnikov kernels are signed estimation kernels and do not define ordinary smooth-bootstrap random perturbations",
+        context
+      ), call. = FALSE)
+    }
+    return(list(family = "epanechnikov", order = 2L))
+  }
+
+  stop(sprintf(
+    "%s currently supports Gaussian, uniform, and second-order Epanechnikov perturbations only",
+    context
+  ), call. = FALSE)
+}
+
+.np_plot_rep_kernel_arg <- function(x, n, default = NULL) {
+  if (is.null(x) || !length(x))
+    x <- default
+  if (is.null(x) || !length(x))
+    x <- NA
+  rep(as.vector(x), length.out = n)
+}
+
+.np_plot_repan2 <- function(n) {
+  n <- as.integer(n[1L])
+  if (!is.finite(n) || n < 0L)
+    stop("invalid Epanechnikov perturbation draw count", call. = FALSE)
+  out <- numeric(n)
+  filled <- 0L
+  while (filled < n) {
+    m <- max(8L, ceiling((n - filled) * 1.75))
+    u <- stats::runif(m, -1, 1)
+    keep <- stats::runif(m) <= (1 - u * u)
+    vals <- u[keep]
+    take <- min(length(vals), n - filled)
+    if (take > 0L) {
+      out[filled + seq_len(take)] <- vals[seq_len(take)]
+      filled <- filled + take
+    }
+  }
+  out
+}
+
+.np_plot_kernel_random <- function(n, ckertype, ckerorder = 2L,
+                                   context = "smooth bootstrap perturbation") {
+  policy <- .np_plot_kernel_perturbation_policy(
+    ckertype = ckertype,
+    ckerorder = ckerorder,
+    context = context
+  )
+  out <- switch(policy$family,
+                gaussian = stats::rnorm(n),
+                uniform = stats::runif(n, -1, 1),
+                epanechnikov = .np_plot_repan2(n))
+  if (length(out) != n || anyNA(out) || !all(is.finite(out)))
+    stop(sprintf("%s produced invalid kernel perturbation draws", context), call. = FALSE)
+  out
+}
+
+.np_plot_smooth_resample_frame <- function(dat, idx, icon, g,
+                                           ckertype = "gaussian",
+                                           ckerorder = 2L,
+                                           context = "smooth bootstrap perturbation") {
+  dat <- toFrame(dat)
+  icon <- as.logical(icon)
+  if (length(icon) != ncol(dat))
+    stop("smooth-bootstrap resampling received incompatible variable metadata", call. = FALSE)
+  out <- dat[idx, , drop = FALSE]
+  row.names(out) <- NULL
+  cont.idx <- which(icon)
+  if (length(cont.idx)) {
+    g <- as.numeric(g)
+    if (length(g) != ncol(dat) || anyNA(g[cont.idx]) ||
+        !all(is.finite(g[cont.idx])) || any(g[cont.idx] <= 0)) {
+      stop("invalid smooth-bootstrap pilot bandwidth vector", call. = FALSE)
+    }
+    kernel.types <- .np_plot_rep_kernel_arg(ckertype, ncol(dat), default = "gaussian")
+    kernel.orders <- .np_plot_rep_kernel_arg(ckerorder, ncol(dat), default = 2L)
+    for (k in seq_along(cont.idx)) {
+      j <- cont.idx[k]
+      noise <- .np_plot_kernel_random(
+        n = length(idx),
+        ckertype = kernel.types[j],
+        ckerorder = kernel.orders[j],
+        context = context
+      )
+      out[[j]] <- as.numeric(out[[j]]) + noise * g[j]
+    }
+  }
+  out
+}
+
+.np_plot_require_conditional_gradient_bootstrap_supported <- function(bws,
+                                                                      gradient.index,
+                                                                      where) {
+  .np_plot_validate_conditional_gradient_target(
+    bws = bws,
+    gradient.index = gradient.index,
+    where = where
+  )
+  invisible(TRUE)
+}
+
+.np_plot_oversmooth_regression_bws <- function(bws) {
+  if (!inherits(bws, "rbandwidth"))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for regression bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed regression bandwidths", call. = FALSE)
+  icon <- bws$icon
+  if (is.null(icon) || !length(icon) || !any(icon))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap requires at least one continuous predictor", call. = FALSE)
+
+  bw <- bws$bw
+  if (!is.numeric(bw) || length(bw) != length(icon))
+    stop("invalid regression bandwidth vector for oversmoothed bootstrap center", call. = FALSE)
+
+  pilot <- .np_plot_oversmooth_factor(
+    nobs = bws$nobs,
+    p.continuous = sum(icon),
+    kernel.order = bws$ckerorder,
+    family = "density"
+  )
+
+  out <- bws
+  out$bw[icon] <- out$bw[icon] * pilot$factor
+  out$bandwidth$x <- out$bw
+  if (!is.null(out$sfactor$x) && length(out$sfactor$x) == length(out$bw)) {
+    out$sfactor$x[icon] <- out$sfactor$x[icon] * pilot$factor
+  }
+  out <- .np_plot_apply_cat_lambda_pilot(
+    bws = out,
+    side = "x",
+    icon = icon,
+    dati = out$xdati,
+    ukernel = out$ukertype,
+    okernel = out$okertype,
+    factor = pilot$factor
+  )
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = "regression-full"
+  )
+}
+
+.np_plot_oversmooth_unconditional_bws <- function(bws, cdf = FALSE) {
+  if (!(inherits(bws, "bandwidth") || inherits(bws, "dbandwidth")))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for unconditional density/distribution bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed unconditional density/distribution bandwidths", call. = FALSE)
+
+  icon <- bws$xdati$icon
+  if (is.null(icon))
+    icon <- bws$icon
+  if (is.null(icon) || !length(icon) || !any(icon))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap requires continuous variables for unconditional density/distribution", call. = FALSE)
+  invisible(.np_plot_kernel_perturbation_policy(
+    ckertype = bws$ckertype,
+    ckerorder = bws$ckerorder,
+    context = "center=\"bias-corrected\" with pair/block/geometric bootstrap for unconditional density/distribution plots"
+  ))
+
+  bw <- bws$bw
+  if (!is.numeric(bw) || length(bw) != length(icon))
+    stop("invalid unconditional bandwidth vector for oversmoothed bootstrap center", call. = FALSE)
+
+  pilot <- list(factor = 1, exponent = 0)
+
+  out <- bws
+  out$bw[icon] <- out$bw[icon] * pilot$factor
+  if (!is.null(out$bandwidth$x) && length(out$bandwidth$x) == length(out$bw)) {
+    out$bandwidth$x[icon] <- out$bandwidth$x[icon] * pilot$factor
+  }
+  if (!is.null(out$sfactor$x) && length(out$sfactor$x) == length(out$bw)) {
+    out$sfactor$x[icon] <- out$sfactor$x[icon] * pilot$factor
+  }
+  if (!is.null(out$sumNum$x) && length(out$sumNum$x) == length(out$bw)) {
+    out$sumNum$x[icon] <- out$sumNum$x[icon] * pilot$factor
+  }
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = if (isTRUE(cdf)) "unconditional-distribution-g-equals-h" else "unconditional-density-g-equals-h"
+  )
+}
+
+.np_plot_unconditional_oversmoothed_boot <- function(xdat,
+                                                     exdat,
+                                                     bws,
+                                                     cdf,
+                                                     plot.errors.boot.method,
+                                                     plot.errors.boot.blocklen,
+                                                     plot.errors.boot.num,
+                                                     progress.label) {
+  xdat <- toFrame(xdat)
+  exdat <- toFrame(exdat)
+  B <- as.integer(plot.errors.boot.num)
+  if (B < 1L)
+    stop("B must be a positive integer")
+
+  bws.smooth <- .np_plot_oversmooth_unconditional_bws(bws, cdf = cdf)
+  g <- as.numeric(bws.smooth$bw)
+  icon <- bws$xdati$icon
+  if (is.null(icon))
+    icon <- bws$icon
+  icon <- as.logical(icon)
+  if (length(g) != ncol(xdat) || length(icon) != ncol(xdat) ||
+      anyNA(g[icon]) || !all(is.finite(g[icon])) || any(g[icon] <= 0))
+    stop("invalid smooth-bootstrap pilot bandwidth vector for unconditional plot bias correction", call. = FALSE)
+
+  operator <- if (isTRUE(cdf)) "integral" else "normal"
+  n <- nrow(xdat)
+  neval <- nrow(exdat)
+
+  t0 <- .np_ksum_unconditional_eval_exact(
+    xdat = xdat,
+    exdat = exdat,
+    bws = bws,
+    operator = operator
+  )
+  tmat <- matrix(NA_real_, nrow = B, ncol = neval)
+
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  index.drawer <- if (is.block) {
+    .np_block_indices_drawer(
+      n = n,
+      B = B,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+
+  fit_one <- function(idx) {
+    xstar <- .np_plot_smooth_resample_frame(
+      dat = xdat,
+      idx = idx,
+      icon = icon,
+      g = g,
+      ckertype = bws$ckertype,
+      ckerorder = bws$ckerorder,
+      context = "unconditional density/distribution smooth bootstrap"
+    )
+    .np_ksum_unconditional_eval_exact(
+      xdat = xstar,
+      exdat = exdat,
+      bws = bws,
+      operator = operator
+    )
+  }
+
+  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = is.block)
+  progress <- .np_plot_bootstrap_progress_begin(
+    total = B,
+    label = if (is.null(progress.label)) "Plot bootstrap smooth" else progress.label
+  )
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size, progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    idx.chunk <- if (!is.null(index.drawer)) {
+      index.drawer(start, stopi)
+    } else {
+      matrix(sample.int(n = n, size = n * bsz, replace = TRUE), nrow = n)
+    }
+    for (jj in seq_len(bsz))
+      tmat[start + jj - 1L, ] <- fit_one(idx.chunk[, jj])
+
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
+}
+
+.np_plot_regression_oversmoothed_boot <- function(xdat, ydat,
+                                                  exdat,
+                                                  bws,
+                                                  gradients,
+                                                  gradient.order,
+                                                  slice.index,
+                                                  plot.errors.boot.method,
+                                                  plot.errors.boot.wild,
+                                                  plot.errors.boot.blocklen,
+                                                  plot.errors.boot.num,
+                                                  progress.label,
+                                                  prep.label,
+                                                  profile.setup = NULL) {
+  bws.pilot <- .np_plot_oversmooth_regression_bws(bws)
+  if (.np_plot_is_wild_method(plot.errors.boot.method)) {
+    fit.h.train <- as.vector(suppressWarnings(npreghat(
+      bws = bws,
+      txdat = xdat,
+      exdat = xdat,
+      y = ydat,
+      output = "apply"
+    )))
+    fit.g.train <- as.vector(suppressWarnings(npreghat(
+      bws = bws.pilot,
+      txdat = xdat,
+      exdat = xdat,
+      y = ydat,
+      output = "apply"
+    )))
+
+    cont.idx <- which(bws$xdati$icon)
+    xi.factor <- isTRUE(slice.index > 0L) &&
+      (isTRUE(bws$xdati$iord[slice.index]) || isTRUE(bws$xdati$iuno[slice.index]))
+    s.vec <- NULL
+    if (gradients && !xi.factor) {
+      cpos <- match(slice.index, cont.idx)
+      gorder <- if (length(gradient.order) == 1L) {
+        rep.int(as.integer(gradient.order), length(cont.idx))
+      } else {
+        as.integer(gradient.order)
+      }
+      if (length(gorder) != length(cont.idx))
+        gorder <- rep.int(1L, length(cont.idx))
+      s.vec <- integer(length(cont.idx))
+      s.vec[cpos] <- gorder[cpos]
+    }
+
+    H <- suppressWarnings(npreghat(
+      bws = bws,
+      txdat = xdat,
+      exdat = exdat,
+      s = s.vec,
+      output = "matrix"
+    ))
+    H.pilot <- suppressWarnings(npreghat(
+      bws = bws.pilot,
+      txdat = xdat,
+      exdat = exdat,
+      s = s.vec,
+      output = "matrix"
+    ))
+
+    out <- .np_plot_boot_from_hat_wild_residuals(
+      H = H,
+      ydat = ydat,
+      fit.center = fit.g.train,
+      residuals = as.double(ydat - fit.h.train),
+      B = plot.errors.boot.num,
+      wild = plot.errors.boot.wild,
+      progress.label = progress.label,
+      prefer.local.single_worker = identical(bws$type, "fixed")
+    )
+    center <- as.vector(H.pilot %*% as.double(ydat))
+    if (gradients && xi.factor && ncol(out$t) >= 1L) {
+      out <- .np_plot_factor_contrast_boot(out)
+      center <- .np_plot_factor_contrast_vector(center)
+    }
+    out$center <- center
+    return(out)
+  }
+
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  counts.drawer <- if (is.block) {
+    .np_block_counts_drawer(
+      n = nrow(xdat),
+      B = plot.errors.boot.num,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+
+  profile.setup.pilot <- NULL
+  if (!is.null(profile.setup) && !isTRUE(gradients)) {
+    profile.setup.pilot <- .np_regression_cat_profile_boot_setup(
+      xdat = xdat,
+      exdat = exdat,
+      ydat = ydat,
+      bws = bws.pilot
+    )
+  }
+
+  if (!is.null(profile.setup.pilot)) {
+    .np_inid_boot_from_regression_cat_profile(
+      setup = profile.setup.pilot,
+      B = plot.errors.boot.num,
+      counts.drawer = counts.drawer,
+      progress.label = progress.label
+    )
+  } else {
+    .np_inid_boot_from_regression(
+      xdat = xdat,
+      exdat = exdat,
+      bws = bws.pilot,
+      ydat = ydat,
+      B = plot.errors.boot.num,
+      counts.drawer = counts.drawer,
+      gradients = gradients,
+      gradient.order = gradient.order,
+      slice.index = slice.index,
+      prefer.local.single_worker = identical(bws$type, "fixed"),
+      prep.label = prep.label,
+      progress.label = progress.label
+    )
+  }
+}
+
+.np_plot_oversmooth_conditional_bws <- function(bws, cdf = FALSE) {
+  if (!(inherits(bws, "conbandwidth") || inherits(bws, "condbandwidth")))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for conditional density/distribution bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed conditional density/distribution bandwidths", call. = FALSE)
+
+  xicon <- bws$xdati$icon
+  yicon <- bws$ydati$icon
+  if (is.null(xicon) || is.null(yicon) || !any(yicon))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap requires at least one continuous dependent variable for conditional density/distribution", call. = FALSE)
+
+  cx.policy <- .np_plot_kernel_perturbation_policy(
+    ckertype = bws$cxkertype,
+    ckerorder = bws$cxkerorder,
+    context = "center=\"bias-corrected\" with pair/block/geometric bootstrap for conditional density/distribution x-kernel plots"
+  )
+  cy.policy <- .np_plot_kernel_perturbation_policy(
+    ckertype = bws$cykertype,
+    ckerorder = bws$cykerorder,
+    context = "center=\"bias-corrected\" with pair/block/geometric bootstrap for conditional density/distribution y-kernel plots"
+  )
+  cx.order <- as.numeric(cx.policy$order)
+  cy.order <- as.numeric(cy.policy$order)
+  if (!is.finite(cx.order) || !is.finite(cy.order) || cx.order <= 0 || cy.order <= 0 ||
+      !isTRUE(all.equal(cx.order, cy.order, tolerance = 0))) {
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires matching continuous x/y kernel orders for conditional density/distribution", call. = FALSE)
+  }
+
+  pilot <- .np_plot_oversmooth_factor(
+    nobs = bws$nobs,
+    p.continuous = sum(xicon) + sum(yicon),
+    kernel.order = cx.order,
+    family = if (isTRUE(cdf)) "distribution" else "density"
+  )
+
+  out <- bws
+  out$bandwidth$x[xicon] <- out$bandwidth$x[xicon] * pilot$factor
+  if (!is.null(out$xbw) && length(out$xbw) == length(out$bandwidth$x)) {
+    out$xbw[xicon] <- out$xbw[xicon] * pilot$factor
+  }
+  if (!is.null(out$sfactor$x) && length(out$sfactor$x) == length(out$bandwidth$x)) {
+    out$sfactor$x[xicon] <- out$sfactor$x[xicon] * pilot$factor
+  }
+  out <- .np_plot_apply_cat_lambda_pilot(
+    bws = out,
+    side = "x",
+    icon = xicon,
+    dati = out$xdati,
+    ukernel = out$uxkertype,
+    okernel = out$oxkertype,
+    factor = pilot$factor
+  )
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = if (isTRUE(cdf)) "conditional-distribution-x-full-y-equals-h" else "conditional-density-x-full-y-equals-h"
+  )
+}
+
+.np_plot_conditional_smooth_boot <- function(xdat, ydat,
+                                             exdat, eydat,
+                                             bws,
+                                             cdf,
+                                             plot.errors.boot.method,
+                                             plot.errors.boot.blocklen,
+                                             plot.errors.boot.num,
+                                             progress.label) {
+  xdat <- toFrame(xdat)
+  ydat <- toFrame(ydat)
+  exdat <- toFrame(exdat)
+  eydat <- toFrame(eydat)
+  B <- as.integer(plot.errors.boot.num)
+  n <- nrow(xdat)
+  neval <- nrow(exdat)
+
+  if (nrow(ydat) != n || nrow(eydat) != neval)
+    stop("conditional smooth-bootstrap helper requires aligned x/y training and evaluation rows")
+  if (n < 1L || neval < 1L || B < 1L)
+    stop("invalid conditional smooth-bootstrap dimensions")
+
+  bws.pilot <- .np_plot_oversmooth_conditional_bws(bws, cdf = cdf)
+  gx <- as.numeric(bws.pilot$bandwidth$x)
+  gy <- as.numeric(bws.pilot$bandwidth$y)
+  xicon <- as.logical(bws$xdati$icon)
+  yicon <- as.logical(bws$ydati$icon)
+  if (length(gx) != ncol(xdat) || length(gy) != ncol(ydat) ||
+      length(xicon) != ncol(xdat) || length(yicon) != ncol(ydat) ||
+      anyNA(gx[xicon]) || anyNA(gy[yicon]) ||
+      !all(is.finite(gx[xicon])) || !all(is.finite(gy[yicon])) ||
+      any(gx[xicon] <= 0) || any(gy[yicon] <= 0)) {
+    stop("invalid smooth-bootstrap pilot bandwidth vectors for conditional plot bias correction", call. = FALSE)
+  }
+
+  fit_one <- function(x.train, y.train) {
+    kbx <- .np_con_make_kbandwidth_x(bws = bws, xdat = x.train)
+    kbxy <- .np_con_make_kbandwidth_xy(bws = bws, xdat = x.train, ydat = y.train)
+    .np_ksum_conditional_eval_exact(
+      xdat = x.train,
+      ydat = y.train,
+      exdat = exdat,
+      eydat = eydat,
+      kbx = kbx,
+      kbxy = kbxy,
+      cdf = cdf
+    )
+  }
+
+  t0 <- fit_one(x.train = xdat, y.train = ydat)
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(t0))
+
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  index.drawer <- if (is.block) {
+    .np_block_indices_drawer(
+      n = n,
+      B = B,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+
+  smooth_one <- function(idx) {
+    xstar <- .np_plot_smooth_resample_frame(
+      dat = xdat,
+      idx = idx,
+      icon = xicon,
+      g = gx,
+      ckertype = bws$cxkertype,
+      ckerorder = bws$cxkerorder,
+      context = "conditional density/distribution x-side smooth bootstrap"
+    )
+    ystar <- .np_plot_smooth_resample_frame(
+      dat = ydat,
+      idx = idx,
+      icon = yicon,
+      g = gy,
+      ckertype = bws$cykertype,
+      ckerorder = bws$cykerorder,
+      context = "conditional density/distribution y-side smooth bootstrap"
+    )
+    fit_one(x.train = xstar, y.train = ystar)
+  }
+
+  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = is.block)
+  progress <- .np_plot_bootstrap_progress_begin(
+    total = B,
+    label = if (is.null(progress.label)) "Plot bootstrap smooth" else progress.label
+  )
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size, progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    idx.chunk <- if (!is.null(index.drawer)) {
+      index.drawer(start, stopi)
+    } else {
+      matrix(sample.int(n = n, size = n * bsz, replace = TRUE), nrow = n)
+    }
+    for (jj in seq_len(bsz))
+      tmat[start + jj - 1L, ] <- smooth_one(idx.chunk[, jj])
+
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
+}
+
+.np_plot_conditional_gradient_smooth_boot <- function(xdat, ydat,
+                                                      exdat, eydat,
+                                                      bws,
+                                                      cdf,
+                                                      gradient.index,
+                                                      gradient.order,
+                                                      plot.errors.boot.method,
+                                                      plot.errors.boot.blocklen,
+                                                      plot.errors.boot.num,
+                                                      progress.label) {
+  xdat <- toFrame(xdat)
+  ydat <- toFrame(ydat)
+  exdat <- toFrame(exdat)
+  eydat <- toFrame(eydat)
+  B <- as.integer(plot.errors.boot.num)
+  n <- nrow(xdat)
+  neval <- nrow(exdat)
+  where <- if (isTRUE(cdf)) {
+    "conditional distribution gradient smooth bootstrap"
+  } else {
+    "conditional density gradient smooth bootstrap"
+  }
+
+  if (nrow(ydat) != n || nrow(eydat) != neval)
+    stop("conditional gradient smooth-bootstrap helper requires aligned x/y training and evaluation rows")
+  if (n < 1L || neval < 1L || B < 1L)
+    stop("invalid conditional gradient smooth-bootstrap dimensions")
+
+  gradient.index <- .np_plot_validate_conditional_gradient_target(
+    bws = bws,
+    gradient.index = gradient.index,
+    where = where
+  )
+
+  bws.pilot <- .np_plot_oversmooth_conditional_bws(bws, cdf = cdf)
+  gx <- as.numeric(bws.pilot$bandwidth$x)
+  gy <- as.numeric(bws.pilot$bandwidth$y)
+  xicon <- as.logical(bws$xdati$icon)
+  yicon <- as.logical(bws$ydati$icon)
+  if (length(gx) != ncol(xdat) || length(gy) != ncol(ydat) ||
+      length(xicon) != ncol(xdat) || length(yicon) != ncol(ydat) ||
+      anyNA(gx[xicon]) || anyNA(gy[yicon]) ||
+      !all(is.finite(gx[xicon])) || !all(is.finite(gy[yicon])) ||
+      any(gx[xicon] <= 0) || any(gy[yicon] <= 0)) {
+    stop("invalid smooth-bootstrap pilot bandwidth vectors for conditional gradient plot bias correction",
+         call. = FALSE)
+  }
+
+  fit_one <- function(x.train, y.train) {
+    fit <- .np_plot_conditional_eval(
+      bws = bws,
+      xdat = x.train,
+      ydat = y.train,
+      exdat = exdat,
+      eydat = eydat,
+      cdf = cdf,
+      gradients = TRUE,
+      gradient.order = gradient.order
+    )
+    .np_plot_extract_conditional_gradient(
+      fit = fit,
+      gradient.index = gradient.index,
+      neval = neval,
+      where = where
+    )
+  }
+
+  t0 <- fit_one(x.train = xdat, y.train = ydat)
+  tmat <- matrix(NA_real_, nrow = B, ncol = length(t0))
+
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  index.drawer <- if (is.block) {
+    .np_block_indices_drawer(
+      n = n,
+      B = B,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+
+  smooth_one <- function(idx) {
+    xstar <- .np_plot_smooth_resample_frame(
+      dat = xdat,
+      idx = idx,
+      icon = xicon,
+      g = gx,
+      ckertype = bws$cxkertype,
+      ckerorder = bws$cxkerorder,
+      context = "conditional density/distribution gradient x-side smooth bootstrap"
+    )
+    ystar <- .np_plot_smooth_resample_frame(
+      dat = ydat,
+      idx = idx,
+      icon = yicon,
+      g = gy,
+      ckertype = bws$cykertype,
+      ckerorder = bws$cykerorder,
+      context = "conditional density/distribution gradient y-side smooth bootstrap"
+    )
+    fit_one(x.train = xstar, y.train = ystar)
+  }
+
+  chunk.size <- .np_inid_chunk_size(n = n, B = B, progress_cap = is.block)
+  progress <- .np_plot_bootstrap_progress_begin(
+    total = B,
+    label = if (is.null(progress.label)) "Plot bootstrap gradient smooth" else progress.label
+  )
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size, progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    idx.chunk <- if (!is.null(index.drawer)) {
+      index.drawer(start, stopi)
+    } else {
+      matrix(sample.int(n = n, size = n * bsz, replace = TRUE), nrow = n)
+    }
+    for (jj in seq_len(bsz))
+      tmat[start + jj - 1L, ] <- smooth_one(idx.chunk[, jj])
+
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = tmat, t0 = t0)
+}
+
+.np_plot_conditional_oversmoothed_boot <- function(xdat, ydat,
+                                                   exdat, eydat,
+                                                   bws,
+                                                   cdf,
+                                                   plot.errors.boot.method,
+                                                   plot.errors.boot.blocklen,
+                                                   plot.errors.boot.num,
+                                                   progress.label) {
+  .np_plot_conditional_smooth_boot(
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    eydat = eydat,
+    bws = bws,
+    cdf = cdf,
+    plot.errors.boot.method = plot.errors.boot.method,
+    plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+    plot.errors.boot.num = plot.errors.boot.num,
+    progress.label = progress.label
+  )
+}
+
+.np_plot_quantile_level_oversmoothed_boot <- function(xdat, ydat,
+                                                      exdat,
+                                                      bws,
+                                                      tau,
+                                                      plot.errors.boot.method,
+                                                      plot.errors.boot.blocklen,
+                                                      plot.errors.boot.num,
+                                                      progress.label) {
+  bws.pilot <- .np_plot_oversmooth_conditional_bws(bws, cdf = TRUE)
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  counts.drawer <- if (is.block) {
+    .np_block_counts_drawer(
+      n = nrow(xdat),
+      B = plot.errors.boot.num,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+  .npRmpi_inid_boot_from_quantile_level(
+    xdat = xdat,
+    ydat = ydat[[1L]],
+    exdat = exdat,
+    bws = bws.pilot,
+    B = plot.errors.boot.num,
+    tau = tau,
+    counts.drawer = counts.drawer,
+    progress.label = progress.label
+  )
+}
+
+.np_plot_conditional_gradient_oversmoothed_boot <- function(xdat, ydat,
+                                                            exdat, eydat,
+                                                            bws,
+                                                            cdf,
+                                                            gradient.index,
+                                                            gradient.order,
+                                                            plot.errors.boot.method,
+                                                            plot.errors.boot.blocklen,
+                                                            plot.errors.boot.num,
+                                                            progress.label) {
+  .np_plot_conditional_gradient_smooth_boot(
+    xdat = xdat,
+    ydat = ydat,
+    exdat = exdat,
+    eydat = eydat,
+    bws = bws,
+    cdf = cdf,
+    gradient.index = gradient.index,
+    gradient.order = gradient.order,
+    plot.errors.boot.method = plot.errors.boot.method,
+    plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+    plot.errors.boot.num = plot.errors.boot.num,
+    progress.label = progress.label
+  )
+}
+
+.np_plot_refresh_plbandwidth_summaries <- function(bws) {
+  bws$sfactor <- lapply(seq_along(bws$bw), function(i) unlist(bws$bw[[i]]$sfactor))
+  bws$bandwidth <- lapply(seq_along(bws$bw), function(i) unlist(bws$bw[[i]]$bandwidth))
+  bws$sumNum <- lapply(seq_along(bws$bw), function(i) unlist(bws$bw[[i]]$sumNum))
+  names(bws$sfactor) <- names(bws$bandwidth) <- names(bws$sumNum) <- rep("z", length(bws$bw))
+  bws
+}
+
+.np_plot_oversmooth_scbandwidth_bws <- function(bws) {
+  if (!inherits(bws, "scbandwidth"))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for smooth coefficient bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed smooth coefficient bandwidths", call. = FALSE)
+  icon <- bws$icon
+  if (is.null(icon) || !length(icon) || !any(icon))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap requires at least one continuous smoothing variable for smooth coefficient plots", call. = FALSE)
+  if (!is.numeric(bws$bw) || length(bws$bw) != length(icon))
+    stop("invalid smooth coefficient bandwidth vector for oversmoothed bootstrap center", call. = FALSE)
+
+  pilot <- .np_plot_oversmooth_factor(
+    nobs = bws$nobs,
+    p.continuous = sum(icon),
+    kernel.order = bws$ckerorder,
+    family = "density-sqrt"
+  )
+
+  out <- bws
+  out$bw[icon] <- out$bw[icon] * pilot$factor
+  bw.name <- names(out$bandwidth)[1L]
+  if (is.null(bw.name) || !nzchar(bw.name))
+    bw.name <- "x"
+  out$bandwidth[[bw.name]] <- out$bw
+  if (!is.null(out$sfactor[[bw.name]]) && length(out$sfactor[[bw.name]]) == length(out$bw))
+    out$sfactor[[bw.name]][icon] <- out$sfactor[[bw.name]][icon] * pilot$factor
+  if (!is.null(out$sumNum[[bw.name]]) && length(out$sumNum[[bw.name]]) == length(out$bw))
+    out$sumNum[[bw.name]][icon] <- out$sumNum[[bw.name]][icon] * pilot$factor
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = "smooth-coefficient-square-root"
+  )
+}
+
+.np_plot_oversmooth_plbandwidth_bws <- function(bws) {
+  if (!inherits(bws, "plbandwidth"))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for partially linear bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed partially linear bandwidths", call. = FALSE)
+  icon <- bws$zdati$icon
+  if (is.null(icon) || !length(icon) || !any(icon))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap requires at least one continuous nonparametric smoothing variable for partially linear plots", call. = FALSE)
+  if (!is.list(bws$bw) || !length(bws$bw))
+    stop("invalid partially linear bandwidth object for oversmoothed bootstrap center", call. = FALSE)
+
+  pilot <- .np_plot_oversmooth_factor(
+    nobs = bws$nobs,
+    p.continuous = sum(icon),
+    kernel.order = bws$ckerorder,
+    family = "density-sqrt"
+  )
+
+  out <- bws
+  for (ii in seq_along(out$bw)) {
+    child <- out$bw[[ii]]
+    if (!inherits(child, "rbandwidth") || is.null(child$xdati$icon) ||
+        length(child$xdati$icon) != length(icon) || !identical(as.logical(child$xdati$icon), as.logical(icon))) {
+      stop("partially linear child bandwidths are not coherent for oversmoothed bootstrap center", call. = FALSE)
+    }
+    if (!is.numeric(child$bw) || length(child$bw) != length(icon))
+      stop("invalid partially linear child bandwidth vector for oversmoothed bootstrap center", call. = FALSE)
+    child$bw[icon] <- child$bw[icon] * pilot$factor
+    child$bandwidth$x <- child$bw
+    if (!is.null(child$sfactor$x) && length(child$sfactor$x) == length(child$bw))
+      child$sfactor$x[icon] <- child$sfactor$x[icon] * pilot$factor
+    if (!is.null(child$sumNum$x) && length(child$sumNum$x) == length(child$bw))
+      child$sumNum$x[icon] <- child$sumNum$x[icon] * pilot$factor
+    out$bw[[ii]] <- child
+  }
+  out <- .np_plot_refresh_plbandwidth_summaries(out)
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = "partially-linear-square-root"
+  )
+}
+
+.np_plot_scoef_oversmoothed_boot <- function(xdat, ydat, zdat,
+                                             exdat, ezdat,
+                                             bws,
+                                             miss.z,
+                                             plot.errors.boot.method,
+                                             plot.errors.boot.blocklen,
+                                             plot.errors.boot.num,
+                                             progress.label,
+                                             helper.mode,
+                                             target = c("mean", "grad"),
+                                             gradient.index = 1L) {
+  target <- match.arg(target)
+  bws.pilot <- .np_plot_oversmooth_scbandwidth_bws(bws)
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  counts.drawer <- if (is.block) {
+    .np_block_counts_drawer(
+      n = nrow(xdat),
+      B = plot.errors.boot.num,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+  .np_inid_boot_from_scoef(
+    txdat = xdat,
+    ydat = ydat,
+    tzdat = if (miss.z) NULL else zdat,
+    exdat = exdat,
+    ezdat = if (miss.z) NULL else ezdat,
+    bws = bws.pilot,
+    B = plot.errors.boot.num,
+    counts.drawer = counts.drawer,
+    leave.one.out = FALSE,
+    progress.label = progress.label,
+    mode = helper.mode,
+    target = target,
+    gradient.index = gradient.index
+  )
+}
+
+.np_plot_plreg_oversmoothed_boot <- function(xdat, ydat, zdat,
+                                             exdat, ezdat,
+                                             bws,
+                                             plot.errors.boot.method,
+                                             plot.errors.boot.blocklen,
+                                             plot.errors.boot.num,
+                                             progress.label,
+                                             helper.mode) {
+  bws.pilot <- .np_plot_oversmooth_plbandwidth_bws(bws)
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  counts.drawer <- if (is.block) {
+    .np_block_counts_drawer(
+      n = nrow(xdat),
+      B = plot.errors.boot.num,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+  .np_inid_boot_from_plreg(
+    txdat = xdat,
+    ydat = ydat,
+    tzdat = zdat,
+    exdat = exdat,
+    ezdat = ezdat,
+    bws = bws.pilot,
+    B = plot.errors.boot.num,
+    counts.drawer = counts.drawer,
+    prefer.local.single_worker = identical(bws$type, "fixed"),
+    progress.label = progress.label,
+    mode = helper.mode
+  )
+}
+
+.np_plot_oversmooth_sibandwidth_bws <- function(bws) {
+  if (!inherits(bws, "sibandwidth"))
+    stop("oversmoothed pair/block/geometric bootstrap center is currently implemented only for single-index bandwidth objects", call. = FALSE)
+  if (!identical(bws$type, "fixed"))
+    stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed single-index bandwidths", call. = FALSE)
+  if (!is.numeric(bws$bw) || length(bws$bw) != 1L || !is.finite(bws$bw))
+    stop("invalid single-index bandwidth for oversmoothed bootstrap center", call. = FALSE)
+  if (is.null(bws$beta) || !is.numeric(bws$beta) || !length(bws$beta) ||
+      any(!is.finite(bws$beta)))
+    stop("invalid single-index beta vector for oversmoothed bootstrap center", call. = FALSE)
+
+  pilot <- .np_plot_oversmooth_factor(
+    nobs = bws$nobs,
+    p.continuous = 1L,
+    kernel.order = bws$ckerorder,
+    family = "density-sqrt"
+  )
+
+  out <- bws
+  beta.original <- out$beta
+  out$bw <- out$bw * pilot$factor
+  out$bandwidth$index <- out$bw
+  if (!is.null(out$sfactor$index) &&
+      length(out$sfactor$index) == 1L &&
+      is.finite(out$sfactor$index)) {
+    out$sfactor$index <- out$sfactor$index * pilot$factor
+  }
+  if (!is.null(out$sumNum$index) &&
+      length(out$sumNum$index) == 1L &&
+      is.finite(out$sumNum$index)) {
+    out$sumNum$index <- out$sumNum$index * pilot$factor
+  }
+  if (!identical(out$beta, beta.original))
+    stop("single-index oversmoothed pilot changed beta", call. = FALSE)
+
+  .np_plot_mark_oversmoothed_bws(
+    bws = out,
+    factor = pilot$factor,
+    exponent = pilot$exponent,
+    family = "single-index-square-root"
+  )
+}
+
+.np_plot_singleindex_oversmoothed_boot <- function(xdat, ydat,
+                                                   bws,
+                                                   idx.eval,
+                                                   gradients = FALSE,
+                                                   plot.errors.boot.method,
+                                                   plot.errors.boot.blocklen,
+                                                   plot.errors.boot.num,
+                                                   progress.label) {
+  bws.pilot <- .np_plot_oversmooth_sibandwidth_bws(bws)
+  is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+  counts.drawer <- if (is.block) {
+    .np_block_counts_drawer(
+      n = nrow(xdat),
+      B = plot.errors.boot.num,
+      blocklen = plot.errors.boot.blocklen,
+      sim = plot.errors.boot.method
+    )
+  } else {
+    NULL
+  }
+  .np_inid_boot_from_index(
+    xdat = xdat,
+    ydat = ydat,
+    bws = bws.pilot,
+    B = plot.errors.boot.num,
+    counts.drawer = counts.drawer,
+    gradients = gradients,
+    frozen = FALSE,
+    idx.eval = idx.eval,
+    progress.label = progress.label
+  )
+}
+
+.np_plot_reject_oversmoothed_center <- function(center, where,
+                                               plot.errors.boot.method = NULL) {
+  if (identical(center, "bias-corrected") &&
+      (is.null(plot.errors.boot.method) ||
+       is.element(plot.errors.boot.method, c("inid", "fixed", "geom")))) {
+    stop(sprintf("center=\"bias-corrected\" with pair/block/geometric bootstrap is not yet implemented for %s",
+                 where),
+         call. = FALSE)
+  }
+}
+
+.np_plot_reject_quantile_bias_center <- function(center, plot.errors.boot.method = NULL) {
+  if (!identical(center, "bias-corrected"))
+    return(invisible(FALSE))
+  method <- if (!is.null(plot.errors.boot.method) &&
+                length(plot.errors.boot.method) == 1L &&
+                !is.na(plot.errors.boot.method)) {
+    sprintf(" with bootstrap=\"%s\"", plot.errors.boot.method)
+  } else {
+    ""
+  }
+  stop(sprintf("center=\"bias-corrected\"%s is not supported for conditional quantile (npqreg) bootstrap plots; use center=\"estimate\"",
+               method),
+       call. = FALSE)
+}
+
+.np_plot_bootstrap_center <- function(center, t0, boot.t, oversmooth.boot = NULL) {
+  if (identical(center, "estimate"))
+    return(t0)
+  if (identical(center, "bias-corrected") && !is.null(oversmooth.boot)) {
+    if (is.null(oversmooth.boot$t))
+      stop("oversmoothed bootstrap center was requested but no oversmoothed bootstrap matrix is available", call. = FALSE)
+    reference <- oversmooth.boot$center
+    if (is.null(reference))
+      reference <- t0
+    return(t0 - (colMeans(oversmooth.boot$t) - reference))
+  }
+  if (identical(center, "bias-corrected"))
+    return(2 * t0 - colMeans(boot.t))
+  stop("unknown bootstrap center", call. = FALSE)
 }
 
 
@@ -14205,6 +16487,7 @@ compute.bootstrap.errors.rbandwidth =
       neval = .np_nrows_safe(exdat)
     )
     boot.out <- NULL
+    oversmooth.boot <- NULL
 
     boot.err = matrix(data = NA, nrow = dim(exdat)[1], ncol = 3)
     boot.all.err <- NULL
@@ -14220,6 +16503,7 @@ compute.bootstrap.errors.rbandwidth =
     if (is.wild.hat && gradients && !xi.factor && is.na(match(slice.index, cont.idx))) {
       stop("bootstrap=\"wild\" supports gradients only for continuous or categorical slices in npRmpi; no serial fallback is permitted", call. = FALSE)
     }
+    regtype <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
 
     profile.setup <- NULL
     if (!isTRUE(gradients)) {
@@ -14353,6 +16637,49 @@ compute.bootstrap.errors.rbandwidth =
         )
       )
 
+      use.exact.degree0.derivative <- isTRUE(gradients) &&
+        !isTRUE(xi.factor) &&
+        .np_plot_regression_exact_lc_derivative_requested(
+          bws = bws,
+          regtype = regtype,
+          gradient.order = gradient.order
+        )
+
+      if (isTRUE(use.exact.degree0.derivative)) {
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.exact.start",
+          fields = list(
+            slice = slice.index,
+            n = length(ydat),
+            B = plot.errors.boot.num
+          )
+        )
+        boot.out <- .np_wild_boot_from_regression_exact(
+          xdat = xdat,
+          exdat = exdat,
+          bws = bws,
+          ydat = ydat,
+          B = plot.errors.boot.num,
+          wild = plot.errors.boot.wild,
+          fit.mean.train = fit.mean.train,
+          gradients = TRUE,
+          gradient.order = gradient.order,
+          slice.index = slice.index,
+          progress.label = progress.label,
+          prefer.local.single_worker = identical(bws$type, "fixed"),
+          master_local_chunk = TRUE
+        )
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.exact.done",
+          fields = list(
+            slice = slice.index,
+            t_rows = nrow(boot.out$t),
+            t_cols = ncol(boot.out$t)
+          )
+        )
+      } else {
       s.vec <- NULL
       if (gradients && !xi.factor) {
         cpos <- match(slice.index, cont.idx)
@@ -14366,43 +16693,10 @@ compute.bootstrap.errors.rbandwidth =
         s.vec <- integer(length(cont.idx))
         s.vec[cpos] <- gorder[cpos]
       }
-      .npRmpi_bootstrap_transport_trace(
-        what = "rbandwidth.wild",
-        event = "wild.hat.start",
-        fields = list(
-          slice = slice.index,
-          gradients = gradients
-        )
-      )
-
-      H <- if (identical(bws$type, "adaptive_nn")) {
-        suppressWarnings(npreghat.rbandwidth(
-          bws = bws,
-          txdat = xdat,
-          exdat = exdat,
-          s = s.vec,
-          output = "matrix"
-        ))
-      } else {
-        .npRmpi_with_local_regression(suppressWarnings(npreghat.rbandwidth(
-          bws = bws,
-          txdat = xdat,
-          exdat = exdat,
-          s = s.vec,
-          output = "matrix"
-        )))
-      }
-      .npRmpi_bootstrap_transport_trace(
-        what = "rbandwidth.wild",
-        event = "wild.hat.done",
-        fields = list(
-          slice = slice.index,
-          h_rows = nrow(H),
-          h_cols = ncol(H)
-        )
-      )
-
       B <- plot.errors.boot.num
+      use.blocks <- .np_plot_wild_apply_operator_enabled(ntrain = nrow(xdat),
+                                                         neval = nrow(exdat),
+                                                         bwtype = bws$type)
       .npRmpi_bootstrap_transport_trace(
         what = "rbandwidth.wild",
         event = "wild.boot.start",
@@ -14414,26 +16708,107 @@ compute.bootstrap.errors.rbandwidth =
         )
       )
 
-      boot.out <- if (gradients && xi.factor) {
-        .np_plot_boot_from_hat_wild_factor_effects(
-          H = H,
+      if (use.blocks) {
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.hat.blocks.start",
+          fields = list(
+            slice = slice.index,
+            gradients = gradients,
+            n_eval = nrow(exdat)
+          )
+        )
+        hat.block.fun <- function(start, stopi) {
+          .npRmpi_with_local_regression(suppressWarnings(npreghat.rbandwidth(
+            bws = bws,
+            txdat = xdat,
+            exdat = exdat[start:stopi, , drop = FALSE],
+            s = s.vec,
+            output = "matrix"
+          )))
+        }
+
+        boot.out <- .np_plot_boot_from_hat_blocks_wild(
+          hat.block.fun = hat.block.fun,
+          neval = nrow(exdat),
+          ntrain = nrow(xdat),
           ydat = ydat,
           fit.mean = fit.mean.train,
           B = B,
           wild = plot.errors.boot.wild,
-          progress.label = progress.label,
-          prefer.local.single_worker = identical(bws$type, "fixed")
+          progress.label = progress.label
+        )
+        if (gradients && xi.factor && ncol(boot.out$t) >= 1L) {
+          boot.out <- .np_plot_factor_contrast_boot(boot.out)
+        }
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.hat.blocks.done",
+          fields = list(
+            slice = slice.index,
+            t_rows = nrow(boot.out$t),
+            t_cols = ncol(boot.out$t)
+          )
         )
       } else {
-        .np_plot_boot_from_hat_wild(
-          H = H,
-          ydat = ydat,
-          fit.mean = fit.mean.train,
-          B = B,
-          wild = plot.errors.boot.wild,
-          progress.label = progress.label,
-          prefer.local.single_worker = identical(bws$type, "fixed")
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.hat.start",
+          fields = list(
+            slice = slice.index,
+            gradients = gradients
+          )
         )
+
+        H <- if (identical(bws$type, "adaptive_nn")) {
+          suppressWarnings(npreghat.rbandwidth(
+            bws = bws,
+            txdat = xdat,
+            exdat = exdat,
+            s = s.vec,
+            output = "matrix"
+          ))
+        } else {
+          .npRmpi_with_local_regression(suppressWarnings(npreghat.rbandwidth(
+            bws = bws,
+            txdat = xdat,
+            exdat = exdat,
+            s = s.vec,
+            output = "matrix"
+          )))
+        }
+        .npRmpi_bootstrap_transport_trace(
+          what = "rbandwidth.wild",
+          event = "wild.hat.done",
+          fields = list(
+            slice = slice.index,
+            h_rows = nrow(H),
+            h_cols = ncol(H)
+          )
+        )
+
+        boot.out <- if (gradients && xi.factor) {
+          .np_plot_boot_from_hat_wild_factor_effects(
+            H = H,
+            ydat = ydat,
+            fit.mean = fit.mean.train,
+            B = B,
+            wild = plot.errors.boot.wild,
+            progress.label = progress.label,
+            prefer.local.single_worker = identical(bws$type, "fixed")
+          )
+        } else {
+          .np_plot_boot_from_hat_wild(
+            H = H,
+            ydat = ydat,
+            fit.mean = fit.mean.train,
+            B = B,
+            wild = plot.errors.boot.wild,
+            progress.label = progress.label,
+            prefer.local.single_worker = identical(bws$type, "fixed")
+          )
+        }
+      }
       }
       .npRmpi_bootstrap_transport_trace(
         what = "rbandwidth.wild",
@@ -14449,6 +16824,41 @@ compute.bootstrap.errors.rbandwidth =
 
     if (is.null(boot.out))
       stop("no MPI helper path available for this regression bootstrap configuration in npRmpi; no serial fallback is permitted", call. = FALSE)
+
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- tryCatch(
+        .np_plot_regression_oversmoothed_boot(
+          xdat = xdat,
+          ydat = ydat,
+          exdat = exdat,
+          bws = bws,
+          gradients = gradients,
+          gradient.order = gradient.order,
+          slice.index = slice.index,
+          plot.errors.boot.method = plot.errors.boot.method,
+          plot.errors.boot.wild = plot.errors.boot.wild,
+          plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+          plot.errors.boot.num = plot.errors.boot.num,
+          progress.label = .np_plot_bootstrap_stage_label(
+            stage = "Oversmoothed bias bootstrap",
+            target_label = progress.target
+          ),
+          prep.label = prep.label,
+          profile.setup = profile.setup
+        ),
+        error = function(e) {
+          stop(sprintf("oversmoothed regression bootstrap center failed (%s)",
+                       conditionMessage(e)),
+               call. = FALSE)
+        }
+      )
+    }
+
+    if (gradients && xi.factor) {
+      boot.out <- .np_plot_factor_contrast_boot(boot.out)
+      if (!is.null(oversmooth.boot))
+        oversmooth.boot <- .np_plot_factor_contrast_boot(oversmooth.boot)
+    }
 
     all.bp <- list()
 
@@ -14487,18 +16897,27 @@ compute.bootstrap.errors.rbandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
         band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
         progress.label = interval.label
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -14511,6 +16930,7 @@ compute.bootstrap.errors.scbandwidth =
   function(xdat, ydat, zdat,
            exdat, ezdat,
            gradients,
+           gradient.index = 1L,
            slice.index,
            progress.target = NULL,
            plot.errors.boot.method,
@@ -14555,20 +16975,31 @@ compute.bootstrap.errors.scbandwidth =
     miss.z <- missing(zdat)
     boot.err = matrix(data = NA, nrow = dim(exdat)[1], ncol = 3)
     boot.all.err <- NULL
+    oversmooth.boot <- NULL
 
     is.wild.hat <- .np_plot_is_wild_method(plot.errors.boot.method)
     is.inid <- plot.errors.boot.method == "inid"
     is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
+    target <- if (isTRUE(gradients)) "grad" else "mean"
+    gradient.index <- as.integer(gradient.index)[1L]
+    if (identical(target, "grad") &&
+        (!is.finite(gradient.index) || is.na(gradient.index) || gradient.index < 1L))
+      stop("invalid smooth coefficient gradient index", call. = FALSE)
     use.frozen.nonfixed <- identical(plot.errors.boot.nonfixed, "frozen") &&
       !identical(bws$type, "fixed")
     helper.mode <- if (isTRUE(use.frozen.nonfixed)) "frozen" else "exact"
     boot.out <- NULL
 
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      if (isTRUE(is.wild.hat))
+        .np_plot_reject_oversmoothed_center(plot.errors.center, "smooth coefficient wild bootstrap plots")
+      if (!identical(bws$type, "fixed"))
+        stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed smooth coefficient bandwidths", call. = FALSE)
+    }
+
     if (is.inid) {
       if (!isTRUE(.np_plot_inid_fastpath_enabled()))
         stop("inid bootstrap requires fastpath-enabled helper for smooth coefficient plots", call. = FALSE)
-      if (isTRUE(gradients))
-        stop("inid bootstrap for smooth coefficient gradients is not supported in helper mode", call. = FALSE)
       boot.out <- .npRmpi_with_local_bootstrap({
         tryCatch(
           .np_inid_boot_from_scoef(
@@ -14581,7 +17012,9 @@ compute.bootstrap.errors.scbandwidth =
             B = plot.errors.boot.num,
             leave.one.out = FALSE,
             progress.label = progress.label,
-            mode = helper.mode
+            mode = helper.mode,
+            target = target,
+            gradient.index = gradient.index
           ),
           error = function(e) {
             stop(sprintf("inid smooth coefficient helper failed in compute.bootstrap.errors.scbandwidth (%s)",
@@ -14594,8 +17027,6 @@ compute.bootstrap.errors.scbandwidth =
     if (is.null(boot.out) && is.block) {
       if (!isTRUE(.np_plot_block_fastpath_enabled()))
         stop("fixed/geom bootstrap requires fastpath-enabled helper for smooth coefficient plots", call. = FALSE)
-      if (isTRUE(gradients))
-        stop("fixed/geom bootstrap for smooth coefficient gradients is not supported in helper mode", call. = FALSE)
       counts.drawer <- .np_block_counts_drawer(
         n = nrow(xdat),
         B = plot.errors.boot.num,
@@ -14615,7 +17046,9 @@ compute.bootstrap.errors.scbandwidth =
             counts.drawer = counts.drawer,
             leave.one.out = FALSE,
             progress.label = progress.label,
-            mode = helper.mode
+            mode = helper.mode,
+            target = target,
+            gradient.index = gradient.index
           ),
           error = function(e) {
             stop(sprintf("%s smooth coefficient helper failed in compute.bootstrap.errors.scbandwidth (%s)",
@@ -14632,47 +17065,66 @@ compute.bootstrap.errors.scbandwidth =
         plot.errors.boot.wild <- plot.errors.boot.wild[1L]
       plot.errors.boot.wild <- match.arg(plot.errors.boot.wild, c("mammen", "rademacher"))
 
-      hat.eval.args <- list(
-        bws = bws,
-        txdat = xdat,
-        exdat = exdat,
-        output = "matrix",
-        iterate = FALSE
-      )
-      hat.train.args <- list(
-        bws = bws,
-        txdat = xdat,
-        exdat = xdat,
-        y = ydat,
-        output = "apply",
-        iterate = FALSE
-      )
-      if (!miss.z) {
-        hat.eval.args$tzdat <- zdat
-        hat.eval.args$ezdat <- ezdat
-        hat.train.args$tzdat <- zdat
-        hat.train.args$ezdat <- zdat
-      }
-
-      fit.mean <- as.vector(do.call(npscoefhat, hat.train.args))
-      H <- do.call(npscoefhat, hat.eval.args)
-      t0 <- as.vector(H %*% as.double(ydat))
-      eps <- as.double(ydat - fit.mean)
-      B <- plot.errors.boot.num
-
-      boot.out <- .npRmpi_with_local_bootstrap({
-        list(
-          t = .np_wild_boot_t(
-            H = H,
-            fit.mean = fit.mean,
-            residuals = eps,
-            B = B,
+      if (identical(target, "grad")) {
+        boot.out <- .npRmpi_with_local_bootstrap({
+          .np_wild_boot_from_scoef_exact(
+            txdat = xdat,
+            ydat = ydat,
+            tzdat = if (miss.z) NULL else zdat,
+            exdat = exdat,
+            ezdat = if (miss.z) NULL else ezdat,
+            bws = bws,
+            B = plot.errors.boot.num,
             wild = plot.errors.boot.wild,
-            progress.label = progress.label
-          ),
-          t0 = t0
+            leave.one.out = FALSE,
+            progress.label = progress.label,
+            target = target,
+            gradient.index = gradient.index
+          )
+        })
+      } else {
+        hat.eval.args <- list(
+          bws = bws,
+          txdat = xdat,
+          exdat = exdat,
+          output = "matrix",
+          iterate = FALSE
         )
-      })
+        hat.train.args <- list(
+          bws = bws,
+          txdat = xdat,
+          exdat = xdat,
+          y = ydat,
+          output = "apply",
+          iterate = FALSE
+        )
+        if (!miss.z) {
+          hat.eval.args$tzdat <- zdat
+          hat.eval.args$ezdat <- ezdat
+          hat.train.args$tzdat <- zdat
+          hat.train.args$ezdat <- zdat
+        }
+
+        fit.mean <- as.vector(do.call(npscoefhat, hat.train.args))
+        H <- do.call(npscoefhat, hat.eval.args)
+        t0 <- as.vector(H %*% as.double(ydat))
+        eps <- as.double(ydat - fit.mean)
+        B <- plot.errors.boot.num
+
+        boot.out <- .npRmpi_with_local_bootstrap({
+          list(
+            t = .np_wild_boot_t(
+              H = H,
+              fit.mean = fit.mean,
+              residuals = eps,
+              B = B,
+              wild = plot.errors.boot.wild,
+              progress.label = progress.label
+            ),
+            t0 = t0
+          )
+        })
+      }
     }
 
     if (is.null(boot.out))
@@ -14684,6 +17136,37 @@ compute.bootstrap.errors.scbandwidth =
         stop("invalid smooth coefficient bootstrap t0 override", call. = FALSE)
       }
       boot.out$t0 <- t0.override
+    }
+
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- .npRmpi_with_local_bootstrap({
+        tryCatch(
+          .np_plot_scoef_oversmoothed_boot(
+            xdat = xdat,
+            ydat = ydat,
+            zdat = if (miss.z) NULL else zdat,
+            exdat = exdat,
+            ezdat = if (miss.z) NULL else ezdat,
+            bws = bws,
+            miss.z = miss.z,
+            plot.errors.boot.method = plot.errors.boot.method,
+            plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+            plot.errors.boot.num = plot.errors.boot.num,
+            progress.label = .np_plot_bootstrap_stage_label(
+              stage = "Oversmoothed bias bootstrap",
+              target_label = progress.target
+            ),
+            helper.mode = helper.mode,
+            target = target,
+            gradient.index = gradient.index
+          ),
+          error = function(e) {
+            stop(sprintf("oversmoothed smooth coefficient bootstrap center failed (%s)",
+                         conditionMessage(e)),
+                 call. = FALSE)
+          }
+        )
+      })
     }
 
     all.bp <- list()
@@ -14732,18 +17215,27 @@ compute.bootstrap.errors.scbandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
         band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
         progress.label = interval.label
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -14799,6 +17291,7 @@ compute.bootstrap.errors.plbandwidth =
     )
     boot.err = matrix(data = NA, nrow = dim(exdat)[1], ncol = 3)
     boot.all.err <- NULL
+    oversmooth.boot <- NULL
 
     is.wild.hat <- .np_plot_is_wild_method(plot.errors.boot.method)
     is.inid <- plot.errors.boot.method == "inid"
@@ -14806,6 +17299,15 @@ compute.bootstrap.errors.plbandwidth =
     use.frozen.nonfixed <- identical(plot.errors.boot.nonfixed, "frozen") &&
       !identical(bws$type, "fixed")
     helper.mode <- if (isTRUE(use.frozen.nonfixed)) "frozen" else "exact"
+
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      if (isTRUE(is.wild.hat))
+        .np_plot_reject_oversmoothed_center(plot.errors.center, "partial linear wild bootstrap plots")
+      if (isTRUE(gradients))
+        .np_plot_reject_oversmoothed_center(plot.errors.center, "partial linear gradient plots")
+      if (!identical(bws$type, "fixed"))
+        stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed partially linear bandwidths", call. = FALSE)
+    }
 
     if (is.wild.hat) {
       if (length(plot.errors.boot.wild) > 1L)
@@ -14916,6 +17418,32 @@ compute.bootstrap.errors.plbandwidth =
       boot.out$t0 <- t0.override
     }
 
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- tryCatch(
+        .np_plot_plreg_oversmoothed_boot(
+          xdat = xdat,
+          ydat = ydat,
+          zdat = zdat,
+          exdat = exdat,
+          ezdat = ezdat,
+          bws = bws,
+          plot.errors.boot.method = plot.errors.boot.method,
+          plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+          plot.errors.boot.num = plot.errors.boot.num,
+          progress.label = .np_plot_bootstrap_stage_label(
+            stage = "Oversmoothed bias bootstrap",
+            target_label = progress.target
+          ),
+          helper.mode = helper.mode
+        ),
+        error = function(e) {
+          stop(sprintf("oversmoothed partially linear bootstrap center failed (%s)",
+                       conditionMessage(e)),
+               call. = FALSE)
+        }
+      )
+    }
+
     all.bp <- list()
 
     if (slice.index <= bws$xndim){
@@ -14961,18 +17489,27 @@ compute.bootstrap.errors.plbandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
         band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
         progress.label = interval.label
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -15010,6 +17547,7 @@ compute.bootstrap.errors.bandwidth =
     .np_plot_reject_wild_unsupervised(plot.errors.boot.method, "unconditional density/distribution estimators")
     boot.err = matrix(data = NA, nrow = dim(exdat)[1], ncol = 3)
     boot.all.err <- NULL
+    oversmooth.boot <- NULL
 
     is.inid = plot.errors.boot.method=="inid"
     is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
@@ -15075,6 +17613,28 @@ compute.bootstrap.errors.bandwidth =
     if (is.null(boot.out))
       stop("no MPI helper path available for this unconditional bootstrap configuration in npRmpi; no serial fallback is permitted", call. = FALSE)
 
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- .npRmpi_with_local_bootstrap({
+        tryCatch(
+          .np_plot_unconditional_oversmoothed_boot(
+            xdat = xdat,
+            exdat = exdat,
+            bws = bws,
+            cdf = FALSE,
+            plot.errors.boot.method = plot.errors.boot.method,
+            plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+            plot.errors.boot.num = plot.errors.boot.num,
+            progress.label = "Oversmoothed bias bootstrap"
+          ),
+          error = function(e) {
+            stop(sprintf("oversmoothed unconditional density bootstrap center failed (%s)",
+                         conditionMessage(e)),
+                 call. = FALSE)
+          }
+        )
+      })
+    }
+
     all.bp <- list()
 
     if (slice.index > 0 && (bws$xdati$iord[slice.index] || bws$xdati$iuno[slice.index])){
@@ -15112,17 +17672,27 @@ compute.bootstrap.errors.bandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
-        band.type = plot.errors.type
+        band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
+        progress.label = NULL
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -15159,6 +17729,7 @@ compute.bootstrap.errors.dbandwidth =
     .np_plot_reject_wild_unsupervised(plot.errors.boot.method, "unconditional density/distribution estimators")
     boot.err = matrix(data = NA, nrow = dim(exdat)[1], ncol = 3)
     boot.all.err <- NULL
+    oversmooth.boot <- NULL
 
     is.inid = plot.errors.boot.method=="inid"
     is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
@@ -15218,6 +17789,28 @@ compute.bootstrap.errors.dbandwidth =
     if (is.null(boot.out))
       stop("no MPI helper path available for this unconditional distribution bootstrap configuration in npRmpi; no serial fallback is permitted", call. = FALSE)
 
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- .npRmpi_with_local_bootstrap({
+        tryCatch(
+          .np_plot_unconditional_oversmoothed_boot(
+            xdat = xdat,
+            exdat = exdat,
+            bws = bws,
+            cdf = TRUE,
+            plot.errors.boot.method = plot.errors.boot.method,
+            plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+            plot.errors.boot.num = plot.errors.boot.num,
+            progress.label = "Oversmoothed bias bootstrap"
+          ),
+          error = function(e) {
+            stop(sprintf("oversmoothed unconditional distribution bootstrap center failed (%s)",
+                         conditionMessage(e)),
+                 call. = FALSE)
+          }
+        )
+      })
+    }
+
     all.bp <- list()
 
     if (slice.index > 0 && (bws$xdati$iord[slice.index] || bws$xdati$iuno[slice.index])){
@@ -15255,17 +17848,27 @@ compute.bootstrap.errors.dbandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
-        band.type = plot.errors.type
+        band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
+        progress.label = NULL
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -15329,6 +17932,23 @@ compute.bootstrap.errors.conbandwidth =
       else if (cdf) "dist"
       else "dens"
 
+    if (identical(tboo, "quant")) {
+      .np_plot_reject_quantile_bias_center(
+        center = plot.errors.center,
+        plot.errors.boot.method = plot.errors.boot.method
+      )
+    }
+
+    oversmooth.boot <- NULL
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      if (isTRUE(proper)) {
+        stop("center=\"bias-corrected\" with pair/block/geometric bootstrap is not yet implemented for proper conditional density/distribution projections", call. = FALSE)
+      }
+      if (!identical(bws$type, "fixed")) {
+        stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed conditional density/distribution bandwidths", call. = FALSE)
+      }
+    }
+
     if (!identical(tboo, "quant")) {
       .np_plot_reject_wild_unsupervised(plot.errors.boot.method, "conditional density/distribution estimators")
     }
@@ -15355,6 +17975,15 @@ compute.bootstrap.errors.conbandwidth =
     gradient.local.ok <- isTRUE(!quantreg) && isTRUE(gradients)
     quantile.level.local.ok <- isTRUE(quantreg) && isTRUE(!gradients)
     quantile.gradient.local.ok <- isTRUE(quantreg) && isTRUE(gradients)
+
+    if (isTRUE(gradient.local.ok) && (isTRUE(is.inid) || isTRUE(is.block))) {
+      .np_plot_require_conditional_gradient_bootstrap_supported(
+        bws = bws,
+        gradient.index = gradient.index,
+        where = sprintf("%s conditional density/distribution bootstrap gradients",
+                        if (is.block) plot.errors.boot.method else "inid")
+      )
+    }
 
     if (is.inid && !isTRUE(fast.inid) && !isTRUE(gradient.local.ok) && !isTRUE(quantile.level.local.ok) && !isTRUE(quantile.gradient.local.ok))
       stop("inid conditional helper unavailable for this configuration in npRmpi; no serial fallback is permitted", call. = FALSE)
@@ -15579,6 +18208,59 @@ compute.bootstrap.errors.conbandwidth =
       }
     }
 
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- .npRmpi_with_local_bootstrap({
+        tryCatch(
+          if (identical(tboo, "quant")) {
+            .np_plot_quantile_level_oversmoothed_boot(
+              xdat = xdat,
+              ydat = ydat,
+              exdat = exdat,
+              bws = bws,
+              tau = tau,
+              plot.errors.boot.method = plot.errors.boot.method,
+              plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+              plot.errors.boot.num = plot.errors.boot.num,
+              progress.label = progress.label
+            )
+          } else if (isTRUE(gradients)) {
+            .np_plot_conditional_gradient_oversmoothed_boot(
+              xdat = xdat,
+              ydat = ydat,
+              exdat = exdat,
+              eydat = eydat,
+              bws = bws,
+              cdf = cdf,
+              gradient.index = gradient.index,
+              gradient.order = gradient.order,
+              plot.errors.boot.method = plot.errors.boot.method,
+              plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+              plot.errors.boot.num = plot.errors.boot.num,
+              progress.label = progress.label
+            )
+          } else {
+            .np_plot_conditional_oversmoothed_boot(
+              xdat = xdat,
+              ydat = ydat,
+              exdat = exdat,
+              eydat = eydat,
+              bws = bws,
+              cdf = cdf,
+              plot.errors.boot.method = plot.errors.boot.method,
+              plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+              plot.errors.boot.num = plot.errors.boot.num,
+              progress.label = progress.label
+            )
+          },
+          error = function(e) {
+            stop(sprintf("oversmoothed conditional density/distribution or quantile bootstrap center failed (%s)",
+                         conditionMessage(e)),
+                 call. = FALSE)
+          }
+        )
+      })
+    }
+
     if (slice.index <= bws$xndim){
       tdati <- bws$xdati
       ti <- slice.index
@@ -15591,6 +18273,7 @@ compute.bootstrap.errors.conbandwidth =
     if (identical(tboo, "quant") && length(tau) > 1L) {
       tau.payload <- .np_plot_bootstrap_quantile_tau_payload(
         boot.out = boot.out,
+        oversmooth.boot = oversmooth.boot,
         neval = nrow(exdat),
         tau = tau,
         alpha = plot.errors.alpha,
@@ -15625,18 +18308,28 @@ compute.bootstrap.errors.conbandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      boot.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
         band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
         progress.label = interval.label
       )
-      boot.err[,1:2] <- boot.summary$err
-      boot.all.err <- boot.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (identical(plot.errors.center, "bias-corrected") &&
+        identical(plot.errors.type, "pmzsd")) {
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
+    }
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = all.bp,
@@ -15734,12 +18427,20 @@ compute.bootstrap.errors.sibandwidth =
 
     boot.err = matrix(data = NA, nrow = nrow(idx.eval), ncol = 3)
     boot.all.err <- NULL
+    oversmooth.boot <- NULL
 
     is.wild.hat <- .np_plot_is_wild_method(plot.errors.boot.method)
     is.inid <- plot.errors.boot.method=="inid"
     is.block <- is.element(plot.errors.boot.method, c("fixed", "geom"))
     use.frozen.nonfixed <- identical(plot.errors.boot.nonfixed, "frozen") &&
       !identical(bws$type, "fixed")
+
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      if (isTRUE(is.wild.hat))
+        .np_plot_reject_oversmoothed_center(plot.errors.center, "single-index wild bootstrap plots")
+      if (!identical(bws$type, "fixed"))
+        stop("center=\"bias-corrected\" with pair/block/geometric bootstrap currently requires fixed single-index bandwidths", call. = FALSE)
+    }
 
     if (is.wild.hat) {
       if (length(plot.errors.boot.wild) > 1L)
@@ -15856,6 +18557,32 @@ compute.bootstrap.errors.sibandwidth =
 
     if (is.null(boot.out))
       stop("no MPI helper path available for this single-index bootstrap configuration in npRmpi; no serial fallback is permitted", call. = FALSE)
+
+    if (.np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+      oversmooth.boot <- .npRmpi_with_local_bootstrap({
+        tryCatch(
+          .np_plot_singleindex_oversmoothed_boot(
+            xdat = xdat,
+            ydat = ydat,
+            bws = bws,
+            idx.eval = idx.eval,
+            gradients = gradients,
+            plot.errors.boot.method = plot.errors.boot.method,
+            plot.errors.boot.blocklen = plot.errors.boot.blocklen,
+            plot.errors.boot.num = plot.errors.boot.num,
+            progress.label = .np_plot_bootstrap_stage_label(
+              stage = "Oversmoothed bias bootstrap",
+              target_label = progress.target
+            )
+          ),
+          error = function(e) {
+            stop(sprintf("oversmoothed single-index bootstrap center failed (%s)",
+                         conditionMessage(e)),
+                 call. = FALSE)
+          }
+        )
+      })
+    }
     
     if (plot.errors.type == "pmzsd") {
       pmz.progress <- .np_plot_stage_progress_begin(
@@ -15869,18 +18596,27 @@ compute.bootstrap.errors.sibandwidth =
       pmz.progress <- .np_plot_progress_tick(state = pmz.progress, done = 2L, force = TRUE)
     }
     else if (plot.errors.type %in% c("pointwise", "bonferroni", "simultaneous", "all")) {
-      interval.summary <- .np_plot_bootstrap_interval_summary(
+      interval.payload <- .np_plot_bootstrap_centered_interval_payload(
         boot.t = boot.out$t,
         t0 = boot.out$t0,
         alpha = plot.errors.alpha,
         band.type = plot.errors.type,
+        center = plot.errors.center,
+        oversmooth.boot = oversmooth.boot,
         progress.label = interval.label
       )
-      boot.err[,1:2] <- interval.summary$err
-      boot.all.err <- interval.summary$all.err
+      boot.err[,1:2] <- interval.payload$err
+      boot.err[,3] <- interval.payload$center
+      boot.all.err <- interval.payload$all.err
     }
-    if (plot.errors.center == "bias-corrected")
-      boot.err[,3] <- 2*boot.out$t0-colMeans(boot.out$t)
+    if (.np_plot_center_is_bias_corrected(plot.errors.center) &&
+        identical(plot.errors.type, "pmzsd"))
+      boot.err[,3] <- .np_plot_bootstrap_center(
+        center = plot.errors.center,
+        t0 = boot.out$t0,
+        boot.t = boot.out$t,
+        oversmooth.boot = oversmooth.boot
+      )
     .npRmpi_profile_finalize_bootstrap(
       boot.err = boot.err,
       bxp = list(),

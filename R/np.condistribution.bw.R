@@ -1862,7 +1862,10 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
                                                            nomad.nmulti = 1L,
                                                            nomad.inner.nmulti = 0L,
                                                            random.seed = 42L,
-                                                           use.runtime.bandwidth.progress = FALSE) {
+                                                           use.runtime.bandwidth.progress = FALSE,
+                                                           source = "explicit",
+                                                           reason = NULL,
+                                                           progress_label = NULL) {
   rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
   old.messages <- getOption("np.messages")
   old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
@@ -2147,6 +2150,10 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
 
       search.result <- list(
         method = degree.search$engine,
+        source = source,
+        reason = reason,
+        source = source,
+        reason = reason,
         direction = "min",
         verify = FALSE,
         completed = TRUE,
@@ -2242,6 +2249,9 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
     remin = isTRUE(opt.args$nomad.remin),
     nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+    source = source,
+    reason = reason,
+    progress_label = progress_label,
     start.lower = c(native.start.bounds$lower, degree.search$lower),
     start.upper = c(native.start.bounds$upper, degree.search$upper),
     degree_spec = list(
@@ -2271,7 +2281,10 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
                                     degree.search,
                                     nomad.inner.nmulti = 0L,
                                     random.seed = 42L,
-                                    nomad.opts = list()) {
+                                    nomad.opts = list(),
+                                    source = "explicit",
+                                    reason = NULL,
+                                    progress_label = NULL) {
   if (isTRUE(degree.search$verify))
     stop("automatic degree search with search.engine='nomad' does not support degree.verify")
   if (is.null(opt.args$nomad.opts) && length(nomad.opts))
@@ -2620,7 +2633,10 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
       nomad.nmulti = nomad.nmulti,
       nomad.inner.nmulti = nomad.inner.nmulti,
       random.seed = random.seed,
-      use.runtime.bandwidth.progress = FALSE
+      use.runtime.bandwidth.progress = FALSE,
+      source = source,
+      reason = reason,
+      progress_label = progress_label
     )
     if (!is.null(search.result$num.feval.total))
       nomad.num.feval.total <- as.numeric(search.result$num.feval.total[1L])
@@ -2673,6 +2689,9 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     nomad.inner.nmulti = nomad.inner.nmulti,
     random.seed = random.seed,
     remin = isTRUE(opt.args$nomad.remin),
+    source = source,
+    reason = reason,
+    progress_label = progress_label,
     start.lower = c(bw_start_bounds$lower, degree.search$lower),
     start.upper = c(bw_start_bounds$upper, degree.search$upper),
     degree_spec = list(
@@ -2700,11 +2719,21 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
                                               degree.max.cycles,
                                               degree.verify,
                                               bernstein.basis,
-                                              bernstein.named) {
+                                              bernstein.named,
+                                              nomad.source = "explicit",
+                                              nomad.auto.filled = character()) {
   degree.select <- match.arg(degree.select, c("manual", "coordinate", "exhaustive"))
   if (identical(degree.select, "manual"))
     return(NULL)
-  search.engine <- .np_degree_search_engine_controls(search.engine)
+  resolved <- .np_degree_resolve_auto_engine(
+    search.engine = search.engine,
+    degree.select = degree.select,
+    ncon = ncon,
+    source = nomad.source,
+    auto.filled = nomad.auto.filled
+  )
+  search.engine <- .np_degree_search_engine_controls(resolved$search.engine)
+  degree.select <- resolved$degree.select
 
   regtype.requested <- if (isTRUE(regtype.named)) match.arg(regtype, c("lc", "ll", "lp")) else "lc"
   if (!identical(regtype.requested, "lp"))
@@ -2753,13 +2782,18 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     restarts = npValidateNonNegativeInteger(degree.restarts, "degree.restarts"),
     max.cycles = npValidatePositiveInteger(degree.max.cycles, "degree.max.cycles"),
     verify = npValidateScalarLogical(degree.verify, "degree.verify"),
-    bernstein.basis = bern.auto
+    bernstein.basis = bern.auto,
+    source = resolved$source,
+    reason = resolved$reason
   )
 }
 
 .npcdistbw_attach_degree_search <- function(bws, search_result) {
   metadata <- list(
     mode = search_result$method,
+    source = if (!is.null(search_result$source)) search_result$source else "explicit",
+    reason = if (!is.null(search_result$reason)) search_result$reason else NULL,
+    engine = if (!is.null(search_result$engine)) search_result$engine else search_result$method,
     verify = isTRUE(search_result$verify),
     completed = isTRUE(search_result$completed),
     certified = isTRUE(search_result$certified),
@@ -2783,6 +2817,7 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     restart.bandwidth.starts = search_result$restart.bandwidth.starts,
     restart.start.info = search_result$restart.start.info,
     restart.results = search_result$restart.results,
+    nn.cache = search_result$nn.cache,
     trace = search_result$trace
   )
 
@@ -2950,7 +2985,8 @@ npcdistbw.default <-
       if ("degree.select" %in% mc.names &&
           identical(as.character(match.arg(nomad.shortcut$values$degree.select, c("manual", "coordinate", "exhaustive")))[1L], "manual"))
         stop("nomad=TRUE requires automatic degree search; use degree.select='coordinate' or 'exhaustive'")
-      if ("search.engine" %in% mc.names &&
+      if (!identical(nomad.shortcut$metadata$source, "auto") &&
+          "search.engine" %in% mc.names &&
           !(as.character(match.arg(nomad.shortcut$values$search.engine, c("nomad+powell", "cell", "nomad")))[1L] %in%
               c("nomad", "nomad+powell")))
         stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'")
@@ -3000,6 +3036,22 @@ npcdistbw.default <-
       ncon = sum(x.info$icon),
       where = "npcdistbw"
     )
+    public.spec <- spec
+    lc.lp0.search.engine <- isTRUE(bandwidth.compute) &&
+      identical(spec$regtype, "lc") &&
+      sum(x.info$icon) > 0L &&
+      (!("bwmethod" %in% mc.names) || identical(as.character(bwmethod)[1L], "cv.ls")) &&
+      (!("bwtype" %in% mc.names) || identical(as.character(bwtype)[1L], "fixed"))
+    if (isTRUE(lc.lp0.search.engine)) {
+      spec$regtype <- "lp"
+      spec$basis <- "glp"
+      spec$degree <- rep.int(0L, sum(x.info$icon))
+      spec$bernstein.basis <- FALSE
+      spec$regtype.engine <- "lp"
+      spec$basis.engine <- "glp"
+      spec$degree.engine <- rep.int(0L, sum(x.info$icon))
+      spec$bernstein.basis.engine <- FALSE
+    }
     pregtype <- switch(spec$regtype,
                        lc = "Local-Constant",
                        ll = "Local-Linear",
@@ -3036,7 +3088,9 @@ npcdistbw.default <-
       degree.max.cycles = degree.max.cycles.value,
       degree.verify = degree.verify.value,
       bernstein.basis = bernstein.value,
-      bernstein.named = bernstein.named
+      bernstein.named = bernstein.named,
+      nomad.source = nomad.shortcut$metadata$source,
+      nomad.auto.filled = nomad.shortcut$metadata$auto.filled
     )
     if (!is.null(degree.search) &&
         "bwsolver" %in% search.mc.names &&
@@ -3176,7 +3230,8 @@ npcdistbw.default <-
         list(
           objective = as.numeric(cell.bws$fval[1L]),
           payload = cell.bws,
-          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
+          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_,
+          nn.cache = cell.bws$nn.cache
         )
       }
 
@@ -3199,7 +3254,9 @@ npcdistbw.default <-
           eval_fun = eval_fun,
           direction = "min",
           trace_level = "full",
-          objective_name = "fval"
+          objective_name = "fval",
+          source = degree.search$source,
+          reason = degree.search$reason
         )
       } else {
         search.result <- .npcdistbw_nomad_search(
@@ -3211,7 +3268,10 @@ npcdistbw.default <-
           degree.search = degree.search,
           nomad.inner.nmulti = nomad.inner.nmulti,
           random.seed = random.seed.value,
-          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts
+          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+          source = degree.search$source,
+          reason = degree.search$reason,
+          progress_label = .np_degree_search_label(degree.search$engine, degree.search$source)
         )
       }
       tbw <- .npcdistbw_attach_degree_search(
@@ -3237,6 +3297,17 @@ npcdistbw.default <-
     environment(mc) <- parent.frame()
     tbw$call <- mc
     tbw <- .np_attach_nomad_shortcut(tbw, nomad.shortcut$metadata)
+    if (isTRUE(lc.lp0.search.engine)) {
+      tbw$regtype <- public.spec$regtype
+      tbw$pregtype <- "Local-Constant"
+      tbw$basis <- public.spec$basis
+      tbw$degree <- public.spec$degree
+      tbw$bernstein.basis <- public.spec$bernstein.basis
+      tbw$regtype.engine <- public.spec$regtype.engine
+      tbw$basis.engine <- public.spec$basis.engine
+      tbw$degree.engine <- public.spec$degree.engine
+      tbw$bernstein.basis.engine <- public.spec$bernstein.basis.engine
+    }
 
     return(tbw)
   }

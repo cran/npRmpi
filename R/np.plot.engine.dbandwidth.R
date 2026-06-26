@@ -34,7 +34,7 @@
            plot.errors.boot.nonfixed = c("exact", "frozen"),
            plot.errors.boot.blocklen = NULL,
            plot.errors.boot.num = 1999,
-           plot.errors.center = c("estimate","bias-corrected"),
+           plot.errors.center = c("estimate", "bias-corrected"),
            plot.errors.type = c("pmzsd","pointwise","bonferroni","simultaneous","all"),
            plot.errors.alpha = 0.05,
            plot.errors.style = c("band","bar"),
@@ -232,7 +232,7 @@
         terr <- terr.obj[["boot.err"]]
         terr.all <- terr.obj[["boot.all.err"]]
 
-        pc = (plot.errors.center == "bias-corrected")
+        pc = (.np_plot_center_is_bias_corrected(plot.errors.center))
         center.val <- if (pc) terr[,3] else tobj$dist
 
         lerr = matrix(data = center.val - terr[,1],
@@ -287,9 +287,10 @@
         d1 <- npdistribution(bws = bws, eval = x.eval,
                              dist = tobj$dist, derr = terr[,1:2], ntrain = nrow(xdat))
         d1$bias = NA
+        d1$bias.corrected = NA
 
-        if (plot.errors.center == "bias-corrected")
-          d1$bias = terr[,3] - tobj$dist
+        if (.np_plot_center_is_bias_corrected(plot.errors.center))
+          d1 <- .np_plot_add_bias_fields(d1, tobj$dist, terr[,3])
         
         if (plot.behavior == "data")
           return ( list(d1 = d1) )
@@ -628,6 +629,13 @@
               )
               do.call(draw.errors, draw.args)
             }
+            if (bws$ndim == 1L && !xi.factor && !plotOnEstimate && plot.errors.type != "all")
+              .np_plot_draw_bias_center_legend(
+                legend = plot.legend,
+                estimate.col = plot.args$col,
+                estimate.lty = plot.args$lty,
+                estimate.lwd = plot.args$lwd
+              )
           }
         }
 
@@ -640,7 +648,14 @@
             derr = na.omit(cbind(-temp.err[,1], temp.err[,2])),
             ntrain = bws$nobs
           )
-          plot.out[[i]]$bias = na.omit(temp.dens - temp.err[,3])
+          plot.out[[i]]$bias = NA
+          plot.out[[i]]$bias.corrected = NA
+          if (.np_plot_center_is_bias_corrected(plot.errors.center))
+            plot.out[[i]] <- .np_plot_add_bias_fields(
+              plot.out[[i]],
+              temp.dens,
+              temp.err[,3]
+            )
           plot.out[[i]]$bxp = temp.boot
         }
       }
@@ -680,7 +695,7 @@
             if (plot.errors) na.omit(as.double(data.err[,jj-2]))
             else 0
             )
-        } else if (plot.errors.center == "bias-corrected") {
+        } else if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
           y.max = max(na.omit(as.double(data.err[,jj] + data.err[,jj-1])))
           y.min = min(na.omit(as.double(data.err[,jj] - data.err[,jj-2])))
         }
@@ -765,6 +780,13 @@
               )
               do.call(draw.errors, draw.args)
             }
+            if (bws$ndim == 1L && !xi.factor && !plotOnEstimate && plot.errors.type != "all")
+              .np_plot_draw_bias_center_legend(
+                legend = plot.legend,
+                estimate.col = plot.args$col,
+                estimate.lty = plot.args$lty,
+                estimate.lwd = plot.args$lwd
+              )
           }
         }
       }

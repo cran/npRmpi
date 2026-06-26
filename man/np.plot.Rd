@@ -176,7 +176,23 @@ Named options passed via \code{\dots} include:
         displays when available.
       }
       \item{\code{center}}{
-        one of \code{"estimate"} or \code{"bias-corrected"}.
+        one of \code{"estimate"} or \code{"bias-corrected"}. When
+        bootstrap errors are requested, \code{center="bias-corrected"}
+        centers plotted uncertainty bands or bars on a bootstrap
+        bias-corrected estimate. The package chooses the validated
+        correction engine for the requested bootstrap route. Wild
+        bootstrap regression routes use the standard wild-bootstrap
+        correction. Pairwise and dependent-bootstrap routes
+        \code{"inid"}, \code{"fixed"}, and \code{"geom"} use an
+        oversmoothed pilot correction for fixed-bandwidth estimators where
+        that route has been implemented and validated. Unsupported
+        combinations fail clearly rather than silently using a weak
+        correction.
+        For one-dimensional regression curves, the
+        ordinary estimate remains visible and the selected bias-corrected
+        estimate is drawn as an additional center line when available.
+        Fixed-bandwidth regression gradient plots use the same returned
+        gradient-bias convention described below.
       }
       \item{\code{errors}}{
         one of \code{"none"}, \code{"bootstrap"}, or
@@ -394,6 +410,111 @@ Further plotting controls are passed through \code{\dots} to the relevant plot m
   typically \eqn{m=\texttt{neval}^2}{m=neval^2} for full 2D perspective
   surfaces).
 
+  When \code{center="bias-corrected"} and \code{output="data"} (or
+  \code{output="both"}) is requested, returned
+  plot objects that support bootstrap bias correction include \code{bias} and
+  \code{bias.corrected} components where available. The sign convention
+  is \code{bias = estimate - bias.corrected}, so the corrected estimate
+  can be recovered as \code{estimate - bias}. For example, regression
+  plot objects use \code{mean - bias}; density objects use
+  \code{dens - bias}; and distribution objects use \code{dist - bias}.
+  Regression-gradient plot objects use the analogous convention
+  \code{gbias = grad - gradient.bias.corrected}, so the corrected
+  gradient can be recovered as \code{grad - gbias}.
+  Two-dimensional plots do not draw a second corrected surface in this
+  tranche; use \code{output="data"} to recover the corrected surface
+  values.
+
+  Kernel estimators are generally biased because smoothing trades
+  variance reduction for bias. For this reason, pointwise and
+  simultaneous error bounds centered on the fitted kernel estimate are
+  often best interpreted as variability bounds rather than literal
+  confidence intervals for the unknown target function.
+  Confidence-interval interpretation requires the smoothing bias to be
+  negligible relative to sampling variability, or to be corrected with
+  sufficient accuracy.
+
+  When bootstrap errors are requested, \code{center="bias-corrected"}
+  recenters the plotted bootstrap bounds on a method-specific
+  Efron-Tibshirani bootstrap bias-corrected estimate, where available.
+  This produces bounds that are closer in spirit to confidence intervals
+  than variability bounds centered on the original biased estimate. Bias
+  correction for nonparametric estimators is difficult, however, and no
+  universal correction is optimal across estimators, bandwidths,
+  supports, and data types.
+
+  For wild-bootstrap regression routes, \code{center="bias-corrected"}
+  uses the standard wild-bootstrap correction, without a second
+  oversmoothed pilot bandwidth. This follows the wild-bootstrap
+  regression literature and the package's finite-sample evidence that
+  an additional pilot can underadjust in this route. For supported
+  fixed-bandwidth regression-style routes with \code{bootstrap="inid"},
+  \code{"fixed"}, or \code{"geom"}, \code{center="bias-corrected"}
+  estimates the bias center from a second pilot bootstrap matrix while
+  retaining the ordinary bootstrap matrix for variability widths. These
+  combinations can behave differently in finite samples, so the returned
+  \code{bias} and \code{bias.corrected} components should be inspected
+  when bias correction is scientifically important. For supported fixed
+  regression gradient plots, inspect \code{gbias},
+  \code{gradient.bias.corrected}, or route-specific gradient-bias
+  components such as \code{gc1bias}; different bootstrap schemes can
+  give materially different derivative-bias corrections.
+
+  The pilot rule is family-specific. For fixed-bandwidth regression
+  plots, the non-wild pilot uses the full oversmoothing-rate rule:
+  \deqn{g_j = h_j n^{2r / ((p + 2r)(p + 4r))},}
+  where \eqn{h_j} is the selected bandwidth, \eqn{r} is the continuous
+  kernel order, and \eqn{p} is the number of continuous smoothing
+  variables in that regression route. For ordinary second-order
+  kernels with one continuous smoothing variable this reduces to
+  \eqn{g_j = h_j n^{4/45}}. Categorical variables do not enter this
+  continuous-rate exponent. Supported semiparametric regression and
+  single-index plot routes use the square-root version of this rule.
+
+  For unconditional density and distribution plots with continuous
+  variables, including mixed-data routes supported by the estimator, the
+  smooth-bootstrap perturbation rule uses \eqn{g_j = h_j}, following the
+  density smooth-bootstrap literature. Continuous variables are
+  perturbed and categorical variables are resampled row-wise without
+  perturbation. The smooth perturbation law is drawn from the selected
+  ordinary continuous kernel when that kernel defines a probability law:
+  second-order Gaussian, uniform, and second-order Epanechnikov kernels
+  are supported. Higher-order Gaussian and Epanechnikov kernels remain
+  valid estimation kernels, but their signed equivalent-kernel forms do
+  not define ordinary random perturbations, so
+  \code{center="bias-corrected"} with pair/block/geometric bootstrap
+  fails clearly for those higher-order smooth-bootstrap perturbation
+  routes. For conditional density/distribution plots, the
+  continuous dependent-variable side uses the same density-style rule
+  \eqn{g_y = h_y}; categorical dependent variables are resampled row-wise
+  without perturbation. The conditioning-variable side uses a full
+  regression-style pilot: continuous conditioning bandwidths are
+  enlarged, and categorical conditioning lambdas are moved toward their
+  admissible upper bounds without crossing them. For
+  conditional density this is
+  \deqn{g_{xj} = h_{xj} n^{2r / ((p + 2r)(p + 4r))},}
+  and for conditional distribution this is
+  \deqn{g_{xj} = h_{xj} n^{r / ((p + r)(p + 2r))},}
+  where here \eqn{p} is the total number of continuous dependent and
+  explanatory variables. The same conditional pilot rule is used for
+  supported fixed-bandwidth conditional density/distribution gradient
+  plots, including mixed-data routes. In mixed-data conditional
+  gradients, continuous dependent variables are perturbed by the
+  density-style rule, categorical dependent variables are resampled
+  row-wise without perturbation, continuous conditioning variables use
+  the conditional regression-style pilot, and categorical conditioning
+  lambdas are moved toward their admissible upper bounds as in the
+  corresponding level route.
+  These are practical, evidence-backed rules-of-thumb guided by the
+  smoothed-bootstrap and regression two-bandwidth literatures, not claims
+  of universal optimality.
+
+  In practice, users who want confidence-style bounds should prefer
+  bootstrap errors with \code{center="bias-corrected"}. The
+  ordinary fitted curve or surface remains the default estimate because
+  bias correction can increase variance and may have larger mean squared
+  error than the uncorrected estimator.
+
   For asymptotic intervals, let \eqn{T(x)} denote the plotted functional
   (mean, gradient, density, distribution, etc.) and \eqn{\widehat{se}(x)}
   its asymptotic standard error:
@@ -414,9 +535,22 @@ Further plotting controls are passed through \code{\dots} to the relevant plot m
   Bootstrap method support differs by estimator family:
   \preformatted{
   Regression-family (npreg/npindex/npscoef/npplreg): wild, inid, fixed, geom
-  Density/distribution-family (npudens/npudist/npcdens/npcdist): inid, fixed, geom
+  Density/distribution-family (npudens/npudist/npcdens/npcdist/npconmode): inid, fixed, geom
   }
   hence \code{"wild"} is only available for regression-family plotting.
+  Bias-corrected bootstrap centering is currently restricted to supported
+  fixed-bandwidth plot routes. Non-fixed, adaptive-nearest-neighbor, and
+  generalized-nearest-neighbor bandwidth routes fail closed for
+  \code{center="bias-corrected"}. Conditional quantile
+  \code{npqreg} bootstrap plots currently require \code{center="estimate"};
+  \code{center="bias-corrected"} fails clearly for this route. Copula
+  \code{npcopula} and instrumental-variable \code{npregiv}
+  bias-corrected bootstrap plot routes are not claimed in this release
+  tranche and fail clearly when unsupported bias-corrected bootstrap
+  controls are requested. Partially linear
+  \code{npplreg} level plots support the regression-family bootstrap
+  methods above; \code{gradients=TRUE} is not a partially linear plot
+  route and fails clearly.
 
   Implementation notes for speed:
   \preformatted{
@@ -540,9 +674,24 @@ Further plotting controls are passed through \code{\dots} to the relevant plot m
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
 
+  Cao-Abad, R. (1991), \dQuote{Rate of convergence for the wild
+    bootstrap in nonparametric regression,} The Annals of Statistics,
+  19, 2226-2231.
+
   Hall, P. and J.S. Racine and Q. Li (2004), \dQuote{Cross-validation and the
     estimation of conditional probability densities,} Journal of the
   American Statistical Association, 99, 1015-1026.
+
+  Hall, P. (1992a), \dQuote{Effect of bias estimation on coverage
+    accuracy of bootstrap confidence intervals for a probability
+    density,} The Annals of Statistics, 20, 675-694.
+
+  Hall, P. (1992b), \dQuote{On bootstrap confidence intervals in
+    nonparametric regression,} The Annals of Statistics, 20, 695-711.
+
+  Hardle, W. and J.S. Marron (1991), \dQuote{Bootstrap simultaneous
+    error bars for nonparametric regression,} The Annals of Statistics,
+  19, 778-796.
 
   Kunsch, H.R. (1989), \dQuote{The jackknife and the bootstrap for
     general stationary observations,} The Annals of Statistics, 17,
@@ -557,6 +706,12 @@ Further plotting controls are passed through \code{\dots} to the relevant plot m
   Politis, D.N. and J.P. Romano (1994), \dQuote{The stationary
     bootstrap,} Journal of the American Statistical Association, 89,
   1303-1313.
+
+  Silverman, B.W. and G.A. Young (1987), \dQuote{The bootstrap: to smooth or
+    not to smooth?} Biometrika, 74, 469-479.
+
+  De Angelis, D. and G.A. Young (1992), \dQuote{Smoothing the bootstrap,}
+    International Statistical Review, 60, 45-56.
 
   Scott, D.W. (1992), \emph{Multivariate Density Estimation. Theory,
   Practice and Visualization,} New York: Wiley.
@@ -748,6 +903,22 @@ with(cps71, plot(age, logwage, cex=0.2, xlab="Age", ylab="log(Wage)"))
 lines(age.eval,logwage.eval)
 lines(age.eval,logwage.lower.ci,lty=3)
 lines(age.eval,logwage.upper.ci,lty=3)
+
+# Bias-corrected bootstrap output includes the estimated bias and the
+# bias-corrected center when available. The sign convention is
+# bias = estimate - bias.corrected, so bias.corrected = estimate - bias.
+
+plot.out <- plot(fit,
+                 perspective=FALSE,
+                 errors="bootstrap",
+                 center="bias-corrected",
+                 B=25,
+                 output="data")
+
+logwage.eval <- fitted(plot.out$r1)
+logwage.bias <- plot.out$r1$bias
+logwage.bc <- plot.out$r1$bias.corrected
+stopifnot(all.equal(logwage.bc, logwage.eval - logwage.bias))
 
 # If you wanted plot() data for gradients, you would use the argument
 # `gradients=TRUE' in the call to plot() as the following

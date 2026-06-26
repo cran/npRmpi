@@ -70,6 +70,28 @@ int int_TREE_XY;
 int int_TREE_PROFILE_X;
 int int_nn_k_min_extern = 1;
 
+static int np_int_product_overflows(int a, int b)
+{
+  return (a < 0) || (b < 0) || ((a > 0) && (b > INT_MAX / a));
+}
+
+static int np_int_product3_overflows(int a, int b, int c)
+{
+  return np_int_product_overflows(a, b) ||
+    np_int_product_overflows(a * b, c);
+}
+
+static void np_load_crs_namespace(void)
+{
+  SEXP pkg;
+  SEXP call;
+
+  PROTECT(pkg = mkString("crs"));
+  PROTECT(call = lang2(install("loadNamespace"), pkg));
+  Rf_eval(call, R_GlobalEnv);
+  UNPROTECT(2);
+}
+
 static int np_mpi_local_regression_mode = 0;
 #ifdef MPI2
 static int np_mpi_local_regression_saved_rank = 0;
@@ -243,7 +265,7 @@ SEXP C_np_nomad_r_callback_native_search(SEXP eval_f,
   SEXP eval_fun = R_NilValue, eval_rho = R_NilValue;
   SEXP x0_r = R_NilValue, bbin_i = R_NilValue, lower_r = R_NilValue;
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
-  SEXP call = R_NilValue, out = R_NilValue, names = R_NilValue, sol = R_NilValue;
+  SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -296,9 +318,7 @@ SEXP C_np_nomad_r_callback_native_search(SEXP eval_f,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs"))); nprotect++;
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1); nprotect--;
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -814,6 +834,7 @@ static int bwm_transform_buf_len = 0;
 
 static void bwm_nn_cache_free(void);
 static void bwm_objective_cache_free(void);
+extern void np_accel_gauss_release_buffers(void);
 
 static void bwm_reserve_transform_buf(int needed_len)
 {
@@ -837,6 +858,7 @@ void np_release_static_buffers(int *unused)
   bwm_transform_buf_len = 0;
   bwm_nn_cache_free();
   bwm_objective_cache_free();
+  np_accel_gauss_release_buffers();
 }
 static int bwm_penalty_mode = 0;
 static double bwm_penalty_value = DBL_MAX;
@@ -2955,6 +2977,8 @@ static void np_clear_estimator_extern_aliases(void)
   num_categories_extern_Y = NULL;
   num_categories_extern_XY = NULL;
   vector_continuous_stddev_extern = NULL;
+  vector_extendednn_upper_extern = NULL;
+  int_extendednn_upper_num_extern = 0;
   ipt_extern_X = NULL;
   ipt_extern_Y = NULL;
   ipt_extern_XY = NULL;
@@ -3880,7 +3904,6 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   SEXP option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
   SEXP best_bw = R_NilValue, best_degree = R_NilValue, first_degree = R_NilValue;
-  SEXP call = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -3936,9 +3959,7 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -5376,7 +5397,7 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   SEXP point_upper_r = R_NilValue, option_values_s = R_NilValue, out = R_NilValue;
   SEXP option_names_s = R_NilValue;
   SEXP names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  SEXP best_flat = R_NilValue, best_degree = R_NilValue, call = R_NilValue;
+  SEXP best_flat = R_NilValue, best_degree = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -5442,9 +5463,7 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -5640,7 +5659,7 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   SEXP point_upper_r = R_NilValue, option_values_s = R_NilValue, out = R_NilValue;
   SEXP option_names_s = R_NilValue;
   SEXP names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  SEXP best_flat = R_NilValue, best_degree = R_NilValue, call = R_NilValue;
+  SEXP best_flat = R_NilValue, best_degree = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -5706,9 +5725,7 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -7113,7 +7130,6 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  SEXP call = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -7169,9 +7185,7 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -7730,7 +7744,6 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  SEXP call = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -7790,9 +7803,7 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn)
     R_GetCCallable("crs", "crs_nomad_solve");
@@ -9125,7 +9136,7 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   SEXP option_names_s = R_NilValue, option_values_s = R_NilValue, degree_i = R_NilValue;
   SEXP cxkerlb_r = R_NilValue, cxkerub_r = R_NilValue, cykerlb_r = R_NilValue, cykerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  SEXP best_degree = R_NilValue, first_degree = R_NilValue, call = R_NilValue;
+  SEXP best_degree = R_NilValue, first_degree = R_NilValue;
   crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
@@ -9199,9 +9210,7 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   }
   n_options = (int) XLENGTH(option_names_s);
 
-  PROTECT(call = lang2(install("loadNamespace"), mkString("crs")));
-  Rf_eval(call, R_GlobalEnv);
-  UNPROTECT(1);
+  np_load_crs_namespace();
 
   solve = (crs_nomad_solve_fn) R_GetCCallable("crs", "crs_nomad_solve");
   if (solve == NULL) {
@@ -9622,7 +9631,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
 
   double **matrix_y;
 
-  double *vector_continuous_stddev;
+  double *vector_continuous_stddev = NULL;
   double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
   double *vector_scale_factor_startbest;
 
@@ -9763,8 +9772,10 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
       matrix_X_continuous_train_extern[j][i]=mycon[j*num_obs_train_extern+i];
 
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt != NULL))
-    error("!(ipt != NULL)");
+  if(!(ipt != NULL)){
+    bw_error_msg = "!(ipt != NULL)";
+    goto cleanup_np_density_bw;
+  }
 
   for(i = 0; i < num_obs_train_extern; i++){
     ipt[i] = i;
@@ -9917,14 +9928,16 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
     case BWM_CVLS : bwmfunc = cv_func_density_categorical_ls; break;
       //case BWM_CVML_NP : bwmfunc = cv_func_np_density_categorical_ml; break;
     default : REprintf("np.c: invalid bandwidth selection method.");
-      error("np.c: invalid bandwidth selection method."); break;
+      bw_error_msg = "np.c: invalid bandwidth selection method.";
+      goto cleanup_np_density_bw;
     }
   } else {
     switch(myopti[BW_MI]){
     case BWM_CVML : bwmfunc = np_cv_func_density_categorical_ml; break;
     case BWM_CVLS : bwmfunc = np_cv_func_density_categorical_ls; break;
     default : REprintf("np.c: invalid bandwidth selection method.");
-      error("np.c: invalid bandwidth selection method."); break;
+      bw_error_msg = "np.c: invalid bandwidth selection method.";
+      goto cleanup_np_density_bw;
     }
 
   }
@@ -10435,7 +10448,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
 
   double **matrix_y;
 
-  double *vector_continuous_stddev;
+  double *vector_continuous_stddev = NULL;
   double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
   double *vector_scale_factor_startbest;
 
@@ -10569,8 +10582,10 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   // nb check vals
   matrix_categorical_vals_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
 
-  if(num_reg_unordered_extern > 0)
-    error("np.c: distribution bw selection only works on ordered and continuous data."); 
+  if(num_reg_unordered_extern > 0){
+    bw_error_msg = "np.c: distribution bw selection only works on ordered and continuous data.";
+    goto cleanup_np_distribution_bw;
+  }
 
   if (int_use_starting_values)
     for( i=0;i<num_var; i++ )
@@ -10608,8 +10623,10 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   }
 
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt != NULL))
-    error("!(ipt != NULL)");
+  if(!(ipt != NULL)){
+    bw_error_msg = "!(ipt != NULL)";
+    goto cleanup_np_distribution_bw;
+  }
 
   for(i = 0; i < num_obs_train_extern; i++){
     ipt[i] = i;
@@ -10617,8 +10634,10 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
 
   if(!cdfontrain) {
     ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
-    if(!(ipe != NULL))
-      error("!(ipe != NULL)");
+    if(!(ipe != NULL)){
+      bw_error_msg = "!(ipe != NULL)";
+      goto cleanup_np_distribution_bw;
+    }
 
     for(i = 0; i < num_obs_eval_extern; i++){
       ipe[i] = i;
@@ -10788,7 +10807,8 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   switch(myopti[DBW_MI]){
   case DBWM_CVLS : bwmfunc = cv_func_distribution_categorical_ls; break;
   default : REprintf("np.c: invalid bandwidth selection method.");
-    error("np.c: invalid bandwidth selection method."); break;
+    bw_error_msg = "np.c: invalid bandwidth selection method.";
+    goto cleanup_np_distribution_bw;
   }
 
   if (bwm_use_transform)
@@ -11296,7 +11316,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
 
   double **matrix_y = NULL;
 
-  double *vector_continuous_stddev;
+  double *vector_continuous_stddev = NULL;
   double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
   double *vector_scale_factor_startbest;
   double *cxylb = NULL, *cxyub = NULL;
@@ -11573,13 +11593,15 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   // we use 3 trees for cpdf ls, and 2 for cpdf ml
 
   ipt_X = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_X != NULL))
-    error("!(ipt_X != NULL)");
+  if(!(ipt_X != NULL)){
+    bw_error_msg = "!(ipt_X != NULL)";
+    goto cleanup_np_density_conditional_bw;
+  }
 
   ipt_lookup_X = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_lookup_X != NULL)){
-    safe_free(ipt_X);
-    error("!(ipt_lookup_X != NULL)");
+    bw_error_msg = "!(ipt_lookup_X != NULL)";
+    goto cleanup_np_density_conditional_bw;
   }
 
   for(i = 0; i < num_obs_train_extern; i++){
@@ -11592,17 +11614,14 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   if(need_y_side){
     ipt_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
     if(!(ipt_Y != NULL)){
-      safe_free(ipt_X);
-      safe_free(ipt_lookup_X);
-      error("!(ipt_Y != NULL)");
+      bw_error_msg = "!(ipt_Y != NULL)";
+      goto cleanup_np_density_conditional_bw;
     }
 
     ipt_lookup_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
     if(!(ipt_lookup_Y != NULL)){
-      safe_free(ipt_X);
-      safe_free(ipt_lookup_X);
-      safe_free(ipt_Y);
-      error("!(ipt_lookup_Y != NULL)");
+      bw_error_msg = "!(ipt_lookup_Y != NULL)";
+      goto cleanup_np_density_conditional_bw;
     }
 
     for(i = 0; i < num_obs_train_extern; i++){
@@ -11619,25 +11638,14 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
 
   ipt_XY = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_XY != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    if(need_y_side){
-      safe_free(ipt_Y);
-      safe_free(ipt_lookup_Y);
-    }
-    error("!(ipt_XY != NULL)");
+    bw_error_msg = "!(ipt_XY != NULL)";
+    goto cleanup_np_density_conditional_bw;
   }
 
   ipt_lookup_XY = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_lookup_XY != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    if(need_y_side){
-      safe_free(ipt_Y);
-      safe_free(ipt_lookup_Y);
-    }
-    safe_free(ipt_XY);
-    error("!(ipt_lookup_XY != NULL)");
+    bw_error_msg = "!(ipt_lookup_XY != NULL)";
+    goto cleanup_np_density_conditional_bw;
   }
 
   for(i = 0; i < num_obs_train_extern; i++){
@@ -11918,14 +11926,16 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
     case CBWM_NPLS : bwmfunc = np_cv_func_con_density_categorical_ls;break;
     case CBWM_CCDF : bwmfunc = cv_func_con_distribution_categorical_ccdf; break;
     default : REprintf("np.c: invalid bandwidth selection method.");
-      error("np.c: invalid bandwidth selection method."); break;
+      bw_error_msg = "np.c: invalid bandwidth selection method.";
+      goto cleanup_np_density_conditional_bw;
     }
   } else {
     switch(ibwmfunc){
     case CBWM_CVML : bwmfunc = np_cv_func_con_density_categorical_ml; break;
     case CBWM_CVLS : bwmfunc = np_cv_func_con_density_categorical_ls_npksum; break;
     default : REprintf("np.c: invalid bandwidth selection method.");
-      error("np.c: invalid bandwidth selection method."); break;
+      bw_error_msg = "np.c: invalid bandwidth selection method.";
+      goto cleanup_np_density_conditional_bw;
     }
   }
 
@@ -12517,7 +12527,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
   double **matrix_y;
 
-  double *vector_continuous_stddev;
+  double *vector_continuous_stddev = NULL;
   double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
   double *vector_scale_factor_startbest;
   double *cxylb = NULL, *cxyub = NULL;
@@ -12780,13 +12790,15 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   // we need 3 trees to accelerate cg_concdf :)
 
   ipt_X = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_X != NULL))
-    error("!(ipt_X != NULL)");
+  if(!(ipt_X != NULL)){
+    bw_error_msg = "!(ipt_X != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
+  }
 
   ipt_lookup_X = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_lookup_X != NULL)){
-    safe_free(ipt_X);
-    error("!(ipt_lookup_X != NULL)");
+    bw_error_msg = "!(ipt_lookup_X != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   for(i = 0; i < num_obs_train_extern; i++){
@@ -12799,17 +12811,14 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
   ipt_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_Y != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    error("!(ipt_Y != NULL)");
+    bw_error_msg = "!(ipt_Y != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   ipt_lookup_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
   if(!(ipt_lookup_Y != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    safe_free(ipt_Y);
-    error("!(ipt_lookup_Y != NULL)");
+    bw_error_msg = "!(ipt_lookup_Y != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   for(i = 0; i < num_obs_train_extern; i++){
@@ -12823,21 +12832,14 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
   ipt_XY = (int *)malloc(num_obs_alt*sizeof(int));
   if(!(ipt_XY != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    safe_free(ipt_Y);
-    safe_free(ipt_lookup_Y);
-    error("!(ipt_XY != NULL)");
+    bw_error_msg = "!(ipt_XY != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   ipt_lookup_XY = (int *)malloc(num_obs_alt*sizeof(int));
   if(!(ipt_lookup_XY != NULL)){
-    safe_free(ipt_X);
-    safe_free(ipt_lookup_X);
-    safe_free(ipt_Y);
-    safe_free(ipt_lookup_Y);
-    safe_free(ipt_XY);
-    error("!(ipt_lookup_XY != NULL)");
+    bw_error_msg = "!(ipt_lookup_XY != NULL)";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   for(i = 0; i < num_obs_alt; i++){
@@ -13101,7 +13103,8 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   switch(ibwmfunc){
   case CDBWM_CVLS : bwmfunc = cv_func_con_distribution_categorical_ls; break;
   default : REprintf("np.c: invalid bandwidth selection method.");
-    error("np.c: invalid bandwidth selection method."); break;
+    bw_error_msg = "np.c: invalid bandwidth selection method.";
+    goto cleanup_np_distribution_conditional_bw;
   }
 
   if (bwm_use_transform)
@@ -14838,7 +14841,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
   double **matrix_y;
 
-  double *vector_continuous_stddev;
+  double *vector_continuous_stddev = NULL;
   double *vector_scale_factor, *vector_scale_factor_multistart, *vsfh;
   double *vector_scale_factor_startbest;
 
@@ -15054,8 +15057,10 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
   // initialize permutation arrays
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt != NULL))
-    error("!(ipt != NULL)");
+  if(!(ipt != NULL)){
+    bw_error_msg = "!(ipt != NULL)";
+    goto cleanup_np_regression_bw_mode;
+  }
 
   for(i = 0; i < num_obs_train_extern; i++){
     ipt[i] = i;
@@ -15067,9 +15072,8 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   if(int_TREE_X == NP_TREE_TRUE){
     ipt_lookup = (int *)malloc(num_obs_train_extern*sizeof(int));
     if(!(ipt_lookup != NULL)){
-      safe_free(ipt);
-      ipt = NULL;
-      error("!(ipt_lookup != NULL)");
+      bw_error_msg = "!(ipt_lookup != NULL)";
+      goto cleanup_np_regression_bw_mode;
     }
 
     build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
@@ -15124,7 +15128,8 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
                                 num_obs_train_extern,
                                 num_reg_continuous_extern,
                                 matrix_X_continuous_train_extern))){
-    error("failed to prepare LP CV basis cache");
+    bw_error_msg = "failed to prepare LP CV basis cache";
+    goto cleanup_np_regression_bw_mode;
   }
 
   vector_extendednn_upper_extern = (!eval_only) ?
@@ -15237,7 +15242,8 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   case RBWM_CVLS : bwmfunc = cv_func_regression_categorical_ls; break;
   case RBWM_CVCHECK : bwmfunc = cv_func_lsqregression_categorical_check; break;
   default : REprintf("np.c: invalid bandwidth selection method.");
-    error("np.c: invalid bandwidth selection method.");break;
+    bw_error_msg = "np.c: invalid bandwidth selection method.";
+    goto cleanup_np_regression_bw_mode;
   }
 
   spinner(0);
@@ -16370,6 +16376,8 @@ void np_kernelsum(double * tuno, double * tord, double * tcon,
     ksum = weighted_sum;
     ksum_is_output = 1;
   } else {
+    if(np_int_product_overflows(num_obs_eval_alloc, sum_element_length))
+      error("C_np_kernelsum: requested kernel-sum buffer is too large");
     ksum = alloc_vecd(num_obs_eval_alloc*sum_element_length);
   }
 
@@ -16379,6 +16387,8 @@ void np_kernelsum(double * tuno, double * tord, double * tcon,
       p_ksum = weighted_p_sum;
       pksum_is_output = 1;
     } else {
+      if(np_int_product3_overflows(num_obs_eval_alloc, sum_element_length, p_nvar))
+        error("C_np_kernelsum: requested derivative kernel-sum buffer is too large");
       p_ksum = alloc_vecd(num_obs_eval_alloc*sum_element_length*p_nvar);
     }
   }
@@ -16616,11 +16626,15 @@ void np_kernelsum(double * tuno, double * tord, double * tcon,
       kw = kernel_weights;
       kw_is_output = 1;
     } else {
+      if(np_int_product_overflows(num_obs_train_extern, num_obs_eval_extern))
+        error("C_np_kernelsum: requested kernel-weight buffer is too large");
       kw = alloc_vecd(num_obs_train_extern*num_obs_eval_extern);
     }
   }
 
   if(return_kernel_weights && (p_nvar > 0)){
+    if(np_int_product3_overflows(num_obs_train_extern, num_obs_eval_extern, p_nvar))
+      error("C_np_kernelsum: requested derivative kernel-weight buffer is too large");
     pkw = alloc_vecd(num_obs_train_extern*num_obs_eval_extern*p_nvar);
   }
   

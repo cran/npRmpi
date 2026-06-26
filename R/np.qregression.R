@@ -88,6 +88,18 @@ npqreg <-
   dots[keep]
 }
 
+.npqreg_reject_gradient_order_dots <- function(dots) {
+  dot.names <- names(dots)
+  if (is.null(dot.names))
+    dot.names <- rep("", length(dots))
+
+  bad <- dot.names %in% c("gradient.order", "gradient_order")
+  if (any(bad))
+    .np_reject_unused_dots(dots[which(bad)[1L]], "npqreg")
+
+  invisible(TRUE)
+}
+
 .npqreg_strip_fit_controls_from_bw_call <- function(call) {
   for (nm in c("tau", "gradients", "tol", "small", "itmax", "newdata", "exdat")) {
     if (nm %in% names(call))
@@ -1166,8 +1178,9 @@ npqreg.condbandwidth <-
 
 
 npqreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
-  nomad <- npValidateScalarLogical(nomad, "nomad")
+  nomad <- npValidateNomadControl(nomad, "nomad")
   early.dots <- list(...)
+  .npqreg_reject_gradient_order_dots(early.dots)
   if ("tau" %in% names(early.dots))
     .npqreg_validate_tau(early.dots$tau)
 

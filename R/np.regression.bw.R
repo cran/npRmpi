@@ -92,22 +92,24 @@ npregbw.NULL <-
     )
     .npRmpi_require_active_slave_pool(where = "npregbw()")
     dot.names <- names(dots)
+    nomad.requested <- ("nomad" %in% dot.names) &&
+      npNomadControlRequested(dots$nomad, "nomad")
     degree.select.value <- if ("degree.select" %in% dot.names) {
       match.arg(as.character(dots$degree.select[[1L]]), c("manual", "coordinate", "exhaustive"))
     } else {
       "manual"
     }
-    automatic.degree.search <- isTRUE(dots$nomad) || !identical(degree.select.value, "manual")
+    automatic.degree.search <- isTRUE(nomad.requested) || !identical(degree.select.value, "manual")
     regtype.value <- if ("regtype" %in% dot.names) {
       match.arg(as.character(dots$regtype[[1L]]), c("lc", "ll", "lp"))
-    } else if (isTRUE(dots$nomad)) {
+    } else if (isTRUE(nomad.requested)) {
       "lp"
     } else {
       "lc"
     }
     search.engine.value <- if ("search.engine" %in% dot.names) {
       match.arg(as.character(dots$search.engine[[1L]]), c("nomad+powell", "cell", "nomad"))
-    } else if (isTRUE(dots$nomad)) {
+    } else if (isTRUE(nomad.requested)) {
       "nomad+powell"
     } else {
       "nomad+powell"
@@ -1607,7 +1609,8 @@ npRmpiNomadEvalOnlyRegression <- function(runo,
     list(
       objective = out$objective,
       degree = integer(0L),
-      num.feval = out$num.feval
+      num.feval = out$num.feval,
+      num.feval.fast = out$num.feval.fast
     )
   }
 
@@ -2253,7 +2256,10 @@ npRmpiNomadShadowSearchRegression <- function(template,
                                               nomad.inner.nmulti = 0L,
                                               random.seed = 42L,
                                               remin = FALSE,
-                                              nomad.opts = list()) {
+                                              nomad.opts = list(),
+                                              source = "explicit",
+                                              reason = NULL,
+                                              progress_label = NULL) {
   rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
   old.messages <- getOption("np.messages")
   old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
@@ -2294,7 +2300,9 @@ npRmpiNomadShadowSearchRegression <- function(template,
       powell.time = NA_real_,
       num.feval.total = 0,
       num.feval.fast.total = 0,
-      method = degree.search$engine
+      method = degree.search$engine,
+      source = source,
+      reason = reason
     ))
   mpi.barrier(1L)
   on.exit({
@@ -2527,6 +2535,8 @@ npRmpiNomadShadowSearchRegression <- function(template,
 
     search.result <- list(
       method = degree.search$engine,
+      source = source,
+      reason = reason,
       direction = "min",
       verify = FALSE,
       completed = TRUE,
@@ -2618,6 +2628,9 @@ npRmpiNomadShadowSearchRegression <- function(template,
     random.seed = random.seed,
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
     remin = isTRUE(remin),
+    source = source,
+    reason = reason,
+    progress_label = progress_label,
     start.lower = start.lower,
     start.upper = start.upper,
     degree_spec = list(
@@ -2649,7 +2662,10 @@ npRmpiNomadShadowSearchRegression <- function(template,
                                   degree.search,
                                   nomad.inner.nmulti = 0L,
                                   random.seed = 42L,
-                                  nomad.opts = list()) {
+                                  nomad.opts = list(),
+                                  source = "explicit",
+                                  reason = NULL,
+                                  progress_label = NULL) {
   if (isTRUE(degree.search$verify))
     stop("automatic degree search with search.engine='nomad' does not support degree.verify")
   if (is.null(opt.args$nomad.opts) && length(nomad.opts))
@@ -2807,7 +2823,10 @@ npRmpiNomadShadowSearchRegression <- function(template,
           INNERNMULTI,
           RSEED,
           REMIN,
-          NOMADOPTS
+          NOMADOPTS,
+          SOURCE,
+          REASON,
+          PROGRESSLABEL
         ),
         list(
           TEMPLATE = shadow.template,
@@ -2824,7 +2843,10 @@ npRmpiNomadShadowSearchRegression <- function(template,
           INNERNMULTI = nomad.inner.nmulti,
           RSEED = random.seed,
           REMIN = isTRUE(opt.args$nomad.remin),
-          NOMADOPTS = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts
+          NOMADOPTS = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+          SOURCE = source,
+          REASON = reason,
+          PROGRESSLABEL = progress_label
         )
       )
 
@@ -2945,6 +2967,9 @@ npRmpiNomadShadowSearchRegression <- function(template,
     handoff_before_build = identical(degree.search$engine, "nomad+powell"),
     remin = isTRUE(opt.args$nomad.remin),
     nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+    source = source,
+    reason = reason,
+    progress_label = progress_label,
     start.lower = c(bw_start_bounds$lower, degree.search$lower),
     start.upper = c(bw_start_bounds$upper, degree.search$upper),
     coordinate.roles = .np_nomad_coordinate_roles(bw_bounds, degree.search),
@@ -2979,11 +3004,21 @@ npRmpiNomadShadowSearchRegression <- function(template,
                                             degree.max.cycles,
                                             degree.verify,
                                             bernstein.basis,
-                                            bernstein.named) {
+                                            bernstein.named,
+                                            nomad.source = "explicit",
+                                            nomad.auto.filled = character()) {
   degree.select <- match.arg(degree.select, c("manual", "coordinate", "exhaustive"))
   if (identical(degree.select, "manual"))
     return(NULL)
-  search.engine <- .npregbw_nomad_controls(search.engine)
+  resolved <- .np_degree_resolve_auto_engine(
+    search.engine = search.engine,
+    degree.select = degree.select,
+    ncon = ncon,
+    source = nomad.source,
+    auto.filled = nomad.auto.filled
+  )
+  search.engine <- .npregbw_nomad_controls(resolved$search.engine)
+  degree.select <- resolved$degree.select
 
   regtype.requested <- if (isTRUE(regtype.named)) match.arg(regtype, c("lc", "ll", "lp")) else "lc"
   if (!identical(regtype.requested, "lp"))
@@ -3034,13 +3069,50 @@ npRmpiNomadShadowSearchRegression <- function(template,
     restarts = npValidateNonNegativeInteger(degree.restarts, "degree.restarts"),
     max.cycles = npValidatePositiveInteger(degree.max.cycles, "degree.max.cycles"),
     verify = npValidateScalarLogical(degree.verify, "degree.verify"),
-    bernstein.basis = bern.auto
+    bernstein.basis = bern.auto,
+    source = resolved$source,
+    reason = resolved$reason
   )
 }
 
 .npregbw_attach_degree_search <- function(bws, search_result) {
+  cumulative_count <- function(name, total.name) {
+    if (!is.null(search_result[[total.name]])) {
+      total <- suppressWarnings(as.numeric(search_result[[total.name]][1L]))
+      if (is.finite(total))
+        return(total)
+    }
+
+    trace <- search_result$trace
+    trace.summable <- !(search_result$method %in% c("nomad", "nomad+powell"))
+    if (!is.null(search_result$engine))
+      trace.summable <- trace.summable && !(search_result$engine %in% c("nomad", "nomad+powell"))
+    if (!isTRUE(trace.summable))
+      return(NA_real_)
+    if (!is.data.frame(trace) || !nrow(trace) || !(name %in% names(trace)))
+      return(NA_real_)
+
+    actual <- rep(TRUE, nrow(trace))
+    if ("status" %in% names(trace))
+      actual <- actual & !is.na(trace$status) & as.character(trace$status) == "ok"
+    if ("cached" %in% names(trace)) {
+      cached <- suppressWarnings(as.logical(trace$cached))
+      cached[is.na(cached)] <- FALSE
+      actual <- actual & !cached
+    }
+
+    values <- suppressWarnings(as.numeric(trace[[name]]))
+    values <- values[actual & is.finite(values)]
+    if (!length(values))
+      return(NA_real_)
+    sum(values)
+  }
+
   metadata <- list(
     mode = search_result$method,
+    source = if (!is.null(search_result$source)) search_result$source else "explicit",
+    reason = if (!is.null(search_result$reason)) search_result$reason else NULL,
+    engine = if (!is.null(search_result$engine)) search_result$engine else search_result$method,
     verify = isTRUE(search_result$verify),
     completed = isTRUE(search_result$completed),
     certified = isTRUE(search_result$certified),
@@ -3064,6 +3136,7 @@ npRmpiNomadShadowSearchRegression <- function(template,
     restart.bandwidth.starts = search_result$restart.bandwidth.starts,
     restart.start.info = search_result$restart.start.info,
     restart.results = search_result$restart.results,
+    nn.cache = search_result$nn.cache,
     trace = search_result$trace
   )
 
@@ -3076,6 +3149,12 @@ npRmpiNomadShadowSearchRegression <- function(template,
   if (is.null(bws$timing.profile) && is.list(search_result$best$timing.profile))
     bws$timing.profile <- search_result$best$timing.profile
   bws <- .np_attach_nomad_restart_summary(bws, search_result)
+  total.num.feval <- cumulative_count("num.feval", "num.feval.total")
+  total.num.feval.fast <- cumulative_count("num.feval.fast", "num.feval.fast.total")
+  if (is.finite(total.num.feval))
+    bws$num.feval <- total.num.feval
+  if (is.finite(total.num.feval.fast))
+    bws$num.feval.fast <- total.num.feval.fast
   bws$degree.search <- metadata
   bws
 }
@@ -3209,7 +3288,8 @@ npregbw.default <-
       if ("degree.select" %in% mc.names &&
           identical(as.character(match.arg(nomad.shortcut$values$degree.select, c("manual", "coordinate", "exhaustive")))[1L], "manual"))
         stop("nomad=TRUE requires automatic degree search; use degree.select='coordinate' or 'exhaustive'")
-      if ("search.engine" %in% mc.names &&
+      if (!identical(nomad.shortcut$metadata$source, "auto") &&
+          "search.engine" %in% mc.names &&
           !(as.character(match.arg(nomad.shortcut$values$search.engine, c("nomad+powell", "cell", "nomad")))[1L] %in%
               c("nomad", "nomad+powell")))
         stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'")
@@ -3317,12 +3397,21 @@ npregbw.default <-
       degree.max.cycles = degree.max.cycles.value,
       degree.verify = degree.verify.value,
       bernstein.basis = bernstein.value,
-      bernstein.named = isTRUE(nomad.shortcut$enabled) || ("bernstein.basis" %in% search.mc.names)
+      bernstein.named = isTRUE(nomad.shortcut$enabled) || ("bernstein.basis" %in% search.mc.names),
+      nomad.source = nomad.shortcut$metadata$source,
+      nomad.auto.filled = nomad.shortcut$metadata$auto.filled
     )
     if (!is.null(degree.search) &&
         "bwsolver" %in% search.mc.names &&
         npBwsolverUsesMads(bwsolver)) {
       stop("bwsolver is for fixed-degree bandwidth searches; use search.engine for automatic degree search")
+    }
+    if (nomad.inner.named &&
+        (is.null(degree.search) || !(degree.search$engine %in% c("nomad", "nomad+powell")))) {
+      if (!is.null(degree.search) && identical(degree.search$source, "auto")) {
+        stop("nomad.nmulti applies only to NOMAD-backed degree search; nomad=\"auto\" selected exhaustive/cell search for this one-continuous-predictor problem")
+      }
+      stop("nomad.nmulti is only supported when regtype='lp', automatic degree search is active, and search.engine is 'nomad' or 'nomad+powell'")
     }
     if (!is.null(degree.search) && is.null(reg.args$degree)) {
       reg.args$degree <- npSetupGlpDegree(
@@ -3350,7 +3439,9 @@ npregbw.default <-
         list(
           objective = as.numeric(cell.bws$fval[1L]),
           payload = cell.bws,
-          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_
+          num.feval = if (!is.null(cell.bws$num.feval)) as.numeric(cell.bws$num.feval[1L]) else NA_real_,
+          num.feval.fast = if (!is.null(cell.bws$num.feval.fast)) as.numeric(cell.bws$num.feval.fast[1L]) else NA_real_,
+          nn.cache = cell.bws$nn.cache
         )
       }
 
@@ -3373,7 +3464,9 @@ npregbw.default <-
           eval_fun = eval_fun,
           direction = "min",
           trace_level = "full",
-          objective_name = "fval"
+          objective_name = "fval",
+          source = degree.search$source,
+          reason = degree.search$reason
         )
       } else {
         search.result <- .npregbw_nomad_search(
@@ -3386,7 +3479,10 @@ npregbw.default <-
           degree.search = degree.search,
           nomad.inner.nmulti = nomad.inner.nmulti,
           random.seed = random.seed.value,
-          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts
+          nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
+          source = degree.search$source,
+          reason = degree.search$reason,
+          progress_label = .np_degree_search_label(degree.search$engine, degree.search$source)
         )
       }
       tbw <- .npregbw_attach_degree_search(

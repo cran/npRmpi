@@ -639,6 +639,8 @@ npplreg.plbandwidth <-
     ev$total.time <- total.time
     ev$optim.time <- optim.time
     ev$fit.time <- fit.elapsed
+    ev$nomad.time <- if (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) as.double(bws$nomad.time) else NA_real_
+    ev$powell.time <- if (!is.null(bws$powell.time) && is.finite(bws$powell.time)) as.double(bws$powell.time) else NA_real_
 
     
     ev$call <- match.call(expand.dots = FALSE)
@@ -653,8 +655,8 @@ npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   .npRmpi_require_active_slave_pool(where = "npplreg()")
   explicit.plbandwidth <- (!missing(bws)) && inherits(bws, "plbandwidth")
   formula.forwarded <- (!missing(txdat)) && inherits(txdat, "formula")
-  nomad <- npValidateScalarLogical(nomad, "nomad")
-  degree.select.value <- if (isTRUE(nomad)) {
+  nomad <- npValidateNomadControl(nomad, "nomad")
+  degree.select.value <- if (npNomadControlRequested(nomad)) {
     "coordinate"
   } else if ("degree.select" %in% names(list(...))) {
     match.arg(list(...)$degree.select, c("manual", "coordinate", "exhaustive"))

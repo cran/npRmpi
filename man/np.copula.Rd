@@ -286,8 +286,10 @@ surface plots.
   }
 
   \item{center}{
-    centering convention for bootstrap intervals, either
-    \code{"estimate"} or \code{"bias-corrected"}.
+    centering convention for bootstrap intervals. Copula plots support
+    \code{"estimate"} and \code{"bias-corrected"}. Copula plots do not
+    currently have a validated oversmoothed pilot correction; unsupported
+    bootstrap bias-correction combinations fail clearly.
   }
 
   \item{errors}{

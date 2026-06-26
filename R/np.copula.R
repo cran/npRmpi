@@ -670,6 +670,14 @@ npcopula <- function(bws, ...) {
     return(NULL)
   if (!identical(x$evaluation, "grid"))
     stop("npcopula intervals are available only for grid evaluation output")
+  if (identical(plot.errors.method, "bootstrap") &&
+      .np_plot_center_is_oversmoothed(plot.errors.center, plot.errors.boot.method)) {
+    .np_plot_reject_oversmoothed_center(
+      plot.errors.center,
+      "copula plots",
+      plot.errors.boot.method
+    )
+  }
 
   data <- .npcopula_training_data(x)
   grid <- .npcopula_grid_eval(x)

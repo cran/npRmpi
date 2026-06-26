@@ -147,8 +147,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   .npRmpi_require_active_slave_pool(where = "npscoef()")
   explicit.scbandwidth <- (!missing(bws)) && inherits(bws, "scbandwidth")
   formula.forwarded <- (!missing(txdat)) && inherits(txdat, "formula")
-  nomad <- npValidateScalarLogical(nomad, "nomad")
-  degree.select.value <- if (isTRUE(nomad)) {
+  nomad <- npValidateNomadControl(nomad, "nomad")
+  degree.select.value <- if (npNomadControlRequested(nomad)) {
     "coordinate"
   } else if ("degree.select" %in% names(list(...))) {
     match.arg(list(...)$degree.select, c("manual", "coordinate", "exhaustive"))

@@ -247,6 +247,24 @@ npValidateScalarLogical <- function(value, argname) {
   value
 }
 
+npValidateNomadControl <- function(value, argname = "nomad") {
+  if (is.logical(value))
+    return(if (npValidateScalarLogical(value, argname)) "true" else "false")
+
+  if (!is.character(value) || length(value) != 1L || is.na(value))
+    stop(sprintf("'%s' must be TRUE, FALSE, or \"auto\"", argname), call. = FALSE)
+
+  token <- tolower(trimws(value))
+  if (token %in% c("true", "false", "auto"))
+    return(token)
+
+  stop(sprintf("'%s' must be TRUE, FALSE, or \"auto\"", argname), call. = FALSE)
+}
+
+npNomadControlRequested <- function(value, argname = "nomad") {
+  npValidateNomadControl(value, argname) %in% c("true", "auto")
+}
+
 npValidateNewdataColumns <- function(newdata, required, argname = "newdata") {
   nd <- toFrame(newdata)
   required <- unique(as.character(required))
@@ -274,16 +292,19 @@ npValidateNewdataFormula <- function(newdata, formula, include.response = TRUE,
                                        values,
                                        where = "npregbw") {
   call_names <- if (is.null(call_names)) character(0) else call_names[nzchar(call_names)]
-  nomad.enabled <- if ("nomad" %in% call_names) {
-    npValidateScalarLogical(nomad, "nomad")
+  nomad.mode <- if ("nomad" %in% call_names) {
+    npValidateNomadControl(nomad, "nomad")
   } else {
-    FALSE
+    "false"
   }
+  nomad.enabled <- nomad.mode %in% c("true", "auto")
 
   metadata <- list(
     enabled = isTRUE(nomad.enabled),
     where = where,
     preset = "lp_nomad",
+    source = if (identical(nomad.mode, "auto")) "auto" else if (identical(nomad.mode, "true")) "explicit" else "default",
+    nomad = nomad.mode,
     auto.filled = character(0),
     user.supplied = character(0),
     normalized.values = preset
@@ -443,8 +464,7 @@ npValidateNewdataFormula <- function(newdata, formula, include.response = TRUE,
       !is.null(bws$powell.time) && is.finite(bws$powell.time))
     result$bws$powell.time <- as.double(bws$powell.time)
 
-  if ((is.null(result$bws$total.time) || !is.finite(result$bws$total.time)) &&
-      !is.null(bws$total.time) && is.finite(bws$total.time))
+  if (!is.null(bws$total.time) && is.finite(bws$total.time))
     result$bws$total.time <- as.double(bws$total.time)
 
   result$bws <- .npRmpi_reconcile_nomad_bws_timing(result$bws)
@@ -760,6 +780,29 @@ npValidateGlpGradientOrder <- function(regtype,
   as.integer(gradient.order)
 }
 
+npValidateLcGradientOrder <- function(regtype,
+                                      gradient.order,
+                                      ncon,
+                                      argname = "gradient.order",
+                                      where = "local-constant regression") {
+  if (!identical(regtype, "lc"))
+    return(invisible(NULL))
+
+  gradient.order <- npValidateGlpGradientOrder(
+    regtype = "lp",
+    gradient.order = gradient.order,
+    ncon = ncon,
+    argname = argname
+  )
+  if (any(gradient.order != 1L)) {
+    stop(sprintf("%s supports only first derivatives for regtype='lc'; use regtype='lp' with sufficient degree for higher-order derivatives",
+                 where),
+         call. = FALSE)
+  }
+
+  gradient.order
+}
+
 npGlpDegree0FirstDerivativeLcOk <- function(regtype.engine,
                                             degree.engine,
                                             gradient.order,
@@ -770,6 +813,43 @@ npGlpDegree0FirstDerivativeLcOk <- function(regtype.engine,
     all(degree.engine == 0L) &&
     length(gradient.order) == ncon &&
     all(gradient.order == 1L)
+}
+
+npValidateGlpGradientDegree <- function(regtype.engine,
+                                        degree.engine,
+                                        gradient.order,
+                                        ncon,
+                                        where = "local-polynomial estimator",
+                                        allow.lp0.lc.first = TRUE) {
+  if (!identical(regtype.engine, "lp") || ncon == 0L)
+    return(invisible(gradient.order))
+
+  degree.engine <- as.integer(degree.engine)
+  gradient.order <- as.integer(gradient.order)
+
+  if (!length(degree.engine) || !length(gradient.order))
+    return(invisible(gradient.order))
+
+  if (isTRUE(allow.lp0.lc.first) &&
+      npGlpDegree0FirstDerivativeLcOk(
+        regtype.engine = regtype.engine,
+        degree.engine = degree.engine,
+        gradient.order = gradient.order,
+        ncon = ncon
+      ))
+    return(invisible(gradient.order))
+
+  bad <- which(gradient.order > degree.engine)
+  if (length(bad)) {
+    stop(sprintf(
+      "%s supports derivative orders only up to the fitted polynomial degree; requested order %s for degree %s",
+      where,
+      paste(gradient.order[bad], collapse = ","),
+      paste(degree.engine[bad], collapse = ",")
+    ), call. = FALSE)
+  }
+
+  invisible(gradient.order)
 }
 
 npConditionalRegEngineSpec <- function(bws, where = "conditional estimator") {
@@ -2369,6 +2449,30 @@ genGofStr <- function(x){
   paste(mse.str, r2.str, sep = "")
 }
 
+.np_timing_optim_label <- function(x) {
+  degree.search <- if (is.list(x$degree.search)) {
+    x$degree.search
+  } else if (is.list(x$bws) && is.list(x$bws$degree.search)) {
+    x$bws$degree.search
+  } else {
+    NULL
+  }
+
+  if (is.list(degree.search)) {
+    labels <- character(0)
+    for (field in c("mode", "method", "engine")) {
+      value <- degree.search[[field]]
+      if (!is.null(value) && length(value))
+        labels <- c(labels, as.character(value[1L]))
+    }
+    labels <- labels[!is.na(labels)]
+    if ("exhaustive" %in% labels)
+      return("Exhaustive Powell")
+  }
+
+  "optim"
+}
+
 genTimingStr <- function(x){
   if (is.null(x$total.time) || is.na(x$total.time))
     return("")
@@ -2507,10 +2611,24 @@ genTimingStr <- function(x){
                  .npRmpiTimingSessionStr(), .npRmpiTimingProfileStr(), sep = ""))
   }
 
-  if (!is.null(x$optim.time) && !is.na(x$optim.time) &&
-      !is.null(x$fit.time) && !is.na(x$fit.time))
-    return(paste("\nEstimation Time: ", format(x$total.time), " seconds (optim ",
-                 format(x$optim.time), "s, fit ", format(x$fit.time), "s)",
+  optim.label <- .np_timing_optim_label(x)
+  optim.time <- if (!is.null(x$optim.time) && !is.na(x$optim.time)) {
+    as.double(x$optim.time)
+  } else if (!identical(optim.label, "optim")) {
+    as.double(x$total.time)
+  } else {
+    NA_real_
+  }
+
+  if (is.finite(optim.time) && !is.null(x$fit.time) && !is.na(x$fit.time))
+    return(paste("\nEstimation Time: ", format(x$total.time), " seconds (",
+                 optim.label, " ", format(optim.time), "s, fit ",
+                 format(x$fit.time), "s)",
+                 .npRmpiTimingSessionStr(), .npRmpiTimingProfileStr(), sep = ""))
+
+  if (is.finite(optim.time) && !identical(optim.label, "optim"))
+    return(paste("\nEstimation Time: ", format(x$total.time), " seconds (",
+                 optim.label, " ", format(optim.time), "s)",
                  .npRmpiTimingSessionStr(), .npRmpiTimingProfileStr(), sep = ""))
 
   paste("\nEstimation Time: ",format(x$total.time)," seconds",
@@ -2888,6 +3006,166 @@ npUsesPolynomialSummaryLabel <- function(x){
   any(class(x) %in% density.classes)
 }
 
+.np_summary_missing_number <- function(x) {
+  length(x) != 1L || is.na(x) || !is.finite(x)
+}
+
+.np_summary_format_count <- function(x) {
+  format(round(as.numeric(x)[1L]), big.mark = ",", trim = TRUE,
+         scientific = FALSE)
+}
+
+.np_summary_format_percent <- function(hits, requests) {
+  format(round(100 * as.numeric(hits)[1L] / as.numeric(requests)[1L], 1L),
+         nsmall = 1L, trim = TRUE)
+}
+
+.np_summary_cache_avoided_line <- function(label, hits, requests, request.label) {
+  if (.np_summary_missing_number(hits) ||
+      .np_summary_missing_number(requests) ||
+      hits <= 0 || requests <= 0 || requests < hits)
+    return(NULL)
+
+  paste0(label, ": ", .np_summary_format_count(hits),
+         " repeated ", request.label, " avoided out of ",
+         .np_summary_format_count(requests), " (",
+         .np_summary_format_percent(hits, requests), "%)")
+}
+
+.np_summary_fast_route_line <- function(fast, computed) {
+  if (.np_summary_missing_number(fast) ||
+      .np_summary_missing_number(computed) ||
+      fast <= 0 || computed <= 0 || fast > computed)
+    return(NULL)
+
+  paste0("Fast CV route: ", .np_summary_format_count(fast),
+         " of ", .np_summary_format_count(computed),
+         " function evaluations (",
+         .np_summary_format_percent(fast, computed), "%)")
+}
+
+.np_summary_named_number <- function(x, name) {
+  if (is.null(x) || is.null(names(x)) || !(name %in% names(x)))
+    return(NA_real_)
+  out <- suppressWarnings(as.numeric(x[[name]][1L]))
+  if (length(out) != 1L) NA_real_ else out
+}
+
+.np_summary_nomad_cache_counts <- function(x) {
+  ds <- x$degree.search
+  if (!is.list(ds) || is.null(ds$restart.results) ||
+      !is.list(ds$restart.results))
+    return(list(hits = NA_real_, lookups = NA_real_))
+
+  hits <- 0
+  lookups <- 0
+  found <- FALSE
+
+  for (res in ds$restart.results) {
+    native <- if (is.list(res)) res$native else NULL
+    if (!is.list(native))
+      next
+    h <- .np_summary_named_number(native, "cache_hits")
+    l <- .np_summary_named_number(native, "total_evaluations")
+    if (.np_summary_missing_number(h) || .np_summary_missing_number(l))
+      next
+    hits <- hits + h
+    lookups <- lookups + l
+    found <- TRUE
+  }
+
+  if (!isTRUE(found))
+    return(list(hits = NA_real_, lookups = NA_real_))
+  list(hits = hits, lookups = lookups)
+}
+
+.np_summary_powell_cache_counts <- function(x) {
+  ds <- x$degree.search
+  nn.cache <- if (is.list(ds) && !is.null(ds$nn.cache)) ds$nn.cache else x$nn.cache
+  objective.hits <- .np_summary_named_number(nn.cache, "objective.hits")
+  objective.lookups <- .np_summary_named_number(nn.cache, "objective.visits")
+  objective.raw <- .np_summary_named_number(nn.cache, "objective.raw.evals")
+  if (.np_summary_missing_number(objective.hits))
+    objective.hits <- .np_summary_named_number(nn.cache, "hits")
+  if (.np_summary_missing_number(objective.lookups))
+    objective.lookups <- .np_summary_named_number(nn.cache, "visits")
+  if (.np_summary_missing_number(objective.lookups)) {
+    if (.np_summary_missing_number(objective.raw))
+      objective.raw <- .np_summary_named_number(nn.cache, "raw.evals")
+    if (!.np_summary_missing_number(objective.raw) &&
+        !.np_summary_missing_number(objective.hits))
+      objective.lookups <- objective.raw + objective.hits
+  }
+  list(hits = objective.hits, lookups = objective.lookups)
+}
+
+.np_bandwidth_eval_accounting_lines <- function(x) {
+  lines <- character()
+  cache.hits.displayed <- 0
+
+  nomad.cache <- .np_summary_nomad_cache_counts(x)
+  line <- .np_summary_cache_avoided_line("NOMAD cache",
+                                         nomad.cache$hits,
+                                         nomad.cache$lookups,
+                                         "point lookups")
+  has.nomad.cache <- !is.null(line)
+  if (has.nomad.cache)
+    lines <- c(lines, line)
+
+  ## NOMAD cache hits are whole-parameter point lookups. Powell/fast counts
+  ## below are objective-evaluation-layer lookups, so they are not subtracted
+  ## from one another.
+  powell.cache <- .np_summary_powell_cache_counts(x)
+  degree.search <- x$degree.search
+  degree.engine <- if (is.list(degree.search) && !is.null(degree.search$engine)) {
+    as.character(degree.search$engine[1L])
+  } else {
+    NA_character_
+  }
+  powell.label <- if (isTRUE(has.nomad.cache) ||
+                      (!is.na(degree.engine) && degree.engine %in% c("nomad", "nomad+powell"))) {
+    "Powell refinement cache"
+  } else {
+    "Powell cache"
+  }
+  line <- .np_summary_cache_avoided_line(powell.label,
+                                         powell.cache$hits,
+                                         powell.cache$lookups,
+                                         "objective lookups")
+  if (!is.null(line)) {
+    lines <- c(lines, line)
+    cache.hits.displayed <- cache.hits.displayed + powell.cache$hits
+  }
+
+  if (!(is.null(x$num.feval.fast) ||
+        (length(x$num.feval.fast) == 1L && is.na(x$num.feval.fast)))) {
+    fast <- suppressWarnings(as.numeric(x$num.feval.fast[1L]))
+    computed <- suppressWarnings(as.numeric(x$num.feval[1L]))
+    if (is.finite(fast) && fast > 0) {
+      fast.extra <- if (cache.hits.displayed > 0) {
+        fast - cache.hits.displayed
+      } else {
+        fast
+      }
+      if (is.finite(fast.extra) && fast.extra > 0) {
+        line <- .np_summary_fast_route_line(fast.extra, computed)
+        if (!is.null(line))
+          lines <- c(lines, line)
+      }
+    }
+  }
+
+  if (!(is.null(x$num.feval.guarded) ||
+        (length(x$num.feval.guarded) == 1L && is.na(x$num.feval.guarded)))) {
+    guarded <- suppressWarnings(as.numeric(x$num.feval.guarded[1L]))
+    if (is.finite(guarded) && guarded > 0)
+      lines <- c(lines, paste0("Guarded evaluations: ",
+                               .np_summary_format_count(guarded)))
+  }
+
+  lines
+}
+
 
 ## bandwidth-related report generating functions
 genBwSelStr <- function(x){
@@ -2905,21 +3183,16 @@ genBwSelStr <- function(x){
   nfe.str <- ""
   if(!(is.null(x$num.feval) || (length(x$num.feval) == 1L && is.na(x$num.feval)))){
     nfe.str <- paste("\nNumber of Function Evaluations: ", format(x$num.feval), sep="")
-    nfe.parts <- character()
-    if(!(is.null(x$num.feval.fast) || (length(x$num.feval.fast) == 1L && is.na(x$num.feval.fast)))){
-      nfe.parts <- c(nfe.parts, paste("fast = ", format(x$num.feval.fast), sep = ""))
-    }
-    if(!(is.null(x$num.feval.guarded) || (length(x$num.feval.guarded) == 1L && is.na(x$num.feval.guarded)))){
-      nfe.parts <- c(nfe.parts, paste("guarded = ", format(x$num.feval.guarded), sep = ""))
-    }
-    if(length(nfe.parts) > 0L)
-      nfe.str <- paste(nfe.str, " (", paste(nfe.parts, collapse = ", "), ")", sep="")
+    nfe.lines <- .np_bandwidth_eval_accounting_lines(x)
+    if(length(nfe.lines) > 0L)
+      nfe.str <- paste(c(nfe.str, nfe.lines), collapse = "\n")
   }
 
   pregtype <- npFormatRegressionType(x)
 
   pregtype.str <- if (is.null(pregtype)) "" else paste("\n", npPolynomialSummaryLabel(x), ": ", pregtype, sep = "")
   pmethod.str <- if (is.null(x$pmethod)) "" else paste("\nBandwidth Selection Method:", x$pmethod)
+  degree.search.str <- .np_degree_search_summary_str(x)
   formula.str <- if (!identical(x$formula, NULL)) paste("\nFormula:", paste(deparse(x$formula), collapse = "\n")) else ""
   ptype.str <- if (is.null(x$ptype)) "" else paste("\nBandwidth Type: ", x$ptype, sep = "")
   extendednn.str <- if (npRegressionHasExtendedNn(x)) {
@@ -2930,6 +3203,7 @@ genBwSelStr <- function(x){
 
   paste(pregtype.str,
         pmethod.str,
+        degree.search.str,
         formula.str,
         ptype.str,
         extendednn.str,
