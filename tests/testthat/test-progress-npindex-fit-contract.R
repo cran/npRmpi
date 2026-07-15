@@ -19,6 +19,27 @@ npindex_fit_progress_lines <- function(shadow) {
   vapply(shadow$trace, `[[`, character(1L), "line")
 }
 
+npindex_refinement_iterations <- function(lines) {
+  refine.lines <- lines[grepl("^\\[npRmpi\\] Refining bandwidth \\(", lines)]
+  iter.lines <- refine.lines[grepl("iter [0-9]+", refine.lines)]
+  if (!length(iter.lines)) {
+    return(integer())
+  }
+
+  as.integer(sub(
+    ".*iter ([0-9]+).*",
+    "\\1",
+    iter.lines
+  ))
+}
+
+npindex_degree_bandwidth_progress_positions <- function(lines) {
+  grep(
+    "^\\[npRmpi\\] (Bandwidth selection|Selecting degree and bandwidth|Degree/bw|NOMAD degree/bw|NOMAD deg/bw|Exhaustive degree/bw|Exhaustive deg/bw|Auto:NOMAD degree/bw|Auto:NOMAD deg/bw|Auto:exhaustive degree/bw|Auto:exhaustive deg/bw)",
+    lines
+  )
+}
+
 make_npindex_fit_progress_fixture <- function() {
   set.seed(20260404)
   n <- 24L
@@ -85,11 +106,11 @@ test_that("npindex direct lp fit emits fit progress without handoff", {
   expect_s3_class(actual$value, "singleindex")
   expect_false(any(grepl(": starting$", lines)))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/24 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/12 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
 })
@@ -153,13 +174,13 @@ test_that("npindex lp bw to fit route hands off into the regression fit surface"
   )
 
   lines <- npindex_fit_progress_lines(actual)
-  bandwidth.pos <- grep("^\\[npRmpi\\] Bandwidth selection \\(", lines)
+  bandwidth.pos <- npindex_degree_bandwidth_progress_positions(lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/12 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
     lines
   )
   fit.finish.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )
 
@@ -201,20 +222,23 @@ test_that("npindex lp nomad to powell to fit route preserves single-line handoff
   )
 
   lines <- npindex_fit_progress_lines(actual)
-  bandwidth.pos <- grep("^\\[npRmpi\\] (Selecting degree and bandwidth|NOMAD degree/bw|Exhaustive degree/bw|Auto:NOMAD degree/bw|Auto:exhaustive degree/bw)", lines)
+  bandwidth.pos <- npindex_degree_bandwidth_progress_positions(lines)
   powell.pos <- grep("^\\[npRmpi\\] Refining bandwidth \\(", lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/12 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
     lines
   )
   fit.finish.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )
 
   expect_s3_class(actual$value, "singleindex")
   expect_true(length(bandwidth.pos) > 0L)
   expect_true(length(powell.pos) > 0L)
+  powell.iter <- npindex_refinement_iterations(lines)
+  expect_true(length(powell.iter) > 0L)
+  expect_true(length(unique(powell.iter)) >= 2L)
   expect_true(length(fit.start.pos) == 1L)
   expect_true(length(fit.finish.pos) >= 1L)
   expect_lt(max(bandwidth.pos), fit.start.pos[[1L]])
@@ -252,19 +276,19 @@ test_that("predict.singleindex lp re-entry emits evaluation and training fit pro
 
   expect_false(any(grepl(": starting$", lines)))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/2 \\(50\\.0%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/1 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 2/2 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/1 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/24 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/12 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
 })
@@ -298,11 +322,11 @@ test_that("npindex direct fixed lc fit emits fit progress without handoff", {
   expect_s3_class(actual$value, "singleindex")
   expect_false(any(grepl(": starting$", lines)))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/24 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/12 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
 })
@@ -364,11 +388,11 @@ test_that("npindex fixed lc bw to fit route hands off into the regression fit su
   lines <- npindex_fit_progress_lines(actual)
   bandwidth.pos <- grep("^\\[npRmpi\\] Bandwidth selection \\(", lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/12 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
     lines
   )
   fit.finish.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )
 
@@ -410,19 +434,19 @@ test_that("predict.singleindex fixed lc re-entry emits evaluation and training f
 
   expect_false(any(grepl(": starting$", lines)))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/2 \\(50\\.0%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/1 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 2/2 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/1 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 1/24 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
+    "^\\[npRmpi\\] Fitting regression 1/12 \\([0-9]+\\.[0-9]%, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$",
     lines
   )))
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Fitting regression 24/24 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
+    "^\\[npRmpi\\] Fitting regression 12/12 \\(100\\.0%, elapsed [0-9]+\\.[0-9]s, eta 0\\.0s\\)$",
     lines
   )))
 })

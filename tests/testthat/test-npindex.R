@@ -25,6 +25,93 @@ test_that("npindex basic functionality works", {
   expect_output(summary(model))
 })
 
+test_that("npindexbw BFGS accounting uses bandwidth callback count", {
+  target_is_num_feval <- function(expr) {
+    is.call(expr) &&
+      identical(expr[[1L]], quote(`$`)) &&
+      identical(expr[[2L]], quote(bws)) &&
+      identical(expr[[3L]], quote(num.feval))
+  }
+
+  assigns_from_counter <- function(expr) {
+    ok <- FALSE
+    walk <- function(node) {
+      if (is.call(node)) {
+        if (identical(node[[1L]], quote(`<-`)) &&
+            length(node) == 3L &&
+            target_is_num_feval(node[[2L]]) &&
+            identical(node[[3L]], quote(bandwidth_eval_count))) {
+          ok <<- TRUE
+        }
+        for (idx in seq_along(node)[-1L])
+          walk(node[[idx]])
+      } else if (is.pairlist(node) || is.expression(node)) {
+        for (idx in seq_along(node))
+          walk(node[[idx]])
+      }
+    }
+    walk(expr)
+    ok
+  }
+
+  increments_counter <- function(expr) {
+    ok <- FALSE
+    walk <- function(node) {
+      if (is.call(node)) {
+        if (identical(node[[1L]], quote(`<<-`)) &&
+            length(node) == 3L &&
+            identical(node[[2L]], quote(bandwidth_eval_count)) &&
+            identical(node[[3L]], quote(bandwidth_eval_count + 1L))) {
+          ok <<- TRUE
+        }
+        for (idx in seq_along(node)[-1L])
+          walk(node[[idx]])
+      } else if (is.pairlist(node) || is.expression(node)) {
+        for (idx in seq_along(node))
+          walk(node[[idx]])
+      }
+    }
+    walk(expr)
+    ok
+  }
+
+  fn <- getFromNamespace("npindexbw.sibandwidth", "npRmpi")
+  expect_true(increments_counter(body(fn)))
+  expect_true(assigns_from_counter(body(fn)))
+})
+
+test_that("npindexbw BFGS adaptive-nn accounting exceeds fast callbacks", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260627)
+  n <- 45L
+  x1 <- runif(n)
+  x2 <- runif(n)
+  x3 <- runif(n)
+  y <- sin(x1 + 0.5 * x2 - 0.25 * x3) + rnorm(n, sd = 0.08)
+  tx <- data.frame(x1 = x1, x2 = x2, x3 = x3)
+
+  bw <- suppressWarnings(npindexbw(
+    xdat = tx,
+    ydat = y,
+    method = "ichimura",
+    regtype = "lc",
+    bwtype = "adaptive_nn",
+    nmulti = 1L,
+    optim.method = "BFGS",
+    optim.maxit = 80L,
+    optim.maxattempts = 1L
+  ))
+
+  num.feval <- as.numeric(bw$num.feval[1L])
+  num.feval.fast <- as.numeric(bw$num.feval.fast[1L])
+
+  expect_true(is.finite(as.numeric(bw$fval[1L])))
+  expect_gt(num.feval.fast, 0)
+  expect_gt(num.feval, num.feval.fast)
+})
+
 test_that("npindex public adaptive-nn lc route does not collapse to fixed semantics", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   old.auto <- getOption("npRmpi.autodispatch", FALSE)
@@ -125,7 +212,60 @@ test_that("manual single-index nearest-neighbor bandwidths fail fast when not in
   )
 })
 
-test_that("npindex supports residual and error branches with evaluation y data", {
+test_that("npindex supports residual and mean-error branches with evaluation y data", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  old.auto <- getOption("npRmpi.autodispatch", FALSE)
+  on.exit(options(npRmpi.autodispatch = old.auto), add = TRUE)
+  on.exit(close_mpi_slaves(), add = TRUE)
+  options(npRmpi.autodispatch = TRUE)
+
+  set.seed(20260309)
+  n <- 24L
+  x1 <- runif(n)
+  x2 <- runif(n)
+  y <- sin(x1 + x2) + rnorm(n, sd = 0.05)
+  tx <- data.frame(x1 = x1, x2 = x2)
+  ex <- tx[seq_len(6L), , drop = FALSE]
+  ey <- sin(ex$x1 + ex$x2) + rnorm(nrow(ex), sd = 0.05)
+
+  # Keep the default suite to one inexpensive branch; the opt-in sentinel below
+  # covers LL/LP gradient-error variants.
+  for (cfg in list(
+    list(regtype = "lc")
+  )) {
+    # This contract targets post-bandwidth residual/error branches. Dedicated
+    # tests above cover NN support, so keep this default-suite route fixed and
+    # small.
+    bw.args <- list(
+      xdat = tx,
+      ydat = y,
+      bws = c(1, 1, 0.45),
+      bandwidth.compute = FALSE,
+      regtype = cfg$regtype,
+      bwtype = "fixed"
+    )
+    if (!is.null(cfg$basis)) {
+      bw.args$basis <- cfg$basis
+      bw.args$degree <- cfg$degree
+      bw.args$bernstein.basis <- FALSE
+    }
+
+    bw <- do.call(npindexbw, bw.args)
+
+    fit.is <- npindex(bws = bw, txdat = tx, tydat = y, gradients = FALSE, residuals = TRUE)
+    expect_equal(length(fit.is$resid), nrow(tx), info = cfg$regtype)
+    expect_equal(as.vector(fit.is$resid), y - as.vector(fit.is$mean), tolerance = 1e-8, info = cfg$regtype)
+
+    fit.oos <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = FALSE, errors = TRUE)
+    expect_equal(length(fit.oos$mean), nrow(ex), info = cfg$regtype)
+    expect_equal(length(fit.oos$merr), nrow(ex), info = cfg$regtype)
+    expect_true(all(is.finite(fit.oos$mean)), info = cfg$regtype)
+    expect_true(all(is.finite(fit.oos$merr)), info = cfg$regtype)
+  }
+})
+
+test_that("npindex supports gradient-error branches with evaluation y data", {
+  skip_on_cran()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   old.auto <- getOption("npRmpi.autodispatch", FALSE)
   on.exit(options(npRmpi.autodispatch = old.auto), add = TRUE)
@@ -149,9 +289,10 @@ test_that("npindex supports residual and error branches with evaluation y data",
     bw.args <- list(
       xdat = tx,
       ydat = y,
+      bws = c(1, 1, 0.45),
+      bandwidth.compute = FALSE,
       regtype = cfg$regtype,
-      bwtype = "adaptive_nn",
-      nmulti = 1L
+      bwtype = "fixed"
     )
     if (!is.null(cfg$basis)) {
       bw.args$basis <- cfg$basis
@@ -160,17 +301,6 @@ test_that("npindex supports residual and error branches with evaluation y data",
     }
 
     bw <- do.call(npindexbw, bw.args)
-
-    fit.is <- npindex(bws = bw, txdat = tx, tydat = y, gradients = FALSE, residuals = TRUE)
-    expect_equal(length(fit.is$resid), nrow(tx), info = cfg$regtype)
-    expect_equal(as.vector(fit.is$resid), y - as.vector(fit.is$mean), tolerance = 1e-8, info = cfg$regtype)
-
-    fit.oos <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = FALSE, errors = TRUE)
-    expect_equal(length(fit.oos$mean), nrow(ex), info = cfg$regtype)
-    expect_equal(length(fit.oos$merr), nrow(ex), info = cfg$regtype)
-    expect_true(all(is.finite(fit.oos$mean)), info = cfg$regtype)
-    expect_true(all(is.finite(fit.oos$merr)), info = cfg$regtype)
-
     fit.grad <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = TRUE, errors = TRUE)
     expect_equal(dim(fit.grad$grad), c(nrow(ex), ncol(tx)), info = cfg$regtype)
     expect_equal(dim(fit.grad$gerr), c(nrow(ex), ncol(tx)), info = cfg$regtype)

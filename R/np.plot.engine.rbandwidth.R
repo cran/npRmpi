@@ -211,14 +211,37 @@
       go <- npValidateGlpGradientOrder(regtype = bws$regtype,
                                        gradient.order = gradient.order,
                                        ncon = bws$ncon)
-      if (length(go))
+      if (length(go)) {
         plot.gradient.order.label[which(bws$icon)] <- go
-      npValidateGlpGradientDegree(
-        regtype.engine = bws$regtype,
-        degree.engine = bws$degree,
-        gradient.order = go,
-        ncon = bws$ncon,
-        where = "plot.rbandwidth()"
+      }
+      if (bws$ncon > 0L) {
+        available <- npGlpGradientAvailability(
+          regtype.engine = bws$regtype,
+          degree.engine = bws$degree,
+          gradient.order = go,
+          ncon = bws$ncon
+        )
+        if (!any(available)) {
+          stop("plot.rbandwidth() has no available derivative components for the requested gradient.order and fitted polynomial degree",
+               call. = FALSE)
+        }
+        if (any(!available)) {
+          npWarnGlpGradientPartialAvailability(
+            where = "plot.rbandwidth()",
+            degree.engine = bws$degree,
+            gradient.order = go,
+            available = available,
+            con.names = bws$xnames[bws$icon]
+          )
+        }
+      }
+    }
+    if (plot.errors && gradients &&
+        identical(plot.errors.method, "asymptotic") &&
+        any(vapply(xdat, is.factor, logical(1)))) {
+      stop(
+        "asymptotic intervals for categorical gradient contrast panels are not available; use errors = \"bootstrap\"",
+        call. = FALSE
       )
     }
 
@@ -745,13 +768,7 @@
           )
         }
 
-        temp.mean[seq_len(xi.neval)] = if (gradients && xi.factor) {
-          .np_plot_factor_contrast_vector(tr$mean)
-        } else if (gradients) {
-          tr$grad[, i]
-        } else {
-          tr$mean
-        }
+        temp.mean[seq_len(xi.neval)] = if (gradients) tr$grad[, i] else tr$mean
 
         if (plot.errors){
           if (plot.errors.method == "asymptotic") {

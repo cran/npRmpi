@@ -82,17 +82,24 @@ npcdensbw.formula <-
   method <- if (!is.null(bws$method) && length(bws$method)) {
     as.character(bws$method[1L])
   } else {
-    "cv.ml"
+    NA_character_
   }
-
-  if (!identical(method, "cv.ls"))
-    return(invisible(TRUE))
 
   cykerlb <- if (is.null(bws$cykerlb)) numeric(0L) else bws$cykerlb[bws$iycon]
   cykerub <- if (is.null(bws$cykerub)) numeric(0L) else bws$cykerub[bws$iycon]
   bounded.y <- length(cykerlb) > 0L && any(is.finite(cykerlb) | is.finite(cykerub))
 
   if (!bounded.y)
+    return(invisible(TRUE))
+
+  if (is.na(method)) {
+    stop(sprintf(
+      "%s bounded response bandwidth objects must carry explicit bandwidth-selection method metadata",
+      where
+    ), call. = FALSE)
+  }
+
+  if (!identical(method, "cv.ls"))
     return(invisible(TRUE))
 
   if (bws$yncon < 1L || bws$yncon > 2L) {
@@ -330,8 +337,12 @@ npcdensbw.conbandwidth <-
            small = 1.490116e-05,
            tol = 1.490116e-04,
            transform.bounds = FALSE,
-           ...){
+           ...,
+           nomad.opts = list()){
+    nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npcdensbw")
     dot.args <- list(...)
+    if (length(nomad.opts))
+      dot.args$nomad.opts <- nomad.opts
     elapsed.start <- proc.time()[3]
     ydat = toFrame(ydat)
     xdat = toFrame(xdat)
@@ -641,7 +652,7 @@ npcdensbw.conbandwidth <-
           liracine = UKER_LR),
         oxkerneval = switch(bws$oxkertype,
           wangvanryzin = OKER_WANG,
-          liracine = OKER_LR,
+          liracine = OKER_NLR,
         "racineliyan" = OKER_RLY),
         oykerneval = switch(bws$oykertype,
           wangvanryzin = OKER_WANG,
@@ -682,7 +693,9 @@ npcdensbw.conbandwidth <-
       cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
       cyker.bounds.c <- .npcdensbw_marshal_y_bounds(bws$cykerlb[bws$iycon],
                                                     bws$cykerub[bws$iycon],
-                                                    bws$cykerbound)
+                                                    bws$cykerbound,
+                                                    ycon = ycon,
+                                                    extend.factor = tbw$cvls.quadrature.extend.factor)
 
       if (bws$method != "normal-reference"){
         myout <- npWithLocalLinearRawBasisSearchError(
@@ -1102,11 +1115,45 @@ npcdensbw.conbandwidth <-
   tbw
 }
 
-.npcdensbw_marshal_y_bounds <- function(kerlb, kerub, kerbound) {
+.npcdensbw_response_span_bounds <- function(ycon, extend.factor = 1) {
+  ycon <- as.matrix(ycon)
+  n <- ncol(ycon)
+  if (n == 0L)
+    return(list(lb = numeric(0L), ub = numeric(0L)))
+
+  extend.factor <- as.double(extend.factor)[1L]
+  if (!is.finite(extend.factor) || extend.factor < 0)
+    extend.factor <- 1
+
+  lb <- ub <- numeric(n)
+  for (j in seq_len(n)) {
+    vals <- as.double(ycon[, j])
+    vals <- vals[is.finite(vals)]
+    if (length(vals) == 0L) {
+      rng <- c(0, 1)
+      span <- 1
+    } else {
+      rng <- range(vals)
+      span <- diff(rng)
+      if (!is.finite(span) || span <= 0)
+        span <- 1
+    }
+    lb[j] <- rng[1L] - extend.factor * span
+    ub[j] <- rng[2L] + extend.factor * span
+  }
+
+  list(lb = lb, ub = ub)
+}
+
+.npcdensbw_marshal_y_bounds <- function(kerlb,
+                                        kerub,
+                                        kerbound,
+                                        ycon = NULL,
+                                        extend.factor = 1) {
   if (.npcdensbw_is_explicit_fixed_all_infinite(kerlb, kerub, kerbound)) {
-    sentinel <- .Machine$double.xmax / 4
-    n <- max(length(kerlb), length(kerub))
-    return(list(lb = rep.int(-sentinel, n), ub = rep.int(sentinel, n)))
+    if (is.null(ycon))
+      stop("internal error: response data required for fixed infinite response bounds")
+    return(.npcdensbw_response_span_bounds(ycon, extend.factor = extend.factor))
   }
 
   npKernelBoundsMarshal(kerlb, kerub)
@@ -1225,7 +1272,7 @@ npcdensbw.conbandwidth <-
       liracine = UKER_LR),
     oxkerneval = switch(bws$oxkertype,
       wangvanryzin = OKER_WANG,
-      liracine = OKER_LR,
+      liracine = OKER_NLR,
       racineliyan = OKER_RLY),
     oykerneval = switch(bws$oykertype,
       wangvanryzin = OKER_WANG,
@@ -1280,7 +1327,9 @@ npcdensbw.conbandwidth <-
   cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
   cyker.bounds.c <- .npcdensbw_marshal_y_bounds(bws$cykerlb[bws$iycon],
                                                 bws$cykerub[bws$iycon],
-                                                bws$cykerbound)
+                                                bws$cykerbound,
+                                                ycon = ycon,
+                                                extend.factor = cvls.quadrature.extend.factor)
 
   eval_call <- function() {
     .Call(
@@ -1704,7 +1753,7 @@ npRmpiNomadShadowClearConditionalDensity <- function() {
       liracine = UKER_LR),
     oxkerneval = switch(bws$oxkertype,
       wangvanryzin = OKER_WANG,
-      liracine = OKER_LR,
+      liracine = OKER_NLR,
       racineliyan = OKER_RLY),
     oykerneval = switch(bws$oykertype,
       wangvanryzin = OKER_WANG,
@@ -1759,7 +1808,9 @@ npRmpiNomadShadowClearConditionalDensity <- function() {
   cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
   cyker.bounds.c <- .npcdensbw_marshal_y_bounds(bws$cykerlb[bws$iycon],
                                                 bws$cykerub[bws$iycon],
-                                                bws$cykerbound)
+                                                bws$cykerbound,
+                                                ycon = ycon,
+                                                extend.factor = cvls.quadrature.extend.factor)
   if (is.null(start.bw)) {
     start.bw <- c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
                   bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
@@ -1978,6 +2029,20 @@ npRmpiNomadShadowSearchConditionalDensity <- function(template,
         user_supplied = degree.search$start.user
       )
     )
+    native.baseline.start <- proc.time()[3L]
+    native.baseline.eval <- eval_fun(x0)
+    native.baseline.record <- list(
+      eval_id = 1L,
+      degree = as.integer(native.baseline.eval$degree),
+      objective = as.numeric(native.baseline.eval$objective[1L]),
+      status = "ok",
+      cached = FALSE,
+      message = "baseline degree-search start",
+      elapsed = proc.time()[3L] - native.baseline.start,
+      num.feval = as.numeric(native.baseline.eval$num.feval[1L]),
+      num.feval.fast = as.numeric(native.baseline.eval$num.feval.fast[1L]),
+      num.feval.guarded = as.numeric(native.baseline.eval$num.feval.guarded[1L])
+    )
     native.results <- vector("list", nrow(native.start.matrix))
     native.best.index <- NA_integer_
     native.best.objective <- -Inf
@@ -2113,14 +2178,22 @@ npRmpiNomadShadowSearchConditionalDensity <- function(template,
       best_record = native.record
     )
     search.result <- list(
+      baseline = native.baseline.record,
       best = native.record,
       best_point = as.numeric(native.best$best_point),
       best_payload = NULL,
       completed = TRUE,
+      certified = FALSE,
+      interrupted = FALSE,
       method = search.engine.used,
+      direction = "max",
       restart.results = native.results,
       restart.starts = lapply(seq_len(nrow(native.start.matrix)), function(i) as.numeric(native.start.matrix[i, ])),
       best.restart = native.best.index,
+      n.unique = if (is.finite(native.callback.total)) as.integer(native.callback.total + 1L) else NA_integer_,
+      n.visits = if (is.finite(native.callback.total)) as.integer(native.callback.total + 1L) else NA_integer_,
+      n.cached = 0L,
+      grid.size = NA_integer_,
       nomad.time = native.nomad.elapsed,
       powell.time = NA_real_,
       num.feval.total = nomad.num.feval.total,
@@ -2498,6 +2571,7 @@ npRmpiNomadShadowSearchConditionalDensity <- function(template,
 
   if (.npcdensbw_fixed_native_target(template, reg.args, bwsolver)) {
     .npcdensbw_nomad_shadow_native_require_crs()
+    npObjectiveCacheEnabled()
     native.regtype.engine <- if (!is.null(reg.args$regtype.engine) && length(reg.args$regtype.engine)) {
       as.character(reg.args$regtype.engine[1L])
     } else if (!is.null(reg.args$regtype) && length(reg.args$regtype)) {
@@ -3365,6 +3439,7 @@ npRmpiNomadShadowSearchConditionalDensity <- function(template,
     if (isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
       search.result <- eval(mc, envir = environment())
     } else {
+      npObjectiveCacheEnabled()
       opt.snapshot <- .npRmpi_autodispatch_option_snapshot()
       opt.mc <- substitute(do.call("options", OPTS), list(OPTS = opt.snapshot))
       .npRmpi_bcast_cmd_expr(opt.mc, comm = 1L, caller.execute = FALSE)
@@ -3588,38 +3663,7 @@ npRmpiNomadShadowSearchConditionalDensity <- function(template,
 }
 
 .npcdensbw_attach_degree_search <- function(bws, search_result) {
-  metadata <- list(
-    mode = search_result$method,
-    source = if (!is.null(search_result$source)) search_result$source else "explicit",
-    reason = if (!is.null(search_result$reason)) search_result$reason else NULL,
-    engine = if (!is.null(search_result$engine)) search_result$engine else search_result$method,
-    direction = search_result$direction,
-    verify = isTRUE(search_result$verify),
-    completed = isTRUE(search_result$completed),
-    certified = isTRUE(search_result$certified),
-    interrupted = isTRUE(search_result$interrupted),
-    baseline.degree = search_result$baseline$degree,
-    baseline.fval = search_result$baseline$objective,
-    best.degree = search_result$best$degree,
-    best.fval = search_result$best$objective,
-    nomad.time = search_result$nomad.time,
-    powell.time = search_result$powell.time,
-    optim.time = search_result$optim.time,
-    n.unique = search_result$n.unique,
-    n.visits = search_result$n.visits,
-    n.cached = search_result$n.cached,
-    grid.size = search_result$grid.size,
-    singleton = isTRUE(search_result$singleton),
-    fixed.degree = search_result$fixed.degree,
-    best.restart = search_result$best.restart,
-    restart.starts = search_result$restart.starts,
-    restart.degree.starts = search_result$restart.degree.starts,
-    restart.bandwidth.starts = search_result$restart.bandwidth.starts,
-    restart.start.info = search_result$restart.start.info,
-    restart.results = search_result$restart.results,
-    nn.cache = search_result$nn.cache,
-    trace = search_result$trace
-  )
+  metadata <- .np_degree_search_metadata(search_result, default_direction = "max")
 
   if (!is.null(search_result$nomad.time))
     bws$nomad.time <- as.numeric(search_result$nomad.time[1L])
@@ -3732,7 +3776,9 @@ npcdensbw.default <-
            degree.verify = FALSE,
            bernstein.basis = FALSE,
            ## dummy arguments for conbandwidth() function call
-           ...){
+           ...,
+           nomad.opts = list()){
+    nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npcdensbw")
     ## maintain x names and 'toFrame'
     xdat <- toFrame(xdat)
 
@@ -3891,6 +3937,8 @@ npcdensbw.default <-
 
     search.mc.names <- names(mc)
     lp.dot.args <- list(...)
+    if (length(nomad.opts))
+      lp.dot.args$nomad.opts <- nomad.opts
     .np_degree_reject_unknown_dots(
       lp.dot.args,
       "npcdensbw",

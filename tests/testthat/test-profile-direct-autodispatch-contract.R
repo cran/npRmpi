@@ -69,8 +69,7 @@ subprocess_env <- function(extra = character()) {
 
 test_that("profile direct autodispatch regression routes initialize embedded MPI state automatically", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -97,6 +96,10 @@ test_that("profile direct autodispatch regression routes initialize embedded MPI
     "  bw.manual <- npregbw(xdat = x, ydat = y, regtype = 'lc', bws = 0.25, bandwidth.compute = FALSE)",
     "  fit.manual <- npreg(bws = bw.manual, txdat = x, tydat = y, gradients = FALSE)",
     "  fit.formula <- npreg(y ~ x, data = d, regtype = 'lc', bwmethod = 'cv.ls', nmulti = 1)",
+    "  profile <- bw.cv$timing.profile",
+    "  stopifnot(is.list(profile))",
+    "  stopifnot(identical(as.integer(profile$rank), 0L))",
+    "  stopifnot(identical(as.integer(profile$size), 2L))",
     "  stopifnot(inherits(bw.cv, 'rbandwidth'))",
     "  stopifnot(inherits(fit.cv, 'npregression'))",
     "  stopifnot(inherits(fit.manual, 'npregression'))",

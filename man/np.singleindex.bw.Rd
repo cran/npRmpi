@@ -61,7 +61,8 @@ npindexbw(\dots)
           scale.factor.init.upper = 2.0,
           scale.factor.init = 0.5,
           scale.factor.search.lower = NULL,
-          \dots)
+          \dots,
+          nomad.opts = list())
 
 \method{npindexbw}{sibandwidth}(xdat = stop("training data xdat missing"),
           ydat = stop("training data ydat missing"),
@@ -316,8 +317,9 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     native \pkg{crs} NOMAD API multistarts within each outer restart.
     Returned bandwidth objects retain this normalized preset metadata in
     \code{bw$nomad.shortcut} for a returned object \code{bw}; when
-    available, \code{nomad.time} and \code{powell.time} record the
-    direct-search and Powell-polish timing components.
+    available, \code{nomad.time} records the direct-search component.
+    The legacy field \code{powell.time} records the subsequent family-native
+    R \code{optim} refinement selected by \code{optim.method}.
   }
 
   \item{nomad.nmulti}{
@@ -328,9 +330,14 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     Defaults to \code{0L}, which preserves the current one-start-per-
     restart behavior. This does not replace \code{nmulti}:
     \code{nmulti} controls outer restarts, while \code{nomad.nmulti}
-    controls inner NOMAD multistarts within each outer restart. Advanced
-    native NOMAD parameters may be supplied as \code{nomad.opts} through
-    \code{...}; invalid or unsupported parameters are rejected by NOMAD
+    controls inner NOMAD multistarts within each outer restart.
+  }
+
+  \item{nomad.opts}{
+    optional named list of native NOMAD parameters forwarded to the
+    \pkg{crs} NOMAD C API for NOMAD-backed bandwidth searches.
+    \code{NULL} is treated as no extra NOMAD options. Non-list values and
+    invalid or unsupported parameters are rejected before solver entry
     rather than silently ignored. Routes that evaluate R callbacks require
     serial callback evaluation and reject parallel callback settings such as
     \code{NB_THREADS_PARALLEL_EVAL > 1}.
@@ -348,11 +355,14 @@ These arguments control the optional NOMAD direct-search route for local-polynom
   \item{search.engine}{
     character string controlling the automatic local-polynomial search
     backend when \code{regtype="lp"} and
-    \code{degree.select != "manual"}. \code{"nomad+powell"} (default)
+    \code{degree.select != "manual"}. The compatibility value
+    \code{"nomad+powell"} (default)
     performs direct joint search over the index-smoother bandwidth and
-    degree using the native \pkg{crs} NOMAD C API, then applies one Powell hot
-    start from the NOMAD solution. \code{"nomad"} omits the Powell
-    refinement. \code{"cell"} profiles the criterion over the
+    degree using the native \pkg{crs} NOMAD C API, then applies one
+    family-native R \code{optim} hot start from the NOMAD solution using
+    \code{optim.method}. The value is retained for API compatibility;
+    \code{"nomad"} omits this R-optimizer refinement.
+    \code{"cell"} profiles the criterion over the
     admissible degree grid using repeated fixed-degree solves. Direct
     exhaustive degree-grid search is available with
     \code{degree.select="exhaustive"} and \code{search.engine="cell"}.
@@ -374,12 +384,10 @@ These arguments control outer restart behavior for bandwidth and index-parameter
   }
 
   \item{powell.remin}{
-    logical flag controlling Powell restart-from-minimum behavior. For
-    ordinary fixed-degree Powell-style search, \code{TRUE} restarts the
-    local search from the located minimum. For \code{search.engine="nomad+powell"},
-    this controls only the final Powell bandwidth-polish step. The default
-    is \code{TRUE} for ordinary Powell routes and \code{FALSE} for the
-    Powell polish after NOMAD unless explicitly supplied.
+    compatibility argument shared with bandwidth families that use the Powell
+    direction-set solver. Single-index fixed-degree and post-NOMAD refinement
+    use R \code{\link{optim}} with \code{optim.method}; consequently, this
+    argument does not alter their refinement behavior.
   }
 
 
@@ -400,7 +408,7 @@ These arguments control outer optimization behavior for the semiparametric searc
 
   \item{optim.maxattempts}{
     maximum number of attempts taken trying to achieve successful
-    convergence in \code{\link{optim}}. Defaults to \code{100}.
+    convergence in \code{\link{optim}}. Defaults to \code{10}.
   }
 
   \item{optim.maxit}{
@@ -429,6 +437,16 @@ These arguments control outer optimization behavior for the semiparametric searc
     methods will generally be more fragile than the BFGS method, but as
     they do not store a matrix they may be successful in much larger
     optimization problems.
+
+    The default \code{"Nelder-Mead"} method is a reasonable, robust
+    derivative-free default when the search dimension is small, such as
+    one scalar bandwidth plus only a few index coefficients. As the
+    number of predictors grows, the \eqn{\beta} search becomes higher
+    dimensional and \code{optim.method="BFGS"} can be a useful
+    performance and sensitivity comparison. Because the single-index
+    objective can be nonconvex and route-sensitive, compare the selected
+    objective value, convergence behavior, and resulting bandwidth
+    object against the default search before relying on the result.
   }
 
   \item{optim.reltol}{
@@ -512,6 +530,34 @@ or standard-deviation factors.
   requires that the explanatory variables contain \emph{at least one}
   continuous variable.
 
+  \subsection{Interpreting \eqn{\beta} Coefficients}{
+    The scale of \eqn{X^\prime\beta} and the scale of the unknown link
+    function are not separately identified, so \code{npindexbw}
+    normalizes the first coefficient to one. The remaining coefficients
+    should therefore be read relative to the first explanatory variable,
+    not as standalone linear-model slopes. Holding other variables fixed,
+    a one-unit increase in \eqn{X_j} changes the index by the same amount
+    as a \eqn{\beta_j}-unit increase in \eqn{X_1}. Where the link
+    derivative exists and is nonzero, marginal-effect ratios satisfy
+    \eqn{\partial g(X^\prime\beta)/\partial X_j \; /\;
+    \partial g(X^\prime\beta)/\partial X_1 = \beta_j}{dg/dX_j divided
+    by dg/dX_1 = beta_j}. Signs and magnitudes are therefore relative to
+    the chosen first variable and its units; choose the first continuous
+    regressor deliberately when interpretation is important.
+  }
+
+  \subsection{Choosing \code{optim.method}}{
+    The default \code{"Nelder-Mead"} search is often a good starting
+    point for low-dimensional single-index problems because it uses only
+    objective values and is comparatively tolerant of rough objective
+    surfaces. When \eqn{p} is larger, especially when many coefficients
+    enter \eqn{\beta}, \code{"BFGS"} may reduce runtime for some
+    problems, but it is more dependent on local smoothness and on the
+    quality of numerical gradient information. For important fits, try
+    both methods with adequate multistarts and compare the final
+    objective values, convergence messages, and fitted objects.
+  }
+
   \code{npindexbw} may be invoked \emph{either} with a formula-like
   symbolic description of variables on which bandwidth selection is to
   be performed \emph{or} through a simpler interface whereby data is
@@ -525,7 +571,9 @@ or standard-deviation factors.
   exploratory purposes, you may wish to override the default search
   tolerances, say, setting \code{optim.reltol=.1} and conduct
   multistarting (the default is to restart min(2, ncol(xdat)) times) as is done
-  for a number of examples.
+  for a number of examples. See the optimizer guidance above when
+  choosing between the default \code{"Nelder-Mead"} method and
+  \code{optim.method="BFGS"} for higher-dimensional index searches.
 
   Data for which bandwidths are to be estimated may be specified
   symbolically. A typical description has the form \code{dependent data
@@ -544,9 +592,11 @@ or standard-deviation factors.
   admissible degree grid using cached coordinate-wise or exhaustive
   search. With \code{search.engine="nomad"} or
   \code{"nomad+powell"}, the criterion is optimized directly over the
-  joint degree/bandwidth space using the native \pkg{crs} NOMAD C API;
-  \code{"nomad+powell"} then performs one Powell hot start and retains
-  the better of the direct NOMAD and polished solutions. For the
+  joint degree/bandwidth space using the native \pkg{crs} NOMAD C API.
+  For this family, the compatibility value \code{"nomad+powell"} then
+  performs one family-native R \code{optim} hot start using
+  \code{optim.method} and retains the better of the direct NOMAD and refined
+  solutions. For the
   index-smoother local-polynomial component, this polynomial-adaptive
   joint-search route follows Hall and Racine (2015).
 
@@ -573,7 +623,7 @@ or standard-deviation factors.
   eligible for data-driven resolution when both were not supplied
   explicitly: scalar continuous degree searches use the exhaustive
   degree-grid route, while higher-dimensional degree searches keep the
-  NOMAD/Powell route. Explicit \code{search.engine} or
+  compatibility \code{"nomad+powell"} route. Explicit \code{search.engine} or
   \code{degree.select} choices are honored.
 
 }

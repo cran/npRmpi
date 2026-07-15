@@ -60,8 +60,9 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
   \item{tdat}{
     a \eqn{p}-variate data frame of sample realizations (training data)
-    used to estimate the cumulative distribution. Defaults to the training data used to
-    compute the bandwidth object.
+    used to estimate the cumulative distribution. Defaults to the corresponding
+    training data recoverable from the bandwidth object in the current
+    session.
   }
 
 
@@ -114,6 +115,12 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   from \code{\dots} to that call. When \code{bws} is already a
   \code{dbandwidth} object, \code{npudist} estimates with the stored
   bandwidth metadata in that object.
+
+  With finite continuous bounds, \code{npudist} uses the
+  observation-centered truncated-kernel CDF documented in
+  \code{\link{np.kernels}}. It is exactly zero and one at the declared
+  lower and upper endpoints and has the linear uniform-CDF limit as the
+  bandwidth diverges.
 
   Argument groups for bandwidth selection are documented on
   \code{\link{npudistbw}}. The most common workflow is to choose data
@@ -277,6 +284,14 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work as
   intended on mixed data types and will coerce the data to the same
   type.
+
+  When reusing a bandwidth object without explicit training or evaluation
+  data, the required data are recovered from object-retained state or
+  from the stored call environment when available. This is a convenience
+  for ordinary same-session use, not a guarantee that a saved object is
+  self-contained. For reproducible replay after \code{saveRDS()} and
+  \code{readRDS()} in a fresh R session, supply the required data
+  arguments explicitly.
 }
 
 \seealso{

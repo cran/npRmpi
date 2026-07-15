@@ -73,16 +73,18 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
-    calculate the regression estimators. Defaults to the training data used to
-    compute the bandwidth object.
+    calculate the regression estimators. Defaults to the corresponding
+    training data recoverable from the bandwidth object in the current
+    session.
   }
 
 
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{txdat}. Defaults to the training data used to
-    compute the bandwidth object.
+    \code{txdat}. Defaults to the corresponding
+    training data recoverable from the bandwidth object in the current
+    session.
   }
 
 
@@ -190,6 +192,40 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
 
   A matrix of gradients along with average derivatives are computed and
   returned if \code{gradients=TRUE} is used.
+
+  \subsection{Interpreting \eqn{\beta} Coefficients}{
+    Single-index coefficients are identified only up to scale, so
+    \code{npindexbw} normalizes the first coefficient to one. The
+    remaining coefficients describe relative movement in the index
+    \eqn{X^\prime\beta}, not standalone linear-model slopes. Holding
+    other variables fixed, a one-unit increase in \eqn{X_j} changes the
+    index by the same amount as a \eqn{\beta_j}-unit increase in
+    \eqn{X_1}. Where the link derivative exists and is nonzero, this is
+    also the local marginal-effect ratio relative to \eqn{X_1}. Choose
+    the first continuous regressor deliberately when coefficient
+    interpretation is important.
+
+    For \eqn{E[Y\mid X]=g(X^\prime\beta)}, the component plotted for
+    predictor \eqn{X_j} is
+    \deqn{\frac{\partial E[Y\mid X]}{\partial X_j}
+      = \beta_j g'(X^\prime\beta)}{d E[Y|X] / d X_j = beta_j g'(X' beta).}
+    Accordingly, \code{plot(..., gradients=TRUE)} displays every component
+    against the common scalar index \eqn{X^\prime\beta}; the y-axis identifies
+    the predictor with respect to which the derivative is taken. These panels
+    are not partial-dependence plots against the individual \eqn{X_j} values.
+  }
+
+  \subsection{Optimizer Choice When Bandwidths Are Computed}{
+    When \code{npindex} computes its bandwidth object internally,
+    optimizer controls in \code{\dots} are passed to \code{\link{npindexbw}}.
+    The default \code{optim.method="Nelder-Mead"} is a robust
+    derivative-free starting point for low-dimensional searches, such as
+    one bandwidth plus only a few index coefficients. For larger
+    \eqn{p}, \code{optim.method="BFGS"} can be useful as a performance
+    and sensitivity comparison, but users should compare objective
+    values, convergence behavior, and fitted objects because the
+    single-index criterion can be nonconvex and route-sensitive.
+  }
 
   For practitioners who want the recommended automatic local-polynomial degree-and-bandwidth NOMAD route
   without spelling out all LP tuning arguments,
@@ -299,6 +335,14 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work as
   intended on mixed data types and will coerce the data to the same
   type.
+
+  When reusing a bandwidth object without explicit training or evaluation
+  data, the required data are recovered from object-retained state or
+  from the stored call environment when available. This is a convenience
+  for ordinary same-session use, not a guarantee that a saved object is
+  self-contained. For reproducible replay after \code{saveRDS()} and
+  \code{readRDS()} in a fresh R session, supply the required data
+  arguments explicitly.
 
   \code{\link{vcov}} requires that \code{gradients=TRUE} be set.
 }

@@ -1,4 +1,5 @@
 test_that("npindex NOMAD shortcut stays near the Powell basin on the canonical Ichimura repro", {
+  skip_on_cran()
   skip_if_not_installed("crs")
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
   on.exit(close_mpi_slaves(force = TRUE), add = TRUE)

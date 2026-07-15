@@ -28,6 +28,8 @@ npcdist.formula <-
     tmf <- bws$call[c(1,m)]
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
+    if (!missing(data) && !is.null(data))
+      tmf[["data"]] <- substitute(data)
     mf.args <- as.list(tmf)[-1L]
     umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
 
@@ -56,6 +58,12 @@ npcdist.formula <-
     ev$omit <- attr(umf,"na.action")
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
+    train.omit <- as.vector(attr(tmf, "na.action"))
+    eval.omit <- if (has.eval) as.vector(attr(umf, "na.action")) else integer(0)
+    ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
+    ev$train.nobs.omit <- length(train.omit)
+    ev$eval.rows.omit <- if (length(eval.omit)) eval.omit else NA
+    ev$eval.nobs.omit <- length(eval.omit)
 
     ev$condist <- napredict(ev$omit, ev$condist)
     ev$conderr <- napredict(ev$omit, ev$conderr)
@@ -114,6 +122,24 @@ npcdist.condbandwidth <-
         gradient.order = glp.gradient.order.preflight,
         ncon = bws$xncon
       )
+    glp.gradient.available.preflight <- NULL
+    glp.gradient.partial.preflight <- FALSE
+    if (isTRUE(gradients) &&
+        identical(reg.spec.preflight$reg.engine, "lp") &&
+        (bws$xncon > 0L)) {
+      glp.gradient.available.preflight <- npGlpGradientAvailability(
+        regtype.engine = reg.spec.preflight$reg.engine,
+        degree.engine = reg.spec.preflight$degree.engine,
+        gradient.order = glp.gradient.order.preflight,
+        ncon = bws$xncon
+      )
+      if (!any(glp.gradient.available.preflight)) {
+        stop("npcdist has no available derivative components for the requested gradient.order and fitted polynomial degree",
+             call. = FALSE)
+      }
+      glp.gradient.partial.preflight <- !lp.degree0.lc.gradient.preflight &&
+        any(!glp.gradient.available.preflight)
+    }
     if (isTRUE(gradients) &&
         identical(reg.spec.preflight$reg.engine, "lp") &&
         (bws$xncon > 0L) &&
@@ -121,7 +147,9 @@ npcdist.condbandwidth <-
         all(reg.spec.preflight$degree.engine == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
-    if (isTRUE(gradients) && identical(reg.spec.preflight$reg.engine, "lp")) {
+    if (isTRUE(gradients) &&
+        identical(reg.spec.preflight$reg.engine, "lp") &&
+        !glp.gradient.partial.preflight) {
       npValidateGlpGradientDegree(
         regtype.engine = reg.spec.preflight$reg.engine,
         degree.engine = reg.spec.preflight$degree.engine,
@@ -198,9 +226,9 @@ npcdist.condbandwidth <-
     
     ## catch and destroy NA's
     keep.rows <- rep_len(TRUE, nrow(txdat))
-    rows.omit <- attr(na.omit(data.frame(txdat, tydat)), "na.action")
-    if (length(rows.omit) > 0L)
-      keep.rows[as.integer(rows.omit)] <- FALSE
+    train.rows.omit <- attr(na.omit(data.frame(txdat, tydat)), "na.action")
+    if (length(train.rows.omit) > 0L)
+      keep.rows[as.integer(train.rows.omit)] <- FALSE
 
     if (!any(keep.rows))
       stop("Data has no rows without NAs")
@@ -208,11 +236,12 @@ npcdist.condbandwidth <-
     txdat <- txdat[keep.rows,,drop = FALSE]
     tydat <- tydat[keep.rows,,drop = FALSE]
 
+    eval.rows.omit <- integer(0)
     if (!no.exy){
       keep.eval <- rep_len(TRUE, nrow(exdat))
-      rows.omit <- attr(na.omit(data.frame(exdat, eydat)), "na.action")
-      if (length(rows.omit) > 0L)
-        keep.eval[as.integer(rows.omit)] <- FALSE
+      eval.rows.omit <- attr(na.omit(data.frame(exdat, eydat)), "na.action")
+      if (length(eval.rows.omit) > 0L)
+        keep.eval[as.integer(eval.rows.omit)] <- FALSE
 
       if (!any(keep.eval))
         stop("Data has no rows without NAs")
@@ -311,6 +340,33 @@ npcdist.condbandwidth <-
         gradient.order = glp.gradient.order,
         ncon = bws$xncon
       )
+    glp.gradient.available <- NULL
+    glp.gradient.partial <- FALSE
+    if (isTRUE(gradients) &&
+        identical(reg.engine, "lp") &&
+        (bws$xncon > 0L)) {
+      glp.gradient.available <- npGlpGradientAvailability(
+        regtype.engine = reg.engine,
+        degree.engine = degree.engine,
+        gradient.order = glp.gradient.order,
+        ncon = bws$xncon
+      )
+      if (!any(glp.gradient.available)) {
+        stop("npcdist has no available derivative components for the requested gradient.order and fitted polynomial degree",
+             call. = FALSE)
+      }
+      glp.gradient.partial <- !lp.degree0.lc.gradient &&
+        any(!glp.gradient.available)
+      if (glp.gradient.partial && any(!glp.gradient.available)) {
+        npWarnGlpGradientPartialAvailability(
+          where = "npcdist",
+          degree.engine = degree.engine,
+          gradient.order = glp.gradient.order,
+          available = glp.gradient.available,
+          con.names = colnames(txdat)[bws$ixcon]
+        )
+      }
+    }
     if (isTRUE(gradients) &&
         identical(reg.engine, "lp") &&
         (bws$xncon > 0L) &&
@@ -318,7 +374,9 @@ npcdist.condbandwidth <-
         all(degree.engine == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
-    if (isTRUE(gradients) && identical(reg.engine, "lp")) {
+    if (isTRUE(gradients) &&
+        identical(reg.engine, "lp") &&
+        !glp.gradient.partial) {
       npValidateGlpGradientDegree(
         regtype.engine = reg.engine,
         degree.engine = degree.engine,
@@ -340,6 +398,7 @@ npcdist.condbandwidth <-
       integer(0)
     }
     basis.code <- as.integer(npLpBasisCode(basis.engine))
+    do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
 
     myopti <- list(
         num_obs_train = tnrow,
@@ -381,11 +440,14 @@ npcdist.condbandwidth <-
         num_xord = bws$xnord,
         num_xcon = bws$xncon,
         no.exy = no.exy,
-        gradients = gradients,
+        gradients = do.compiled.gradients,
         ymcv.numRow = attr(bws$ymcv, "num.row"),
         xmcv.numRow = attr(bws$xmcv, "num.row"),
         densOrDist = NP_DO_DIST,
-        int_do_tree = npDoTreeOrCategoricalCompress(ncon = bws$yncon + bws$xncon, ncat = bws$ynuno + bws$ynord + bws$xnuno + bws$xnord, bws = bws))
+        int_do_tree = .npcdistbw_tree_code(
+          bws = bws,
+          ncon = bws$yncon + bws$xncon,
+          ncat = bws$ynuno + bws$ynord + bws$xnuno + bws$xnord))
 
     cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
     cyker.bounds.c <- npKernelBoundsMarshal(bws$cykerlb[bws$iycon], bws$cykerub[bws$iycon])
@@ -422,21 +484,30 @@ npcdist.condbandwidth <-
     names(myout)[1] <- "condist"
 
     if(gradients){
-      myout$congrad = matrix(data=myout$congrad, nrow = enrow, ncol = bws$xndim, byrow = FALSE) 
-      rorder = numeric(bws$xndim)
-      xidx <- seq_len(bws$xndim)
-      rorder[c(xidx[bws$ixcon], xidx[bws$ixuno], xidx[bws$ixord])] <- xidx
-      myout$congrad = myout$congrad[, rorder, drop = FALSE]
+      if (!glp.gradient.partial) {
+        myout$congrad = matrix(data=myout$congrad, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
+        rorder = numeric(bws$xndim)
+        xidx <- seq_len(bws$xndim)
+        rorder[c(xidx[bws$ixcon], xidx[bws$ixuno], xidx[bws$ixord])] <- xidx
+        myout$congrad = myout$congrad[, rorder, drop = FALSE]
 
-      myout$congerr = matrix(data=myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
-      myout$congerr = myout$congerr[, rorder, drop = FALSE]
+        myout$congerr = matrix(data=myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
+        myout$congerr = myout$congerr[, rorder, drop = FALSE]
+      } else {
+        myout$congrad <- matrix(NA_real_, nrow = enrow, ncol = bws$xndim)
+        myout$congerr <- matrix(NA_real_, nrow = enrow, ncol = bws$xndim)
+      }
 
       if (identical(reg.engine, "lp") && bws$xncon > 0L && !lp.degree0.lc.gradient) {
         cont.idx <- which(bws$ixcon)
-        higher.order <- glp.gradient.order > 1L
-        if (any(higher.order)) {
+        hat.gradient.idx <- if (glp.gradient.partial) {
+          which(glp.gradient.available)
+        } else {
+          which(glp.gradient.order > 1L)
+        }
+        if (length(hat.gradient.idx)) {
           rhs <- rep.int(1.0, nrow(proper.slice.context$txdat))
-          for (jj in which(higher.order)) {
+          for (jj in hat.gradient.idx) {
             svec <- integer(bws$xncon)
             svec[jj] <- glp.gradient.order[jj]
             hat.args <- list(
@@ -473,7 +544,9 @@ npcdist.condbandwidth <-
                            congrad = myout$congrad, congerr = myout$congerr,
                            ntrain = tnrow, trainiseval = no.exy, gradients = gradients,
                            gradient.order = if (identical(reg.engine, "lp")) glp.gradient.order else NULL,
-                           rows.omit = rows.omit,
+                           rows.omit = if (no.exy) train.rows.omit else eval.rows.omit,
+                           train.rows.omit = train.rows.omit,
+                           eval.rows.omit = if (no.exy) integer(0) else eval.rows.omit,
                            timing = bws$timing, total.time = total.time,
                            optim.time = optim.time, fit.time = fit.elapsed)
     out$nomad.time <- if (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) as.double(bws$nomad.time) else NA_real_
@@ -545,6 +618,28 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   } else {
     FALSE
   }
+  uses.nomad.degree.search <- FALSE
+  if (!has.explicit.bws && !bws.formula && !txdat.formula && !dots.formula) {
+    sc.bw.dispatch <- sc
+    sc.bw.dispatch[[1]] <- quote(npcdistbw)
+    ostxy.dispatch <- c("txdat", "tydat")
+    nstxy.dispatch <- c("xdat", "ydat")
+    m.txy.dispatch <- match(ostxy.dispatch, names(sc.bw.dispatch), nomatch = 0)
+    if (any(m.txy.dispatch > 0))
+      names(sc.bw.dispatch)[m.txy.dispatch] <- nstxy.dispatch[m.txy.dispatch > 0]
+    sc.bw.dispatch$newdata <- NULL
+    sc.bw.dispatch$exdat <- NULL
+    sc.bw.dispatch$eydat <- NULL
+    sc.bw.dispatch$gradients <- NULL
+    sc.bw.dispatch$gradient.order <- NULL
+    sc.bw.dispatch$proper <- NULL
+    sc.bw.dispatch$proper.method <- NULL
+    sc.bw.dispatch$proper.control <- NULL
+    uses.nomad.degree.search <- .np_bw_call_uses_nomad_degree_search(
+      sc.bw.dispatch,
+      caller_env = parent.frame()
+    )
+  }
   keep_local_cvls_nn <- if (has.explicit.bws) {
     identical(bws$method, "cv.ls") &&
       (identical(bwtype.request[1L], "adaptive_nn") ||
@@ -571,6 +666,7 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     )
   if (.npRmpi_autodispatch_active() &&
       !npNomadControlRequested(nomad) &&
+      !uses.nomad.degree.search &&
       !keep_local_cvls_nn &&
       !keep_local_raw_degree1_cvls &&
       !bws.formula &&

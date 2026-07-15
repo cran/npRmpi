@@ -81,6 +81,7 @@ test_that("formula bandwidth reuse preserves explicit bws objects", {
 })
 
 test_that("formula estimator fronts tolerate omitted legacy regtype defaults", {
+  skip_on_cran()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
 

@@ -75,6 +75,103 @@ npreghat <-
   as.integer(s)
 }
 
+.npreghat_operator_spec <- function(bws,
+                                    degree = NULL,
+                                    basis = NULL,
+                                    bernstein.basis = NULL,
+                                    s = NULL,
+                                    deriv = NULL,
+                                    con.names = NULL) {
+  regtype <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+  ncon <- bws$ncon
+  if (is.null(con.names) || length(con.names) != ncon) {
+    con.names <- if (!is.null(bws$xnames)) {
+      bws$xnames[which(bws$icon)]
+    } else {
+      paste0("continuous[", seq_len(ncon), "]")
+    }
+  }
+
+  degree <- if (identical(regtype, "lc")) {
+    rep.int(0L, ncon)
+  } else if (identical(regtype, "ll")) {
+    rep.int(1L, ncon)
+  } else {
+    npValidateGlpDegree(regtype = "lp",
+                        degree = if (is.null(degree)) bws$degree else degree,
+                        ncon = ncon)
+  }
+
+  basis <- npValidateLpBasis(
+    regtype = "lp",
+    basis = if (is.null(basis)) {
+      if (is.null(bws$basis)) "glp" else bws$basis
+    } else {
+      basis
+    }
+  )
+
+  bernstein.basis <- npValidateGlpBernstein(
+    regtype = "lp",
+    bernstein.basis = if (is.null(bernstein.basis)) {
+      isTRUE(bws$bernstein.basis)
+    } else {
+      bernstein.basis
+    }
+  )
+
+  s <- .npreghat_resolve_s(s = s, deriv = deriv, ncon = ncon, con.names = con.names)
+  reg.spec <- npCanonicalConditionalRegSpec(
+    regtype = regtype,
+    basis = basis,
+    degree = degree,
+    bernstein.basis = bernstein.basis,
+    ncon = ncon,
+    where = "npreghat"
+  )
+
+  first.derivative.request <- (sum(s) == 1L) && all(s %in% c(0L, 1L))
+  simple.operator.request <- (sum(s) == 0L) || first.derivative.request
+
+  lp.degree0.lc.derivative.route <- identical(regtype, "lp") &&
+    first.derivative.request &&
+    npGlpDegree0FirstDerivativeLcOk(
+      regtype.engine = reg.spec$regtype.engine,
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = rep.int(1L, ncon),
+      ncon = ncon
+    )
+
+  if (identical(reg.spec$regtype.engine, "lp") &&
+      any(s > reg.spec$degree.engine) &&
+      !lp.degree0.lc.derivative.route) {
+    stop("requested derivative order in 's' exceeds local polynomial degree")
+  }
+
+  direct.apply.compatible <- !identical(reg.spec$regtype.engine, "lp") ||
+    (!any(s > 0L) && all(reg.spec$degree.engine <= 1L)) ||
+    lp.degree0.lc.derivative.route ||
+    (any(s > 0L) && all(reg.spec$degree.engine == 1L))
+
+  lc.derivative.exact.route <- identical(regtype, "lc") &&
+    first.derivative.request
+
+  list(
+    regtype = regtype,
+    ncon = ncon,
+    degree = degree,
+    basis = basis,
+    bernstein.basis = bernstein.basis,
+    s = s,
+    reg.spec = reg.spec,
+    first.derivative.request = first.derivative.request,
+    simple.operator.request = simple.operator.request,
+    lp.degree0.lc.derivative.route = lp.degree0.lc.derivative.route,
+    direct.apply.compatible = direct.apply.compatible,
+    lc.derivative.exact.route = lc.derivative.exact.route
+  )
+}
+
 .npreghat_native_apply_candidate <- function(bws, output, y, regtype, degree,
                                              basis, bernstein.basis, s,
                                              leave.one.out) {
@@ -154,7 +251,6 @@ npreghat <-
     s <- integer(bws$ncon)
 
   want.grad <- length(s) > 0L && any(s > 0L)
-  tree.enabled <- npUseContinuousTree(ncon = bws$ncon, bws = bws)
   target.col <- NULL
   if (want.grad) {
     if (!(sum(s) == 1L && all(s %in% c(0L, 1L))))
@@ -290,18 +386,72 @@ npreghat <-
     ks <- out$ksum
     ps <- out$p.ksum
 
-    ks <- if (is.null(dim(ks))) {
-      matrix(ks, nrow = ib + 1L, ncol = neval)
-    } else {
-      as.matrix(ks)
+    expected.block.dim <- c(ib + 1L, neval)
+    format_block_dim <- function(x) {
+      d <- dim(x)
+      if (is.null(d))
+        return(sprintf("vector[%d]", length(x)))
+      paste(d, collapse = "x")
     }
-    ps <- if (is.null(dim(ps))) {
-      matrix(ps, nrow = ib + 1L, ncol = neval)
-    } else if (length(dim(ps)) == 3L && dim(ps)[3L] == 1L) {
-      ps[, , 1L, drop = TRUE]
-    } else {
-      as.matrix(ps)
+    block_matrix <- function(x, label) {
+      if (is.null(x))
+        stop(sprintf("lc derivative %s block is NULL", label), call. = FALSE)
+      d <- dim(x)
+      if (is.null(d)) {
+        if (length(x) != prod(expected.block.dim))
+          stop(sprintf(
+            "lc derivative %s block has length %d; expected %dx%d",
+            label,
+            length(x),
+            expected.block.dim[1L],
+            expected.block.dim[2L]
+          ), call. = FALSE)
+        x <- matrix(x, nrow = expected.block.dim[1L], ncol = expected.block.dim[2L])
+      } else if (length(d) == 2L) {
+        x <- as.matrix(x)
+      } else {
+        stop(sprintf(
+          "lc derivative %s block has dimensions %s; expected %dx%d",
+          label,
+          format_block_dim(x),
+          expected.block.dim[1L],
+          expected.block.dim[2L]
+        ), call. = FALSE)
+      }
+      if (!identical(as.integer(dim(x)), as.integer(expected.block.dim)))
+        stop(sprintf(
+          "lc derivative %s block has dimensions %s; expected %dx%d",
+          label,
+          format_block_dim(x),
+          expected.block.dim[1L],
+          expected.block.dim[2L]
+        ), call. = FALSE)
+      x
     }
+    derivative_block_matrix <- function(x) {
+      if (is.null(x))
+        stop("lc derivative p.ksum block is NULL", call. = FALSE)
+      d <- dim(x)
+      if (is.null(d))
+        return(block_matrix(x, "p.ksum"))
+      if (length(d) == 3L) {
+        if (d[3L] < target.cont)
+          stop(sprintf(
+            "lc derivative p.ksum tensor has third dimension %d but target continuous coordinate is %d",
+            d[3L],
+            target.cont
+          ), call. = FALSE)
+        x <- matrix(
+          x[, , target.cont, drop = FALSE],
+          nrow = d[1L],
+          ncol = d[2L]
+        )
+      }
+      block_matrix(x, "p.ksum")
+    }
+
+    ks <- block_matrix(ks, "ksum")
+    ps <- derivative_block_matrix(ps)
 
     sk <- ks[nrow(ks), ]
     dsk <- ps[nrow(ps), ]
@@ -378,6 +528,26 @@ npreghat <-
   H
 }
 
+.npreghat_lp_explicit_first_derivative_operator_available <- function(degree, s) {
+  degree <- as.integer(degree)
+  s <- if (is.null(s)) integer(length(degree)) else as.integer(s)
+
+  length(s) == length(degree) &&
+    length(degree) > 0L &&
+    any(s > 0L) &&
+    sum(s) == 1L &&
+    all(s %in% c(0L, 1L)) &&
+    all(s <= degree) &&
+    any(rep.int(1L, length(degree)) > degree)
+}
+
+.npreghat_lp_generalized_nn_core_fallback_needed <- function(degree, s) {
+  degree <- as.integer(degree)
+  if (!any(degree > 1L))
+    return(FALSE)
+  !.npreghat_lp_explicit_first_derivative_operator_available(degree = degree, s = s)
+}
+
 .npreghat_exact_lp_matrix_from_kernel_weights <- function(bws,
                                                           txdat,
                                                           exdat = NULL,
@@ -389,31 +559,15 @@ npreghat <-
   eval.data <- if (miss.ex) txdat else exdat
   ntrain <- nrow(txdat)
   neval <- nrow(eval.data)
+  degree <- as.integer(degree)
+  s <- if (is.null(s)) integer(length(degree)) else as.integer(s)
   want.grad <- length(s) > 0L && any(s > 0L)
-  tree.enabled <- npUseContinuousTree(ncon = bws$ncon, bws = bws)
-
   if (identical(bws$type, "generalized_nn") &&
-      any(degree > 1L) &&
-      length(s) &&
-      any(s > 0L)) {
+      .npreghat_lp_generalized_nn_core_fallback_needed(degree = degree, s = s)) {
     return(.npreghat_exact_matrix_from_core(
       bws = bws,
       txdat = txdat,
       exdat = if (miss.ex) NULL else exdat,
-      s = s
-    ))
-  }
-
-  if (identical(bws$type, "generalized_nn") &&
-      any(degree > 1L) &&
-      !tree.enabled) {
-    return(.npreghat_exact_lp_matrix_from_regression_core_chunked(
-      bws = bws,
-      txdat = txdat,
-      exdat = if (miss.ex) NULL else exdat,
-      basis = basis,
-      degree = degree,
-      bernstein.basis = bernstein.basis,
       s = s
     ))
   }
@@ -471,143 +625,6 @@ npreghat <-
     }
 
     H[j, ] <- w * drop(W.train %*% solved)
-  }
-
-  H
-}
-
-.npreghat_exact_lp_matrix_from_regression_core_chunked <- function(bws,
-                                                                   txdat,
-                                                                   exdat = NULL,
-                                                                   basis = "glp",
-                                                                   degree = integer(0),
-                                                                   bernstein.basis = FALSE,
-                                                                   s = NULL,
-                                                                   chunk.size = 128L) {
-  no.ex <- is.null(exdat)
-
-  txdat <- toFrame(txdat)
-  if (!no.ex) {
-    exdat <- toFrame(exdat)
-    if (!(txdat %~% exdat))
-      stop("'txdat' and 'exdat' are not similar data frames!")
-  }
-
-  if (length(bws$bw) != length(txdat))
-    stop("length of bandwidth vector does not match number of columns of 'txdat'")
-
-  if ((any(bws$icon) &&
-       !all(vapply(txdat[, bws$icon, drop = FALSE], inherits, logical(1), c("integer", "numeric")))) ||
-      (any(bws$iord) &&
-       !all(vapply(txdat[, bws$iord, drop = FALSE], inherits, logical(1), "ordered"))) ||
-      (any(bws$iuno) &&
-       !all(vapply(txdat[, bws$iuno, drop = FALSE], inherits, logical(1), "factor")))) {
-    stop("supplied bandwidths do not match 'txdat' in type")
-  }
-
-  txdat <- adjustLevels(txdat, bws$xdati)
-  if (!no.ex) {
-    exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
-    npKernelBoundsCheckEval(exdat, bws$icon, bws$ckerlb, bws$ckerub, argprefix = "cker")
-  }
-
-  txmat <- toMatrix(txdat)
-  tuno <- txmat[, bws$iuno, drop = FALSE]
-  tcon <- txmat[, bws$icon, drop = FALSE]
-  tord <- txmat[, bws$iord, drop = FALSE]
-  reg.c <- npRegtypeToC(regtype = "lp",
-                        degree = degree,
-                        ncon = bws$ncon,
-                        context = ".npreghat_exact_lp_matrix_from_regression_core_chunked")
-
-  npCheckRegressionDesignCondition(reg.code = reg.c$code,
-                                   xcon = tcon,
-                                   basis = basis,
-                                   degree = degree,
-                                   bernstein.basis = bernstein.basis,
-                                   where = ".npreghat_exact_lp_matrix_from_regression_core_chunked")
-
-  if (!no.ex) {
-    exmat <- toMatrix(exdat)
-    euno <- exmat[, bws$iuno, drop = FALSE]
-    econ <- exmat[, bws$icon, drop = FALSE]
-    eord <- exmat[, bws$iord, drop = FALSE]
-  } else {
-    euno <- tuno
-    econ <- tcon
-    eord <- tord
-  }
-
-  tuno <- if (bws$nuno > 0L) as.matrix(tuno) else matrix(double(), nrow = nrow(txdat), ncol = 0L)
-  tcon <- if (bws$ncon > 0L) as.matrix(tcon) else matrix(double(), nrow = nrow(txdat), ncol = 0L)
-  tord <- if (bws$nord > 0L) as.matrix(tord) else matrix(double(), nrow = nrow(txdat), ncol = 0L)
-  euno <- if (bws$nuno > 0L) as.matrix(euno) else matrix(double(), nrow = if (no.ex) nrow(txdat) else nrow(exdat), ncol = 0L)
-  econ <- if (bws$ncon > 0L) as.matrix(econ) else matrix(double(), nrow = if (no.ex) nrow(txdat) else nrow(exdat), ncol = 0L)
-  eord <- if (bws$nord > 0L) as.matrix(eord) else matrix(double(), nrow = if (no.ex) nrow(txdat) else nrow(exdat), ncol = 0L)
-
-  bwtype.c <- switch(bws$type,
-    fixed = BW_FIXED,
-    generalized_nn = BW_GEN_NN,
-    adaptive_nn = BW_ADAP_NN
-  )
-  kernel.x.c <- switch(bws$ckertype,
-    gaussian = CKER_GAUSS + bws$ckerorder / 2 - 1,
-    epanechnikov = CKER_EPAN + bws$ckerorder / 2 - 1,
-    uniform = CKER_UNI,
-    "truncated gaussian" = CKER_TGAUSS
-  )
-  kernel.xu.c <- switch(bws$ukertype,
-    aitchisonaitken = UKER_AIT,
-    liracine = UKER_LR
-  )
-  kernel.xo.c <- switch(bws$okertype,
-    wangvanryzin = OKER_WANG,
-    liracine = OKER_LR,
-    racineliyan = OKER_RLY
-  )
-
-  ntrain <- nrow(txdat)
-  neval <- if (no.ex) ntrain else nrow(exdat)
-  H <- matrix(0.0, nrow = neval, ncol = ntrain)
-  chunk.size <- max(1L, min(as.integer(chunk.size), ntrain))
-  bw.vec <- as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord]))
-  tree.flag <- identical(
-    .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
-    DO_TREE_YES
-  )
-  grad.vec <- if (length(s) && any(s > 0L)) as.integer(s) else integer(0L)
-  on.exit(
-    tryCatch(.Call("C_np_shadow_reset_state", PACKAGE = "npRmpi"),
-             error = function(e) NULL),
-    add = TRUE
-  )
-
-  for (start in seq.int(1L, ntrain, by = chunk.size)) {
-    stop.col <- min(ntrain, start + chunk.size - 1L)
-    cols <- seq.int(start, stop.col)
-    rhs <- matrix(0.0, nrow = ntrain, ncol = length(cols))
-    rhs[cbind(cols, seq_along(cols))] <- 1.0
-    H[, cols] <- .Call(
-      "C_np_regression_lp_apply_conditional",
-      tuno,
-      tord,
-      tcon,
-      euno,
-      eord,
-      econ,
-      rhs,
-      bw.vec,
-      as.integer(bwtype.c),
-      as.integer(kernel.x.c),
-        as.integer(kernel.xu.c),
-        as.integer(kernel.xo.c),
-        as.logical(tree.flag),
-        as.integer(degree),
-        grad.vec,
-        as.integer(isTRUE(bernstein.basis)),
-        as.integer(npLpBasisCode(basis)),
-        PACKAGE = "npRmpi"
-      )
   }
 
   H
@@ -1024,6 +1041,24 @@ npreghat <-
       gradient.order = glp.gradient.order,
       ncon = bws$ncon
     )
+  glp.gradient.available <- NULL
+  glp.gradient.partial <- FALSE
+  if (isTRUE(gradients) &&
+      identical(reg.spec$regtype.engine, "lp") &&
+      (bws$ncon > 0L)) {
+    glp.gradient.available <- npGlpGradientAvailability(
+      regtype.engine = reg.spec$regtype.engine,
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = glp.gradient.order,
+      ncon = bws$ncon
+    )
+    if (!any(glp.gradient.available)) {
+      stop(".np_regression_direct has no available derivative components for the requested gradient.order and fitted polynomial degree",
+           call. = FALSE)
+    }
+    glp.gradient.partial <- !lp.degree0.lc.gradient &&
+      any(!glp.gradient.available)
+  }
   if (isTRUE(gradients) &&
       identical(reg.spec$regtype.engine, "lp") &&
       (bws$ncon > 0L) &&
@@ -1031,7 +1066,9 @@ npreghat <-
       all(reg.spec$degree.engine == 0L)) {
     stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
   }
-  if (isTRUE(gradients) && identical(reg.spec$regtype.engine, "lp")) {
+  if (isTRUE(gradients) &&
+      identical(reg.spec$regtype.engine, "lp") &&
+      !glp.gradient.partial) {
     npValidateGlpGradientDegree(
       regtype.engine = reg.spec$regtype.engine,
       degree.engine = reg.spec$degree.engine,
@@ -1081,6 +1118,7 @@ npreghat <-
     (bws$ncon > 0L)
   txdat.frame <- txdat
   exdat.frame <- if (no.ex) NULL else exdat
+  do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
 
   txdat <- adjustLevels(txdat, bws$xdati)
   if (!no.ex) {
@@ -1151,6 +1189,7 @@ npreghat <-
     int_do_tree = .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
     old.reg = FALSE
   )
+  myopti$do_grad <- do.compiled.gradients
 
   cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
@@ -1183,7 +1222,7 @@ npreghat <-
     as.integer(npLpBasisCode(reg.spec$basis.engine)),
     as.integer(enrow),
     as.integer(ncol.x),
-    as.logical(gradients),
+    as.logical(do.compiled.gradients),
     as.double(cker.bounds.c$lb),
     as.double(cker.bounds.c$ub),
     PACKAGE = "npRmpi"
@@ -1201,7 +1240,7 @@ npreghat <-
 
   out <- list(mean = mean.out)
 
-  if (gradients) {
+  if (gradients && !glp.gradient.partial) {
     grad <- matrix(data = myout$g, nrow = enrow, ncol = ncol.x, byrow = FALSE)
     rorder <- numeric(ncol.x)
     ord.idx <- seq_len(ncol.x)
@@ -1218,6 +1257,17 @@ npreghat <-
     }
 
     out$grad <- grad
+  } else if (gradients) {
+    out$grad <- .npreg_glp_partial_gradients_from_npreghat(
+      bws = bws,
+      txdat = txdat.frame,
+      tydat = tydat,
+      exdat = exdat.frame,
+      gradient.order = glp.gradient.order,
+      available = glp.gradient.available,
+      nrow.eval = enrow,
+      ncol.x = ncol.x
+    )
   }
 
   out
@@ -1232,6 +1282,8 @@ npreghat.formula <-
     tmf <- bws$call[c(1, m)]
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
+    if (!is.null(data))
+      tmf[["data"]] <- substitute(data)
     mf.args <- as.list(tmf)[-1L]
     mf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
 
@@ -1365,6 +1417,14 @@ npreghat.rbandwidth <-
     if (.npRmpi_has_active_slave_pool(comm = 1L) &&
         !.npRmpi_autodispatch_in_context() &&
         !.npRmpi_autodispatch_called_from_bcast()) {
+      invisible(.npreghat_operator_spec(
+        bws = bws,
+        degree = degree,
+        basis = basis,
+        bernstein.basis = bernstein.basis,
+        s = s,
+        deriv = deriv
+      ))
       expr <- substitute({
         old.ctx <- getOption("npRmpi.autodispatch.context", FALSE)
         old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
@@ -1487,59 +1547,35 @@ npreghat.rbandwidth <-
       exdat <- exdat[keep.eval, , drop = FALSE]
     }
 
-    regtype <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
-    ncon <- bws$ncon
-    con.names <- names(txdat)[which(bws$icon)]
-
-    degree <- if (identical(regtype, "lc")) {
-      rep.int(0L, ncon)
-    } else if (identical(regtype, "ll")) {
-      rep.int(1L, ncon)
-    } else {
-      npValidateGlpDegree(regtype = "lp",
-                          degree = if (is.null(degree)) bws$degree else degree,
-                          ncon = ncon)
-    }
-
-    basis <- npValidateLpBasis(
-      regtype = "lp",
-      basis = if (is.null(basis)) {
-        if (is.null(bws$basis)) "glp" else bws$basis
-      } else {
-        basis
-      }
-    )
-
-    bernstein.basis <- npValidateGlpBernstein(
-      regtype = "lp",
-      bernstein.basis = if (is.null(bernstein.basis)) {
-        isTRUE(bws$bernstein.basis)
-      } else {
-        bernstein.basis
-      }
-    )
-
-    s <- .npreghat_resolve_s(s = s, deriv = deriv, ncon = ncon, con.names = con.names)
-    reg.spec <- npCanonicalConditionalRegSpec(
-      regtype = regtype,
-      basis = basis,
+    operator.spec <- .npreghat_operator_spec(
+      bws = bws,
       degree = degree,
+      basis = basis,
       bernstein.basis = bernstein.basis,
-      ncon = ncon,
-      where = "npreghat"
+      s = s,
+      deriv = deriv,
+      con.names = names(txdat)[which(bws$icon)]
     )
-
-    first.derivative.request <- (sum(s) == 1L) && all(s %in% c(0L, 1L))
-    simple.operator.request <- (sum(s) == 0L) || first.derivative.request
+    regtype <- operator.spec$regtype
+    ncon <- operator.spec$ncon
+    degree <- operator.spec$degree
+    basis <- operator.spec$basis
+    bernstein.basis <- operator.spec$bernstein.basis
+    s <- operator.spec$s
+    reg.spec <- operator.spec$reg.spec
+    first.derivative.request <- operator.spec$first.derivative.request
+    simple.operator.request <- operator.spec$simple.operator.request
+    lp.degree0.lc.derivative.route <- operator.spec$lp.degree0.lc.derivative.route
+    direct.apply.compatible <- operator.spec$direct.apply.compatible
+    lc.derivative.exact.route <- operator.spec$lc.derivative.exact.route
 
     direct.apply <- identical(output, "apply") &&
       !is.null(y) &&
       !isTRUE(leave.one.out) &&
       (ncol(y) == 1L) &&
-      simple.operator.request
-
-    lc.derivative.exact.route <- identical(regtype, "lc") &&
-      first.derivative.request
+      simple.operator.request &&
+      direct.apply.compatible &&
+      !lc.derivative.exact.route
 
     exact.lc.kernel.route <- !isTRUE(leave.one.out) &&
       !any(s > 0L) &&
@@ -1555,6 +1591,7 @@ npreghat.rbandwidth <-
       simple.operator.request &&
       identical(regtype, "lp") &&
       identical(reg.spec$regtype.engine, "lp") &&
+      !lp.degree0.lc.derivative.route &&
       (bws$ncon > 0L)
 
     exact.core.route <- !isTRUE(leave.one.out) &&
@@ -1563,6 +1600,7 @@ npreghat.rbandwidth <-
         exact.lc.kernel.route ||
         exact.ll.kernel.route ||
         exact.lp.kernel.route ||
+        lp.degree0.lc.derivative.route ||
         lc.derivative.exact.route ||
         FALSE
       )
@@ -1620,7 +1658,14 @@ npreghat.rbandwidth <-
     }
 
     if (exact.core.route) {
-      H <- if (lc.derivative.exact.route) {
+      H <- if (lp.degree0.lc.derivative.route) {
+        .npreghat_exact_matrix_from_core(
+          bws = bws,
+          txdat = txdat,
+          exdat = if (no.ex) NULL else exdat,
+          s = s
+        )
+      } else if (lc.derivative.exact.route) {
         .npRmpi_with_local_regression(.npreghat_exact_lc_derivative_matrix_from_npksum_chunked(
           bws = bws,
           txdat = txdat,
@@ -1846,6 +1891,33 @@ predict.npreghat <-
 
     if (is.null(bws) || is.null(txdat))
       stop("object does not carry 'bws' and training data attributes")
+
+    object.s <- attr(object, "s")
+    object.loo <- attr(object, "leave.one.out")
+    if (is.null(object.loo))
+      object.loo <- FALSE
+
+    no.recompute <- is.null(newdata) &&
+      length(dots) == 0L &&
+      (missing(deriv) || is.null(deriv)) &&
+      (missing(s) || identical(s, object.s)) &&
+      (missing(leave.one.out) || identical(leave.one.out, object.loo))
+
+    if (no.recompute) {
+      if (identical(output, "matrix"))
+        return(object)
+
+      if (identical(output, "apply")) {
+        if (is.null(y))
+          stop("argument 'y' is required when output='apply'")
+        out <- object %*% y
+        if (ncol(out) == 1L)
+          return(as.vector(out))
+        return(out)
+      }
+
+      return(.np_hat_constraint_from_matrix(object, y, "npreghat"))
+    }
 
     leave.one.out <- if (is.null(leave.one.out)) FALSE else leave.one.out
     call.args <- list(

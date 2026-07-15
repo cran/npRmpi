@@ -320,6 +320,8 @@
 }
 
 .np_plot_restore_par <- function(oldpar, reset.new = TRUE) {
+  if (isTRUE(unname(as.integer(grDevices::dev.cur())) == 1L))
+    return(invisible(NULL))
   if (isTRUE(reset.new))
     suppressWarnings(try(par(new = FALSE), silent = TRUE))
   if (!is.null(oldpar) && length(oldpar))
@@ -887,6 +889,65 @@
   if (!is.null(boot$center))
     boot$center <- .np_plot_factor_contrast_vector(boot$center, ref = ref)
   attr(boot, "np.factor.contrast") <- TRUE
+  boot
+}
+
+.np_plot_categorical_gradient_vector <- function(x, tdati, ti, ref = 1L) {
+  x <- as.double(x)
+  ti <- as.integer(ti)[1L]
+  if (length(x) < 1L)
+    return(x)
+  if (is.na(ti) || ti < 1L ||
+      ti > length(tdati$iord) || ti > length(tdati$iuno)) {
+    stop("invalid categorical gradient index for plot bootstrap", call. = FALSE)
+  }
+  if (isTRUE(tdati$iord[ti])) {
+    if (length(x) == 1L)
+      return(x - x[1L])
+    dx <- diff(x)
+    return(c(dx[1L], dx))
+  }
+  if (isTRUE(tdati$iuno[ti]))
+    return(.np_plot_factor_contrast_vector(x, ref = ref))
+  stop("plot bootstrap categorical gradient requested for a non-categorical slice",
+       call. = FALSE)
+}
+
+.np_plot_categorical_gradient_matrix <- function(x, tdati, ti, ref = 1L) {
+  x <- as.matrix(x)
+  ti <- as.integer(ti)[1L]
+  if (ncol(x) < 1L)
+    return(x)
+  if (is.na(ti) || ti < 1L ||
+      ti > length(tdati$iord) || ti > length(tdati$iuno)) {
+    stop("invalid categorical gradient index for plot bootstrap", call. = FALSE)
+  }
+  if (isTRUE(tdati$iord[ti])) {
+    if (ncol(x) == 1L)
+      return(sweep(x, 1L, x[, 1L], "-", check.margin = FALSE))
+    dx <- x[, -1L, drop = FALSE] - x[, -ncol(x), drop = FALSE]
+    return(cbind(dx[, 1L], dx))
+  }
+  if (isTRUE(tdati$iuno[ti]))
+    return(.np_plot_factor_contrast_matrix(x, ref = ref))
+  stop("plot bootstrap categorical gradient requested for a non-categorical slice",
+       call. = FALSE)
+}
+
+.np_plot_categorical_gradient_boot <- function(boot, tdati, ti, ref = 1L) {
+  if (is.null(boot))
+    return(boot)
+  if (!is.list(boot))
+    stop("bootstrap categorical-gradient payload must be a list", call. = FALSE)
+  if (isTRUE(attr(boot, "np.categorical.gradient")))
+    return(boot)
+  if (!is.null(boot$t))
+    boot$t <- .np_plot_categorical_gradient_matrix(boot$t, tdati = tdati, ti = ti, ref = ref)
+  if (!is.null(boot$t0))
+    boot$t0 <- .np_plot_categorical_gradient_vector(boot$t0, tdati = tdati, ti = ti, ref = ref)
+  if (!is.null(boot$center))
+    boot$center <- .np_plot_categorical_gradient_vector(boot$center, tdati = tdati, ti = ti, ref = ref)
+  attr(boot, "np.categorical.gradient") <- TRUE
   boot
 }
 
@@ -1917,7 +1978,10 @@
       where = profile.where
     )
     .npRmpi_bootstrap_fail_or_fallback(
-      msg = sprintf("fan-out failed (%s)", conditionMessage(parts)),
+      msg = sprintf(
+        "fan-out failed (%s). Restart R before performing further MPI-backed computation.",
+        conditionMessage(parts)
+      ),
       what = what
     )
   }
@@ -3912,8 +3976,6 @@
       gradient.order = gradient.order,
       local.mode = use.local.direct
     )
-    if (isTRUE(gradients) && isTRUE(xi.factor))
-      return(.np_plot_factor_contrast_vector(fit$mean))
     if (isTRUE(gradients))
       as.vector(fit$grad[, slice.index])
     else
@@ -4134,8 +4196,6 @@
       gradient.order = gradient.order,
       local.mode = use.local.direct
     )
-    if (isTRUE(gradients) && isTRUE(xi.factor))
-      return(.np_plot_factor_contrast_vector(fit$mean))
     if (isTRUE(gradients))
       as.vector(fit$grad[, slice.index])
     else
@@ -5962,6 +6022,279 @@
   list(train = x.train.num, eval = x.eval.num)
 }
 
+.np_plot_plreg_apply_block_rows <- function(ntrain, neval) {
+  target <- getOption("np.plot.plreg.apply.block.bytes", 32 * 1024^2)
+  target <- suppressWarnings(as.numeric(target)[1L])
+  if (!is.finite(target) || is.na(target) || target <= 0)
+    target <- 32 * 1024^2
+  rows <- as.integer(floor(target / (8 * max(1L, as.integer(ntrain)))))
+  max(1L, min(as.integer(neval), rows))
+}
+
+.np_plot_plreg_wild_apply_operator_enabled <- function(ntrain, neval) {
+  threshold <- getOption(
+    "np.plot.plreg.wild.apply.operator.threshold.bytes",
+    getOption("np.plot.wild.apply.operator.threshold.bytes", 128 * 1024^2)
+  )
+  threshold <- suppressWarnings(as.numeric(threshold)[1L])
+  if (!is.finite(threshold) || is.na(threshold) || threshold < 0)
+    threshold <- 128 * 1024^2
+  hidden.self.bytes <- as.double(ntrain) * as.double(ntrain) * 8.0
+  eval.bytes <- as.double(ntrain) * as.double(neval) * 8.0
+  max(hidden.self.bytes, eval.bytes) >= threshold
+}
+
+.np_plot_plreg_response_matrix <- function(y, n, where) {
+  yy <- as.matrix(y)
+  if (nrow(yy) != n)
+    stop(sprintf("%s requires response rows to match training rows", where),
+         call. = FALSE)
+  if (!is.numeric(yy))
+    storage.mode(yy) <- "double"
+  yy
+}
+
+.np_plot_plreg_npreghat_apply_chunked <- function(bws,
+                                                  txdat,
+                                                  exdat,
+                                                  y,
+                                                  where) {
+  txdat <- toFrame(txdat)
+  exdat <- toFrame(exdat)
+  yy <- .np_plot_plreg_response_matrix(y, n = nrow(txdat), where = where)
+  neval <- nrow(exdat)
+  if (neval < 1L)
+    stop(sprintf("%s requires at least one evaluation row", where),
+         call. = FALSE)
+
+  out <- matrix(NA_real_, nrow = neval, ncol = ncol(yy))
+  block.rows <- .np_plot_plreg_apply_block_rows(ntrain = nrow(txdat),
+                                                neval = neval)
+  start <- 1L
+  while (start <= neval) {
+    stopi <- min(neval, start + block.rows - 1L)
+    rows <- seq.int(start, stopi)
+    val <- npreghat(
+      bws = bws,
+      txdat = txdat,
+      exdat = exdat[rows, , drop = FALSE],
+      y = yy,
+      output = "apply"
+    )
+    val <- matrix(as.double(val), nrow = length(rows), ncol = ncol(yy))
+    out[rows, ] <- val
+    start <- stopi + 1L
+  }
+
+  out
+}
+
+.np_plot_plreg_apply_common <- function(bws,
+                                        txdat,
+                                        tzdat,
+                                        where = "partial linear plot bootstrap") {
+  txdat <- toFrame(txdat)
+  tzdat <- toFrame(tzdat)
+  n <- nrow(txdat)
+  p <- ncol(txdat)
+  if (nrow(tzdat) != n)
+    stop(sprintf("%s requires aligned txdat/tzdat rows", where),
+         call. = FALSE)
+  if (n < 1L || p < 1L)
+    stop(sprintf("%s requires non-empty training data", where),
+         call. = FALSE)
+
+  txdat <- adjustLevels(txdat, bws$xdati)
+  tzdat <- adjustLevels(tzdat, bws$zdati)
+  x.num <- .np_plreg_numeric_x_matrix(txdat = txdat, exdat = txdat, bws = bws)
+  x.train.num <- x.num$train
+  resx.train <- matrix(0.0, nrow = n, ncol = p)
+
+  for (j in seq_len(p)) {
+    xhat.train <- .np_plot_plreg_npreghat_apply_chunked(
+      bws = bws$bw[[j + 1L]],
+      txdat = tzdat,
+      exdat = tzdat,
+      y = x.train.num[, j],
+      where = where
+    )
+    resx.train[, j] <- x.train.num[, j] - as.vector(xhat.train)
+  }
+
+  list(
+    bws = bws,
+    txdat = txdat,
+    tzdat = tzdat,
+    n = n,
+    p = p,
+    x.train.num = x.train.num,
+    qrR = qr(resx.train, tol = .Machine$double.eps)
+  )
+}
+
+.np_plot_plreg_apply_eval_state <- function(common,
+                                            exdat,
+                                            ezdat,
+                                            where = "partial linear plot bootstrap") {
+  exdat <- toFrame(exdat)
+  ezdat <- toFrame(ezdat)
+  if (nrow(exdat) != nrow(ezdat))
+    stop(sprintf("%s requires aligned exdat/ezdat rows", where),
+         call. = FALSE)
+  if (ncol(exdat) != common$p)
+    stop(sprintf("%s training/evaluation linear regressor dimensions do not match",
+                 where),
+         call. = FALSE)
+
+  npKernelBoundsCheckEval(ezdat, common$bws$zdati$icon,
+                          common$bws$ckerlb, common$bws$ckerub,
+                          argprefix = "cker")
+  exdat <- adjustLevels(exdat, common$bws$xdati, allowNewCells = TRUE)
+  ezdat <- adjustLevels(ezdat, common$bws$zdati, allowNewCells = TRUE)
+  x.num <- .np_plreg_numeric_x_matrix(txdat = common$txdat,
+                                      exdat = exdat,
+                                      bws = common$bws)
+  x.eval.num <- x.num$eval
+  resx.eval <- matrix(0.0, nrow = nrow(exdat), ncol = common$p)
+
+  for (j in seq_len(common$p)) {
+    xhat.eval <- .np_plot_plreg_npreghat_apply_chunked(
+      bws = common$bws$bw[[j + 1L]],
+      txdat = common$tzdat,
+      exdat = ezdat,
+      y = common$x.train.num[, j],
+      where = where
+    )
+    resx.eval[, j] <- x.eval.num[, j] - as.vector(xhat.eval)
+  }
+
+  list(
+    common = common,
+    ezdat = ezdat,
+    resx.eval = resx.eval
+  )
+}
+
+.np_plot_plreg_apply_from_state <- function(state,
+                                            y,
+                                            where = "partial linear plot bootstrap",
+                                            drop = TRUE) {
+  common <- state$common
+  yy <- .np_plot_plreg_response_matrix(y, n = common$n, where = where)
+  Hy.train <- .np_plot_plreg_npreghat_apply_chunked(
+    bws = common$bws$bw$yzbw,
+    txdat = common$tzdat,
+    exdat = common$tzdat,
+    y = yy,
+    where = where
+  )
+  Hy.eval <- .np_plot_plreg_npreghat_apply_chunked(
+    bws = common$bws$bw$yzbw,
+    txdat = common$tzdat,
+    exdat = state$ezdat,
+    y = yy,
+    where = where
+  )
+  .np_plreg_check_residualized_rank(qrX = common$qrR,
+                                    p = common$p,
+                                    where = where)
+  beta <- qr.coef(common$qrR, yy - Hy.train)
+
+  out <- Hy.eval + state$resx.eval %*% beta
+  if (isTRUE(drop) && ncol(out) == 1L)
+    as.vector(out)
+  else
+    out
+}
+
+.np_plot_plreg_boot_from_apply_wild <- function(bws,
+                                                txdat,
+                                                ydat,
+                                                tzdat,
+                                                exdat,
+                                                ezdat,
+                                                B,
+                                                wild,
+                                                progress.label = "Plot bootstrap wild") {
+  B <- as.integer(B)
+  if (B < 1L)
+    stop("B must be a positive integer")
+  where <- "partial linear wild plot bootstrap"
+  common <- .np_plot_plreg_apply_common(
+    bws = bws,
+    txdat = txdat,
+    tzdat = tzdat,
+    where = where
+  )
+  train.state <- .np_plot_plreg_apply_eval_state(
+    common = common,
+    exdat = txdat,
+    ezdat = tzdat,
+    where = where
+  )
+  eval.state <- .np_plot_plreg_apply_eval_state(
+    common = common,
+    exdat = exdat,
+    ezdat = ezdat,
+    where = where
+  )
+
+  fit.mean <- as.vector(.np_plot_plreg_apply_from_state(
+    state = train.state,
+    y = ydat,
+    where = where
+  ))
+  ydat <- as.double(ydat)
+  residuals <- as.double(ydat - fit.mean)
+  if (length(residuals) != common$n)
+    stop("length mismatch between fitted means and residuals for wild bootstrap")
+
+  t0 <- as.vector(.np_plot_plreg_apply_from_state(
+    state = eval.state,
+    y = ydat,
+    where = where
+  ))
+  neval <- length(t0)
+  out <- matrix(NA_real_, nrow = B, ncol = neval)
+
+  chunk.size <- .np_wild_chunk_size(n = common$n, B = B)
+  wild <- .np_plot_normalize_wild(wild)
+  draw.fun <- if (identical(wild, "mammen")) .np_mammen_draws else .np_rademacher_draws
+  progress <- .np_plot_bootstrap_progress_begin(total = B, label = progress.label)
+  on.exit({
+    .np_plot_progress_end(progress)
+  }, add = TRUE)
+  chunk.controller <- .np_plot_progress_chunk_controller(chunk.size = chunk.size,
+                                                        progress = progress)
+
+  start <- 1L
+  while (start <= B) {
+    stopi <- min(B, start + chunk.controller$chunk.size - 1L)
+    bsz <- stopi - start + 1L
+    chunk.started <- .np_progress_now()
+    draws <- draw.fun(n = common$n, B = bsz)
+    ystar <- residuals * draws
+    ystar <- ystar + fit.mean
+    pred <- .np_plot_plreg_apply_from_state(
+      state = eval.state,
+      y = ystar,
+      where = where,
+      drop = FALSE
+    )
+    pred <- matrix(as.double(pred), nrow = neval, ncol = bsz)
+    out[start:stopi, ] <- t(pred)
+    progress <- .np_plot_progress_tick(state = progress, done = stopi)
+    chunk.controller <- .np_plot_progress_chunk_observe(
+      controller = chunk.controller,
+      bsz = bsz,
+      elapsed.sec = .np_progress_now() - chunk.started
+    )
+    start <- stopi + 1L
+  }
+
+  list(t = out, t0 = t0)
+}
+
 .np_plreg_weighted_coef <- function(X, y, w, ridge = 1.0e-12) {
   X <- as.matrix(X)
   y <- as.double(y)
@@ -7435,6 +7768,39 @@
   )
 }
 
+.np_inid_ksum_unconditional_exact_eval_counts <- function(counts.col,
+                                                          xdat,
+                                                          exdat,
+                                                          bws,
+                                                          kb,
+                                                          operator) {
+  if (identical(bws$type, "adaptive_nn")) {
+    idx <- .np_counts_to_indices(counts.col)
+    return(.np_ksum_unconditional_eval_exact(
+      xdat = xdat[idx, , drop = FALSE],
+      exdat = exdat,
+      bws = bws,
+      operator = operator
+    ))
+  }
+
+  active.sample <- .np_active_boot_sample(
+    xdat = xdat,
+    counts.col = counts.col
+  )
+  bw.eval <- if (!is.null(kb) &&
+                 .np_unconditional_exact_precomputed_kband_safe(
+                   bws = bws,
+                   n.train = nrow(active.sample$xdat)
+                 )) kb else bws
+  .np_inid_ksum_unconditional_exact_eval_one(
+    active.sample = active.sample,
+    exdat = exdat,
+    bw.eval = bw.eval,
+    operator = operator
+  )
+}
+
 .np_ksum_kernel_weights_matrix <- function(kernel.weights, ntrain, neval, where = "ksum helper path") {
   if (is.null(kernel.weights))
     stop(sprintf("%s did not return kernel weights", where))
@@ -7713,19 +8079,12 @@
         bsz <- ncol(counts.chunk)
         out <- matrix(NA_real_, nrow = bsz, ncol = nout)
         for (jj in seq_len(bsz)) {
-          active.sample <- .np_active_boot_sample(
+          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_counts(
+            counts.col = counts.chunk[, jj],
             xdat = xdat,
-            counts.col = counts.chunk[, jj]
-          )
-          bw.eval <- if (!is.null(kb) &&
-                         .np_unconditional_exact_precomputed_kband_safe(
-                           bws = bws,
-                           n.train = nrow(active.sample$xdat)
-                         )) kb else bws
-          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_one(
-            active.sample = active.sample,
             exdat = exdat,
-            bw.eval = bw.eval,
+            bws = bws,
+            kb = kb,
             operator = operator
           )
         }
@@ -7748,8 +8107,10 @@
           operator = operator,
           n = n,
           nout = nout,
+          .np_counts_to_indices = .np_counts_to_indices,
           .np_active_boot_sample = .np_active_boot_sample,
           .np_inid_ksum_unconditional_exact_eval_one = .np_inid_ksum_unconditional_exact_eval_one,
+          .np_inid_ksum_unconditional_exact_eval_counts = .np_inid_ksum_unconditional_exact_eval_counts,
           .np_make_kbandwidth_unconditional = .np_make_kbandwidth_unconditional,
           .np_unconditional_exact_precomputed_kband_safe = .np_unconditional_exact_precomputed_kband_safe,
           .np_ksum_unconditional_eval_exact = .np_ksum_unconditional_eval_exact
@@ -7782,19 +8143,12 @@
         bsz <- ncol(counts.chunk)
         out <- matrix(NA_real_, nrow = bsz, ncol = nout)
         for (jj in seq_len(bsz)) {
-          active.sample <- .np_active_boot_sample(
+          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_counts(
+            counts.col = counts.chunk[, jj],
             xdat = xdat,
-            counts.col = counts.chunk[, jj]
-          )
-          bw.eval <- if (!is.null(kb) &&
-                         .np_unconditional_exact_precomputed_kband_safe(
-                           bws = bws,
-                           n.train = nrow(active.sample$xdat)
-                         )) kb else bws
-          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_one(
-            active.sample = active.sample,
             exdat = exdat,
-            bw.eval = bw.eval,
+            bws = bws,
+            kb = kb,
             operator = operator
           )
         }
@@ -7817,8 +8171,10 @@
           kb = kb,
           operator = operator,
           nout = nout,
+          .np_counts_to_indices = .np_counts_to_indices,
           .np_active_boot_sample = .np_active_boot_sample,
           .np_inid_ksum_unconditional_exact_eval_one = .np_inid_ksum_unconditional_exact_eval_one,
+          .np_inid_ksum_unconditional_exact_eval_counts = .np_inid_ksum_unconditional_exact_eval_counts,
           .np_make_kbandwidth_unconditional = .np_make_kbandwidth_unconditional,
           .np_unconditional_exact_precomputed_kband_safe = .np_unconditional_exact_precomputed_kband_safe,
           .np_ksum_unconditional_eval_exact = .np_ksum_unconditional_eval_exact
@@ -7852,19 +8208,12 @@
         counts.chunk <- .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
         out <- matrix(NA_real_, nrow = bsz, ncol = nout)
         for (jj in seq_len(bsz)) {
-          active.sample <- .np_active_boot_sample(
+          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_counts(
+            counts.col = counts.chunk[, jj],
             xdat = xdat,
-            counts.col = counts.chunk[, jj]
-          )
-          bw.eval <- if (!is.null(kb) &&
-                         .np_unconditional_exact_precomputed_kband_safe(
-                           bws = bws,
-                           n.train = nrow(active.sample$xdat)
-                         )) kb else bws
-          out[jj, ] <- .np_inid_ksum_unconditional_exact_eval_one(
-            active.sample = active.sample,
             exdat = exdat,
-            bw.eval = bw.eval,
+            bws = bws,
+            kb = kb,
             operator = operator
           )
         }
@@ -7887,8 +8236,10 @@
           kb = kb,
           operator = operator,
           nout = nout,
+          .np_counts_to_indices = .np_counts_to_indices,
           .np_active_boot_sample = .np_active_boot_sample,
           .np_inid_ksum_unconditional_exact_eval_one = .np_inid_ksum_unconditional_exact_eval_one,
+          .np_inid_ksum_unconditional_exact_eval_counts = .np_inid_ksum_unconditional_exact_eval_counts,
           .np_make_kbandwidth_unconditional = .np_make_kbandwidth_unconditional,
           .np_unconditional_exact_precomputed_kband_safe = .np_unconditional_exact_precomputed_kband_safe,
           .np_ksum_unconditional_eval_exact = .np_ksum_unconditional_eval_exact
@@ -9697,31 +10048,40 @@
   )
 }
 
-.np_inid_boot_from_ksum_conditional_adaptive_exact_mpi <- function(xdat,
-                                                                  ydat,
-                                                                  exdat,
-                                                                  eydat,
-                                                                  bws,
-                                                                  B,
-                                                                  cdf,
-                                                                  counts = NULL,
-                                                                  counts.drawer = NULL,
-                                                                  progress.label = NULL,
-                                                                  fit_one_local) {
-  ## Contract: partition adaptive-NN exact conditional bootstrap replications
-  ## across MPI workers. Worker payloads reconstruct active bootstrap samples
-  ## and call the supplied local evaluator; they must not call public
-  ## estimators, bandwidth constructors, or nested MPI wrappers.
+.np_inid_boot_from_ksum_conditional_nn_exact_mpi <- function(xdat,
+                                                            ydat,
+                                                            exdat,
+                                                            eydat,
+                                                            bws,
+                                                            B,
+                                                            cdf,
+                                                            counts = NULL,
+                                                            counts.drawer = NULL,
+                                                            progress.label = NULL,
+                                                            fit_one_local) {
+  ## Contract: partition exact conditional NN bootstrap replications across
+  ## MPI workers. Each worker reconstructs duplicate-row bootstrap samples and
+  ## calls the supplied local evaluator so sample-dependent NN bandwidth state
+  ## is rebuilt per replicate.
   n <- nrow(xdat)
   t0 <- fit_one_local(x.train = xdat, y.train = ydat)
   nout <- length(t0)
+  what.prefix <- if (identical(bws$type, "generalized_nn")) {
+    "inid-ksum-conditional-generalized-exact"
+  } else {
+    "inid-ksum-conditional-adaptive-exact"
+  }
   chunk.size <- .npRmpi_bootstrap_tune_chunk_size(
     B = B,
     chunk.size = .np_inid_chunk_size(n = n, B = B, progress_cap = !is.null(counts.drawer)),
     comm = 1L,
     include.master = TRUE
   )
-  tasks <- .npRmpi_bootstrap_chunk_tasks(B = B, chunk.size = chunk.size)
+  tasks <- .npRmpi_bootstrap_chunk_tasks(
+    B = B,
+    chunk.size = chunk.size,
+    with.seeds = FALSE
+  )
 
   eval_counts_chunk <- function(counts.chunk) {
     counts.chunk <- as.matrix(counts.chunk)
@@ -9754,7 +10114,7 @@
     .np_ksum_conditional_eval_exact = .np_ksum_conditional_eval_exact
   )
 
-  run_adaptive_fanout <- function(what, worker, required.bindings) {
+  run_nn_fanout <- function(what, worker, required.bindings) {
     if (!.npRmpi_bootstrap_fanout_enabled(
           comm = 1L,
           n = n,
@@ -9783,43 +10143,36 @@
     list(t = tmat, t0 = t0)
   }
 
-  if (!is.null(counts)) {
-    counts.mat <- .np_inid_counts_matrix(n = n, B = B, counts = counts)
+  run_counts_matrix_fanout <- function(counts.mat, what) {
     worker <- function(task) {
       start <- as.integer(task$start)
       stopi <- start + as.integer(task$bsz) - 1L
       eval_counts_chunk(counts.mat[, start:stopi, drop = FALSE])
     }
-    out <- run_adaptive_fanout(
-      what = "inid-ksum-conditional-adaptive-exact-counts",
+    run_nn_fanout(
+      what = what,
       worker = worker,
       required.bindings = c(common.bindings, list(counts.mat = counts.mat))
+    )
+  }
+
+  if (!is.null(counts)) {
+    counts.mat <- .np_inid_counts_matrix(n = n, B = B, counts = counts)
+    out <- run_counts_matrix_fanout(
+      counts.mat = counts.mat,
+      what = paste0(what.prefix, "-counts")
     )
     if (!is.null(out))
       return(out)
   } else if (!is.null(counts.drawer)) {
-    worker <- function(task) {
-      start <- as.integer(task$start)
-      stopi <- start + as.integer(task$bsz) - 1L
-      eval_counts_chunk(
-        .np_inid_counts_matrix(
-          n = n,
-          B = as.integer(task$bsz),
-          counts = counts.drawer(start, stopi)
-        )
-      )
-    }
-    out <- run_adaptive_fanout(
-      what = "inid-ksum-conditional-adaptive-exact-block",
-      worker = worker,
-      required.bindings = c(
-        common.bindings,
-        list(
-          n = n,
-          counts.drawer = counts.drawer,
-          .np_inid_counts_matrix = .np_inid_counts_matrix
-        )
-      )
+    counts.mat <- .np_inid_counts_matrix(
+      n = n,
+      B = B,
+      counts = counts.drawer(1L, B)
+    )
+    out <- run_counts_matrix_fanout(
+      counts.mat = counts.mat,
+      what = paste0(what.prefix, "-block")
     )
     if (!is.null(out))
       return(out)
@@ -9836,18 +10189,26 @@
         .npRmpi_bootstrap_task_rmultinom(task = task, n = n, prob = prob)
       )
     }
-    out <- run_adaptive_fanout(
-      what = "inid-ksum-conditional-adaptive-exact",
+    out <- run_nn_fanout(
+      what = what.prefix,
       worker = worker,
-      required.bindings = c(common.bindings, list(n = n, prob = prob))
+      required.bindings = c(
+        common.bindings,
+        list(
+          n = n,
+          prob = prob,
+          .npRmpi_bootstrap_task_rmultinom = .npRmpi_bootstrap_task_rmultinom,
+          .npRmpi_bootstrap_use_task_rng = .npRmpi_bootstrap_use_task_rng
+        )
+      )
     )
     if (!is.null(out))
       return(out)
   }
 
   .npRmpi_bootstrap_fail_or_fallback(
-    msg = "adaptive exact conditional bootstrap fan-out did not dispatch",
-    what = "inid-ksum-conditional-adaptive-exact"
+    msg = "conditional NN exact bootstrap fan-out did not dispatch",
+    what = what.prefix
   )
 }
 
@@ -9967,8 +10328,8 @@
     return(list(t = tmat.local, t0 = t0.local))
   }
 
-  if (identical(bws$type, "adaptive_nn")) {
-    return(.np_inid_boot_from_ksum_conditional_adaptive_exact_mpi(
+  if (identical(bws$type, "adaptive_nn") || identical(bws$type, "generalized_nn")) {
+    return(.np_inid_boot_from_ksum_conditional_nn_exact_mpi(
       xdat = xdat,
       ydat = ydat,
       exdat = exdat,
@@ -10681,6 +11042,66 @@
 
 gen.label = function(label, altlabel){
   paste(if (is.null(label)) altlabel else label)
+}
+
+.np_plot_resolve_axis_label <- function(label, fallback) {
+  missing.label <- is.null(label) || length(label) == 0L ||
+    is.na(label[[1L]]) || !nzchar(as.character(label[[1L]]))
+  if (missing.label)
+    return(as.character(fallback[[1L]]))
+  as.character(label[[1L]])
+}
+
+.np_plot_gradient_axis_label <- function(target,
+                                         predictor,
+                                         order = 1L,
+                                         categorical = FALSE,
+                                         target.fallback = "Conditional Mean",
+                                         predictor.fallback = "X") {
+  target <- .np_plot_resolve_axis_label(target, target.fallback)
+  predictor <- .np_plot_resolve_axis_label(predictor, predictor.fallback)
+
+  if (isTRUE(categorical))
+    return(paste("Delta", target, "/ Delta", predictor))
+
+  if (!is.numeric(order) || length(order) != 1L || is.na(order) ||
+      !is.finite(order) || order < 1 || order > .Machine$integer.max ||
+      order != as.integer(order))
+    stop("internal plot derivative order must be a positive integer",
+         call. = FALSE)
+  order <- as.integer(order)
+
+  if (order == 1L)
+    return(paste("d", target, "/ d", predictor))
+  paste0("d^", order, " ", target, " / d ", predictor, "^", order)
+}
+
+.np_plot_conditional_gradient_axis_label <- function(target,
+                                                     predictor,
+                                                     component,
+                                                     continuous,
+                                                     gradient.order = NULL,
+                                                     predictor.fallback = NULL) {
+  is.continuous <- isTRUE(continuous[component])
+  order <- 1L
+  if (is.continuous && length(gradient.order)) {
+    continuous.position <- match(component, which(continuous))
+    order <- if (length(gradient.order) == 1L) {
+      gradient.order[[1L]]
+    } else {
+      gradient.order[[continuous.position]]
+    }
+  }
+  if (is.null(predictor.fallback))
+    predictor.fallback <- paste0("X", component)
+
+  .np_plot_gradient_axis_label(
+    target = target,
+    predictor = predictor,
+    order = order,
+    categorical = !is.continuous,
+    predictor.fallback = predictor.fallback
+  )
 }
 
 gen.tflabel = function(condition, tlabel, flabel){
@@ -12779,9 +13200,51 @@ plotFactor <- function(f, y, ...){
   c(base.args, override.args)
 }
 
+.np_plot_resolve_native_xydat_from_bws_call <- function(bws, allow.failure = FALSE) {
+  if (is.null(bws$call))
+    return(NULL)
+
+  call.names <- names(bws$call)
+  has.xdat <- "xdat" %in% call.names
+  has.ydat <- "ydat" %in% call.names
+  if (!has.xdat && !has.ydat)
+    return(NULL)
+
+  if (!(has.xdat && has.ydat)) {
+    if (isTRUE(allow.failure))
+      return(NULL)
+    stop("plot bandwidth call must contain both 'xdat' and 'ydat'",
+         call. = FALSE)
+  }
+
+  tryCatch(
+    list(
+      xdat = data.frame(.np_eval_bws_call_arg(bws, "xdat")),
+      ydat = .np_eval_bws_call_arg(bws, "ydat")
+    ),
+    error = function(e) {
+      if (isTRUE(allow.failure))
+        return(NULL)
+      stop(conditionMessage(e), call. = FALSE)
+    }
+  )
+}
+
 .np_plot_resolve_xydat <- function(bws, xdat, ydat, miss.xy) {
   if (any(miss.xy) && !all(miss.xy))
     stop("one of, but not both, xdat and ydat was specified")
+
+  if (all(miss.xy)) {
+    native.xy <- .np_plot_resolve_native_xydat_from_bws_call(
+      bws = bws,
+      allow.failure = !is.null(bws$formula)
+    )
+    if (!is.null(native.xy)) {
+      xdat <- native.xy$xdat
+      ydat <- native.xy$ydat
+      miss.xy <- c(FALSE, FALSE)
+    }
+  }
 
   if (all(miss.xy) && !is.null(bws$formula)) {
     tt <- terms(bws)
@@ -12912,6 +13375,33 @@ plotFactor <- function(f, y, ...){
     output = "apply",
     s = 0L
   )
+}
+
+.np_plot_singleindex_training_mean_index <- function(bws, idx.train, y) {
+  if (!identical(bws$type, "fixed")) {
+    return(as.vector(.np_plot_singleindex_hat_apply_index(
+      bws = bws,
+      idx.train = idx.train,
+      idx.eval = idx.train,
+      y = y
+    )))
+  }
+
+  rbw <- .np_indexhat_rbw(bws = bws, idx.train = idx.train)
+  fit <- .np_plot_with_local_compiled_eval(.np_regression_direct(
+    bws = rbw,
+    txdat = idx.train,
+    tydat = y,
+    exdat = idx.train,
+    gradients = FALSE,
+    local.mode = identical(rbw$type, "generalized_nn")
+  ))
+
+  mean <- as.vector(fit$mean)
+  if (length(mean) != nrow(idx.train))
+    stop("internal single-index training fit length mismatch",
+         call. = FALSE)
+  mean
 }
 
 .np_plot_singleindex_hat_matrix_index <- function(bws, idx.train, idx.eval, s = 0L) {
@@ -14032,9 +14522,7 @@ plotFactor <- function(f, y, ...){
       fit.start <- proc.time()[3]
       gradients <- npValidateScalarLogical(gradients, "gradients")
 
-      if (!is.numeric(itmax) || length(itmax) != 1L || is.na(itmax) ||
-          !is.finite(itmax) || itmax < 1 || itmax != floor(itmax))
-        stop("'itmax' must be a positive integer")
+      itmax <- .npqreg_validate_itmax(itmax)
       if (!is.numeric(tol) || length(tol) != 1L || is.na(tol) ||
           !is.finite(tol) || tol <= 0)
         stop("'tol' must be a positive finite numeric scalar")
@@ -14042,7 +14530,6 @@ plotFactor <- function(f, y, ...){
           !is.finite(small) || small <= 0)
         stop("'small' must be a positive finite numeric scalar")
 
-      itmax <- as.integer(itmax)
       tol <- as.double(tol)
       small <- as.double(small)
 
@@ -14088,11 +14575,12 @@ plotFactor <- function(f, y, ...){
       xdat <- xdat[keep.rows, , drop = FALSE]
       ydat <- ydat[keep.rows, , drop = FALSE]
 
+      eval.omit <- NULL
       if (!no.ex) {
         keep.eval <- rep_len(TRUE, nrow(exdat))
-        rows.omit <- attr(na.omit(exdat), "na.action")
-        if (length(rows.omit) > 0L)
-          keep.eval[as.integer(rows.omit)] <- FALSE
+        eval.omit <- attr(na.omit(exdat), "na.action")
+        if (length(eval.omit) > 0L)
+          keep.eval[as.integer(eval.omit)] <- FALSE
         exdat <- exdat[keep.eval, , drop = FALSE]
       }
 
@@ -14102,7 +14590,7 @@ plotFactor <- function(f, y, ...){
       xdat <- adjustLevels(xdat, bws$xdati)
       ydat <- adjustLevels(ydat, bws$ydati)
       if (!no.ex)
-        exdat <- adjustLevels(exdat, bws$xdati)
+        exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
 
       txeval <- if (no.ex) xdat else exdat
       xdat.df <- xdat
@@ -14151,6 +14639,7 @@ plotFactor <- function(f, y, ...){
           cdf.cache = cdf.cache,
           cdf.row.keys = cdf.row.keys
         )
+        qclamp <- .npqreg_quantile_clamp(yq)
         if (!isTRUE(need.errors) && !isTRUE(gradients)) {
           return(list(
             yq = yq,
@@ -14167,6 +14656,7 @@ plotFactor <- function(f, y, ...){
           quantile = yq,
           gradients = gradients
         )
+        qdelta <- .npqreg_mark_clamped_delta(qdelta, qclamp)
         list(
           yq = yq,
           yqerr = qdelta$quanterr,
@@ -14206,6 +14696,16 @@ plotFactor <- function(f, y, ...){
           }
         }
       }
+      }
+
+      if (!no.ex && length(eval.omit) > 0L) {
+        myout$yq <- .npqreg_napredict_eval(eval.omit, myout$yq)
+        myout$yqerr <- .npqreg_napredict_eval(eval.omit, myout$yqerr)
+        if (gradients) {
+          myout$yqgrad <- .npqreg_napredict_eval(eval.omit, myout$yqgrad)
+          myout$yqgerr <- .npqreg_napredict_eval(eval.omit, myout$yqgerr)
+        }
+        txeval <- .npqreg_napredict_eval(eval.omit, txeval)
       }
 
       fit.elapsed <- proc.time()[3] - fit.start
@@ -15705,8 +16205,8 @@ compute.default.error.range <- function(center, err) {
     )
     center <- as.vector(H.pilot %*% as.double(ydat))
     if (gradients && xi.factor && ncol(out$t) >= 1L) {
-      out <- .np_plot_factor_contrast_boot(out)
-      center <- .np_plot_factor_contrast_vector(center)
+      out <- .np_plot_categorical_gradient_boot(out, tdati = bws$xdati, ti = slice.index)
+      center <- .np_plot_categorical_gradient_vector(center, tdati = bws$xdati, ti = slice.index)
     }
     out$center <- center
     return(out)
@@ -16739,7 +17239,11 @@ compute.bootstrap.errors.rbandwidth =
           progress.label = progress.label
         )
         if (gradients && xi.factor && ncol(boot.out$t) >= 1L) {
-          boot.out <- .np_plot_factor_contrast_boot(boot.out)
+          boot.out <- .np_plot_categorical_gradient_boot(
+            boot.out,
+            tdati = bws$xdati,
+            ti = slice.index
+          )
         }
         .npRmpi_bootstrap_transport_trace(
           what = "rbandwidth.wild",
@@ -16787,25 +17291,20 @@ compute.bootstrap.errors.rbandwidth =
           )
         )
 
-        boot.out <- if (gradients && xi.factor) {
-          .np_plot_boot_from_hat_wild_factor_effects(
-            H = H,
-            ydat = ydat,
-            fit.mean = fit.mean.train,
-            B = B,
-            wild = plot.errors.boot.wild,
-            progress.label = progress.label,
-            prefer.local.single_worker = identical(bws$type, "fixed")
-          )
-        } else {
-          .np_plot_boot_from_hat_wild(
-            H = H,
-            ydat = ydat,
-            fit.mean = fit.mean.train,
-            B = B,
-            wild = plot.errors.boot.wild,
-            progress.label = progress.label,
-            prefer.local.single_worker = identical(bws$type, "fixed")
+        boot.out <- .np_plot_boot_from_hat_wild(
+          H = H,
+          ydat = ydat,
+          fit.mean = fit.mean.train,
+          B = B,
+          wild = plot.errors.boot.wild,
+          progress.label = progress.label,
+          prefer.local.single_worker = identical(bws$type, "fixed")
+        )
+        if (gradients && xi.factor && ncol(boot.out$t) >= 1L) {
+          boot.out <- .np_plot_categorical_gradient_boot(
+            boot.out,
+            tdati = bws$xdati,
+            ti = slice.index
           )
         }
       }
@@ -16852,12 +17351,6 @@ compute.bootstrap.errors.rbandwidth =
                call. = FALSE)
         }
       )
-    }
-
-    if (gradients && xi.factor) {
-      boot.out <- .np_plot_factor_contrast_boot(boot.out)
-      if (!is.null(oversmooth.boot))
-        oversmooth.boot <- .np_plot_factor_contrast_boot(oversmooth.boot)
     }
 
     all.bp <- list()
@@ -17314,42 +17807,61 @@ compute.bootstrap.errors.plbandwidth =
         plot.errors.boot.wild <- plot.errors.boot.wild[1L]
       plot.errors.boot.wild <- match.arg(plot.errors.boot.wild, c("mammen", "rademacher"))
 
-      fit.mean <- as.vector(npplreghat(
-        bws = bws,
-        txdat = xdat,
-        tzdat = zdat,
-        exdat = xdat,
-        ezdat = zdat,
-        y = ydat,
-        output = "apply"
-      ))
-      H <- npplreghat(
-        bws = bws,
-        txdat = xdat,
-        tzdat = zdat,
-        exdat = exdat,
-        ezdat = ezdat,
-        output = "matrix"
+      use.apply <- .np_plot_plreg_wild_apply_operator_enabled(
+        ntrain = nrow(xdat),
+        neval = nrow(exdat)
       )
-
-      t0 <- as.vector(H %*% as.double(ydat))
-      eps <- as.double(ydat - fit.mean)
-      n <- length(eps)
-      B <- plot.errors.boot.num
-
-      boot.out <- .npRmpi_with_local_bootstrap({
-        list(
-          t = .np_wild_boot_t(
-            H = H,
-            fit.mean = fit.mean,
-            residuals = eps,
-            B = B,
+      if (isTRUE(use.apply)) {
+        boot.out <- .npRmpi_with_local_bootstrap({
+          .np_plot_plreg_boot_from_apply_wild(
+            bws = bws,
+            txdat = xdat,
+            ydat = ydat,
+            tzdat = zdat,
+            exdat = exdat,
+            ezdat = ezdat,
+            B = plot.errors.boot.num,
             wild = plot.errors.boot.wild,
             progress.label = progress.label
-          ),
-          t0 = t0
+          )
+        })
+      } else {
+        fit.mean <- as.vector(npplreghat(
+          bws = bws,
+          txdat = xdat,
+          tzdat = zdat,
+          exdat = xdat,
+          ezdat = zdat,
+          y = ydat,
+          output = "apply"
+        ))
+        H <- npplreghat(
+          bws = bws,
+          txdat = xdat,
+          tzdat = zdat,
+          exdat = exdat,
+          ezdat = ezdat,
+          output = "matrix"
         )
-      })
+        t0 <- as.vector(H %*% as.double(ydat))
+        eps <- as.double(ydat - fit.mean)
+        n <- length(eps)
+        B <- plot.errors.boot.num
+
+        boot.out <- .npRmpi_with_local_bootstrap({
+          list(
+            t = .np_wild_boot_t(
+              H = H,
+              fit.mean = fit.mean,
+              residuals = eps,
+              B = B,
+              wild = plot.errors.boot.wild,
+              progress.label = progress.label
+            ),
+            t0 = t0
+          )
+        })
+      }
     } else {
       boot.out <- NULL
       if (is.inid) {
@@ -18447,37 +18959,63 @@ compute.bootstrap.errors.sibandwidth =
         plot.errors.boot.wild <- plot.errors.boot.wild[1L]
       plot.errors.boot.wild <- match.arg(plot.errors.boot.wild, c("mammen", "rademacher"))
 
-      fit.train.mean <- .np_plot_singleindex_hat_apply_index(
+      fit.train.mean <- .np_plot_singleindex_training_mean_index(
         bws = bws,
         idx.train = idx.train,
-        idx.eval = idx.train,
         y = ydat
       )
-      H <- .np_plot_singleindex_hat_matrix_index(
-        bws = bws,
-        idx.train = idx.train,
-        idx.eval = idx.eval,
-        s = if (gradients) 1L else 0L
+      s.index <- if (gradients) 1L else 0L
+      use.blocks <- .np_plot_wild_apply_operator_enabled(
+        ntrain = nrow(idx.train),
+        neval = nrow(idx.eval),
+        bwtype = bws$type
       )
-
-      t0 <- as.vector(H %*% as.double(ydat))
-      eps <- as.double(ydat - as.vector(fit.train.mean))
-      n <- length(eps)
-      B <- plot.errors.boot.num
-
-      boot.out <- .npRmpi_with_local_bootstrap({
-        list(
-          t = .np_wild_boot_t(
-            H = H,
-            fit.mean = as.vector(fit.train.mean),
-            residuals = eps,
-            B = B,
-            wild = plot.errors.boot.wild,
-            progress.label = progress.label
-          ),
-          t0 = t0
+      if (use.blocks) {
+        hat.block.fun <- function(start, stopi) {
+          .np_plot_singleindex_hat_matrix_index(
+            bws = bws,
+            idx.train = idx.train,
+            idx.eval = idx.eval[start:stopi, , drop = FALSE],
+            s = s.index
+          )
+        }
+        boot.out <- .np_plot_boot_from_hat_blocks_wild(
+          hat.block.fun = hat.block.fun,
+          neval = nrow(idx.eval),
+          ntrain = nrow(idx.train),
+          ydat = ydat,
+          fit.mean = fit.train.mean,
+          B = plot.errors.boot.num,
+          wild = plot.errors.boot.wild,
+          progress.label = progress.label
         )
-      })
+      } else {
+        H <- .np_plot_singleindex_hat_matrix_index(
+          bws = bws,
+          idx.train = idx.train,
+          idx.eval = idx.eval,
+          s = s.index
+        )
+
+        t0 <- as.vector(H %*% as.double(ydat))
+        eps <- as.double(ydat - as.vector(fit.train.mean))
+        n <- length(eps)
+        B <- plot.errors.boot.num
+
+        boot.out <- .npRmpi_with_local_bootstrap({
+          list(
+            t = .np_wild_boot_t(
+              H = H,
+              fit.mean = as.vector(fit.train.mean),
+              residuals = eps,
+              B = B,
+              wild = plot.errors.boot.wild,
+              progress.label = progress.label
+            ),
+            t0 = t0
+          )
+        })
+      }
     } else if (is.inid) {
       inid.helper.ok <- isTRUE(.np_plot_inid_fastpath_enabled()) &&
         (isTRUE(use.frozen.nonfixed) || (!isTRUE(gradients)) || identical(bws$type, "fixed"))

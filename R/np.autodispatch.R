@@ -8,7 +8,14 @@
   setNames(lapply(keys, getOption), keys)
 }
 
+.npRmpi_autodispatch_validate_option_snapshot <- function(snapshot) {
+  if (is.list(snapshot) && "np.objective.cache" %in% names(snapshot))
+    npObjectiveCacheEnabled(snapshot[["np.objective.cache"]])
+  invisible(TRUE)
+}
+
 .npRmpi_autodispatch_should_sync_options <- function(snapshot) {
+  .npRmpi_autodispatch_validate_option_snapshot(snapshot)
   mode <- getOption("npRmpi.autodispatch.option.sync", "onchange")
   if (!is.character(mode) || length(mode) != 1L || is.na(mode))
     mode <- "onchange"
@@ -97,6 +104,56 @@
   ref
 }
 
+.npRmpi_autodispatch_raw_md5 <- function(raw) {
+  path <- tempfile("npRmpi-autodispatch-fingerprint-", fileext = ".bin")
+  on.exit(unlink(path), add = TRUE)
+  writeBin(raw, path, useBytes = TRUE)
+  unname(as.character(tools::md5sum(path)))
+}
+
+.npRmpi_autodispatch_fingerprint <- function(x) {
+  normalize <- function(z) {
+    if (is.environment(z))
+      return(sprintf("<environment:%s>", environmentName(z)))
+    if (inherits(z, "formula")) {
+      environment(z) <- emptyenv()
+      return(z)
+    }
+    if (is.call(z)) {
+      out <- lapply(as.list(z), normalize)
+      names(out) <- names(as.list(z))
+      return(as.call(out))
+    }
+    if (is.pairlist(z)) {
+      out <- lapply(as.list(z), normalize)
+      names(out) <- names(as.list(z))
+      return(as.pairlist(out))
+    }
+    if (is.list(z)) {
+      for (i in seq_along(z))
+        z[i] <- list(normalize(z[[i]]))
+    }
+    attrs <- attributes(z)
+    if (length(attrs)) {
+      attrs <- lapply(attrs, normalize)
+      attributes(z) <- attrs
+    }
+    z
+  }
+  y <- x
+  attr(y, "npRmpi.dispatch.mode") <- NULL
+  attr(y, "npRmpi.autodispatch.remote") <- NULL
+  attr(y, "npRmpi.autodispatch.fingerprint") <- NULL
+  y <- normalize(y)
+  raw <- tryCatch(serialize(y, connection = NULL, xdr = FALSE), error = function(e) raw())
+  if (!length(raw))
+    return(NA_character_)
+  digest <- tryCatch(.npRmpi_autodispatch_raw_md5(raw), error = function(e) NA_character_)
+  if (!is.character(digest) || length(digest) != 1L || is.na(digest) || !nzchar(digest))
+    return(NA_character_)
+  sprintf("md5:%d:%s", length(raw), digest)
+}
+
 .npRmpi_autodispatch_has_tmp_symbols <- function(x) {
   if (is.symbol(x)) {
     nm <- as.character(x)
@@ -114,6 +171,10 @@
 
 .npRmpi_autodispatch_can_reuse_bws_ref <- function(val, call.base) {
   if (is.null(.npRmpi_autodispatch_remote_ref(val)))
+    return(FALSE)
+  fp <- tryCatch(attr(val, "npRmpi.autodispatch.fingerprint", exact = TRUE), error = function(e) NULL)
+  if (!is.character(fp) || length(fp) != 1L || is.na(fp) ||
+      !identical(fp, .npRmpi_autodispatch_fingerprint(val)))
     return(FALSE)
 
   allowed <- list(
@@ -208,7 +269,7 @@
   out.names <- character(0)
 
   append_arg <- function(val, nm) {
-    out.args[[length(out.args) + 1L]] <<- val
+    out.args[length(out.args) + 1L] <<- list(val)
     out.names[[length(out.names) + 1L]] <<- if (is.null(nm)) "" else nm
   }
 
@@ -1762,8 +1823,10 @@
 .npRmpi_autodispatch_tag_result <- function(x, mode = "auto", remote = NULL) {
   if (!is.null(x)) {
     attr(x, "npRmpi.dispatch.mode") <- mode
-    if (is.character(remote) && length(remote) == 1L && nzchar(remote))
+    if (is.character(remote) && length(remote) == 1L && nzchar(remote)) {
       attr(x, "npRmpi.autodispatch.remote") <- remote
+      attr(x, "npRmpi.autodispatch.fingerprint") <- .npRmpi_autodispatch_fingerprint(x)
+    }
   }
   x
 }
@@ -1778,6 +1841,7 @@
   }
   attr(x, "npRmpi.dispatch.mode") <- NULL
   attr(x, "npRmpi.autodispatch.remote") <- NULL
+  attr(x, "npRmpi.autodispatch.fingerprint") <- NULL
   x
 }
 
@@ -1840,12 +1904,12 @@
     wall <- unname(as.double(dt[["elapsed"]]))
     if (!is.finite(wall) || wall < 0)
       wall <- 0.0
-    comm <- as.double(comm.elapsed)
-    if (!is.finite(comm) || comm < 0)
-      comm <- 0.0
-    compute <- max(0.0, wall - comm)
-    denom <- comm + compute
-    ratio <- if (denom > 0) min(1.0, max(0.0, comm / denom)) else NA_real_
+    comm.time <- as.double(comm.elapsed)
+    if (!is.finite(comm.time) || comm.time < 0)
+      comm.time <- 0.0
+    compute <- max(0.0, wall - comm.time)
+    denom <- comm.time + compute
+    ratio <- if (denom > 0) min(1.0, max(0.0, comm.time / denom)) else NA_real_
     rec <- list(
       profile_kind = "call",
       where = .npRmpi_autodispatch_call_name(mc),
@@ -1857,7 +1921,7 @@
       size = tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) NA_integer_),
       via_bcast = isTRUE(.npRmpi_autodispatch_called_from_bcast()),
       wall_elapsed_sec = wall,
-      comm_elapsed_sec = comm,
+      comm_elapsed_sec = comm.time,
       compute_elapsed_sec = compute,
       comm_ratio = ratio,
       comm_calls = as.integer(comm.calls),
@@ -1884,6 +1948,7 @@
   if (!is.na(rank) && rank != 0L)
     return(.npRmpi_eval_without_dispatch(mc, caller_env))
 
+  .npRmpi_autodispatch_validate_option_snapshot(.npRmpi_autodispatch_option_snapshot())
   .npRmpi_autodispatch_failfast_formula_data(mc, caller_env = caller_env)
 
   if (!.npRmpi_autodispatch_preflight(comm = comm))

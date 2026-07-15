@@ -115,6 +115,10 @@ startup/teardown behavior:
   used on small \code{n}.
   \item As \code{n} grows, compute usually dominates fixed messaging costs and
   relative penalties commonly shrink.
+  \item Worker-count changes can also change summation or reduction order at
+  numerical roundoff scale. Use tolerance-based comparisons for objective
+  values or selected bandwidths across worker counts unless the run is a
+  controlled single-process reproducibility check.
   \item In session/attach mode with auto-dispatch enabled, lightweight calls
   (especially post-bandwidth \code{npreg(bws=...)} and \code{predict(...)})
   can be slower due to command marshalling/serialization overhead. A practical
@@ -190,6 +194,10 @@ ranks to exit their loop and returns on rank 0 without forcing an R quit
 on the master process. In profile/manual-broadcast mode, termination is
 handled explicitly in the script via broadcasted \code{mpi.quit()} calls
 rather than via \code{npRmpi.quit()}.
+
+If an MPI-fanned bootstrap dispatch fails or times out, the current MPI
+session may no longer be usable. Restart R before performing further
+MPI-backed computations.
 
 Advanced diagnostic option: setting environment variable
 \code{NP_RMPI_SKIP_INIT} to a non-empty value before loading \pkg{npRmpi}

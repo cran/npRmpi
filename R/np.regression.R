@@ -42,6 +42,39 @@ npreg <-
   code
 }
 
+.npreg_glp_partial_gradients_from_npreghat <- function(bws,
+                                                       txdat,
+                                                       tydat,
+                                                       exdat,
+                                                       gradient.order,
+                                                       available,
+                                                       nrow.eval,
+                                                       ncol.x) {
+  grad <- matrix(NA_real_, nrow = nrow.eval, ncol = ncol.x)
+  cont.idx <- which(bws$icon)
+
+  if (!length(cont.idx) || !any(available))
+    return(grad)
+
+  for (jj in which(available)) {
+    svec <- integer(bws$ncon)
+    svec[jj] <- as.integer(gradient.order[jj])
+    hat.args <- list(
+      bws = bws,
+      txdat = txdat,
+      y = tydat,
+      output = "apply",
+      s = svec
+    )
+    if (!is.null(exdat))
+      hat.args$exdat <- exdat
+
+    grad[, cont.idx[jj]] <- as.vector(do.call(npreghat, hat.args))
+  }
+
+  grad
+}
+
 npreg.formula <-
   function(bws, data = NULL, newdata = NULL, y.eval = FALSE, ...){
 
@@ -149,6 +182,12 @@ npreg.formula <-
     ev$omit <- attr(umf,"na.action")
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
+    train.omit <- as.vector(attr(tmf, "na.action"))
+    eval.omit <- if (has.eval) as.vector(attr(umf, "na.action")) else integer(0)
+    ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
+    ev$train.nobs.omit <- length(train.omit)
+    ev$eval.rows.omit <- if (length(eval.omit)) eval.omit else NA
+    ev$eval.nobs.omit <- length(eval.omit)
 
     ev$mean <- napredict(ev$omit, ev$mean)
     ev$merr <- napredict(ev$omit, ev$merr)
@@ -243,6 +282,24 @@ npreg.rbandwidth <-
         gradient.order = glp.gradient.order.raw,
         ncon = bws$ncon
       )
+    glp.gradient.available.raw <- NULL
+    glp.gradient.partial.raw <- FALSE
+    if (isTRUE(gradients) &&
+        identical(reg.spec.raw$regtype.engine, "lp") &&
+        (bws$ncon > 0L)) {
+      glp.gradient.available.raw <- npGlpGradientAvailability(
+        regtype.engine = reg.spec.raw$regtype.engine,
+        degree.engine = reg.spec.raw$degree.engine,
+        gradient.order = glp.gradient.order.raw,
+        ncon = bws$ncon
+      )
+      if (!any(glp.gradient.available.raw)) {
+        stop("npreg has no available derivative components for the requested gradient.order and fitted polynomial degree",
+             call. = FALSE)
+      }
+      glp.gradient.partial.raw <- !lp.degree0.lc.gradient.raw &&
+        any(!glp.gradient.available.raw)
+    }
     if (isTRUE(gradients) &&
         identical(reg.spec.raw$regtype.engine, "lp") &&
         (bws$ncon > 0L) &&
@@ -250,7 +307,9 @@ npreg.rbandwidth <-
         all(reg.spec.raw$degree.engine == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
-    if (isTRUE(gradients) && identical(reg.spec.raw$regtype.engine, "lp")) {
+    if (isTRUE(gradients) &&
+        identical(reg.spec.raw$regtype.engine, "lp") &&
+        !glp.gradient.partial.raw) {
       npValidateGlpGradientDegree(
         regtype.engine = reg.spec.raw$regtype.engine,
         degree.engine = reg.spec.raw$degree.engine,
@@ -424,6 +483,34 @@ npreg.rbandwidth <-
         gradient.order = glp.gradient.order,
         ncon = bws$ncon
       )
+    glp.gradient.available <- NULL
+    glp.gradient.partial <- FALSE
+    if (isTRUE(gradients) &&
+        identical(reg.spec$regtype.engine, "lp") &&
+        (bws$ncon > 0L)) {
+      glp.gradient.available <- npGlpGradientAvailability(
+        regtype.engine = reg.spec$regtype.engine,
+        degree.engine = reg.spec$degree.engine,
+        gradient.order = glp.gradient.order,
+        ncon = bws$ncon
+      )
+      if (!any(glp.gradient.available)) {
+        stop("npreg has no available derivative components for the requested gradient.order and fitted polynomial degree",
+             call. = FALSE)
+      }
+      glp.gradient.partial <- !lp.degree0.lc.gradient &&
+        any(!glp.gradient.available)
+      if (glp.gradient.partial && any(!glp.gradient.available) &&
+          isTRUE(warn.glp.gradient)) {
+        npWarnGlpGradientPartialAvailability(
+          where = "npreg",
+          degree.engine = reg.spec$degree.engine,
+          gradient.order = glp.gradient.order,
+          available = glp.gradient.available,
+          con.names = names(txdat)[bws$icon]
+        )
+      }
+    }
     if (isTRUE(gradients) &&
         identical(reg.spec$regtype.engine, "lp") &&
         (bws$ncon > 0L) &&
@@ -431,7 +518,9 @@ npreg.rbandwidth <-
         all(reg.spec$degree.engine == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
-    if (isTRUE(gradients) && identical(reg.spec$regtype.engine, "lp")) {
+    if (isTRUE(gradients) &&
+        identical(reg.spec$regtype.engine, "lp") &&
+        !glp.gradient.partial) {
       npValidateGlpGradientDegree(
         regtype.engine = reg.spec$regtype.engine,
         degree.engine = reg.spec$degree.engine,
@@ -464,27 +553,29 @@ npreg.rbandwidth <-
 
     ## catch and destroy NA's
     keep.rows <- rep_len(TRUE, nrow(txdat))
-    rows.omit <- attr(na.omit(data.frame(txdat,tydat)), "na.action")
-    if (length(rows.omit) > 0L)
-      keep.rows[as.integer(rows.omit)] <- FALSE
+    train.rows.omit <- attr(na.omit(data.frame(txdat,tydat)), "na.action")
+    if (length(train.rows.omit) > 0L)
+      keep.rows[as.integer(train.rows.omit)] <- FALSE
 
     if (!any(keep.rows))
       stop("Training data has no rows without NAs")
 
     txdat <- txdat[keep.rows,,drop = FALSE]
     tydat <- tydat[keep.rows]
+    resid.response <- tydat
 
     ## no.ex = missing(exdat)
     ## no.ey = missing(eydat)
 
+    eval.rows.omit <- integer(0)
     if (!no.ex){
       keep.eval <- rep_len(TRUE, nrow(exdat))
       eval.df <- data.frame(exdat)
       if (!no.ey)
         eval.df <- data.frame(eval.df, eydat)
-      rows.omit <- attr(na.omit(eval.df), "na.action")
-      if (length(rows.omit) > 0L)
-        keep.eval[as.integer(rows.omit)] <- FALSE
+      eval.rows.omit <- attr(na.omit(eval.df), "na.action")
+      if (length(eval.rows.omit) > 0L)
+        keep.eval[as.integer(eval.rows.omit)] <- FALSE
 
       if (!any(keep.eval))
         stop("Evaluation data has no rows without NAs")
@@ -515,10 +606,22 @@ npreg.rbandwidth <-
       }
     }
 
-    ## evaluate residuals before data conversion ...
+    resid <- NULL
+    compute.resid.from.fit <- isTRUE(residuals) && no.ex && !is.factor(resid.response)
 
-    if (residuals){
-      resid <- tydat - npreg(txdat = txdat, tydat = tydat, bws = bws)$mean
+    if (residuals && !compute.resid.from.fit){
+      if (isTRUE(glp.gradient.partial)) {
+        mean.args <- list(
+          bws = bws,
+          txdat = txdat,
+          y = tydat,
+          output = "apply",
+          s = integer(bws$ncon)
+        )
+        resid <- tydat - as.vector(do.call(npreghat, mean.args))
+      } else {
+        resid <- tydat - npreg(txdat = txdat, tydat = tydat, bws = bws)$mean
+      }
     }
 
 
@@ -557,6 +660,7 @@ npreg.rbandwidth <-
       (bws$ncon > 0L)
     txdat.frame <- txdat
     exdat.frame <- if (no.ex) NULL else exdat
+    do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
 
     ## re-assign levels in training and evaluation data to ensure correct
     ## conversion to numeric type.
@@ -628,7 +732,7 @@ npreg.rbandwidth <-
         liracine = OKER_LR,
         "racineliyan" = OKER_RLY),
       ey_is_ty = no.ey,
-      do_grad = gradients,
+      do_grad = do.compiled.gradients,
       regtype = reg.c$code,
       no.ex = no.ex,
       mcv.numRow = attr(bws$xmcv, "num.row"),
@@ -668,13 +772,18 @@ npreg.rbandwidth <-
             as.integer(npLpBasisCode(reg.spec$basis.engine)),
             as.integer(enrow),
             as.integer(ncol),
-            as.logical(gradients),
+            as.logical(do.compiled.gradients),
             as.double(cker.bounds.c$lb),
             as.double(cker.bounds.c$ub),
             PACKAGE = "npRmpi")
     }
 
-    use.local.regression <- identical(bws$type, "generalized_nn") &&
+    local.regression.context <- .npRmpi_has_active_slave_pool(comm = 1L) ||
+      isTRUE(.npRmpi_autodispatch_in_context()) ||
+      isTRUE(.npRmpi_autodispatch_called_from_bcast())
+
+    use.local.regression <- (
+      identical(bws$type, "generalized_nn") &&
       identical(reg.spec$regtype.engine, "lp") &&
       identical(reg.spec$basis.engine, "glp") &&
       !isTRUE(reg.spec$bernstein.basis.engine) &&
@@ -683,7 +792,15 @@ npreg.rbandwidth <-
       !isTRUE(gradients) &&
       !isTRUE(residuals) &&
       no.ey &&
-      .npRmpi_has_active_slave_pool(comm = 1L)
+      isTRUE(local.regression.context)
+    ) || (
+      identical(reg.spec$regtype.engine, "lp") &&
+      identical(reg.spec$basis.engine, "glp") &&
+      !isTRUE(reg.spec$bernstein.basis.engine) &&
+      (bws$ncon > 0L) &&
+      (isTRUE(glp.gradient.partial) || isTRUE(lp.degree0.lc.gradient)) &&
+      isTRUE(local.regression.context)
+    )
 
     myout <- .np_with_compiled_fit_progress(
       label = "Fitting regression",
@@ -706,7 +823,7 @@ npreg.rbandwidth <-
       )
     }
 
-    if (gradients){
+    if (gradients && !glp.gradient.partial){
       myout$g = matrix(data=myout$g, nrow = enrow, ncol = ncol, byrow = FALSE) 
       rorder = numeric(ncol)
       ord_idx <- seq_len(ncol)
@@ -725,8 +842,22 @@ npreg.rbandwidth <-
         )
       }
 
+    } else if (gradients) {
+      myout$g <- .npreg_glp_partial_gradients_from_npreghat(
+        bws = bws,
+        txdat = txdat.frame,
+        tydat = tydat,
+        exdat = exdat.frame,
+        gradient.order = glp.gradient.order,
+        available = glp.gradient.available,
+        nrow.eval = enrow,
+        ncol.x = ncol
+      )
+      myout$gerr <- matrix(NA_real_, nrow = enrow, ncol = ncol)
     }
 
+    if (compute.resid.from.fit)
+      resid <- as.double(resid.response) - myout$mean
 
     fit.elapsed <- proc.time()[3] - fit.start
     optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
@@ -742,7 +873,9 @@ npreg.rbandwidth <-
       gradients = gradients,
       residuals = residuals,
       xtra = myout$xtra,
-      rows.omit = rows.omit,
+      rows.omit = if (no.ex) train.rows.omit else eval.rows.omit,
+      train.rows.omit = train.rows.omit,
+      eval.rows.omit = if (no.ex) integer(0) else eval.rows.omit,
       timing = bws$timing,
       total.time = total.time,
       optim.time = optim.time,

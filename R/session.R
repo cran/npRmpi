@@ -139,14 +139,16 @@
   rank <- suppressWarnings(as.integer(rank)[1L])
   if (!is.finite(rank) || rank < 1L)
     rank <- 1L
-  as.integer(62000L + rank)
+  .npRmpi_protocol_rank_tag("attach_ack_base", rank, min_rank = 1L,
+                            where = "npRmpi attach close acknowledgement")
 }
 
 .npRmpi_attach_close_release_tag <- function(rank) {
   rank <- suppressWarnings(as.integer(rank)[1L])
   if (!is.finite(rank) || rank < 1L)
     rank <- 1L
-  as.integer(62100L + rank)
+  .npRmpi_protocol_rank_tag("attach_release_base", rank, min_rank = 1L,
+                            where = "npRmpi attach close release")
 }
 
 .npRmpi_attach_close_ack_timeout <- function() {
@@ -680,6 +682,7 @@ npRmpi.quit <- function(force = FALSE,
     .npRmpi_session_reset_spmd_state()
     .npRmpi_attach_state_reset()
     options(npRmpi.master.only = FALSE)
+    options(npRmpi.pool.active = FALSE)
     return(invisible(TRUE))
   }
 

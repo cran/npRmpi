@@ -274,6 +274,75 @@
   )
 }
 
+.np_degree_search_metadata <- function(search_result,
+                                       default_direction = c("min", "max")) {
+  default_direction <- match.arg(default_direction)
+  scalar_character <- function(value, default = NA_character_) {
+    if (is.null(value) || !length(value))
+      return(default)
+    value <- as.character(value[1L])
+    if (is.na(value) || !nzchar(value)) default else value
+  }
+  scalar_logical <- function(value, default = FALSE) {
+    if (is.null(value) || !length(value))
+      return(default)
+    isTRUE(value[1L])
+  }
+  scalar_real <- function(value) {
+    if (is.null(value) || !length(value))
+      return(NA_real_)
+    as.numeric(value[1L])
+  }
+  scalar_integer <- function(value) {
+    if (is.null(value) || !length(value))
+      return(NA_integer_)
+    as.integer(value[1L])
+  }
+  degree_value <- function(value) {
+    if (is.null(value) || !length(value))
+      return(integer(0L))
+    as.integer(value)
+  }
+
+  baseline <- search_result$baseline
+  best <- search_result$best
+  direction <- scalar_character(search_result$direction, default_direction)
+
+  list(
+    mode = scalar_character(search_result$method, "explicit"),
+    source = scalar_character(search_result$source, "explicit"),
+    reason = if (!is.null(search_result$reason)) search_result$reason else NULL,
+    engine = scalar_character(search_result$engine,
+                              scalar_character(search_result$method, "explicit")),
+    direction = direction,
+    verify = scalar_logical(search_result$verify),
+    completed = scalar_logical(search_result$completed),
+    certified = scalar_logical(search_result$certified),
+    interrupted = scalar_logical(search_result$interrupted),
+    baseline.degree = degree_value(baseline$degree),
+    baseline.fval = scalar_real(baseline$objective),
+    best.degree = degree_value(best$degree),
+    best.fval = scalar_real(best$objective),
+    nomad.time = scalar_real(search_result$nomad.time),
+    powell.time = scalar_real(search_result$powell.time),
+    optim.time = scalar_real(search_result$optim.time),
+    n.unique = scalar_integer(search_result$n.unique),
+    n.visits = scalar_integer(search_result$n.visits),
+    n.cached = scalar_integer(search_result$n.cached),
+    grid.size = scalar_integer(search_result$grid.size),
+    singleton = scalar_logical(search_result$singleton),
+    fixed.degree = degree_value(search_result$fixed.degree),
+    best.restart = scalar_integer(search_result$best.restart),
+    restart.starts = search_result$restart.starts,
+    restart.degree.starts = search_result$restart.degree.starts,
+    restart.bandwidth.starts = search_result$restart.bandwidth.starts,
+    restart.start.info = search_result$restart.start.info,
+    restart.results = search_result$restart.results,
+    nn.cache = search_result$nn.cache,
+    trace = search_result$trace
+  )
+}
+
 .np_degree_format_degree <- function(degree) {
   sprintf("(%s)", paste(as.integer(degree), collapse = ","))
 }
@@ -1037,6 +1106,7 @@
     method = method,
     source = source,
     reason = reason,
+    direction = direction,
     verify = isTRUE(verify),
     completed = !isTRUE(state$interrupted),
     certified = !isTRUE(state$interrupted) && (identical(method, "exhaustive") || isTRUE(verify)),
@@ -1435,6 +1505,16 @@
   starts
 }
 
+.np_nomad_normalize_user_opts <- function(nomad.opts, where = "NOMAD") {
+  if (is.null(nomad.opts))
+    return(list())
+
+  if (!is.list(nomad.opts))
+    stop(sprintf("%s: 'nomad.opts' must be a list", where), call. = FALSE)
+
+  nomad.opts
+}
+
 .np_nomad_default_opts <- function(random.seed, nomad.opts = list()) {
   base <- list(
     SEED = as.integer(random.seed),
@@ -1765,14 +1845,20 @@
   if (is.null(state))
     return(state)
 
+  now <- .np_progress_now()
   state$label <- .np_nomad_powell_progress_label()
   state$unknown_total_fields <- .np_nomad_powell_progress_fields
   state$nomad_current_degree <- as.integer(degree)
   state$nomad_best_record <- best_record
+  state$started <- now
+  state$last_done <- NULL
+  state$last_emitted_done <- NULL
+  state$last_emitted_detail <- NULL
+  state$last_emit <- now - state$throttle_sec
   .np_progress_step_at(
     state = state,
-    now = .np_progress_now(),
-    done = state$last_done,
+    now = now,
+    done = NULL,
     force = TRUE
   )
 }
@@ -1813,6 +1899,7 @@
     local.state$unknown_total_fields <- .np_nomad_powell_progress_fields
     local.state$nomad_current_degree <- as.integer(degree)
     local.state$nomad_best_record <- best_record
+    local.state$nomad_nmulti <- 1L
     local.state <- .np_progress_show_now(local.state)
     .np_progress_runtime$bandwidth_state <- local.state
   } else if (isTRUE(worker_silent)) {

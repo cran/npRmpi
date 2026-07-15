@@ -364,6 +364,8 @@ test_that("session npplreg plain fixed lc plot-data completes locally", {
       "tz <- data.frame(x=x)",
       "bw.fix <- npplregbw(xdat=tx, zdat=tz, ydat=y, regtype='lc', bwmethod='cv.ls', bwtype='fixed', nmulti=1)",
       "bw.ann <- npplregbw(xdat=tx, zdat=tz, ydat=y, regtype='lc', bwmethod='cv.ls', bwtype='adaptive_nn', nmulti=1)",
+      "grDevices::pdf(NULL)",
+      "on.exit(grDevices::dev.off(), add=TRUE)",
       "data.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
       "plot.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'plot-data', perspective=FALSE, errors='none'))",
       "ann.out <- suppressWarnings(plot(bw.ann, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
@@ -456,12 +458,12 @@ test_that("session npindex residual and evaluation-error branches complete in in
       "  fit.is <- npindex(bws=bw, txdat=tx, tydat=y, gradients=FALSE, residuals=TRUE)",
       "  stopifnot(length(fit.is$resid) == nrow(tx))",
       "  stopifnot(max(abs(as.vector(fit.is$resid) - (y - as.vector(fit.is$mean)))) < 1e-8)",
-      "  fit.oos <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=FALSE, errors=TRUE)",
+      "  fit.oos <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=FALSE, errors=TRUE, boot.num=9L)",
       "  stopifnot(length(fit.oos$mean) == nrow(ex))",
       "  stopifnot(length(fit.oos$merr) == nrow(ex))",
       "  stopifnot(all(is.finite(fit.oos$mean)))",
       "  stopifnot(all(is.finite(fit.oos$merr)))",
-      "  fit.grad <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=TRUE, errors=TRUE)",
+      "  fit.grad <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=TRUE, errors=TRUE, boot.num=9L)",
       "  stopifnot(identical(dim(fit.grad$grad), c(nrow(ex), ncol(tx))))",
       "  stopifnot(identical(dim(fit.grad$gerr), c(nrow(ex), ncol(tx))))",
       "  stopifnot(all(is.finite(fit.grad$grad)))",
@@ -1341,8 +1343,7 @@ test_that("session npindex geom-block consumer plot preserves bwtype variants in
 
 test_that("session inid density plot smoke completes in subprocess", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_DENSITY_INID_TEST"), "1"),
-              "set NP_RMPI_ENABLE_DENSITY_INID_TEST=1 to run density inid session smoke")
+  skip_on_cran()
   env <- subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
   res <- run_rscript_subprocess(
@@ -1515,8 +1516,7 @@ test_that("manual-broadcast mode smoke completes in subprocess", {
 
 test_that("attach mode smoke completes under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -1631,8 +1631,7 @@ test_that("attach mode smoke completes under mpiexec when enabled", {
 
 test_that("attach npindexhat adaptive-nn exact owner route completes under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -1702,8 +1701,7 @@ test_that("attach npindexhat adaptive-nn exact owner route completes under mpiex
 
 test_that("attach npindexhat adaptive-nn ll owner route stays exact under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -1781,8 +1779,7 @@ test_that("attach npindexhat adaptive-nn ll owner route stays exact under mpiexe
 
 test_that("attach npindex adaptive-nn public route preserves bwtype semantics under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -1854,8 +1851,7 @@ test_that("attach npindex adaptive-nn public route preserves bwtype semantics un
 
 test_that("attach npindex nearest-neighbor exact route stays green under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -1931,8 +1927,7 @@ test_that("attach npindex nearest-neighbor exact route stays green under mpiexec
 
 test_that("attach smooth-coefficient ll coef plot-data route completes under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_TEST=1 to run attach-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2008,8 +2003,7 @@ test_that("attach smooth-coefficient ll coef plot-data route completes under mpi
 
 test_that("attach mode NP transition close stays stable when stress test is enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_ATTACH_STRESS_TEST"), "1"),
-              "set NP_RMPI_ENABLE_ATTACH_STRESS_TEST=1 to run attach close stress")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2032,6 +2026,8 @@ test_that("attach mode NP transition close stays stable when stress test is enab
     "  stopifnot(inherits(fit, 'conmode'))",
     "  cat('ATTACH_NPCONMODE_ROUTE_OK\\n')",
     "  npRmpi.quit(mode='attach')",
+    "  stopifnot(isFALSE(getOption('npRmpi.pool.active', FALSE)))",
+    "  cat('ATTACH_POOL_INACTIVE_AFTER_CLOSE_OK\\n')",
     "}"
   ), script, useBytes = TRUE)
 
@@ -2076,6 +2072,8 @@ test_that("attach mode NP transition close stays stable when stress test is enab
   expect_equal(res2$status, 0L, info = paste(res2$output, collapse = "\n"))
   expect_true(any(grepl("ATTACH_NPCONMODE_ROUTE_OK", res2$output, fixed = TRUE)),
               info = paste(res2$output, collapse = "\n"))
+  expect_true(any(grepl("ATTACH_POOL_INACTIVE_AFTER_CLOSE_OK", res2$output, fixed = TRUE)),
+              info = paste(res2$output, collapse = "\n"))
 
   res3 <- run_once(3L)
   if (res3$status != 0L && .is_mpi_init_env_failure(res3$output))
@@ -2083,12 +2081,22 @@ test_that("attach mode NP transition close stays stable when stress test is enab
   expect_equal(res3$status, 0L, info = paste(res3$output, collapse = "\n"))
   expect_true(any(grepl("ATTACH_NPCONMODE_ROUTE_OK", res3$output, fixed = TRUE)),
               info = paste(res3$output, collapse = "\n"))
+  expect_true(any(grepl("ATTACH_POOL_INACTIVE_AFTER_CLOSE_OK", res3$output, fixed = TRUE)),
+              info = paste(res3$output, collapse = "\n"))
+
+  res3.repeat <- run_once(3L)
+  if (res3.repeat$status != 0L && .is_mpi_init_env_failure(res3.repeat$output))
+    skip("MPI runtime interface unavailable in this environment for attach stress")
+  expect_equal(res3.repeat$status, 0L, info = paste(res3.repeat$output, collapse = "\n"))
+  expect_true(any(grepl("ATTACH_NPCONMODE_ROUTE_OK", res3.repeat$output, fixed = TRUE)),
+              info = paste(res3.repeat$output, collapse = "\n"))
+  expect_true(any(grepl("ATTACH_POOL_INACTIVE_AFTER_CLOSE_OK", res3.repeat$output, fixed = TRUE)),
+              info = paste(res3.repeat$output, collapse = "\n"))
 })
 
 test_that("profile mode smoke completes under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2226,8 +2234,7 @@ test_that("profile mode smoke completes under mpiexec when enabled", {
 
 test_that("profile npindexhat adaptive-nn exact owner route completes under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2308,8 +2315,7 @@ test_that("profile npindexhat adaptive-nn exact owner route completes under mpie
 
 test_that("profile npindexhat adaptive-nn ll owner route stays exact under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2400,8 +2406,7 @@ test_that("profile npindexhat adaptive-nn ll owner route stays exact under mpiex
 
 test_that("profile npindex adaptive-nn public route preserves bwtype semantics under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2486,8 +2491,7 @@ test_that("profile npindex adaptive-nn public route preserves bwtype semantics u
 
 test_that("profile npindex nearest-neighbor exact route stays green under mpiexec when enabled", {
   skip_on_cran()
-  skip_if_not(identical(Sys.getenv("NP_RMPI_ENABLE_PROFILE_TEST"), "1"),
-              "set NP_RMPI_ENABLE_PROFILE_TEST=1 to run profile-mode smoke")
+  skip_on_cran()
   mpiexec <- Sys.which("mpiexec")
   skip_if(!nzchar(mpiexec), "mpiexec unavailable")
 
@@ -2635,7 +2639,7 @@ test_that("session conditional density fixed ll cv.ls uses MPI autodispatch rout
       "stopifnot(is.finite(bw$fval))",
       "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
       "stopifnot(is.list(bw$timing.profile))",
-      "stopifnot(identical(bw$timing.profile$where, 'npcdensbw'))",
+      "stopifnot(identical(bw$timing.profile$where, 'autodispatch-call'))",
       "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
       "cat('SESSION_NPCDENS_LL_CVLS_AUTODISPATCH_OK\\n')"
     ),
@@ -2669,7 +2673,7 @@ test_that("session conditional distribution fixed ll cv.ls uses MPI autodispatch
       "stopifnot(is.finite(bw$fval))",
       "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
       "stopifnot(is.list(bw$timing.profile))",
-      "stopifnot(identical(bw$timing.profile$where, 'npcdistbw'))",
+      "stopifnot(identical(bw$timing.profile$where, 'autodispatch-call'))",
       "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
       "cat('SESSION_NPCDIST_LL_CVLS_AUTODISPATCH_OK\\n')"
     ),

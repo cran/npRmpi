@@ -115,17 +115,34 @@ npcdistbw.formula <-
   force(expr)
 }
 
+.npcdistbw_method_name <- function(bws, where = "npcdistbw") {
+  method <- bws$method
+  if (is.null(method) || !length(method) || is.na(method[1L]))
+    stop(sprintf("%s requires valid bwmethod metadata", where), call. = FALSE)
+
+  method <- as.character(method[1L])
+  switch(method,
+    cv.ls = method,
+    "normal-reference" = method,
+    stop(sprintf("%s does not support bwmethod '%s'", where, method),
+         call. = FALSE)
+  )
+}
+
+.npcdistbw_method_code <- function(bws, where = "npcdistbw") {
+  switch(.npcdistbw_method_name(bws, where = where),
+    cv.ls = CDBWM_CVLS,
+    "normal-reference" = NA_integer_
+  )
+}
+
 .npcdistbw_tree_code <- function(bws, ncon, ncat) {
   code <- npDoTreeOrCategoricalCompress(ncon = ncon, ncat = ncat, bws = bws)
 
   if (!identical(code, DO_TREE_YES))
     return(code)
 
-  method <- if (!is.null(bws$method) && length(bws$method)) {
-    as.character(bws$method[1L])
-  } else {
-    "cv.ls"
-  }
+  method <- .npcdistbw_method_name(bws, where = ".npcdistbw_tree_code")
   bwtype <- if (!is.null(bws$type) && length(bws$type)) {
     as.character(bws$type[1L])
   } else {
@@ -176,8 +193,12 @@ npcdistbw.condbandwidth <-
            small = 1.490116e-05,
            tol = 1.490116e-04,
            transform.bounds = FALSE,
-           ...){
+           ...,
+           nomad.opts = list()){
+    nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npcdistbw")
     dot.args <- list(...)
+    if (length(nomad.opts))
+      dot.args$nomad.opts <- nomad.opts
     elapsed.start <- proc.time()[3]
     ydat = toFrame(ydat)
     xdat = toFrame(xdat)
@@ -468,8 +489,7 @@ npcdistbw.condbandwidth <-
           adaptive_nn = BW_ADAP_NN),
         itmax=itmax, int_RESTART_FROM_MIN=(if (remin) RE_MIN_TRUE else RE_MIN_FALSE),
         int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE,
-        bwmethod = switch(bws$method,
-          cv.ls = CDBWM_CVLS),
+        bwmethod = .npcdistbw_method_code(bws),
         xkerneval = switch(bws$cxkertype,
           gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
           epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
@@ -488,7 +508,7 @@ npcdistbw.condbandwidth <-
           liracine = UKER_LR),
         oxkerneval = switch(bws$oxkertype,
           wangvanryzin = OKER_WANG,
-          liracine = OKER_LR,
+          liracine = OKER_NLR,
         "racineliyan" = OKER_RLY),
         oykerneval = switch(bws$oykertype,
           wangvanryzin = OKER_WANG,
@@ -523,6 +543,9 @@ npcdistbw.condbandwidth <-
       cyker.bounds.c <- npKernelBoundsMarshal(bws$cykerlb[bws$iycon], bws$cykerub[bws$iycon])
 
       if (bws$method != "normal-reference"){
+        if (is.na(myopti$bwmethod))
+          stop("npcdistbw native search requires a valid bandwidth method code",
+               call. = FALSE)
         myout <- npWithLocalLinearRawBasisSearchError(
           if (keep_local_cvls_nn) {
             .npRmpi_with_local_cdist_eval(
@@ -948,7 +971,7 @@ npcdistbw.condbandwidth <-
       liracine = UKER_LR),
     oxkerneval = switch(bws$oxkertype,
       wangvanryzin = OKER_WANG,
-      liracine = OKER_LR,
+      liracine = OKER_NLR,
       racineliyan = OKER_RLY),
     oykerneval = switch(bws$oykertype,
       wangvanryzin = OKER_WANG,
@@ -1245,7 +1268,7 @@ npcdistbw.condbandwidth <-
       liracine = UKER_LR),
     oxkerneval = switch(bws$oxkertype,
       wangvanryzin = OKER_WANG,
-      liracine = OKER_LR,
+      liracine = OKER_NLR,
       racineliyan = OKER_RLY),
     oykerneval = switch(bws$oykertype,
       wangvanryzin = OKER_WANG,
@@ -2571,6 +2594,7 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
     if (isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
       search.result <- eval(mc, envir = environment())
     } else {
+      npObjectiveCacheEnabled()
       search.result <- .npRmpi_bcast_cmd_expr(mc, comm = 1L, caller.execute = TRUE)
     }
     if (!is.null(search.result$num.feval.total))
@@ -2789,37 +2813,7 @@ npRmpiNomadShadowSearchConditionalDistribution <- function(xdat,
 }
 
 .npcdistbw_attach_degree_search <- function(bws, search_result) {
-  metadata <- list(
-    mode = search_result$method,
-    source = if (!is.null(search_result$source)) search_result$source else "explicit",
-    reason = if (!is.null(search_result$reason)) search_result$reason else NULL,
-    engine = if (!is.null(search_result$engine)) search_result$engine else search_result$method,
-    verify = isTRUE(search_result$verify),
-    completed = isTRUE(search_result$completed),
-    certified = isTRUE(search_result$certified),
-    interrupted = isTRUE(search_result$interrupted),
-    baseline.degree = search_result$baseline$degree,
-    baseline.fval = search_result$baseline$objective,
-    best.degree = search_result$best$degree,
-    best.fval = search_result$best$objective,
-    nomad.time = search_result$nomad.time,
-    powell.time = search_result$powell.time,
-    optim.time = search_result$optim.time,
-    n.unique = search_result$n.unique,
-    n.visits = search_result$n.visits,
-    n.cached = search_result$n.cached,
-    grid.size = search_result$grid.size,
-    singleton = isTRUE(search_result$singleton),
-    fixed.degree = search_result$fixed.degree,
-    best.restart = search_result$best.restart,
-    restart.starts = search_result$restart.starts,
-    restart.degree.starts = search_result$restart.degree.starts,
-    restart.bandwidth.starts = search_result$restart.bandwidth.starts,
-    restart.start.info = search_result$restart.start.info,
-    restart.results = search_result$restart.results,
-    nn.cache = search_result$nn.cache,
-    trace = search_result$trace
-  )
+  metadata <- .np_degree_search_metadata(search_result, default_direction = "min")
 
   if (!is.null(search_result$nomad.time))
     bws$nomad.time <- as.numeric(search_result$nomad.time[1L])
@@ -2930,7 +2924,9 @@ npcdistbw.default <-
            degree.verify = FALSE,
            bernstein.basis = FALSE,
            ## dummy arguments for condbandwidth() function call
-           ...){
+           ...,
+           nomad.opts = list()){
+    nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npcdistbw")
     ## maintain x names and 'toFrame'
     xdat <- toFrame(xdat)
 
@@ -3059,6 +3055,8 @@ npcdistbw.default <-
 
     search.mc.names <- names(mc)
     lp.dot.args <- list(...)
+    if (length(nomad.opts))
+      lp.dot.args$nomad.opts <- nomad.opts
     .np_degree_reject_unknown_dots(
       lp.dot.args,
       "npcdistbw",

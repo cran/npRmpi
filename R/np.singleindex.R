@@ -16,6 +16,7 @@
 npindex <-
   function(bws, ...){
     args <- list(...)
+    .np_singleindex_reject_higher_gradient_order(args, where = "npindex")
 
     if (!missing(bws)){
       if (length(args) > 0L &&
@@ -140,6 +141,10 @@ npindex.formula <-
             if (!is.null(ev$bws))
                 ev$bws$ynames <- response.name
         }
+        if (!is.null(ev$bws) && inherits(bws, "formula")) {
+            ev$bws$formula <- bws
+            ev$bws$terms <- attr(tmf, "terms")
+        }
 
         ev$omit <- attr(umf,"na.action")
         ev$rows.omit <- as.vector(ev$omit)
@@ -166,6 +171,30 @@ npindex.call <-
             bws = bws, ...)
   }
 
+.np_index_kernel_args <- function(bws) {
+  args <- list(
+    bwtype = bws$type,
+    ckertype = bws$ckertype,
+    ckerorder = bws$ckerorder
+  )
+  if (!is.null(bws$ckerbound))
+    args$ckerbound <- bws$ckerbound
+  args
+}
+
+.np_index_ks_prediction <- function(prob) {
+  pred <- as.integer(round(as.double(prob)))
+  pmax(0L, pmin(1L, pred))
+}
+
+.np_index_ks_confusion_matrix <- function(actual, pred) {
+  table(
+    factor(as.integer(actual), levels = 0:1),
+    factor(pred, levels = 0:1),
+    dnn = c("Actual", "Predicted")
+  )
+}
+
 .np_index_regression_bw_state <- function(index.df, ydat, bws) {
   .np_semihat_make_regbw_state(
     source = bws,
@@ -173,6 +202,64 @@ npindex.call <-
     ydat = ydat,
     bw = bws$bw
   )
+}
+
+.np_index_formula_reentry_xdat <- function(mf) {
+  terms.obj <- attr(mf, "terms")
+  mf[, attr(terms.obj, "term.labels"), drop = FALSE]
+}
+
+.np_index_formula_reentry_rhs_terms <- function(formula, xdat) {
+  delete.response(terms(formula, data = toFrame(xdat)))
+}
+
+.np_index_formula_reentry_response_name <- function(formula) {
+  response.vars <- all.vars(formula[[2L]])
+  if (length(response.vars) != 1L)
+    stop("direct formula 'bws' with explicit 'txdat'/'tydat' requires a single response variable",
+         call. = FALSE)
+  response.vars
+}
+
+.np_index_formula_reentry_model_frame <- function(formula, txdat, tydat, call, caller_env) {
+  data <- toFrame(txdat)
+  if (is.data.frame(tydat) && ncol(tydat) == 1L)
+    tydat <- tydat[[1L]]
+  data[[.np_index_formula_reentry_response_name(formula)]] <- tydat
+  data[[".np_index_formula_reentry_response"]] <- tydat
+
+  rhs.formula <- formula(.np_index_formula_reentry_rhs_terms(formula, txdat))
+  mf.formula <- as.formula(
+    as.call(list(as.name("~"),
+                 as.name(".np_index_formula_reentry_response"),
+                 rhs.formula[[2L]])),
+    env = environment(formula)
+  )
+
+  mf.call <- as.call(list(quote(stats::model.frame),
+                          formula = mf.formula,
+                          data = as.name(".np_index_formula_reentry_data")))
+  call.names <- names(call)
+  for (arg in c("subset", "na.action")) {
+    pos <- match(arg, call.names, nomatch = 0L)
+    if (pos > 0L)
+      mf.call[[arg]] <- call[[pos]]
+  }
+
+  eval.env <- new.env(parent = caller_env)
+  eval.env$.np_index_formula_reentry_data <- data
+  eval(mf.call, envir = eval.env)
+}
+
+.np_index_formula_reentry_eval_xdat <- function(formula, xdat, caller_env) {
+  tt <- .np_index_formula_reentry_rhs_terms(formula, xdat)
+  mf.call <- as.call(list(quote(stats::model.frame),
+                          formula = tt,
+                          data = as.name(".np_index_formula_reentry_data")))
+  eval.env <- new.env(parent = caller_env)
+  eval.env$.np_index_formula_reentry_data <- toFrame(xdat)
+  mf <- eval(mf.call, envir = eval.env)
+  .np_index_formula_reentry_xdat(mf)
 }
 
 npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
@@ -197,8 +284,49 @@ npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   if (.npRmpi_autodispatch_active() &&
       !bws.formula &&
       !bws.call &&
-      (explicit.sibandwidth || identical(degree.select.value, "manual")))
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      (explicit.sibandwidth || identical(degree.select.value, "manual"))) {
+    dispatch.call <- match.call()
+    if (explicit.sibandwidth && isTRUE(.np_progress_enabled(domain = "bandwidth")))
+      dispatch.call$.np_lc_fixed_progress_route <- TRUE
+    return(.npRmpi_autodispatch_call(dispatch.call, parent.frame()))
+  }
+
+  if (!explicit.sibandwidth && (bws.formula || bws.call) && !no.txdat && !no.tydat) {
+    txdat <- toFrame(txdat)
+    if (bws.formula) {
+      mf <- .np_index_formula_reentry_model_frame(
+        formula = bws,
+        txdat = txdat,
+        tydat = tydat,
+        call = sc,
+        caller_env = parent.frame()
+      )
+      txdat <- .np_index_formula_reentry_xdat(mf)
+      tydat <- model.response(mf)
+    }
+
+    dots <- list(...)
+    bw.dots <- dots
+    bw.dots$.np_fit_progress_handoff <- NULL
+    if (bws.formula)
+      bw.dots[c("subset", "na.action")] <- NULL
+    bw.args <- c(list(xdat = txdat, ydat = tydat, nomad = nomad), bw.dots)
+    tbw <- do.call(npindexbw, bw.args)
+
+    fit.args <- list(bws = tbw, txdat = txdat, tydat = tydat)
+    fit.dots <- dots
+    fit.dots$.np_fit_progress_handoff <- TRUE
+    if (bws.formula) {
+      fit.dots[c("subset", "na.action")] <- NULL
+      if (!is.null(fit.dots$exdat))
+        fit.dots$exdat <- .np_index_formula_reentry_eval_xdat(
+          formula = bws,
+          xdat = fit.dots$exdat,
+          caller_env = parent.frame()
+        )
+    }
+    return(do.call(npindex, c(fit.args, fit.dots)))
+  }
 
   ## here we check to see if the function was called with tdat =
   ## if it was, we need to catch that and map it to dat =
@@ -219,7 +347,16 @@ npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   
   sc.bw[[1]] <- quote(npindexbw)
 
-  if(bws.named){
+  if (bws.formula) {
+    ib <- match("bws", names(sc.bw), nomatch = 0L)
+    if (ib > 0L)
+      names(sc.bw)[ib] <- "formula"
+    drop.xy <- names(sc.bw) %in% c("txdat", "tydat")
+    if (any(drop.xy))
+      sc.bw <- sc.bw[!drop.xy]
+  }
+
+  if(bws.named && !bws.formula){
     sc.bw$bandwidth.compute <- FALSE
   }
 
@@ -228,7 +365,7 @@ npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   
   m.txy <- match(ostxy, names(sc.bw), nomatch = 0)
 
-  if(any(m.txy > 0)) {
+  if(!bws.formula && any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
     
@@ -247,7 +384,7 @@ npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
       .np_eval_bw_call(sc.bw, caller_env = parent.frame())
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+    bws
   }
 
   call.args <- list(bws = tbw)
@@ -295,6 +432,119 @@ npindex.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   do.call(.np_regression_direct, direct.args)
 }
 
+.npindex_spmd_active <- function(comm = 1L) {
+  if (!isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+    return(FALSE)
+  size <- tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) NA_integer_)
+  !is.na(size) && size >= 2L
+}
+
+.npindex_spmd_row_task <- function(neval, comm = 1L) {
+  neval <- as.integer(neval)
+  if (is.na(neval) || neval < 1L)
+    return(list(active = FALSE, rank = 0L, size = 1L, rows = integer(0L)))
+
+  if (!.npindex_spmd_active(comm = comm))
+    return(list(active = FALSE, rank = 0L, size = 1L,
+                rows = as.integer(seq_len(neval))))
+
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm)), error = function(e) NA_integer_)
+  size <- tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) NA_integer_)
+  if (is.na(rank) || is.na(size) || size < 2L || rank < 0L)
+    return(list(active = FALSE, rank = 0L, size = 1L,
+                rows = as.integer(seq_len(neval))))
+
+  base <- neval %/% size
+  extra <- neval %% size
+  bsz <- base + if (rank < extra) 1L else 0L
+  start <- rank * base + min(rank, extra) + 1L
+  rows <- if (bsz > 0L) seq.int(start, length.out = bsz) else integer(0L)
+  list(active = TRUE, rank = rank, size = size, rows = as.integer(rows))
+}
+
+.npindex_as_chunk_matrix <- function(x, nrow.out, ncol.out, what) {
+  nrow.out <- as.integer(nrow.out)
+  ncol.out <- as.integer(ncol.out)
+  if (nrow.out == 0L)
+    return(matrix(numeric(0L), nrow = 0L, ncol = ncol.out))
+  if (!is.matrix(x))
+    x <- matrix(as.numeric(x), nrow = nrow.out, ncol = ncol.out)
+  if (!identical(dim(x), c(nrow.out, ncol.out))) {
+    if (length(x) != nrow.out * ncol.out)
+      stop(sprintf("%s returned a malformed chunk", what), call. = FALSE)
+    x <- matrix(as.numeric(x), nrow = nrow.out, ncol = ncol.out)
+  }
+  x
+}
+
+.npindex_spmd_collect_matrix <- function(local,
+                                         rows,
+                                         neval,
+                                         ncol.out,
+                                         what,
+                                         comm = 1L) {
+  neval <- as.integer(neval)
+  ncol.out <- as.integer(ncol.out)
+  rows <- as.integer(rows)
+  local <- .npindex_as_chunk_matrix(local, length(rows), ncol.out, what)
+
+  if (!.npindex_spmd_active(comm = comm))
+    return(local)
+
+  rank <- tryCatch(as.integer(mpi.comm.rank(comm)), error = function(e) NA_integer_)
+  payload <- list(list(rank = rank, rows = rows, value = local))
+  gathered <- mpi.allgather.Robj(payload, comm = comm)
+
+  out <- matrix(NA_real_, nrow = neval, ncol = ncol.out)
+  seen <- integer(neval)
+  if (!is.list(gathered) || !length(gathered))
+    stop(sprintf("%s failed to gather worker chunks", what), call. = FALSE)
+  for (wrapped in gathered) {
+    part <- if (is.list(wrapped) && length(wrapped) == 1L &&
+                is.list(wrapped[[1L]]) && !is.null(wrapped[[1L]]$rows)) {
+      wrapped[[1L]]
+    } else {
+      wrapped
+    }
+    if (!is.list(part) || is.null(part$rows) || is.null(part$value))
+      stop(sprintf("%s gathered a malformed worker payload", what), call. = FALSE)
+    part.rows <- as.integer(part$rows)
+    if (length(part.rows)) {
+      if (any(is.na(part.rows)) || any(part.rows < 1L) || any(part.rows > neval))
+        stop(sprintf("%s gathered out-of-range row ownership", what), call. = FALSE)
+      part.value <- .npindex_as_chunk_matrix(
+        part$value,
+        length(part.rows),
+        ncol.out,
+        what
+      )
+      out[part.rows, ] <- part.value
+      seen[part.rows] <- seen[part.rows] + 1L
+    }
+  }
+  if (any(seen != 1L))
+    stop(sprintf("%s row ownership was incomplete or duplicated", what), call. = FALSE)
+  out
+}
+
+.npindex_spmd_eval_rows <- function(neval,
+                                    ncol.out,
+                                    worker,
+                                    what,
+                                    comm = 1L) {
+  task <- .npindex_spmd_row_task(neval = neval, comm = comm)
+  rows <- task$rows
+  local <- worker(rows)
+  .npindex_spmd_collect_matrix(
+    local = local,
+    rows = rows,
+    neval = neval,
+    ncol.out = ncol.out,
+    what = what,
+    comm = comm
+  )
+}
+
 npindex.sibandwidth <-
   function(bws,
            txdat = stop("training data 'txdat' missing"),
@@ -309,6 +559,8 @@ npindex.sibandwidth <-
     fit.start <- proc.time()[3]
     dots <- list(...)
     fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
+    lc.fixed.progress.intent <- isTRUE(dots$.np_lc_fixed_progress_route)
+    dots$.np_lc_fixed_progress_route <- NULL
     fit.progress.allow <- isTRUE(.np_progress_enabled(domain = "bandwidth"))
     gradients <- npValidateScalarLogical(gradients, "gradients")
     residuals <- npValidateScalarLogical(residuals, "residuals")
@@ -368,7 +620,18 @@ npindex.sibandwidth <-
     }
     if (.npRmpi_autodispatch_active() &&
         !(isTRUE(gradients) && identical(bws$type, "generalized_nn"))) {
-      result <- .npRmpi_autodispatch_call(match.call(), parent.frame())
+      dispatch.call <- match.call()
+      if (identical(bws$method, "ichimura") &&
+          identical(spec$regtype.engine, "lc") &&
+          identical(bws$type, "fixed") &&
+          !gradients &&
+          !errors &&
+          !residuals &&
+          (no.ex || (!no.ex && no.ey)) &&
+          (fit.progress.allow || fit.progress.handoff)) {
+        dispatch.call$.np_lc_fixed_progress_route <- TRUE
+      }
+      result <- .npRmpi_autodispatch_call(dispatch.call, parent.frame())
       return(.npRmpi_restore_nomad_fit_bws_metadata(result, bws))
     }
 
@@ -489,17 +752,15 @@ npindex.sibandwidth <-
       !errors &&
       !residuals &&
       (no.ex || (!no.ex && no.ey)) &&
-      (fit.progress.allow || fit.progress.handoff)
+      (fit.progress.allow || fit.progress.handoff || lc.fixed.progress.intent)
     npreg.idx.args <- list(
       txdat = if (gradients) index.df else index,
       tydat = tydat,
       bws = bws$bw,
-      bwtype = bws$type,
-      ckertype = bws$ckertype,
-      ckerorder = bws$ckerorder,
       regtype = regtype,
       warn.glp.gradient = FALSE
     )
+    npreg.idx.args <- c(npreg.idx.args, .np_index_kernel_args(bws))
     if (identical(regtype, "lp")) {
       npreg.idx.args$basis <- spec$basis.engine
       npreg.idx.args$degree <- spec$degree.engine
@@ -541,17 +802,121 @@ npindex.sibandwidth <-
     }
 
     run_npreg_fit <- function(args) {
-      if (isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+      if (isTRUE(lc.fixed.progress.route) ||
+          isTRUE(.npRmpi_autodispatch_called_from_bcast()) ||
+          isTRUE(.npRmpi_autodispatch_in_context()))
         .npRmpi_with_local_regression(do.call(npreg, args))
       else
         do.call(npreg, args)
+    }
+
+    eval_fixed_lc_mean <- function(eval.df, label) {
+      out <- .npindex_spmd_eval_rows(
+        neval = nrow(eval.df),
+        ncol.out = 1L,
+        what = label,
+        worker = function(rows) {
+          if (!length(rows))
+            return(matrix(numeric(0L), nrow = 0L, ncol = 1L))
+          tww <- .npRmpi_with_local_regression(npksum(
+            txdat = index.df,
+            tydat = as.matrix(data.frame(tydat, 1)),
+            weights = as.matrix(data.frame(tydat, 1)),
+            exdat = eval.df[rows, , drop = FALSE],
+            bws = bws$bw,
+            bwtype = bws$type,
+            ckertype = bws$ckertype,
+            ckerorder = bws$ckerorder,
+            ckerbound = bws$ckerbound
+          ))$ksum
+          matrix(as.numeric(tww[1, 2, ] / NZD(tww[2, 2, ])),
+                 ncol = 1L)
+        }
+      )
+      as.vector(out[, 1L])
+    }
+
+    eval_exact_mean <- function(eval.df, label) {
+      out <- .npindex_spmd_eval_rows(
+        neval = nrow(eval.df),
+        ncol.out = 1L,
+        what = label,
+        worker = function(rows) {
+          if (!length(rows))
+            return(matrix(numeric(0L), nrow = 0L, ncol = 1L))
+          val <- .npRmpi_with_local_regression(.np_indexhat_exact(
+            bws = bws,
+            idx.train = index.df,
+            idx.eval = eval.df[rows, , drop = FALSE],
+            y = tydat,
+            output = "apply",
+            s = 0L
+          ))
+          matrix(as.numeric(val), ncol = 1L)
+        }
+      )
+      as.vector(out[, 1L])
+    }
+
+    eval_npreg_scalar <- function(eval.df, gradients.flag, label) {
+      gradients.flag <- isTRUE(gradients.flag)
+      ncol.out <- if (gradients.flag) 2L else 1L
+      out <- .npindex_spmd_eval_rows(
+        neval = nrow(eval.df),
+        ncol.out = ncol.out,
+        what = label,
+        worker = function(rows) {
+          if (!length(rows))
+            return(matrix(numeric(0L), nrow = 0L, ncol = ncol.out))
+          model <- run_npreg_fit(next_npreg_fit_args(
+            exdat = eval.df[rows, , drop = FALSE],
+            gradients = gradients.flag
+          ))
+          if (gradients.flag) {
+            cbind(as.numeric(model$mean), as.numeric(as.matrix(model$grad)[, 1L]))
+          } else {
+            matrix(as.numeric(model$mean), ncol = 1L)
+          }
+        }
+      )
+      list(
+        mean = as.vector(out[, 1L]),
+        grad = if (gradients.flag) matrix(out[, 2L], ncol = 1L) else NULL
+      )
+    }
+
+    eval_index_gradient <- function(eval.df, label) {
+      if (identical(bws$type, "generalized_nn")) {
+        out <- .npindex_spmd_eval_rows(
+          neval = nrow(eval.df),
+          ncol.out = 2L,
+          what = label,
+          worker = function(rows) {
+            if (!length(rows))
+              return(matrix(numeric(0L), nrow = 0L, ncol = 2L))
+            model <- .npindex_local_regression_fit(
+              source = bws,
+              idx.train = index.df,
+              ydat = tydat,
+              idx.eval = eval.df[rows, , drop = FALSE],
+              gradients = TRUE,
+              gradient.order = 1L
+            )
+            cbind(as.numeric(model$mean), as.numeric(as.matrix(model$grad)[, 1L]))
+          }
+        )
+        list(mean = as.vector(out[, 1L]), grad = matrix(out[, 2L], ncol = 1L))
+      } else {
+        eval_npreg_scalar(eval.df = eval.df, gradients.flag = TRUE, label = label)
+      }
     }
 
     fast.largeh <- FALSE
     fast.largeh.eval.mean <- NULL
     fast.largeh.train.mean <- NULL
     if (identical(regtype, "lc") && !gradients && !errors &&
-        identical(bws$type, "fixed") && !lc.fixed.progress.route) {
+        identical(bws$type, "fixed") && !lc.fixed.progress.route &&
+        identical(bws$ckerbound, "none")) {
       gate.index <- if (no.ex) index else c(index, index.eval)
       fast.largeh <- .npindexbw_fast_eligible(
         h = as.double(bws$bw),
@@ -568,7 +933,8 @@ npindex.sibandwidth <-
             bws = bws$bw,
             bwtype = bws$type,
             ckertype = bws$ckertype,
-            ckerorder = bws$ckerorder
+            ckerorder = bws$ckerorder,
+            ckerbound = bws$ckerbound
           )$ksum
           as.double(tww.fast[1, 2, 1L] / NZD(tww.fast[2, 2, 1L]))
         }
@@ -583,7 +949,8 @@ npindex.sibandwidth <-
               bws = bws$bw,
               bwtype = bws$type,
               ckertype = bws$ckertype,
-              ckerorder = bws$ckerorder
+              ckerorder = bws$ckerorder,
+              ckerbound = bws$ckerbound
             )$ksum
             as.double(tww.fast[1, 2, 1L] / NZD(tww.fast[2, 2, 1L]))
           }
@@ -598,24 +965,14 @@ npindex.sibandwidth <-
         if (fast.largeh) {
           index.mean <- rep.int(fast.largeh.eval.mean, length(index.eval))
         } else if (identical(bws$type, "fixed")) {
-          tww <- npksum(txdat=as.matrix(txdat) %*% as.matrix(bws$beta),
-                        tydat=as.matrix(data.frame(tydat,1)),
-                        weights=as.matrix(data.frame(tydat,1)),
-                        exdat=as.matrix(exdat) %*% as.matrix(bws$beta),
-                        bws=bws$bw,
-                        bwtype = bws$type,
-                        ckertype = bws$ckertype,
-                        ckerorder = bws$ckerorder)$ksum
-
-          index.mean <- tww[1,2,]/NZD(tww[2,2,])
+          index.mean <- eval_fixed_lc_mean(
+            eval.df = index.eval.df,
+            label = "npindex fixed LC evaluation mean"
+          )
         } else {
-          index.mean <- .np_indexhat_exact(
-            bws = bws,
-            idx.train = index.df,
-            idx.eval = index.eval.df,
-            y = tydat,
-            output = "apply",
-            s = 0L
+          index.mean <- eval_exact_mean(
+            eval.df = index.eval.df,
+            label = "npindex exact evaluation mean"
           )
         }
 
@@ -628,59 +985,42 @@ npindex.sibandwidth <-
           if (fast.largeh) {
             index.tmean <- rep.int(fast.largeh.train.mean, length(tydat))
           } else if (identical(bws$type, "fixed")) {
-            tww <- npksum(txdat=as.matrix(txdat) %*% as.matrix(bws$beta),
-                          tydat=as.matrix(data.frame(tydat,1)),
-                          weights=as.matrix(data.frame(tydat,1)),
-                          bws=bws$bw,
-                          bwtype = bws$type,
-                          ckertype = bws$ckertype,
-                          ckerorder = bws$ckerorder)$ksum
-
-            index.tmean <- tww[1,2,]/NZD(tww[2,2,])
+            index.tmean <- eval_fixed_lc_mean(
+              eval.df = index.df,
+              label = "npindex fixed LC training mean"
+            )
           } else {
-            index.tmean <- .np_indexhat_exact(
-              bws = bws,
-              idx.train = index.df,
-              idx.eval = index.df,
-              y = tydat,
-              output = "apply",
-              s = 0L
+            index.tmean <- eval_exact_mean(
+              eval.df = index.df,
+              label = "npindex exact training mean"
             )
           }
 
         }
       } else {
-        model <- run_npreg_fit(next_npreg_fit_args(
-          exdat = index.eval.df,
-          gradients = FALSE
-        ))
+        model <- eval_npreg_scalar(
+          eval.df = index.eval.df,
+          gradients.flag = FALSE,
+          label = "npindex scalar npreg evaluation mean"
+        )
         index.mean <- model$mean
 
         if (!no.ex && (no.ey || residuals)) {
-          model <- run_npreg_fit(next_npreg_fit_args(
-            gradients = FALSE
-          ))
+          model <- eval_npreg_scalar(
+            eval.df = index.df,
+            gradients.flag = FALSE,
+            label = "npindex scalar npreg training mean"
+          )
           index.tmean <- model$mean
         }
 
       }
 
     } else if(gradients==TRUE) {
-      if (identical(bws$type, "generalized_nn")) {
-        model <- .npindex_local_regression_fit(
-          source = bws,
-          idx.train = index.df,
-          ydat = tydat,
-          idx.eval = index.eval.df,
-          gradients = TRUE,
-          gradient.order = 1L
-        )
-      } else {
-        model <- run_npreg_fit(next_npreg_fit_args(
-          exdat = index.eval.df,
-          gradients = TRUE
-        ))
-      }
+      model <- eval_index_gradient(
+        eval.df = index.eval.df,
+        label = "npindex scalar gradient evaluation"
+      )
 
       index.mean <- model$mean
 
@@ -697,19 +1037,10 @@ npindex.sibandwidth <-
         ## are specified. Also, needed for variance-covariance matrix
         ## (uses on ly the training data)
 
-        model <- if (identical(bws$type, "generalized_nn")) {
-          .npindex_local_regression_fit(
-            source = bws,
-            idx.train = index.df,
-            ydat = tydat,
-            gradients = TRUE,
-            gradient.order = 1L
-          )
-        } else {
-          run_npreg_fit(next_npreg_fit_args(
-            gradients = TRUE
-          ))
-        }
+        model <- eval_index_gradient(
+          eval.df = index.df,
+          label = "npindex scalar gradient training"
+        )
 
         index.tmean <- model$mean
 
@@ -736,7 +1067,7 @@ npindex.sibandwidth <-
     if (bws$method == "ichimura" && gradients) {
 
       ## First row & column of covariance matrix `Bvcov' are zero due
-      ## to identification condition that beta_1=0. Note the n n^{-1}
+      ## to identification condition that beta_1=1. Note the n n^{-1}
       ## n in V^{-1}\Sigma V^{-1} and the \sqrt{n} in the
       ## normalization of \hat\beta will cancel.
 
@@ -749,6 +1080,45 @@ npindex.sibandwidth <-
       ## change, only the j for X_{ij} in E(X_{ij}|X_i'\beta)
 
       W <- txdat[,-1,drop=FALSE]
+      eval_ichimura_conditional_index <- function(eval.df, label) {
+        n.w <- ncol(W)
+        out <- .npindex_spmd_eval_rows(
+          neval = nrow(eval.df),
+          ncol.out = n.w + 1L,
+          what = label,
+          worker = function(rows) {
+            if (!length(rows))
+              return(matrix(numeric(0L), nrow = 0L, ncol = n.w + 1L))
+            ty.local <- .npRmpi_with_local_regression(npksum(
+              txdat = index.df,
+              tydat = rep(1, length(tydat)),
+              weights = W,
+              exdat = eval.df[rows, , drop = FALSE],
+              bws = bws$bw,
+              bwtype = bws$type,
+              ckertype = bws$ckertype,
+              ckerorder = bws$ckerorder,
+              ckerbound = bws$ckerbound
+            ))$ksum
+            if (length(dim(ty.local)) == 1L)
+              ty.local <- matrix(ty.local, nrow = n.w, ncol = length(rows))
+            den.local <- .npRmpi_with_local_regression(npksum(
+              txdat = index.df,
+              exdat = eval.df[rows, , drop = FALSE],
+              bws = bws$bw,
+              bwtype = bws$type,
+              ckertype = bws$ckertype,
+              ckerorder = bws$ckerorder,
+              ckerbound = bws$ckerbound
+            ))$ksum
+            cbind(t(ty.local), as.numeric(den.local))
+          }
+        )
+        list(
+          tyindex = t(out[, seq_len(n.w), drop = FALSE]),
+          tindex = as.numeric(out[, n.w + 1L])
+        )
+      }
 
       if (identical(bws$type, "generalized_nn")) {
         kbw <- .np_indexhat_kbw(bws = bws, idx.train = index.df)
@@ -763,19 +1133,12 @@ npindex.sibandwidth <-
         tyindex <- structure(as.vector(t(W) %*% kw), dim = nrow(index.df))
         tindex <- colSums(kw)
       } else {
-        tyindex <- npksum(txdat = index,
-                          tydat = rep(1,length(tydat)),
-                          weights = W,
-                          bws = bws$bw,
-                          bwtype = bws$type,
-                          ckertype = bws$ckertype,
-                          ckerorder = bws$ckerorder)$ksum
-
-        tindex <- npksum(txdat = index,
-                         bws = bws$bw,
-                         bwtype = bws$type,
-                         ckertype = bws$ckertype,
-                         ckerorder = bws$ckerorder)$ksum
+        cond.index <- eval_ichimura_conditional_index(
+          eval.df = index.df,
+          label = "npindex Ichimura covariance conditional expectations"
+        )
+        tyindex <- cond.index$tyindex
+        tindex <- cond.index$tindex
       }
 
       ## Need to trap case where k-1=1... ksum will return a 1 D
@@ -789,20 +1152,19 @@ npindex.sibandwidth <-
 
       ## Need to trap case where k-1=1..., sapply will return a
       ## vector, need a 1 x n matrix
-
-      ## Need to trap case where k-1=1..., sapply will return a
-      ## vector, need a 1 x n matrix
       if(is.vector(xmex)) {
-        dg.db.xmex <- matrix(index.tgrad[,1]*xmex,nrow=1,ncol=length(xmex))
-      } else {
-        dg.db.xmex <- index.tgrad[,1]*xmex
+        xmex <- matrix(xmex,nrow=1,ncol=length(xmex))
       }
+
+      dg.db.xmex <- sweep(xmex, 2L, index.tgrad[,1L], `*`)
 
       uhat <- tydat - index.tmean ## Training y and training mean
 
       Vinv <- chol2inv(chol(dg.db.xmex%*%t(dg.db.xmex)))
 
-      Sigma <- (uhat*dg.db.xmex)%*%t(uhat*dg.db.xmex)
+      weighted.score <- sweep(dg.db.xmex, 2L, uhat, `*`)
+
+      Sigma <- weighted.score%*%t(weighted.score)
 
       Bvcov[-1,-1] <- Vinv %*% Sigma %*% Vinv
 
@@ -818,7 +1180,7 @@ npindex.sibandwidth <-
       dg.db <- txdat[,-1,drop=FALSE]*index.tgrad[,1]
 
       ## First row & column of covariance matrix are zero due to
-      ## identification condition that beta_1=0. Note the n^{-1} in
+      ## identification condition that beta_1=1. Note the n^{-1} in
       ## the E and the \sqrt{n} in the normalization of \hat\beta will
       ## cancel.
 
@@ -841,8 +1203,10 @@ npindex.sibandwidth <-
           tydat = tydat[indices],
           exdat = index.eval,
           bws = bws$bw,
+          bwtype = bws$type,
           ckertype = bws$ckertype,
           ckerorder = bws$ckerorder,
+          ckerbound = bws$ckerbound,
           regtype = regtype,
           gradients = TRUE,
           warn.glp.gradient = FALSE
@@ -868,7 +1232,8 @@ npindex.sibandwidth <-
                         bws = bws$bw,
                         bwtype = bws$type,
                         ckertype = bws$ckertype,
-                        ckerorder = bws$ckerorder)$ksum
+                        ckerorder = bws$ckerorder,
+                        ckerbound = bws$ckerbound)$ksum
 
           tww[1,2,]/NZD(tww[2,2,])
         } else {
@@ -877,8 +1242,10 @@ npindex.sibandwidth <-
             tydat = tydat[indices],
             exdat = index.eval,
             bws = bws$bw,
+            bwtype = bws$type,
             ckertype = bws$ckertype,
             ckerorder = bws$ckerorder,
+            ckerbound = bws$ckerbound,
             regtype = regtype,
             gradients = FALSE,
             warn.glp.gradient = FALSE
@@ -894,23 +1261,148 @@ npindex.sibandwidth <-
       }
     }
 
+    spmd_bootstrap_index_plan <- function() {
+      if (!.npindex_spmd_active(comm = 1L))
+        return(NULL)
+      rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) NA_integer_)
+      if (!is.na(rank) && rank == 0L) {
+        boot.plan <- suppressWarnings(boot(
+          data.frame(txdat, tydat),
+          function(data, indices) 0.0,
+          R = boot.num
+        ))
+        boot.indices <- boot.array(boot.plan, indices = TRUE)
+        mpi.bcast.Robj(boot.indices, rank = 0L, comm = 1L)
+        boot.indices
+      } else {
+        mpi.bcast.Robj(rank = 0L, comm = 1L)
+      }
+    }
+
+    spmd_bootstrap_t <- function() {
+      boot.indices <- spmd_bootstrap_index_plan()
+      if (is.null(boot.indices))
+        return(NULL)
+      boot.indices <- as.matrix(boot.indices)
+      n.eval <- length(index.eval)
+      ncol.boot <- n.eval + if (gradients) n.eval + 1L else 0L
+      boot.t <- matrix(NA_real_, nrow = boot.num, ncol = ncol.boot)
+
+      for (bb in seq_len(boot.num)) {
+        indices <- as.integer(boot.indices[bb, ])
+        rindex <- txdat[indices, , drop = FALSE] %*% bws$beta
+        rindex.df <- data.frame(index = as.vector(rindex))
+
+        if (gradients) {
+          out <- .npindex_spmd_eval_rows(
+            neval = n.eval,
+            ncol.out = 2L,
+            what = "npindex bootstrap gradient replicate",
+            worker = function(rows) {
+              if (!length(rows))
+                return(matrix(numeric(0L), nrow = 0L, ncol = 2L))
+              boot.args <- list(
+                txdat = rindex.df,
+                tydat = tydat[indices],
+                exdat = index.eval.df[rows, , drop = FALSE],
+                bws = bws$bw,
+                bwtype = bws$type,
+                ckertype = bws$ckertype,
+                ckerorder = bws$ckerorder,
+                ckerbound = bws$ckerbound,
+                regtype = regtype,
+                gradients = TRUE,
+                warn.glp.gradient = FALSE
+              )
+              if (identical(regtype, "lp")) {
+                boot.args$basis <- spec$basis.engine
+                boot.args$degree <- spec$degree.engine
+                boot.args$bernstein.basis <- spec$bernstein.basis.engine
+              }
+              model <- run_npreg_fit(boot.args)[c("mean", "grad")]
+              cbind(as.numeric(model$mean), as.numeric(as.matrix(model$grad)[, 1L]))
+            }
+          )
+          boot.t[bb, ] <- c(out[, 1L], out[, 2L], mean(out[, 2L]))
+        } else if (identical(regtype, "lc")) {
+          out <- .npindex_spmd_eval_rows(
+            neval = n.eval,
+            ncol.out = 1L,
+            what = "npindex bootstrap LC replicate",
+            worker = function(rows) {
+              if (!length(rows))
+                return(matrix(numeric(0L), nrow = 0L, ncol = 1L))
+              tww <- .npRmpi_with_local_regression(npksum(
+                txdat = rindex.df,
+                tydat = cbind(tydat[indices], 1),
+                weights = cbind(tydat[indices], 1),
+                exdat = index.eval.df[rows, , drop = FALSE],
+                bws = bws$bw,
+                bwtype = bws$type,
+                ckertype = bws$ckertype,
+                ckerorder = bws$ckerorder,
+                ckerbound = bws$ckerbound
+              ))$ksum
+              matrix(as.numeric(tww[1, 2, ] / NZD(tww[2, 2, ])), ncol = 1L)
+            }
+          )
+          boot.t[bb, ] <- out[, 1L]
+        } else {
+          out <- .npindex_spmd_eval_rows(
+            neval = n.eval,
+            ncol.out = 1L,
+            what = "npindex bootstrap scalar npreg replicate",
+            worker = function(rows) {
+              if (!length(rows))
+                return(matrix(numeric(0L), nrow = 0L, ncol = 1L))
+              boot.args <- list(
+                txdat = rindex.df,
+                tydat = tydat[indices],
+                exdat = index.eval.df[rows, , drop = FALSE],
+                bws = bws$bw,
+                bwtype = bws$type,
+                ckertype = bws$ckertype,
+                ckerorder = bws$ckerorder,
+                ckerbound = bws$ckerbound,
+                regtype = regtype,
+                gradients = FALSE,
+                warn.glp.gradient = FALSE
+              )
+              if (identical(regtype, "lp")) {
+                boot.args$basis <- spec$basis.engine
+                boot.args$degree <- spec$degree.engine
+                boot.args$bernstein.basis <- spec$bernstein.basis.engine
+              }
+              matrix(as.numeric(run_npreg_fit(boot.args)$mean), ncol = 1L)
+            }
+          )
+          boot.t[bb, ] <- out[, 1L]
+        }
+      }
+      boot.t
+    }
+
     if (errors){
 
-      boot.out = suppressWarnings(boot(data.frame(txdat,tydat), boofun, R = boot.num))
+      boot.t <- spmd_bootstrap_t()
+      if (is.null(boot.t)) {
+        boot.out = suppressWarnings(boot(data.frame(txdat,tydat), boofun, R = boot.num))
+        boot.t <- boot.out$t
+      }
 
       index.merr = matrix(data = 0, ncol = 1, nrow = length(index.eval))
-      index.merr[,] = .np_plot_bootstrap_col_sds(boot.out$t[, seq_len(length(index.eval)), drop = FALSE])
+      index.merr[,] = .np_plot_bootstrap_col_sds(boot.t[, seq_len(length(index.eval)), drop = FALSE])
 
       if (gradients) {
         index.gerr = matrix(data = 0, ncol = ncol(txdat), nrow = length(index.eval))
         index.gerr[,] = .np_plot_bootstrap_col_sds(
-          boot.out$t[, (length(index.eval) + 1):(2 * length(index.eval)), drop = FALSE]
+          boot.t[, (length(index.eval) + 1):(2 * length(index.eval)), drop = FALSE]
         )
 
         for (i in seq_len(ncol(txdat)))
           index.gerr[,i] = abs(bws$beta[i])*index.gerr[,i]
 
-        index.mgerr = sd(boot.out$t[,2*length(index.eval)+1])
+        index.mgerr = sd(boot.t[,2*length(index.eval)+1])
         index.mgerr = abs(bws$beta)*index.mgerr
       }
     }
@@ -935,13 +1427,14 @@ npindex.sibandwidth <-
       strgof = "xtra=c(RSQ,MSE,MAE,MAPE,CORR,SIGN),"
       strres = (if (residuals) "resid = tydat - index.tmean," else "")
     } else if(bws$method == "kleinspady") {
-      index.pred =
-        if (!no.ey) round(index.mean)
-        else round(index.tmean)
+      index.pred <- .np_index_ks_prediction(
+        if (!no.ey) index.mean else index.tmean
+      )
 
-      confusion.matrix =
-        table(if (!no.ey) eydat else tydat,
-              index.pred, dnn=c("Actual", "Predicted"))
+      confusion.matrix <- .np_index_ks_confusion_matrix(
+        actual = if (!no.ey) eydat else tydat,
+        pred = index.pred
+      )
 
       CCR.overall <- sum(diag(confusion.matrix))/sum(confusion.matrix)
       CCR.byoutcome <- diag(confusion.matrix)/rowSums(confusion.matrix)

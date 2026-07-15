@@ -10,6 +10,8 @@ condensity <-
              condens.raw = NULL,
              proper.info = NULL,
              rows.omit = NA,
+             train.rows.omit = NULL,
+             eval.rows.omit = NULL,
              timing = NA, total.time = NA,
              optim.time = NA, fit.time = NA){
 
@@ -18,6 +20,10 @@ condensity <-
 
         if (length(rows.omit) == 0)
             rows.omit <- NA
+        if (is.null(train.rows.omit) || length(train.rows.omit) == 0)
+            train.rows.omit <- NA
+        if (is.null(eval.rows.omit) || length(eval.rows.omit) == 0)
+            eval.rows.omit <- NA
 
         d <- list(
             xbw = bws$xbw,
@@ -60,6 +66,10 @@ condensity <-
             proper.info = proper.info,
             rows.omit = rows.omit,
             nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
+            train.rows.omit = train.rows.omit,
+            train.nobs.omit = if (identical(train.rows.omit, NA)) 0 else length(train.rows.omit),
+            eval.rows.omit = eval.rows.omit,
+            eval.nobs.omit = if (identical(eval.rows.omit, NA)) 0 else length(eval.rows.omit),
             timing = timing, total.time = total.time,
             optim.time = optim.time, fit.time = fit.time)
         
@@ -122,6 +132,15 @@ gradients.condensity <- function(x, errors = FALSE, gradient.order = NULL, ...) 
       "gradient standard errors are not available: fit the model with gradients=TRUE")
 
   reg.spec <- npConditionalRegEngineSpec(x$bws, where = "gradients.condensity")
+  if (isTRUE(x$bws$xncon == 0L)) {
+    if (!is.null(gradient.order)) {
+      npValidateCategoricalFirstDifferenceGradientOrder(
+        gradient.order = gradient.order,
+        where = "gradients.condensity"
+      )
+    }
+    return(gout)
+  }
   if (!identical(reg.spec$reg.engine, "lp") || is.null(gradient.order))
     return(gout)
 
@@ -137,15 +156,28 @@ gradients.condensity <- function(x, errors = FALSE, gradient.order = NULL, ...) 
   stored.order <- npValidateGlpGradientOrder(regtype = "lp",
                                              gradient.order = stored.order,
                                              ncon = x$bws$xncon)
-  npValidateGlpGradientDegree(
+  available <- npGlpGradientAvailability(
     regtype.engine = reg.spec$reg.engine,
     degree.engine = reg.spec$degree.engine,
     gradient.order = gorder,
     ncon = x$bws$xncon,
     where = "gradients.condensity"
   )
+  if (!any(available)) {
+    stop("gradients.condensity has no available derivative components for the requested gradient.order and fitted polynomial degree",
+         call. = FALSE)
+  }
+  if (any(!available)) {
+    npWarnGlpGradientPartialAvailability(
+      where = "gradients.condensity",
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = gorder,
+      available = available,
+      con.names = x$xnames[x$bws$ixcon]
+    )
+  }
   if (length(gorder)) {
-    defined.request <- (gorder <= reg.spec$degree.engine)
+    defined.request <- available
     if (any(defined.request & (gorder != stored.order))) {
       stop("requested gradient.order differs from the derivative order stored in this condensity object; refit or predict/evaluate with gradients=TRUE and the desired gradient.order",
            call. = FALSE)
@@ -156,15 +188,7 @@ gradients.condensity <- function(x, errors = FALSE, gradient.order = NULL, ...) 
   gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$ixcon)
   if (length(cont.idx)) {
-    lp.degree0.lc.gradient <- npGlpDegree0FirstDerivativeLcOk(
-      regtype.engine = reg.spec$reg.engine,
-      degree.engine = reg.spec$degree.engine,
-      gradient.order = gorder,
-      ncon = x$bws$xncon
-    )
-    keep.cont <- (gorder <= reg.spec$degree.engine)
-    if (lp.degree0.lc.gradient)
-      keep.cont[] <- TRUE
+    keep.cont <- available
     if (any(keep.cont)) {
       keep.idx <- cont.idx[keep.cont]
       gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]

@@ -57,7 +57,8 @@ npudensbw(\dots)
           tol = 1.490116e-04,
           transform.bounds = FALSE,
           eval.only = FALSE,
-          \dots)
+          \dots,
+          nomad.opts = list())
 
 \method{npudensbw}{default}(dat = stop("invoked without input data 'dat'"),
           bws,
@@ -98,7 +99,8 @@ npudensbw(\dots)
           tol,
           transform.bounds,
           ukertype,
-          \dots)
+          \dots,
+          nomad.opts = list())
 
 }
 
@@ -182,7 +184,8 @@ These arguments choose the selection criterion and the way continuous bandwidths
     the number of observations, \eqn{P} the order of the kernel, and
     \eqn{l} the number of continuous variables. Note that when there
     exist factors and the normal-reference rule is used, there is zero
-    smoothing of the factors. Defaults to \code{cv.ml}.  }
+    smoothing of the factors, corresponding to exact cell-indicator
+    kernels for categorical coordinates. Defaults to \code{cv.ml}.  }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
     supplied bandwidths are interpreted as \sQuote{scale factors}
@@ -386,9 +389,16 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     \code{"powell"} preserves the historical Powell route. \code{"mads"}
     uses the native \pkg{crs} NOMAD C API over the bandwidth coordinates, and
     \code{"mads+powell"} applies one Powell hot start from the MADS
-    solution. Advanced native NOMAD parameters may be supplied through
-    \code{nomad.opts} in \code{...}; invalid or unsupported parameters are
+    solution. Advanced native NOMAD parameters may be supplied through the
+    explicit \code{nomad.opts} argument; invalid or unsupported parameters are
     rejected by NOMAD rather than silently ignored.
+  }
+
+  \item{nomad.opts}{
+    optional named list of native NOMAD parameters forwarded to the
+    \pkg{crs} NOMAD C API for MADS/NOMAD-backed bandwidth searches.
+    \code{NULL} is treated as no extra NOMAD options. Non-list values and
+    unsupported native options are rejected before solver entry.
   }
 
   \item{small}{

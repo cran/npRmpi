@@ -64,8 +64,13 @@ local_npRmpi_subprocess_env <- function(extra = character()) {
   )
 }
 
+skip_slow_npcdist_fitted_subprocess <- function() {
+  skip_on_cran()
+}
+
 test_that("npcdist formula route keeps estimator-only proper arguments out of bandwidth selection", {
   skip_on_cran()
+  skip_slow_npcdist_fitted_subprocess()
   env <- local_npRmpi_subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
 
@@ -94,6 +99,7 @@ test_that("npcdist formula route keeps estimator-only proper arguments out of ba
 
 test_that("npcdist formula route keeps native evaluation arguments out of bandwidth selection", {
   skip_on_cran()
+  skip_slow_npcdist_fitted_subprocess()
   env <- local_npRmpi_subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
 
@@ -122,6 +128,7 @@ test_that("npcdist formula route keeps native evaluation arguments out of bandwi
 
 test_that("npcdist fitted slice repair works in subprocess session mode", {
   skip_on_cran()
+  skip_slow_npcdist_fitted_subprocess()
   env <- local_npRmpi_subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
 
@@ -153,6 +160,7 @@ test_that("npcdist fitted slice repair works in subprocess session mode", {
 
 test_that("npcdist predict newdata stays unchanged under apply='fitted' in subprocess session mode", {
   skip_on_cran()
+  skip_slow_npcdist_fitted_subprocess()
   env <- local_npRmpi_subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
 

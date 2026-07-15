@@ -63,7 +63,8 @@ npcdistbw(\dots)
           small = 1.490116e-05,
           tol = 1.490116e-04,
           transform.bounds = FALSE,
-          \dots)
+          \dots,
+          nomad.opts = list())
 
 \method{npcdistbw}{default}(xdat = stop("data 'xdat' missing"),
           ydat = stop("data 'ydat' missing"),
@@ -130,7 +131,8 @@ npcdistbw(\dots)
           degree.max.cycles = 20L,
           degree.verify = FALSE,
           bernstein.basis = FALSE,
-          \dots)
+          \dots,
+          nomad.opts = list())
 }
 
 \arguments{
@@ -278,17 +280,19 @@ These arguments choose the selection criterion and the way continuous bandwidths
 
   \item{bwmethod}{ which method to use to select bandwidths.
     \code{cv.ls} specifies least-squares cross-validation (Li, Lin and
-    Racine (2013), and \code{normal-reference} just computes the
-    \sQuote{rule-of-thumb} bandwidth \eqn{h_j}{h[j]} using the standard
-    formula \eqn{h_j = 1.06 \sigma_j n^{-1/(2P+l)}}{h[j] =
-    1.06*sigma[j]*n^(-1.0/(2.0*P+l))}, where \eqn{\sigma_j}{sigma[j]} is
-    an adaptive measure of spread of the \eqn{j}th continuous variable
-    defined as min(standard deviation, mean absolute deviation/1.4826,
-    interquartile range/1.349), \eqn{n} the number of observations,
-    \eqn{P} the order of the kernel, and \eqn{l} the number of
-    continuous variables. Note that when there exist factors and the
-    normal-reference rule is used, there is zero smoothing of the
-    factors. Defaults to \code{cv.ls}.  }
+    Racine (2013)).  \code{normal-reference} computes an ad hoc
+    Silverman-style rule-of-thumb intended for fast exploratory data
+    analysis, not production bandwidth selection.  For raw continuous
+    bandwidths it uses \eqn{1.06 \sigma_j n^{-1/(2P+l)}}{1.06*sigma[j]*n^(-1.0/(2.0*P+l))}
+    for conditioning variables and
+    \eqn{1.587 \sigma_j n^{-1/(2P+l)}}{1.587*sigma[j]*n^(-1.0/(2.0*P+l))}
+    for response variables, where \eqn{\sigma_j}{sigma[j]} is an adaptive
+    measure of spread of the \eqn{j}th continuous variable defined as
+    min(standard deviation, mean absolute deviation/1.4826, interquartile
+    range/1.349), \eqn{n} the number of observations, \eqn{P} the order
+    of the kernel, and \eqn{l} the number of continuous variables. Note
+    that when there exist factors and the normal-reference rule is used,
+    there is zero smoothing of the factors. Defaults to \code{cv.ls}.  }
 
   \item{bwscaling}{ a logical value that when set to \code{TRUE} the
     supplied bandwidths are interpreted as \sQuote{scale factors}
@@ -387,7 +391,10 @@ These controls choose and parameterize bounded support for continuous kernels.
     character string controlling continuous-kernel support handling for
     \code{ydat}. Can be set as \code{none} (default kernel on full support),
     \code{range} (use sample min/max), or \code{fixed} (use
-    \code{cykerlb}/\code{cykerub}). The bounded-kernel route reuses the selected continuous kernel and renormalizes it on the chosen support; see \code{\link{np.kernels}}.
+    \code{cykerlb}/\code{cykerub}). For the response-side distribution
+    operator, the selected continuous kernel is integrated after
+    observation-centered truncation and normalization on the chosen support;
+    see \code{\link{np.kernels}}.
   }
 
   \item{cykerlb}{
@@ -605,9 +612,14 @@ These arguments control the optional NOMAD direct-search route for local-polynom
     Defaults to \code{0L}, which preserves the current one-start-per-
     restart behavior. This does not replace \code{nmulti}:
     \code{nmulti} controls outer restarts, while \code{nomad.nmulti}
-    controls inner NOMAD multistarts within each outer restart. Advanced
-    native NOMAD parameters may be supplied as \code{nomad.opts} through
-    \code{...}; invalid or unsupported parameters are rejected by NOMAD
+    controls inner NOMAD multistarts within each outer restart.
+  }
+
+  \item{nomad.opts}{
+    optional named list of native NOMAD parameters forwarded to the
+    \pkg{crs} NOMAD C API for NOMAD-backed bandwidth searches.
+    \code{NULL} is treated as no extra NOMAD options. Non-list values and
+    invalid or unsupported parameters are rejected before solver entry
     rather than silently ignored. Routes that evaluate R callbacks require
     serial callback evaluation and reject parallel callback settings such as
     \code{NB_THREADS_PARALLEL_EVAL > 1}.
@@ -687,7 +699,7 @@ These controls set optimizer tolerances, restart behavior, invalid-candidate pen
     \code{"mads+powell"} applies one Powell hot start from the MADS
     solution. Use \code{search.engine} rather than \code{bwsolver} for
     automatic degree search. Advanced native NOMAD parameters may be supplied
-    as \code{nomad.opts} through \code{...}; invalid or unsupported
+    through the explicit \code{nomad.opts} argument; invalid or unsupported
     parameters are rejected by NOMAD rather than silently ignored.
   }
 

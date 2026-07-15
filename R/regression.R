@@ -5,6 +5,8 @@ npregression <-
              gradient.order = NULL,
              xtra = rep(NA, 6),
              rows.omit = NA,
+             train.rows.omit = NULL,
+             eval.rows.omit = NULL,
              timing = NA,
              total.time = NA,
              optim.time = NA,
@@ -15,6 +17,10 @@ npregression <-
 
         if (length(rows.omit) == 0)
             rows.omit <- NA
+        if (is.null(train.rows.omit) || length(train.rows.omit) == 0)
+            train.rows.omit <- NA
+        if (is.null(eval.rows.omit) || length(eval.rows.omit) == 0)
+            eval.rows.omit <- NA
 
         d <- list(
             bw = bws$bw,
@@ -51,6 +57,10 @@ npregression <-
             SIGN = xtra[6],
             rows.omit = rows.omit,
             nobs.omit = if (identical(rows.omit, NA)) 0 else length(rows.omit),
+            train.rows.omit = train.rows.omit,
+            train.nobs.omit = if (identical(train.rows.omit, NA)) 0 else length(train.rows.omit),
+            eval.rows.omit = eval.rows.omit,
+            eval.nobs.omit = if (identical(eval.rows.omit, NA)) 0 else length(eval.rows.omit),
             timing = timing,
             total.time = total.time,
             optim.time = optim.time,
@@ -112,6 +122,15 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
       where = "gradients.npregression"
     )
   }
+  if (isTRUE(x$bws$ncon == 0L)) {
+    if (!is.null(gradient.order)) {
+      npValidateCategoricalFirstDifferenceGradientOrder(
+        gradient.order = gradient.order,
+        where = "gradients.npregression"
+      )
+    }
+    return(gout)
+  }
   if (!identical(x$bws$regtype, "lp") || is.null(gradient.order))
     return(gout)
 
@@ -127,15 +146,28 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
   stored.order <- npValidateGlpGradientOrder(regtype = x$bws$regtype,
                                              gradient.order = stored.order,
                                              ncon = x$bws$ncon)
-  npValidateGlpGradientDegree(
+  available <- npGlpGradientAvailability(
     regtype.engine = x$bws$regtype,
     degree.engine = x$bws$degree,
     gradient.order = gorder,
     ncon = x$bws$ncon,
     where = "gradients.npregression"
   )
+  if (!any(available)) {
+    stop("gradients.npregression has no available derivative components for the requested gradient.order and fitted polynomial degree",
+         call. = FALSE)
+  }
+  if (any(!available)) {
+    npWarnGlpGradientPartialAvailability(
+      where = "gradients.npregression",
+      degree.engine = x$bws$degree,
+      gradient.order = gorder,
+      available = available,
+      con.names = x$bws$xnames[x$bws$icon]
+    )
+  }
   if (length(gorder)) {
-    defined.request <- (gorder <= x$bws$degree)
+    defined.request <- available
     if (any(defined.request & (gorder != stored.order))) {
       stop("requested gradient.order differs from the derivative order stored in this npregression object; refit or predict/evaluate with gradients=TRUE and the desired gradient.order",
            call. = FALSE)
@@ -146,15 +178,7 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
   gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$icon)
   if (length(cont.idx)) {
-    lp.degree0.lc.gradient <- npGlpDegree0FirstDerivativeLcOk(
-      regtype.engine = x$bws$regtype,
-      degree.engine = x$bws$degree,
-      gradient.order = gorder,
-      ncon = x$bws$ncon
-    )
-    keep.cont <- (gorder <= x$bws$degree)
-    if (lp.degree0.lc.gradient)
-      keep.cont[] <- TRUE
+    keep.cont <- available
     if (any(keep.cont)) {
       keep.idx <- cont.idx[keep.cont]
       gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]

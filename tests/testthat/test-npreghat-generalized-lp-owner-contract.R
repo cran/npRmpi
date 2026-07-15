@@ -140,3 +140,173 @@ npreghat_generalized_lp_derivative_owner_case <- function() {
 test_that("npRmpi generalized higher-degree lp derivative owner matches npreg and apply", {
   npreghat_generalized_lp_derivative_owner_case()
 })
+
+npreghat_lp_gradient_apply_contract_case <- function() {
+  skip_on_cran()
+
+  env <- npRmpi_subprocess_env(c("NP_RMPI_NO_REUSE_SLAVES=1"))
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+
+  ok_tag <- "NPREGHAT_LP_GRADIENT_APPLY_CONTRACT_OK"
+  lines <- c(
+    "suppressPackageStartupMessages(library(npRmpi))",
+    "options(npRmpi.autodispatch=TRUE, np.messages=FALSE)",
+    "npRmpi.init(nslaves=1, quiet=TRUE)",
+    "on.exit(try(npRmpi.quit(force=TRUE), silent=TRUE), add=TRUE)",
+    "set.seed(20260630)",
+    "n <- 18L",
+    "x1 <- runif(n, -1, 1)",
+    "x2 <- runif(n, -1, 1)",
+    "f <- factor(sample(letters[1:3], n, replace = TRUE))",
+    "tx <- data.frame(x1 = x1, x2 = x2, f = f)",
+    "eta <- x1 + 0.5 * x2 + 0.2 * (as.integer(f) - 2L)",
+    "y1 <- sin(eta) + 0.15 * eta^2",
+    "y2 <- cos(eta) + seq_len(n) / (10 * n)",
+    "Y <- cbind(y1 = y1, y2 = y2)",
+    "check_apply_contract <- function(degree, s, tol = 1e-9) {",
+    "  bw <- npregbw(xdat = tx, ydat = y1, regtype = 'lp', degree = degree, bwtype = 'generalized_nn', bws = c(7, 7, 0.5), bandwidth.compute = FALSE)",
+    "  H <- unclass(npreghat(bws = bw, txdat = tx, s = s))",
+    "  a1 <- npreghat(bws = bw, txdat = tx, y = matrix(y1, ncol = 1L), output = 'apply', s = s)",
+    "  a2 <- npreghat(bws = bw, txdat = tx, y = Y, output = 'apply', s = s)",
+    "  stopifnot(isTRUE(all.equal(as.vector(a1), as.vector(H %*% y1), tolerance = tol)))",
+    "  stopifnot(isTRUE(all.equal(unname(as.matrix(a2)), unname(H %*% Y), tolerance = tol)))",
+    "  if (identical(as.integer(degree), c(1L, 0L)) && identical(as.integer(s), c(1L, 0L))) {",
+    "    fit <- npreg(bws = bw, txdat = tx, tydat = y1, gradients = TRUE, warn.glp.gradient = FALSE)",
+    "    stopifnot(isTRUE(all.equal(as.vector(H %*% y1), as.vector(fit$grad[, 1L]), tolerance = 1e-8)))",
+    "  }",
+    "}",
+    "check_apply_contract(degree = c(0L, 0L), s = c(1L, 0L))",
+    "check_apply_contract(degree = c(1L, 0L), s = c(1L, 0L))",
+    sprintf("cat('%s\\n')", ok_tag)
+  )
+
+  res <- npRmpi_run_rscript_subprocess(
+    lines = lines,
+    timeout = 90L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl(ok_tag, res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+}
+
+test_that("npRmpi lp gradient apply routing covers degree-zero and heterogeneous degrees", {
+  npreghat_lp_gradient_apply_contract_case()
+})
+
+npreghat_gennn_mixed_degree_available_derivative_case <- function() {
+  skip_on_cran()
+
+  env <- npRmpi_subprocess_env(c("NP_RMPI_NO_REUSE_SLAVES=1"))
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+
+  ok_tag <- "NPREGHAT_GENNN_MIXED_DEGREE_AVAILABLE_DERIVATIVE_OK"
+  lines <- c(
+    "suppressPackageStartupMessages(library(npRmpi))",
+    "options(npRmpi.autodispatch=TRUE, np.messages=FALSE)",
+    "npRmpi.init(nslaves=1, quiet=TRUE)",
+    "on.exit(try(npRmpi.quit(force=TRUE), silent=TRUE), add=TRUE)",
+    "set.seed(20260701)",
+    "old_tree <- getOption('np.tree')",
+    "on.exit(options(np.tree = old_tree), add = TRUE)",
+    "n <- 24L",
+    "x1 <- runif(n, -1, 1)",
+    "x2 <- runif(n, -1, 1)",
+    "u <- factor(sample(letters[1:3], n, replace = TRUE))",
+    "o <- ordered(sample(1:3, n, replace = TRUE))",
+    "y <- sin(x1) + 0.25 * x1^2 + 0.15 * x2 + 0.2 * (as.integer(u) - 2L)",
+    "Y <- cbind(y = y, shifted = y + seq_len(n) / (10 * n))",
+    "check_case <- function(tx, ex, bws, degree, s_available, s_unavailable) {",
+    "  bw <- npregbw(xdat = tx, ydat = y, regtype = 'lp', degree = degree, bwtype = 'generalized_nn', bws = bws, bandwidth.compute = FALSE)",
+    "  for (tree in c(FALSE, TRUE)) {",
+    "    options(np.tree = tree)",
+    "    H <- npreghat(bws = bw, txdat = tx, exdat = ex, output = 'matrix', s = s_available)",
+    "    a1 <- npreghat(bws = bw, txdat = tx, exdat = ex, y = matrix(y, ncol = 1L), output = 'apply', s = s_available)",
+    "    a2 <- npreghat(bws = bw, txdat = tx, exdat = ex, y = Y, output = 'apply', s = s_available)",
+    "    fit <- npreg(bws = bw, txdat = tx, tydat = y, exdat = ex, gradients = TRUE, warn.glp.gradient = FALSE)",
+    "    stopifnot(isTRUE(all.equal(as.vector(a1), as.vector(unclass(H) %*% y), tolerance = 1e-9)))",
+    "    stopifnot(isTRUE(all.equal(unname(as.matrix(a2)), unname(unclass(H) %*% Y), tolerance = 1e-9)))",
+    "    stopifnot(isTRUE(all.equal(as.vector(unclass(H) %*% y), as.vector(fit$grad[, which(s_available > 0L)]), tolerance = 1e-8)))",
+    "    err <- tryCatch(npreghat(bws = bw, txdat = tx, exdat = ex, output = 'matrix', s = s_unavailable), error = conditionMessage)",
+    "    stopifnot(is.character(err), grepl(\"requested derivative order in 's' exceeds local polynomial degree\", err, fixed = TRUE))",
+    "  }",
+    "}",
+    "tx.cont <- data.frame(x1 = x1, x2 = x2)",
+    "ex.cont <- tx.cont[seq(2L, n, by = 3L), , drop = FALSE]",
+    "check_case(tx.cont, ex.cont, bws = c(9, 9), degree = c(2L, 0L), s_available = c(1L, 0L), s_unavailable = c(0L, 1L))",
+    "check_case(tx.cont, ex.cont, bws = c(9, 9), degree = c(0L, 2L), s_available = c(0L, 1L), s_unavailable = c(1L, 0L))",
+    "tx.uno <- data.frame(x1 = x1, x2 = x2, u = u)",
+    "ex.uno <- tx.uno[seq(2L, n, by = 3L), , drop = FALSE]",
+    "check_case(tx.uno, ex.uno, bws = c(9, 9, 0.5), degree = c(2L, 0L), s_available = c(1L, 0L), s_unavailable = c(0L, 1L))",
+    "check_case(tx.uno, ex.uno, bws = c(9, 9, 0.5), degree = c(0L, 2L), s_available = c(0L, 1L), s_unavailable = c(1L, 0L))",
+    "tx.ord <- data.frame(x1 = x1, x2 = x2, o = o)",
+    "ex.ord <- tx.ord[seq(2L, n, by = 3L), , drop = FALSE]",
+    "check_case(tx.ord, ex.ord, bws = c(9, 9, 0.5), degree = c(2L, 0L), s_available = c(1L, 0L), s_unavailable = c(0L, 1L))",
+    "check_case(tx.ord, ex.ord, bws = c(9, 9, 0.5), degree = c(0L, 2L), s_available = c(0L, 1L), s_unavailable = c(1L, 0L))",
+    sprintf("cat('%s\\n')", ok_tag)
+  )
+
+  res <- npRmpi_run_rscript_subprocess(
+    lines = lines,
+    timeout = 120L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl(ok_tag, res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+}
+
+test_that("npRmpi generalized-nn lp mixed-degree available derivative owner is nonrecursive", {
+  npreghat_gennn_mixed_degree_available_derivative_case()
+})
+
+npreghat_tree_disabled_lp_scalar_apply_guard_case <- function() {
+  skip_on_cran()
+
+  env <- npRmpi_subprocess_env(c("NP_RMPI_NO_REUSE_SLAVES=1"))
+  skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
+
+  ok_tag <- "NPREGHAT_TREE_DISABLED_LP_SCALAR_APPLY_GUARD_OK"
+  lines <- c(
+    "suppressPackageStartupMessages(library(npRmpi))",
+    "options(npRmpi.autodispatch=TRUE, np.messages=FALSE)",
+    "old_tree <- getOption('np.tree')",
+    "options(np.tree=FALSE)",
+    "on.exit(options(np.tree=old_tree), add=TRUE)",
+    "npRmpi.init(nslaves=1, quiet=TRUE)",
+    "on.exit(try(npRmpi.quit(force=TRUE), silent=TRUE), add=TRUE)",
+    "set.seed(20260630)",
+    "n <- 24L",
+    "x1 <- runif(n, -1, 1)",
+    "x2 <- runif(n, -1, 1)",
+    "f <- factor(sample(letters[1:3], n, replace = TRUE))",
+    "tx <- data.frame(x1 = x1, x2 = x2, f = f)",
+    "eta <- x1 + 0.5 * x2 + 0.2 * (as.integer(f) - 2L)",
+    "y <- sin(eta) + 0.15 * eta^2",
+    "check_scalar_apply_contract <- function(degree, s, tol = 1e-9) {",
+    "  bw <- npregbw(xdat = tx, ydat = y, regtype = 'lp', degree = degree, bwtype = 'generalized_nn', bws = c(9, 9, 0.5), bandwidth.compute = FALSE)",
+    "  H <- unclass(npreghat(bws = bw, txdat = tx, output = 'matrix', s = s))",
+    "  a <- npreghat(bws = bw, txdat = tx, y = matrix(y, ncol = 1L), output = 'apply', s = s)",
+    "  stopifnot(isTRUE(all.equal(as.vector(a), as.vector(H %*% y), tolerance = tol)))",
+    "}",
+    "check_scalar_apply_contract(degree = c(2L, 2L), s = c(0L, 0L))",
+    "check_scalar_apply_contract(degree = c(2L, 2L), s = c(1L, 0L))",
+    sprintf("cat('%s\\n')", ok_tag)
+  )
+
+  res <- npRmpi_run_rscript_subprocess(
+    lines = lines,
+    timeout = 90L,
+    env = env
+  )
+
+  expect_equal(res$status, 0L, info = paste(res$output, collapse = "\n"))
+  expect_true(any(grepl(ok_tag, res$output, fixed = TRUE)),
+              info = paste(res$output, collapse = "\n"))
+}
+
+test_that("npRmpi tree-disabled higher-degree lp scalar apply routes through exact matrix contract", {
+  npreghat_tree_disabled_lp_scalar_apply_guard_case()
+})

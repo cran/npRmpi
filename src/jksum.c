@@ -2552,6 +2552,10 @@ static inline void np_cont_largeh_cache_clear(void){
   np_runtime_tol_cache_ready = 0;
 }
 
+void np_cont_largeh_cache_clear_extern(void){
+  np_cont_largeh_cache_clear();
+}
+
 static int np_disc_profile_cache_match(const int num_xt,
                                        const int num_reg_unordered,
                                        const int num_reg_ordered,
@@ -2649,13 +2653,15 @@ static int np_disc_profile_cache_get_or_build(const int num_xt,
 }
 
 /*
-  Large-bandwidth shortcut for ordinary continuous kernels:
+  Large-bandwidth shortcut for conservative ordinary continuous kernels:
   if max_i |(x - x_i)/h| <= u_tol, replace K((x-x_i)/h) by K(0) to avoid
-  repeated kernel evaluations. This is intentionally conservative and only
-  enabled for ordinary continuous kernels (0..9).
+  repeated kernel evaluations. This is intentionally limited to Gaussian
+  order 2 (0), Epanechnikov order 2 (4), and uniform (8). Higher-order
+  kernels and truncated Gaussian have steeper or shifted near-zero behavior
+  under this tolerance contract.
 */
 static inline int np_cont_largeh_kernel_supported(const int kernel){
-  return (kernel >= 0 && kernel <= 9);
+  return (kernel == 0 || kernel == 4 || kernel == 8);
 }
 
 static inline double np_get_option_double(const char * const name, const double fallback){
@@ -3545,50 +3551,299 @@ static inline void np_activate_bounds_xy(void){
   vector_ckerub_extern = vector_cxykerub_extern;
 }
 
-static inline double np_cker_invnorm(const int kernel,
-                                     const double x,
-                                     const double h,
-                                     const double lb,
-                                     const double ub){
-  static double (* const cdfk[])(double) = {
-    np_cdf_gauss2, np_cdf_gauss4, np_cdf_gauss6, np_cdf_gauss8,
-    np_cdf_epan2, np_cdf_epan4, np_cdf_epan6, np_cdf_epan8,
-    np_cdf_rect, np_cdf_tgauss2
-  };
+typedef struct {
+  double inverse_mass;
+  double density_scale;
+} NPCKerBoundedNorm;
+
+static inline double np_cker_halfmass_total(const int k0){
+  const double sqrt5 = 2.23606797749978969640;
+
+  switch(k0){
+  case 0: return 0.5;
+  case 1: return 0.5;
+  case 2: return 0.5;
+  case 3: return 0.500000000025;
+  case 4:
+    return sqrt5*(0.33541019662496845446 +
+                  (-0.067082039324993690892/3.0)*5.0);
+  case 5:
+    return sqrt5*0.008385254916*(75.0-(50.0/3.0)*5.0+(7.0/5.0)*25.0);
+  case 6:
+    return sqrt5*0.33541019662496845446*
+      (2.734375+(-3.828125/3.0)*5.0+(1.378125/5.0)*25.0-
+       (0.144375/7.0)*125.0);
+  case 7:
+    return sqrt5*0.33541019662496845446*
+      (3.5888671875+(-8.61328125/3.0)*5.0+(5.684765625/5.0)*25.0-
+       (1.40765625/7.0)*125.0+(0.1173046875/9.0)*625.0);
+  case 8: return 0.5;
+  case 9:
+    return np_tgauss2_alpha*0.5*erf(0.70710678118654752440*np_tgauss2_b)-
+      np_tgauss2_c0*np_tgauss2_b;
+  default: return R_NaN;
+  }
+}
+
+/* H(r)/r for H(r)=integral_0^r K(t)dt and r >= 0.  Each case is the
+   analytic primitive of the live base-kernel coefficients. */
+static inline double np_cker_halfmass_average(const int k0, const double r){
   static double (* const kbase[])(double) = {
     np_gauss2, np_gauss4, np_gauss6, np_gauss8,
     np_epan2, np_epan4, np_epan6, np_epan8,
     np_rect, np_tgauss2
   };
-  int k0 = kernel % 10;
-  double zu, zl, den, du, zmid;
+  const double sqrt5 = 2.23606797749978969640;
+  double r2, e, gaussian_average;
 
-  if(!(h > 0.0) || !isfinite(h))
+  if((k0 < 0) || (k0 > 9) || !(r >= 0.0) || !isfinite(r))
+    return R_NaN;
+  if(r == 0.0)
+    return kbase[k0](0.0);
+
+  switch(k0){
+  case 0:
+    return 0.5*erf(0.70710678118654752440*r)/r;
+  case 1:
+    r2 = r*r;
+    e = exp(-0.5*r2);
+    gaussian_average = 0.5*erf(0.70710678118654752440*r)/r;
+    return (e == 0.0) ? gaussian_average :
+      gaussian_average + 0.5*ONE_OVER_SQRT_TWO_PI*e;
+  case 2:
+    r2 = r*r;
+    e = exp(-0.5*r2);
+    gaussian_average = 0.5*erf(0.70710678118654752440*r)/r;
+    return (e == 0.0) ? gaussian_average :
+      gaussian_average + ONE_OVER_SQRT_TWO_PI*e*(0.875-0.125*r2);
+  case 3:
+    r2 = r*r;
+    e = exp(-0.5*r2);
+    gaussian_average = 0.500000000025*
+      erf(0.70710678118654752440*r)/r;
+    return (e == 0.0) ? gaussian_average : gaussian_average +
+      ONE_OVER_SQRT_TWO_PI*e*
+      (1.18749999995+r2*(-0.33333333335+0.02083333333*r2));
+  case 4:
+    if(r >= sqrt5) return np_cker_halfmass_total(k0)/r;
+    r2 = r*r;
+    return 0.33541019662496845446+
+      (-0.067082039324993690892/3.0)*r2;
+  case 5:
+    if(r >= sqrt5) return np_cker_halfmass_total(k0)/r;
+    r2 = r*r;
+    return 0.008385254916*
+      (75.0-(50.0/3.0)*r2+(7.0/5.0)*r2*r2);
+  case 6:
+    if(r >= sqrt5) return np_cker_halfmass_total(k0)/r;
+    r2 = r*r;
+    return 0.33541019662496845446*
+      (2.734375+(-3.828125/3.0)*r2+(1.378125/5.0)*r2*r2-
+       (0.144375/7.0)*r2*r2*r2);
+  case 7:
+    if(r >= sqrt5) return np_cker_halfmass_total(k0)/r;
+    r2 = r*r;
+    return 0.33541019662496845446*
+      (3.5888671875+(-8.61328125/3.0)*r2+
+       (5.684765625/5.0)*r2*r2-(1.40765625/7.0)*r2*r2*r2+
+       (0.1173046875/9.0)*r2*r2*r2*r2);
+  case 8:
+    return (r >= 1.0) ? 0.5/r : 0.5;
+  case 9:
+    if(r >= np_tgauss2_b) return np_cker_halfmass_total(k0)/r;
+    return np_tgauss2_alpha*0.5*
+      erf(0.70710678118654752440*r)/r-np_tgauss2_c0;
+  default:
+    return R_NaN;
+  }
+}
+
+static inline double np_cker_scaled_halfmass_term(const int k0,
+                                                   const double distance,
+                                                   const double h){
+  const double r = fabs(distance/h);
+
+  if(distance == 0.0)
+    return 0.0;
+  if(isinf(r))
+    return copysign(h*np_cker_halfmass_total(k0), distance);
+  return distance*np_cker_halfmass_average(k0, r);
+}
+
+/* Centered primitive J(z)=integral_0^z K(t)dt.  Keeping the primitive
+   centered avoids adding and subsequently subtracting the CDF constant 1/2. */
+static inline double np_cker_centered_primitive(const int k0,
+                                                 const double z){
+  const double sqrt5 = 2.23606797749978969640;
+  const double az = fabs(z);
+  double z2, e;
+
+  if((k0 < 0) || (k0 > 9) || isnan(z))
+    return R_NaN;
+  if(z == 0.0)
+    return 0.0;
+  if(isinf(az))
+    return copysign(np_cker_halfmass_total(k0), z);
+
+  switch(k0){
+  case 0:
+    return 0.5*erf(0.70710678118654752440*z);
+  case 1:
+    return 0.5*erf(0.70710678118654752440*z)+
+      0.5*ONE_OVER_SQRT_TWO_PI*z*exp(-0.5*z*z);
+  case 2:
+    z2 = z*z;
+    e = exp(-0.5*z2);
+    return 0.5*erf(0.70710678118654752440*z)+
+      ONE_OVER_SQRT_TWO_PI*z*e*(0.875-0.125*z2);
+  case 3:
+    z2 = z*z;
+    e = exp(-0.5*z2);
+    return 0.500000000025*erf(0.70710678118654752440*z)+
+      ONE_OVER_SQRT_TWO_PI*z*e*
+      (1.18749999995+z2*(-0.33333333335+0.02083333333*z2));
+  case 4:
+    if(az >= sqrt5) return copysign(np_cker_halfmass_total(k0), z);
+    z2 = z*z;
+    return z*(0.33541019662496845446+
+              (-0.067082039324993690892/3.0)*z2);
+  case 5:
+    if(az >= sqrt5) return copysign(np_cker_halfmass_total(k0), z);
+    z2 = z*z;
+    return z*0.008385254916*
+      (75.0-(50.0/3.0)*z2+(7.0/5.0)*z2*z2);
+  case 6:
+    if(az >= sqrt5) return copysign(np_cker_halfmass_total(k0), z);
+    z2 = z*z;
+    return z*0.33541019662496845446*
+      (2.734375+(-3.828125/3.0)*z2+(1.378125/5.0)*z2*z2-
+       (0.144375/7.0)*z2*z2*z2);
+  case 7:
+    if(az >= sqrt5) return copysign(np_cker_halfmass_total(k0), z);
+    z2 = z*z;
+    return z*0.33541019662496845446*
+      (3.5888671875+(-8.61328125/3.0)*z2+
+       (5.684765625/5.0)*z2*z2-(1.40765625/7.0)*z2*z2*z2+
+       (0.1173046875/9.0)*z2*z2*z2*z2);
+  case 8:
+    return (az >= 1.0) ? copysign(0.5, z) : 0.5*z;
+  case 9:
+    if(az >= np_tgauss2_b)
+      return copysign(np_cker_halfmass_total(k0), z);
+    return np_tgauss2_alpha*0.5*erf(0.70710678118654752440*z)-
+      np_tgauss2_c0*z;
+  default:
+    return R_NaN;
+  }
+}
+
+/* Integral of K over [zl,zu].  Split intervals crossing zero into a sum of
+   centered half-masses; same-side intervals use the odd centered primitive. */
+static inline double np_cker_interval_mass(const int k0,
+                                            const double zl,
+                                            const double zu){
+  if((k0 < 0) || (k0 > 9) || isnan(zl) || isnan(zu) || !(zu >= zl))
+    return R_NaN;
+  if(zu == zl)
+    return 0.0;
+  if((zl < 0.0) && (zu > 0.0))
+    return -np_cker_centered_primitive(k0, zl) +
+      np_cker_centered_primitive(k0, zu);
+  return np_cker_centered_primitive(k0, zu) -
+    np_cker_centered_primitive(k0, zl);
+}
+
+/* Observation-centered continuous kernel CDF truncated to [lb,ub]. */
+static inline double np_cker_bounded_cdf(const int kernel,
+                                          const double eval,
+                                          const double train,
+                                          const double h,
+                                          const double lb,
+                                          const double ub){
+  const int k0 = kernel % 10;
+  double zl, zy, zu, numerator, denominator;
+
+  if(!(h > 0.0) || !isfinite(h) || (k0 < 0) || (k0 > 9) ||
+     !isfinite(eval) || !isfinite(train))
+    return R_NaN;
+  if(isfinite(lb) && (eval <= lb))
+    return 0.0;
+  if(isfinite(ub) && (eval >= ub))
     return 1.0;
-  if(!isfinite(lb) && !isfinite(ub))
+
+  zl = isfinite(lb) ? ((lb-train)/h) : R_NegInf;
+  zy = (eval-train)/h;
+  zu = isfinite(ub) ? ((ub-train)/h) : R_PosInf;
+  numerator = np_cker_interval_mass(k0, zl, zy);
+  denominator = np_cker_interval_mass(k0, zl, zu);
+
+  if(!(denominator > 0.0) || !isfinite(denominator) ||
+     !isfinite(numerator))
+    return R_NaN;
+  return numerator/denominator;
+}
+
+static inline double np_cker_bounded_cdf_precomputed(const int kernel,
+                                                      const double eval,
+                                                      const double train,
+                                                      const double h,
+                                                      const double lb,
+                                                      const double ub,
+                                                      const double lower_mass,
+                                                      const double denominator){
+  const int k0 = kernel % 10;
+  double numerator;
+
+  if(isfinite(lb) && (eval <= lb))
+    return 0.0;
+  if(isfinite(ub) && (eval >= ub))
     return 1.0;
+  if(!(denominator > 0.0) || !isfinite(denominator))
+    return R_NaN;
+  numerator = np_cker_centered_primitive(k0, (eval-train)/h)-lower_mass;
+  return isfinite(numerator) ? numerator/denominator : R_NaN;
+}
 
-  if(k0 < 0 || k0 > 9)
-    k0 = 0;
+static inline NPCKerBoundedNorm np_cker_bounded_norm(const int kernel,
+                                                      const double x,
+                                                      const double h,
+                                                      const double lb,
+                                                      const double ub){
+  NPCKerBoundedNorm out = {R_NaN, R_NaN};
+  const int k0 = kernel % 10;
+  const int finite_lb = isfinite(lb);
+  const int finite_ub = isfinite(ub);
+  double scaled_mass = 0.0;
 
-  zu = isfinite(ub) ? ((ub - x)/h) : R_PosInf;
-  zl = isfinite(lb) ? ((lb - x)/h) : R_NegInf;
-  du = zu - zl;
-  zmid = 0.5*(zu + zl);
+  if(!(h > 0.0) || !isfinite(h) || (k0 < 0) || (k0 > 9))
+    return out;
 
-  if(isfinite(du) && fabs(du) < 1.0e-5) {
-    den = kbase[k0](zmid)*du;
+  if(!finite_lb && !finite_ub){
+    out.inverse_mass = 1.0;
+    out.density_scale = 1.0/h;
+    return out;
+  }
+
+  if(finite_lb){
+    const double distance = x-lb;
+    scaled_mass += np_cker_scaled_halfmass_term(k0, distance, h);
   } else {
-    den = cdfk[k0](zu) - cdfk[k0](zl);
+    scaled_mass += h*np_cker_halfmass_total(k0);
   }
 
-  if(!(den > DBL_MIN) && isfinite(du) && (du > 0.0)) {
-    den = fmax(kbase[k0](zmid)*du, kbase[k0](0.0)*du);
+  if(finite_ub){
+    const double distance = ub-x;
+    scaled_mass += np_cker_scaled_halfmass_term(k0, distance, h);
+  } else {
+    scaled_mass += h*np_cker_halfmass_total(k0);
   }
 
-  den = NZD_POS(den);
+  if(!(scaled_mass > 0.0))
+    return out;
 
-  return 1.0/den;
+  out.density_scale = 1.0/scaled_mass;
+  out.inverse_mass = h*out.density_scale;
+  return out;
 }
 
 static inline double np_cker_base_eval(const int kernel,
@@ -5044,7 +5299,13 @@ void np_p_ckernelv(const int KERNEL,
                    const int use_largeh_pre,
                    const double largeh_k0_pre,
                    const double invnorm,
-                   const double p_invnorm){
+                   const double p_invnorm,
+                   const int bounded_integral,
+                   const int p_bounded_integral,
+                   const double bound_lb,
+                   const double bound_ub,
+                   const double * const bounded_lower_vec,
+                   const double * const bounded_den_vec){
 
   /* 
      this should be read as:
@@ -5073,6 +5334,23 @@ void np_p_ckernelv(const int KERNEL,
                                    np_cdf_gauss2, np_cdf_gauss4, np_cdf_gauss6, np_cdf_gauss8, // cdfative kernels
                                    np_cdf_epan2, np_cdf_epan4, np_cdf_epan6, np_cdf_epan8, 
                                    np_cdf_rect, np_cdf_tgauss2 };
+  double bounded_lower = 0.0, bounded_denominator = 0.0;
+  double p_bounded_lower = 0.0, p_bounded_denominator = 0.0;
+
+  if(swap_xxt && bounded_integral){
+    const int k0 = KERNEL % 10;
+    const double zl = isfinite(bound_lb) ? ((bound_lb-x)/h) : R_NegInf;
+    const double zu = isfinite(bound_ub) ? ((bound_ub-x)/h) : R_PosInf;
+    bounded_lower = np_cker_centered_primitive(k0, zl);
+    bounded_denominator = np_cker_interval_mass(k0, zl, zu);
+  }
+  if(swap_xxt && p_bounded_integral){
+    const int k0 = P_KERNEL % 10;
+    const double zl = isfinite(bound_lb) ? ((bound_lb-x)/h) : R_NegInf;
+    const double zu = isfinite(bound_ub) ? ((bound_ub-x)/h) : R_PosInf;
+    p_bounded_lower = np_cker_centered_primitive(k0, zl);
+    p_bounded_denominator = np_cker_interval_mass(k0, zl, zu);
+  }
 
   double *kbuf = scratch_kbuf;
   const int own_kbuf = (kbuf == NULL);
@@ -5082,7 +5360,8 @@ void np_p_ckernelv(const int KERNEL,
   }
 
   /* Base-kernel large-h decision is precomputed by caller once per (j,i). */
-  const int use_largeh = use_largeh_pre;
+  const int use_largeh = use_largeh_pre &&
+    !bounded_integral && !p_bounded_integral;
   const int use_largeh_perm = use_largeh &&
     (!do_score) &&
     do_perm &&
@@ -5125,7 +5404,8 @@ void np_p_ckernelv(const int KERNEL,
   }
 
 #if NP_ACCEL_GAUSS_COMPILED
-  if(np_mseries_accelerate_enabled_cache &&
+  if(!bounded_integral && !p_bounded_integral &&
+     np_mseries_accelerate_enabled_cache &&
      np_p_ckernelv_accel_gauss2_deriv_try(KERNEL,
                                           P_KERNEL,
                                           P_IDX,
@@ -5153,13 +5433,32 @@ void np_p_ckernelv(const int KERNEL,
 
   if(xl == NULL){
     for (i = 0, j = 0; i < num_xt; i++, j += bin_do_xw){
-      const double kn = invnorm*k[KERNEL]((x-xt[i])*zscale);
+      const double eval = swap_xxt ? xt[i] : x;
+      const double train = swap_xxt ? x : xt[i];
+      const double kn = bounded_integral ?
+        ((swap_xxt || bounded_lower_vec != NULL) ?
+         np_cker_bounded_cdf_precomputed(
+          KERNEL, eval, train, h, bound_lb, bound_ub,
+          swap_xxt ? bounded_lower : bounded_lower_vec[i],
+          swap_xxt ? bounded_denominator : bounded_den_vec[i]) :
+         np_cker_bounded_cdf(KERNEL, eval, train, h, bound_lb, bound_ub)) :
+        invnorm*k[KERNEL]((x-xt[i])*zscale);
 
       result[i] = xw[j]*kn;
       kbuf[i] = kn;
       
-      if(do_perm)
-        p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*p_invnorm*k[P_KERNEL]((x-xt[i])*zscale)*(do_score ? ((xt[i]-x)*zscale) : 1.0);
+      if(do_perm){
+        const double pkn = p_bounded_integral ?
+          ((swap_xxt || (bounded_lower_vec != NULL && P_KERNEL == KERNEL)) ?
+           np_cker_bounded_cdf_precomputed(
+            P_KERNEL, eval, train, h, bound_lb, bound_ub,
+            swap_xxt ? p_bounded_lower : bounded_lower_vec[i],
+            swap_xxt ? p_bounded_denominator : bounded_den_vec[i]) :
+           np_cker_bounded_cdf(P_KERNEL, eval, train, h, bound_lb, bound_ub)) :
+          p_invnorm*k[P_KERNEL]((x-xt[i])*zscale);
+        p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
+          pkn*(do_score ? ((xt[i]-x)*zscale) : 1.0);
+      }
 
     }
 
@@ -5176,7 +5475,16 @@ void np_p_ckernelv(const int KERNEL,
       const int istart = xl->istart[m];
       const int nlev = xl->nlev[m];
       for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
-        const double kn = invnorm*k[KERNEL]((x-xt[i])*zscale);
+        const double eval = swap_xxt ? xt[i] : x;
+        const double train = swap_xxt ? x : xt[i];
+        const double kn = bounded_integral ?
+          ((swap_xxt || bounded_lower_vec != NULL) ?
+           np_cker_bounded_cdf_precomputed(
+            KERNEL, eval, train, h, bound_lb, bound_ub,
+            swap_xxt ? bounded_lower : bounded_lower_vec[i],
+            swap_xxt ? bounded_denominator : bounded_den_vec[i]) :
+           np_cker_bounded_cdf(KERNEL, eval, train, h, bound_lb, bound_ub)) :
+          invnorm*k[KERNEL]((x-xt[i])*zscale);
 
         result[i] = xw[j]*kn;
         kbuf[i] = kn;
@@ -5188,7 +5496,18 @@ void np_p_ckernelv(const int KERNEL,
         const int istart = p_xl->istart[m];
         const int nlev = p_xl->nlev[m];
         for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
-          p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*p_invnorm*k[P_KERNEL]((x-xt[i])*zscale)*(do_score ? ((xt[i]-x)*zscale) : 1.0);
+          const double eval = swap_xxt ? xt[i] : x;
+          const double train = swap_xxt ? x : xt[i];
+          const double pkn = p_bounded_integral ?
+            ((swap_xxt || (bounded_lower_vec != NULL && P_KERNEL == KERNEL)) ?
+             np_cker_bounded_cdf_precomputed(
+              P_KERNEL, eval, train, h, bound_lb, bound_ub,
+              swap_xxt ? p_bounded_lower : bounded_lower_vec[i],
+              swap_xxt ? p_bounded_denominator : bounded_den_vec[i]) :
+             np_cker_bounded_cdf(P_KERNEL, eval, train, h, bound_lb, bound_ub)) :
+            p_invnorm*k[P_KERNEL]((x-xt[i])*zscale);
+          p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
+            pkn*(do_score ? ((xt[i]-x)*zscale) : 1.0);
         }
       }
     }
@@ -5943,7 +6262,12 @@ void np_ckernelv(const int KERNEL,
                  const XL * const xl,
                  const int swap_xxt,
                  const int skip_largeh_check,
-                 const double invnorm){
+                 const double invnorm,
+                 const int bounded_integral,
+                 const double bound_lb,
+                 const double bound_ub,
+                 const double * const bounded_lower_vec,
+                 const double * const bounded_den_vec){
 
   /* 
      this should be read as:
@@ -5957,6 +6281,61 @@ void np_ckernelv(const int KERNEL,
   const double sgn = swap_xxt ? -1.0 : 1.0;
   const double zscale = sgn/h;
   double * const xw = (bin_do_xw ? result : &unit_weight);
+
+  if(bounded_integral){
+    double lower_mass = 0.0, denominator = 0.0;
+    if(swap_xxt){
+      const int k0 = KERNEL % 10;
+      const double zl = isfinite(bound_lb) ? ((bound_lb-x)/h) : R_NegInf;
+      const double zu = isfinite(bound_ub) ? ((bound_ub-x)/h) : R_PosInf;
+      lower_mass = np_cker_centered_primitive(k0, zl);
+      denominator = np_cker_interval_mass(k0, zl, zu);
+    }
+    if(xl == NULL){
+      if(!bin_do_xw){
+        for(i = 0; i < num_xt; i++){
+          const double eval = swap_xxt ? xt[i] : x;
+          const double train = swap_xxt ? x : xt[i];
+          result[i] = (swap_xxt || bounded_lower_vec != NULL) ?
+            np_cker_bounded_cdf_precomputed(
+            KERNEL, eval, train, h, bound_lb, bound_ub,
+            swap_xxt ? lower_mass : bounded_lower_vec[i],
+            swap_xxt ? denominator : bounded_den_vec[i]) :
+            np_cker_bounded_cdf(KERNEL, eval, train, h, bound_lb, bound_ub);
+        }
+      } else {
+        for(i = 0; i < num_xt; i++){
+          const double eval = swap_xxt ? xt[i] : x;
+          const double train = swap_xxt ? x : xt[i];
+          if(xw[i] == 0.0) continue;
+          result[i] = xw[i]*((swap_xxt || bounded_lower_vec != NULL) ?
+            np_cker_bounded_cdf_precomputed(
+            KERNEL, eval, train, h, bound_lb, bound_ub,
+            swap_xxt ? lower_mass : bounded_lower_vec[i],
+            swap_xxt ? denominator : bounded_den_vec[i]) :
+            np_cker_bounded_cdf(KERNEL, eval, train, h, bound_lb, bound_ub));
+        }
+      }
+    } else {
+      for(int m = 0; m < xl->n; m++){
+        const int istart = xl->istart[m];
+        const int nlev = xl->nlev[m];
+        for(i = istart; i < istart+nlev; i++){
+          const double eval = swap_xxt ? xt[i] : x;
+          const double train = swap_xxt ? x : xt[i];
+          if(bin_do_xw && (xw[i] == 0.0)) continue;
+          result[i] = (bin_do_xw ? xw[i] : 1.0)*
+            ((swap_xxt || bounded_lower_vec != NULL) ?
+             np_cker_bounded_cdf_precomputed(
+              KERNEL, eval, train, h, bound_lb, bound_ub,
+              swap_xxt ? lower_mass : bounded_lower_vec[i],
+              swap_xxt ? denominator : bounded_den_vec[i]) :
+             np_cker_bounded_cdf(KERNEL, eval, train, h, bound_lb, bound_ub));
+        }
+      }
+    }
+    return;
+  }
 
   if((!skip_largeh_check) && np_cont_largeh_is_active(KERNEL, xt, num_xt, x, h, xl)){
     np_ckernelv_mul_const(np_cont_largeh_k0(KERNEL)*invnorm, num_xt, do_xw, result, xl);
@@ -6263,6 +6642,7 @@ void np_p_ukernelv(const int KERNEL,
                    const XL * const p_xl,
                    const int swap_xxt,
                    const int do_ocg,
+                   const int do_perm,
                    double * const scratch_kbuf){
 
   /* 
@@ -6317,14 +6697,16 @@ void np_p_ukernelv(const int KERNEL,
       result[i] = xw[j]*kn;
       kbuf[i] = kn;
 
-      const double pkn = use_const_pk ?
-        pkn_const :
-        (((p_iscat_const ? p_iscat_const_val : (xt[i] == ex)) ? pkn_same : pkn_diff));
-      p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*pkn;
+      if(do_perm){
+        const double pkn = use_const_pk ?
+          pkn_const :
+          (((p_iscat_const ? p_iscat_const_val : (xt[i] == ex)) ? pkn_same : pkn_diff));
+        p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*pkn;
+      }
     }
 
     for(l = 0, r = 0; l < P_NIDX; l++, r += bin_do_xw){
-      if(l == P_IDX) continue;
+      if((l == P_IDX) && do_perm) continue;
       for (i = 0, j = 0; i < num_xt; i++, j += bin_do_xw){
         p_result[l*num_xt + i] = pxw[r*num_xt + j]*kbuf[i];
       }
@@ -6345,20 +6727,22 @@ void np_p_ukernelv(const int KERNEL,
       }
     }
 
-    for (int m = 0; m < p_xl->n; m++){
-      const int istart = p_xl->istart[m];
-      const int nlev = p_xl->nlev[m];
-      for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
-        const double pkn = use_const_pk ?
-          pkn_const :
-          (((p_iscat_const ? p_iscat_const_val : (xt[i] == ex)) ? pkn_same : pkn_diff));
-        p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*pkn;
+    if(do_perm){
+      for (int m = 0; m < p_xl->n; m++){
+        const int istart = p_xl->istart[m];
+        const int nlev = p_xl->nlev[m];
+        for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
+          const double pkn = use_const_pk ?
+            pkn_const :
+            (((p_iscat_const ? p_iscat_const_val : (xt[i] == ex)) ? pkn_same : pkn_diff));
+          p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*pkn;
+        }
       }
     }
 
 
     for(l = 0, r = 0; l < P_NIDX; l++, r+=bin_do_xw){
-      if(l == P_IDX) continue;
+      if((l == P_IDX) && do_perm) continue;
       for (int m = 0; m < xl->n; m++){
         const int istart = xl->istart[m];
         const int nlev = xl->nlev[m];
@@ -6473,6 +6857,7 @@ void np_p_okernelv(const int KERNEL,
                    const XL * const p_xl,
                    const int swap_xxt,
                    const int do_ocg,
+                   const int do_perm,
                    const int * const ordered_indices,
                    const int swapped_index,
                    double * const scratch_kbuf){
@@ -6539,14 +6924,16 @@ void np_p_okernelv(const int KERNEL,
         result[i] = xw[j]*kn;
         kbuf[i] = kn;
 
-        p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
-          (fast_p_kernel
-            ? np_ordered_eval_kernel(P_KERNEL, c1, c3, lambda, max_cxy, lpow, cats, ncat, cl, ch)
-            : k[P_KERNEL](c1, c3, lambda, cl, ch));
+        if(do_perm){
+          p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
+            (fast_p_kernel
+              ? np_ordered_eval_kernel(P_KERNEL, c1, c3, lambda, max_cxy, lpow, cats, ncat, cl, ch)
+              : k[P_KERNEL](c1, c3, lambda, cl, ch));
+        }
       }
 
       for(l = 0, r = 0; l < P_NIDX; l++, r += bin_do_xw){
-        if(l == P_IDX) continue;
+        if((l == P_IDX) && do_perm) continue;
         for (i = 0, j = 0; i < num_xt; i++, j += bin_do_xw){
           p_result[l*num_xt + i] = pxw[r*num_xt + j]*kbuf[i];
         }
@@ -6569,24 +6956,26 @@ void np_p_okernelv(const int KERNEL,
         }
       }
 
-      for (int m = 0; m < p_xl->n; m++){
-        const int istart = p_xl->istart[m];
-        const int nlev = p_xl->nlev[m];
-        for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
-          const double cat = do_ocg ? (swap_xxt ? cats[abs(ordered_indices[i] - 1)] : s_cat) : 0.0;
-          const double c1 = swap_xxt ? x : xt[i];
-          const double c3 = do_ocg ? cat : (swap_xxt ? xt[i] : x);
+      if(do_perm){
+        for (int m = 0; m < p_xl->n; m++){
+          const int istart = p_xl->istart[m];
+          const int nlev = p_xl->nlev[m];
+          for (i = istart, j = bin_do_xw*istart; i < istart+nlev; i++, j += bin_do_xw){
+            const double cat = do_ocg ? (swap_xxt ? cats[abs(ordered_indices[i] - 1)] : s_cat) : 0.0;
+            const double c1 = swap_xxt ? x : xt[i];
+            const double c3 = do_ocg ? cat : (swap_xxt ? xt[i] : x);
 
-          p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
-            (fast_p_kernel
-              ? np_ordered_eval_kernel(P_KERNEL, c1, c3, lambda, max_cxy, lpow, cats, ncat, cl, ch)
-              : k[P_KERNEL](c1, c3, lambda, cl, ch));
+            p_result[P_IDX*num_xt + i] = pxw[bin_do_xw*P_IDX*num_xt + j]*
+              (fast_p_kernel
+                ? np_ordered_eval_kernel(P_KERNEL, c1, c3, lambda, max_cxy, lpow, cats, ncat, cl, ch)
+                : k[P_KERNEL](c1, c3, lambda, cl, ch));
+          }
         }
       }
 
 
       for(l = 0, r = 0; l < P_NIDX; l++, r+=bin_do_xw){
-        if(l == P_IDX) continue;
+        if((l == P_IDX) && do_perm) continue;
         for (int m = 0; m < xl->n; m++){
           const int istart = xl->istart[m];
           const int nlev = xl->nlev[m];
@@ -7597,6 +7986,8 @@ const int keep_kw_owner_local){
   double *lambda = NULL, **matrix_bandwidth = NULL, **matrix_alt_bandwidth = NULL, **m = NULL;
   double *tprod = NULL, dband, *ws, * p_ws, * tprod_mp = NULL, * p_dband = NULL;
   double *perm_kbuf = NULL, *kw_work = NULL;
+  double **bounded_cdf_lower_fixed = NULL;
+  double **bounded_cdf_den_fixed = NULL;
   double *blas_Apack = NULL;
   int use_disc_profile_cache = 0, disc_nprof = 0, disc_mark_token = 1;
   int disc_profile_from_override = 0;
@@ -7814,6 +8205,35 @@ const int keep_kw_owner_local){
       goto cleanup;
     }
 
+  }
+
+  if((BANDWIDTH_reg == BW_FIXED) && int_cker_bound_extern &&
+     (num_reg_continuous > 0)){
+    int need_bounded_cdf_cache = 0;
+    for(i = 0; i < num_reg_continuous; i++)
+      need_bounded_cdf_cache |= (operator[i] == OP_INTEGRAL) ||
+        (do_perm && (permutation_operator == OP_INTEGRAL));
+    if(need_bounded_cdf_cache){
+      bounded_cdf_lower_fixed = alloc_tmatd(num_obs_train, num_reg_continuous);
+      bounded_cdf_den_fixed = alloc_tmatd(num_obs_train, num_reg_continuous);
+      for(i = 0; i < num_reg_continuous; i++){
+        if((operator[i] == OP_INTEGRAL) ||
+           (do_perm && (permutation_operator == OP_INTEGRAL))){
+          const int k0 = KERNEL_reg_np[i] % 10;
+          const double h = matrix_bandwidth[i][0];
+          const double lb = vector_ckerlb_extern[i];
+          const double ub = vector_ckerub_extern[i];
+          for(int q = 0; q < num_obs_train; q++){
+            const double train = xtc[i][q];
+            const double zl = isfinite(lb) ? ((lb-train)/h) : R_NegInf;
+            const double zu = isfinite(ub) ? ((ub-train)/h) : R_PosInf;
+            bounded_cdf_lower_fixed[i][q] =
+              np_cker_centered_primitive(k0, zl);
+            bounded_cdf_den_fixed[i][q] = np_cker_interval_mass(k0, zl, zu);
+          }
+        }
+      }
+    }
   }
 
   if((!disable_gate_features) && (num_reg_continuous > 0)){
@@ -8480,7 +8900,9 @@ const int keep_kw_owner_local){
           deferred_const *= cont_largeh_k0[i];
           deferred_const_active = 1;
         } else {
-          np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, tprod_has_vals, xc[i][j], m[i][jbw], tprod, pxl, swap_xxt, 1, 1.0);
+          np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, tprod_has_vals,
+                      xc[i][j], m[i][jbw], tprod, pxl, swap_xxt, 1, 1.0,
+                      0, R_NegInf, R_PosInf, NULL, NULL);
           tprod_has_vals = 1;
         }
 
@@ -8503,29 +8925,56 @@ const int keep_kw_owner_local){
           (p_kbase_i >= 0 && p_kbase_i <= 9) &&
           ((isfinite(vector_ckerlb_extern[i]) && (fabs(vector_ckerlb_extern[i]) < 0.5*DBL_MAX)) ||
            (isfinite(vector_ckerub_extern[i]) && (fabs(vector_ckerub_extern[i]) < 0.5*DBL_MAX)));
-        const double invnorm = use_bounds_i ?
-          np_cker_invnorm(KERNEL_reg_np[i], xc[i][j], m[i][jbw],
-                          vector_ckerlb_extern[i], vector_ckerub_extern[i]) : 1.0;
-        const double p_invnorm = use_p_bounds_i ?
-          np_cker_invnorm((do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]),
-                          xc[i][j], m[i][jbw],
-                          vector_ckerlb_extern[i], vector_ckerub_extern[i]) : 1.0;
+        const int bounded_integral = use_bounds_i &&
+          (operator[l] == OP_INTEGRAL);
+        const int p_bounded_integral = use_p_bounds_i && do_perm &&
+          (permutation_operator == OP_INTEGRAL);
+        const double invnorm = (use_bounds_i && !bounded_integral) ?
+          np_cker_bounded_norm(KERNEL_reg_np[i], xc[i][j], m[i][jbw],
+                               vector_ckerlb_extern[i],
+                               vector_ckerub_extern[i]).inverse_mass : 1.0;
+        const double p_invnorm = (use_p_bounds_i && !p_bounded_integral) ?
+          np_cker_bounded_norm((do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]),
+                               xc[i][j], m[i][jbw],
+                               vector_ckerlb_extern[i],
+                               vector_ckerub_extern[i]).inverse_mass : 1.0;
 
         if(operator[l] != OP_CONVOLUTION){
           if(p_nvar == 0){
-            const int use_largeh = any_cont_largeh && (cont_largeh_active != NULL) ? cont_largeh_active[i] : 0;
+            const int use_largeh = !bounded_integral && any_cont_largeh &&
+              (cont_largeh_active != NULL) ? cont_largeh_active[i] : 0;
 
             if(use_largeh){
               deferred_const *= cont_largeh_k0[i]*invnorm;
               deferred_const_active = 1;
             } else {
-              np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, tprod_has_vals, xc[i][j], m[i][jbw], tprod, pxl, swap_xxt, 1, invnorm);
+              np_ckernelv(KERNEL_reg_np[i], xtc[i], num_xt, tprod_has_vals,
+                          xc[i][j], m[i][jbw], tprod, pxl, swap_xxt, 1,
+                          invnorm, bounded_integral,
+                          vector_ckerlb_extern[i], vector_ckerub_extern[i],
+                          bounded_cdf_lower_fixed == NULL ? NULL :
+                            bounded_cdf_lower_fixed[i],
+                          bounded_cdf_den_fixed == NULL ? NULL :
+                            bounded_cdf_den_fixed[i]);
               tprod_has_vals = 1;
             }
           } else {
             const int use_largeh = any_cont_largeh && (cont_largeh_active != NULL) ? cont_largeh_active[i] : 0;
 
-            np_p_ckernelv(KERNEL_reg_np[i], (do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]), k, p_nvar, xtc[i], num_xt, l, xc[i][j], m[i][jbw], tprod, tprod_mp, pxl, (p_pxl==NULL?NULL : p_pxl+k), swap_xxt, bpso[l], do_score, perm_kbuf, use_largeh, (use_largeh ? cont_largeh_k0[i] : 0.0), invnorm, p_invnorm);
+            np_p_ckernelv(KERNEL_reg_np[i],
+                          (do_perm ? permutation_kernel[i] : KERNEL_reg_np[i]),
+                          k, p_nvar, xtc[i], num_xt, l, xc[i][j], m[i][jbw],
+                          tprod, tprod_mp, pxl,
+                          (p_pxl==NULL?NULL : p_pxl+k), swap_xxt, bpso[l],
+                          do_score, perm_kbuf, use_largeh,
+                          (use_largeh ? cont_largeh_k0[i] : 0.0),
+                          invnorm, p_invnorm, bounded_integral,
+                          p_bounded_integral, vector_ckerlb_extern[i],
+                          vector_ckerub_extern[i],
+                          bounded_cdf_lower_fixed == NULL ? NULL :
+                            bounded_cdf_lower_fixed[i],
+                          bounded_cdf_den_fixed == NULL ? NULL :
+                            bounded_cdf_den_fixed[i]);
           }
         }
         else if(p_nvar == 0){
@@ -8705,7 +9154,7 @@ const int keep_kw_owner_local){
       for(i=0; i < num_reg_unordered; i++, l++, ip += doscoreocg){
         if(doscoreocg){
           np_p_ukernelv(KERNEL_unordered_reg_np[i], ps_ukernel[i], k, p_nvar, xtu[i], num_xt, l, xu[i][j], 
-                        lambda[i], num_categories[i], matrix_categorical_vals[i][0], tprod, tprod_mp, pxl, p_pxl + k, swap_xxt, (bpso[l] ? do_ocg : 0), perm_kbuf);
+                        lambda[i], num_categories[i], matrix_categorical_vals[i][0], tprod, tprod_mp, pxl, (p_pxl == NULL ? NULL : p_pxl + k), swap_xxt, (bpso[l] ? do_ocg : 0), bpso[l], perm_kbuf);
         } else {
           if((p_nvar == 0) && (disc_uno_const_ok != NULL) && disc_uno_const_ok[i]){
             deferred_const *= disc_uno_const[i];
@@ -8753,7 +9202,7 @@ const int keep_kw_owner_local){
                         xo[i][j], lambda[num_reg_unordered+i], 
                         (matrix_categorical_vals != NULL) ? matrix_categorical_vals[i+num_reg_unordered] : NULL, 
                         (num_categories != NULL) ? num_categories[i+num_reg_unordered] : 0,
-                        tprod, tprod_mp, pxl, p_pxl + k, swap_xxt, (bpso[l] ? do_ocg : 0),
+                        tprod, tprod_mp, pxl, (p_pxl == NULL ? NULL : p_pxl + k), swap_xxt, (bpso[l] ? do_ocg : 0), bpso[l],
                         matrix_ordered_indices[i], (swap_xxt ? 0 : matrix_ordered_indices[i][j]),
                         perm_kbuf);
         }
@@ -8906,10 +9355,13 @@ cleanup:
   if(!bandwidth_provided && ((BANDWIDTH_reg == BW_ADAP_NN) && any_convolution))
     free_tmat(matrix_alt_bandwidth);
 
+  if(bounded_cdf_lower_fixed != NULL) free_tmat(bounded_cdf_lower_fixed);
+  if(bounded_cdf_den_fixed != NULL) free_tmat(bounded_cdf_den_fixed);
+
   free(tprod);
   free(bpow);
   if(blas_Apack != NULL) free(blas_Apack);
-  
+
   clean_xl(pxl);
   clean_nl(&nls);
 
@@ -10608,6 +11060,7 @@ static inline int np_reg_cv_use_symmetric_dropone_path(const int bwm,
                                                        const int ks_tree_use,
                                                        const int BANDWIDTH_reg){
   return (bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK) ||
+    (bwm == RBWM_CVKS) ||
     ks_tree_use || (BANDWIDTH_reg == BW_ADAP_NN);
 }
 
@@ -10633,6 +11086,12 @@ static inline double np_regression_cv_loss_value(const int bwm,
                                                  const double fit_response,
                                                  const double loss_response)
 {
+  if(bwm == RBWM_CVKS){
+    const double floor = sqrt(DBL_EPSILON);
+    const double p = MIN(1.0 - floor, MAX(floor, fit_response));
+    return -(loss_response*log(p) + (1.0 - loss_response)*log1p(-p));
+  }
+
   const double residual = loss_response - fit_response;
   return (bwm == RBWM_CVCHECK) ?
     np_check_loss_value(residual, np_lsq_tau_extern) :
@@ -10652,7 +11111,8 @@ static inline int np_reg_cv_use_canonical_lp_fixed_kernel(const int int_ll,
     return (int_ll == LL_LP) &&
       (int_glp_basis_extern == 1);
 
-  if((bwm != RBWM_CVLS) && (bwm != RBWM_CVCHECK))
+  if((bwm != RBWM_CVLS) && (bwm != RBWM_CVCHECK) &&
+     (bwm != RBWM_CVKS))
     return 0;
 
   if(int_ll == LL_LL)
@@ -10676,7 +11136,8 @@ static inline int np_reg_cv_use_canonical_ll_degree1_lp_objective(const int int_
                                                                   const int num_reg_continuous,
                                                                   const int ks_tree_use){
   return (int_ll == LL_LL) &&
-    ((bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK)) &&
+    ((bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK) ||
+     (bwm == RBWM_CVKS)) &&
     (BANDWIDTH_reg == BW_FIXED) &&
     (num_reg_continuous > 0) &&
     (!ks_tree_use);
@@ -11759,7 +12220,8 @@ static NPRegCvLpResult np_regression_cv_lp_rawbasis_fixed(
   int use_sparse_tree = 0;
   int tsf = 0;
   const int center_raw_basis = (int_glp_bernstein_extern == 0) && (int_glp_basis_extern == 1);
-  const int track_lowsupport = (bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK);
+  const int track_lowsupport = (bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK) ||
+    (bwm == RBWM_CVKS);
 #ifdef MPI2
   const int use_mpi_transport = (iNum_Processors > 1);
 #else
@@ -12469,7 +12931,8 @@ int * kernel_c = NULL, * kernel_u = NULL, * kernel_o = NULL;
   double *ov_cont_hmin = NULL, *ov_cont_k0 = NULL;
   int ov_cont_from_cache = 0;
 
-  const int leave_one_out = ((bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK))?1:0;
+  const int leave_one_out = ((bwm == RBWM_CVLS) || (bwm == RBWM_CVCHECK) ||
+                             (bwm == RBWM_CVKS))?1:0;
 
   if(!np_reg_cv_core_cache_prepare(KERNEL_reg,
                                    KERNEL_unordered_reg,
@@ -12542,7 +13005,8 @@ int * kernel_c = NULL, * kernel_u = NULL, * kernel_o = NULL;
     
     return(DBL_MAX);
   }
-  if(np_extendednn_mpi_lc_all_large_gate(BANDWIDTH_reg,
+  if((bwm != RBWM_CVKS) &&
+     np_extendednn_mpi_lc_all_large_gate(BANDWIDTH_reg,
                                       int_ll_cv,
                                       num_obs,
                                       num_reg_continuous,
@@ -12608,7 +13072,8 @@ int * kernel_c = NULL, * kernel_u = NULL, * kernel_o = NULL;
                                                  num_reg_continuous,
                                                  ks_tree_use,
                                                  use_bernstein);
-      const int all_large_gate = np_reg_cv_all_large_gate(BANDWIDTH_reg,
+      const int all_large_gate = (bwm != RBWM_CVKS) &&
+        np_reg_cv_all_large_gate(BANDWIDTH_reg,
                                                           num_obs,
                                                           num_reg_continuous,
                                                           num_reg_unordered,
@@ -13326,7 +13791,8 @@ int * kernel_c = NULL, * kernel_u = NULL, * kernel_o = NULL;
     - CVAIC: SSE term from in-sample residuals, trace(H)=sum(h_ii)
   */
   {
-    const int all_large_gate = np_reg_cv_all_large_gate(BANDWIDTH_reg,
+    const int all_large_gate = (bwm != RBWM_CVKS) &&
+      np_reg_cv_all_large_gate(BANDWIDTH_reg,
                                                         num_obs,
                                                         num_reg_continuous,
                                                         num_reg_unordered,
@@ -21995,6 +22461,7 @@ static int np_conditional_y_eval_row_stream_op_core(double *vector_scale_factor,
                                                     double **matrix_Y_continuous_eval,
                                                     int num_eval,
                                                     int map_train_tree_index,
+                                                    int suppress_nn_parallel,
                                                     double *row_out);
 
 static int np_conditional_y_scalar_fixed_row_direct(NPConditionalYRowCtx *ctx,
@@ -22005,7 +22472,7 @@ static int np_conditional_y_scalar_fixed_row_direct(NPConditionalYRowCtx *ctx,
     matrix_Y_continuous_train_extern[0] : NULL;
   const double lb = (vector_cykerlb_extern != NULL) ? vector_cykerlb_extern[0] : R_NegInf;
   const double ub = (vector_cykerub_extern != NULL) ? vector_cykerub_extern[0] : R_PosInf;
-  double h, invnorm;
+  double h, density_scale;
   int all_largeh = 0;
   double max_largeh_abs = 0.0, largeh_k0 = 0.0;
   int j;
@@ -22027,7 +22494,8 @@ static int np_conditional_y_scalar_fixed_row_direct(NPConditionalYRowCtx *ctx,
   if(!(h > 0.0) || !R_FINITE(h) || !R_FINITE(eval_y))
     return 1;
 
-  invnorm = np_cker_invnorm(KERNEL_den_extern, eval_y, h, lb, ub);
+  density_scale = np_cker_bounded_norm(KERNEL_den_extern, eval_y, h, lb, ub).
+    density_scale;
 
   if(np_cont_largeh_kernel_supported(KERNEL_den_extern)){
     const double utol = np_cont_largeh_utol(KERNEL_den_extern, np_cont_largeh_rel_tol());
@@ -22042,11 +22510,11 @@ static int np_conditional_y_scalar_fixed_row_direct(NPConditionalYRowCtx *ctx,
     const double diff = eval_y - train_y[j];
     if(all_largeh && (fabs(diff) > max_largeh_abs))
       all_largeh = 0;
-    row_out[j] = invnorm*np_cker_base_eval(KERNEL_den_extern, diff/h)/h;
+    row_out[j] = density_scale*np_cker_base_eval(KERNEL_den_extern, diff/h);
   }
 
   if(all_largeh){
-    const double kval = invnorm*largeh_k0/h;
+    const double kval = density_scale*largeh_k0;
     for(j = 0; j < num_train; j++)
       row_out[j] = kval;
   }
@@ -22088,6 +22556,7 @@ static int np_conditional_y_scalar_eval_from_ctx(double *vector_scale_factor,
                                                     NULL,
                                                     ctx->eval_ycon_one,
                                                     1,
+                                                    0,
                                                     0,
                                                     row_out);
   }
@@ -22142,6 +22611,7 @@ static int np_conditional_y_scalar_eval_from_ctx(double *vector_scale_factor,
 static int np_conditional_x_weight_row_stream_core_impl(double *vector_scale_factor,
                                                         int eval_idx,
                                                         int drop_eval_self,
+                                                        int suppress_nn_parallel,
                                                         double *row_out){
   const int num_train = num_obs_train_extern;
   const int num_reg_tot = num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern;
@@ -22234,7 +22704,7 @@ static int np_conditional_x_weight_row_stream_core_impl(double *vector_scale_fac
                            num_reg_continuous_extern,
                            num_reg_unordered_extern,
                            num_reg_ordered_extern,
-                           0,
+                           suppress_nn_parallel,
                            vsfx,
                            NULL,
                            NULL,
@@ -22403,6 +22873,18 @@ static int np_conditional_x_weight_row_stream_core(double *vector_scale_factor,
   return np_conditional_x_weight_row_stream_core_impl(vector_scale_factor,
                                                       eval_idx,
                                                       1,
+                                                      0,
+                                                      row_out);
+}
+
+static int np_conditional_x_weight_row_stream_core_suppress(double *vector_scale_factor,
+                                                            int eval_idx,
+                                                            int suppress_nn_parallel,
+                                                            double *row_out){
+  return np_conditional_x_weight_row_stream_core_impl(vector_scale_factor,
+                                                      eval_idx,
+                                                      1,
+                                                      suppress_nn_parallel,
                                                       row_out);
 }
 
@@ -22412,6 +22894,18 @@ static int np_conditional_x_weight_row_full_stream_core(double *vector_scale_fac
   return np_conditional_x_weight_row_stream_core_impl(vector_scale_factor,
                                                       eval_idx,
                                                       0,
+                                                      0,
+                                                      row_out);
+}
+
+static int np_conditional_x_weight_row_full_stream_core_suppress(double *vector_scale_factor,
+                                                                 int eval_idx,
+                                                                 int suppress_nn_parallel,
+                                                                 double *row_out){
+  return np_conditional_x_weight_row_stream_core_impl(vector_scale_factor,
+                                                      eval_idx,
+                                                      0,
+                                                      suppress_nn_parallel,
                                                       row_out);
 }
 
@@ -22429,6 +22923,7 @@ static int np_conditional_y_eval_row_stream_op_core(double *vector_scale_factor,
                                                     double **matrix_Y_continuous_eval,
                                                     int num_eval,
                                                     int map_train_tree_index,
+                                                    int suppress_nn_parallel,
                                                     double *row_out){
   const int num_train = num_obs_train_extern;
   const int num_var_tot = num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern;
@@ -22517,7 +23012,7 @@ static int np_conditional_y_eval_row_stream_op_core(double *vector_scale_factor,
                            num_var_continuous_extern,
                            num_var_unordered_extern,
                            num_var_ordered_extern,
-                           0,
+                           suppress_nn_parallel,
                            vsfy,
                            NULL,
                            NULL,
@@ -22608,6 +23103,7 @@ static int np_conditional_y_row_stream_op_core(double *vector_scale_factor,
                                                   matrix_Y_continuous_train_extern,
                                                   num_obs_train_extern,
                                                   1,
+                                                  0,
                                                   row_out);
 }
 
@@ -24379,22 +24875,28 @@ static int np_density_cvls_bounded_i1_quadrature(const int KERNEL_den,
 
     if((BANDWIDTH_den == BW_FIXED) || (BANDWIDTH_den == BW_GEN_NN)){
       const double h = matrix_bandwidth[0][(BANDWIDTH_den == BW_FIXED) ? 0 : m];
-      const double invnorm = np_cker_invnorm(KERNEL_den, grid[m], h, lb, ub);
+      double density_scale;
 
       if(!(h > 0.0) || !isfinite(h))
         goto cleanup_density_bounded_quad;
+      density_scale = np_cker_bounded_norm(KERNEL_den, grid[m], h, lb, ub).
+        density_scale;
       for(int i = 0; i < num_obs; i++)
-        fit += invnorm*np_cker_base_eval(KERNEL_den, (grid[m] - train_x[i])/h)/h;
+        fit += density_scale*
+          np_cker_base_eval(KERNEL_den, (grid[m] - train_x[i])/h);
       fit /= (double)num_obs;
     } else {
       for(int i = 0; i < num_obs; i++){
         const double h = matrix_bandwidth[0][i];
-        const double invnorm = np_cker_invnorm(KERNEL_den, grid[m], h, lb, ub);
+        double density_scale;
 
         if(!(h > 0.0) || !isfinite(h))
           goto cleanup_density_bounded_quad;
-        fit += invnorm*np_cker_base_eval(KERNEL_den, (grid[m] - train_x[i])/h) /
-          ((double)num_obs*h);
+        density_scale = np_cker_bounded_norm(KERNEL_den, grid[m], h, lb, ub).
+          density_scale;
+        fit += density_scale*
+          np_cker_base_eval(KERNEL_den, (grid[m] - train_x[i])/h) /
+          (double)num_obs;
       }
     }
 
@@ -24535,17 +25037,18 @@ static int np_density_cvls_bounded_i1_quadrature_general(const int KERNEL_den,
             ((BANDWIDTH_den == BW_GEN_NN) ? b : i);
           const double h = matrix_bandwidth[d][bw_idx];
           const double eval_x = eval_xcon[d][b];
-          const double invnorm =
-            np_cker_invnorm(KERNEL_den,
-                            eval_x,
-                            h,
-                            vector_ckerlb_extern[d],
-                            vector_ckerub_extern[d]);
+          double density_scale;
 
           if(!(h > 0.0) || !isfinite(h))
             goto cleanup_density_bounded_quad_general;
-          prod *= invnorm*np_cker_base_eval(KERNEL_den,
-                                            (eval_x - matrix_X_continuous[d][i])/h)/h;
+          density_scale =
+            np_cker_bounded_norm(KERNEL_den,
+                                 eval_x,
+                                 h,
+                                 vector_ckerlb_extern[d],
+                                 vector_ckerub_extern[d]).density_scale;
+          prod *= density_scale*np_cker_base_eval(
+            KERNEL_den, (eval_x - matrix_X_continuous[d][i])/h);
         }
 
         for(l = 0; l < nuno; l++)
@@ -24725,6 +25228,7 @@ static int np_conditional_y_eval_any_block_stream_core(double *vector_scale_fact
                                                        double **matrix_Y_unordered_eval,
                                                        double **matrix_Y_ordered_eval,
                                                        double **matrix_Y_continuous_eval,
+                                                       int suppress_nn_parallel,
                                                        double **rows_out){
   int b;
 
@@ -24740,7 +25244,7 @@ static int np_conditional_y_eval_any_block_stream_core(double *vector_scale_fact
                                                       matrix_Y_ordered_eval,
                                                       matrix_Y_continuous_eval,
                                                       block_rows,
-                                                      0,
+                                                      suppress_nn_parallel,
                                                       rows_out);
   }
 
@@ -24753,6 +25257,7 @@ static int np_conditional_y_eval_any_block_stream_core(double *vector_scale_fact
                                                 matrix_Y_continuous_eval,
                                                 block_rows,
                                                 0,
+                                                suppress_nn_parallel,
                                                 rows_out[b]) != 0)
       return 1;
   }
@@ -24876,18 +25381,48 @@ static int np_conditional_density_cvls_bounded_i1_quadrature_general_row_stream(
     if(use_parallel_blocks && ((block_id % iNum_Processors) != my_rank))
       continue;
 
+    if(BANDWIDTH_den_extern == BW_GEN_NN){
+      if(np_conditional_x_weight_block_stream_core_suppress(vector_scale_factor,
+                                                            i0,
+                                                            ib,
+                                                            use_parallel_blocks,
+                                                            xblock) != 0){
+        local_fail = 1;
+      }
+      if((i1_mode == NP_BOUNDED_CVLS_I1_MODE_FULL) &&
+         (np_conditional_x_weight_block_full_stream_core_suppress(vector_scale_factor,
+                                                                  i0,
+                                                                  ib,
+                                                                  use_parallel_blocks,
+                                                                  xblock_full) != 0))
+        local_fail = 1;
+    } else {
+      for(b = 0; b < ib; b++){
+        const int i = i0 + b;
+
+        if(np_conditional_x_weight_row_stream_core_suppress(vector_scale_factor,
+                                                            i,
+                                                            use_parallel_blocks,
+                                                            xblock[b]) != 0){
+          local_fail = 1;
+          break;
+        }
+        if((i1_mode == NP_BOUNDED_CVLS_I1_MODE_FULL) &&
+           (np_conditional_x_weight_row_full_stream_core_suppress(vector_scale_factor,
+                                                                  i,
+                                                                  use_parallel_blocks,
+                                                                  xblock_full[b]) != 0)){
+          local_fail = 1;
+          break;
+        }
+      }
+    }
+    if(local_fail)
+      break;
+
     for(b = 0; b < ib; b++){
       const int i = i0 + b;
 
-      if(np_conditional_x_weight_row_stream_core(vector_scale_factor, i, xblock[b]) != 0){
-        local_fail = 1;
-        break;
-      }
-      if((i1_mode == NP_BOUNDED_CVLS_I1_MODE_FULL) &&
-         (np_conditional_x_weight_row_full_stream_core(vector_scale_factor, i, xblock_full[b]) != 0)){
-        local_fail = 1;
-        break;
-      }
       if(np_conditional_yrow_from_ctx(&yctx, i, yrow) != 0){
         local_fail = 1;
         break;
@@ -24922,6 +25457,7 @@ static int np_conditional_density_cvls_bounded_i1_quadrature_general_row_stream(
                                                      eval_yuno,
                                                      eval_yord,
                                                      eval_ycon,
+                                                     use_parallel_blocks,
                                                      yevalblock) != 0){
         local_fail = 1;
         break;
@@ -25577,6 +26113,7 @@ static int np_conditional_distribution_cvls_lp_all_large_stream(double *vector_s
                                                 matrix_Y_continuous_eval_extern,
                                                 num_eval,
                                                 cdfontrain_extern && (num_eval == ctx.num_train),
+                                                0,
                                                 yint) != 0)
       goto cleanup_cdist_all_large;
 
@@ -26245,6 +26782,7 @@ static int np_conditional_distribution_cvls_lp_row_stream(double *vector_scale_f
                                                     matrix_Y_continuous_eval_extern,
                                                     num_eval,
                                                     cdfontrain_extern && (num_eval == num_train),
+                                                    0,
                                                     yint) != 0)
           goto cleanup_cdist_lp_stream;
       }

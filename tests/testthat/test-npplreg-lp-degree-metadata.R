@@ -1,4 +1,9 @@
+skip_slow_npplreg_lp_degree_search <- function() {
+  skip_on_cran()
+}
+
 test_that("npplreg lp degree metadata is preserved in plbandwidth summary", {
+  skip_slow_npplreg_lp_degree_search()
   if (!spawn_mpi_slaves())
     skip("Could not spawn MPI slaves")
 

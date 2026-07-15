@@ -75,16 +75,18 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
   \item{txdat}{
     a \eqn{p}-variate data frame of explanatory data (training data) used to
-    calculate the regression estimators. Defaults to the training data used to
-    compute the bandwidth object.
+    calculate the regression estimators. Defaults to the corresponding
+    training data recoverable from the bandwidth object in the current
+    session.
   }
 
 
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{txdat}. Defaults to the training data used to
-    compute the bandwidth object.
+    \code{txdat}. Defaults to the corresponding
+    training data recoverable from the bandwidth object in the current
+    session.
   }
 
   \item{object}{
@@ -242,7 +244,10 @@ prediction/evaluation route, or plot route as appropriate.
   of the dependent variable using the same selected conditional CDF
   estimator that is later used for quantile standard errors and gradients.
   The arguments \code{tol}, \code{small}, and \code{itmax} control this
-  one-dimensional refinement.
+  one-dimensional refinement. Conditional quantile inversion requires a
+  monotone dependent-variable conditional distribution estimate; therefore
+  \code{npqreg} supports \code{cykerorder = 2} for this route and rejects
+  higher-order dependent-variable CDF kernels, which can be nonmonotone.
 
   Let \eqn{f(y|x) = \partial F(y|x)/\partial y} denote the conditional
   density. The asymptotic standard error of the conditional quantile is
@@ -401,6 +406,14 @@ prediction/evaluation route, or plot route as appropriate.
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work as
   intended on mixed data types and will coerce the data to the same
   type.
+
+  When reusing a bandwidth object without explicit training or evaluation
+  data, the required data are recovered from object-retained state or
+  from the stored call environment when available. This is a convenience
+  for ordinary same-session use, not a guarantee that a saved object is
+  self-contained. For reproducible replay after \code{saveRDS()} and
+  \code{readRDS()} in a fresh R session, supply the required data
+  arguments explicitly.
 }
 
 \seealso{
