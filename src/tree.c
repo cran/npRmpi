@@ -79,6 +79,8 @@ void build_kdtree(double ** p, int nump, int ndim, int nbucket, int * ip, KDT **
   *kdt = (KDT *)np_tree_malloc_array_or_die(1, sizeof(KDT), "build_kdtree");
 
   kdx = *kdt;
+  kdx->kdn = NULL;
+  kdx->bb = NULL;
 
   kdx->kdn = (KDN *)np_tree_malloc_array_or_die((size_t)numnode, sizeof(KDN), "build_kdtree kdn");
 
@@ -424,7 +426,7 @@ void mirror_nl(NL * restrict nla, NL * restrict nlb){
   nlb->n = nla->n; 
 }
 
-void mirror_xl(XL * restrict xla, XL * restrict xlb){
+void mirror_xl(const XL * restrict xla, XL * restrict xlb){
   if(xla->n > xlb->nalloc){
     xlb->istart = realloc_int_or_die(xlb->istart, (size_t) (1+xla->n));
     xlb->nlev = realloc_int_or_die(xlb->nlev, (size_t) (1+xla->n));
@@ -435,8 +437,8 @@ void mirror_xl(XL * restrict xla, XL * restrict xlb){
     xlb->istart[i] = xla->istart[i];
     xlb->nlev[i] = xla->nlev[i];
   }
-  
-  xlb->n = xla->n; 
+
+  xlb->n = xla->n;
 }
 
 void merge_end_xl(XL * restrict xl, KDN * restrict kdn){

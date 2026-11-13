@@ -36,7 +36,8 @@ npcdist(bws,
         proper = FALSE,
         proper.method = c("isotonic"),
         proper.control = list(),
-        \dots)
+        \dots,
+        se = FALSE)
 
 \method{npcdist}{default}(bws, 
         txdat, 
@@ -66,6 +67,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object coercible to
     a data frame by \code{\link{as.data.frame}}) containing the
     variables in the model. If not found in data, the variables are
@@ -130,6 +138,19 @@ These arguments control where the fitted conditional distribution is evaluated a
   }
 
 
+  \item{se}{
+    logical scalar, default \code{FALSE}. If \code{TRUE}, compute and retain
+    available asymptotic standard errors of fitted values and, when
+    \code{gradients = TRUE}, of the requested gradients. If \code{FALSE},
+    skip uncertainty-only computation; point estimates and gradients are
+    unchanged. Unavailable derivative errors remain \code{NA} when requested.
+    To obtain errors without repeating bandwidth selection, refit using
+    \code{npcdist(bws = fit$bws, se = TRUE)}; also supply
+    \code{gradients = TRUE} for gradient errors. Explicit training data may
+    be supplied if they are no longer recoverable from the bandwidth object.
+    The argument must be named.
+  }
+
   \item{gradients}{
     a logical value specifying whether to return estimates of the
     gradients at the evaluation points. Defaults to \code{FALSE}.
@@ -143,8 +164,12 @@ These arguments control where the fitted conditional distribution is evaluated a
     be supplied per continuous explanatory variable. The default
     \code{1L} returns first derivatives. Higher orders are available
     for continuous explanatory variables only and must not exceed the
-    corresponding local-polynomial degree; unordered and ordered
-    predictors retain their usual first-order discrete effects.
+    corresponding local-polynomial degree, apart from the established
+    all-degree-zero first-derivative compatibility route. An unavailable continuous
+    component is returned as \code{NA}; plotting retains it as an empty panel
+    when another continuous derivative or categorical effect is available.
+    A request for which no component is available is rejected. Unordered and
+    ordered predictors retain their usual first-order discrete effects.
   }
 
 
@@ -163,6 +188,12 @@ These arguments control optional post-estimation properization of the fitted con
     a logical value specifying whether to post-process the estimated
     conditional distribution so that it is monotone and bounded on the
     evaluation grid. Defaults to \code{FALSE}.
+    Local-constant or degree-zero fits bypass correction only when their
+    kernels and bandwidth geometry guarantee a convex mixture of proper
+    response CDFs. Signed kernels and generalized-nearest-neighbour response
+    bandwidths do not have this guarantee. Requested correction then uses
+    the existing supported grid or slice procedure, with its additional
+    evaluation cost and support requirements.
   }
 
 
@@ -170,6 +201,11 @@ These arguments control optional post-estimation properization of the fitted con
     a named list of control parameters for properization. Supported
     entries are \code{tol}, \code{grid.check}, \code{store.raw}, and
     \code{fail.on.unsupported}.
+    Resolved controls are retained in fitted objects and inherited by
+    \code{predict()} and \code{plot()} unless explicitly replaced. An
+    explicit control list replaces the retained list; unspecified entries
+    then use their defaults. Prediction still errors on unsupported
+    correction unless \code{fail.on.unsupported=FALSE} is explicitly supplied.
   }
 
 
@@ -201,6 +237,57 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
 
 }
 \details{
+  Conditional fitting and replay use the literal categorical kernels for
+  both explanatory and response variables. Near-upper categorical bandwidths
+  are not replaced by approximate constant factors. The same target is used
+  for levels, gradients, standard errors, conditional hats, and reconstructed
+  plot uncertainty. This conditional-family policy does not change direct
+  regression or unconditional kernel-sum evaluation and does not modify the
+  caller's \code{np.largelambda} option.
+
+  With generalized nearest-neighbor bandwidths, query identity matters when
+  selecting a radius: a training observation excludes its own occurrence,
+  whereas explicit evaluation data remain external queries even if their
+  values equal training observations. Consequently,
+  \code{predict(fit, newdata = training.data)} can differ from
+  \code{fitted(fit)}. This does not omit the training contribution from the
+  fitted estimator. See \code{\link{np.kernels}} for the radius convention.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} is split into
+  \code{exdat} and \code{eydat} using the retained predictor and response
+  column names. Names must identify both roles unambiguously;
+  explicitly supplied native evaluation arguments take precedence. This
+  evaluates at the requested rows without repeating bandwidth selection.
+
+  For explicit external evaluation rows, a completed explanatory-kernel row
+  whose weights are all zero has no conditional estimate. Such rows return
+  \code{NA} for the fitted value and requested uncertainty or derivatives,
+  with one notice. A missing categorical counterfactual affects only its
+  contrast; it does not invalidate an otherwise supported base estimate.
+  A zero response-kernel contribution is not a missing explanatory row.
+  Supported rows retain their usual computation. Required internal evaluations
+  remain strict. With \code{proper = TRUE}, complete unsupported fixed-X
+  slices retain \code{NA}; projection still applies to supported slices.
+
   Documentation guide: see \code{\link{npcdistbw}} for bandwidth selection and search controls, \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
   When \code{bws} is omitted, the formula and default methods call
@@ -208,6 +295,38 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
   from \code{\dots} to that call. When \code{bws} is already a
   \code{condbandwidth} object, \code{npcdist} estimates with the stored
   bandwidth metadata in that object.
+
+  Beta associated kernels may be selected independently for explanatory X
+  coordinates (\code{cxkertype="beta"}) and response Y coordinates
+  (\code{cykertype="beta"}). Orders 2, 4, 6, and 8, fixed/generalized-NN/
+  adaptive-NN bandwidths, explicit finite bounds, sample-range bounds, and
+  automatic \code{cv.ls} bandwidth selection are supported. Beta kernels act on continuous
+  coordinates alongside the kernels for categorical coordinates.
+  Local-constant, local-linear and local-polynomial fits are supported.
+  For local-constant fits, analytic first derivatives with respect to continuous X
+  coordinates are available with \code{gradients=TRUE}; the Y-side CDF factor
+  itself is not differentiated. Fixed/adaptive order-2 Y CDF
+  factors are proper on their declared support; generalized-NN order-2 curves
+  may be locally nonmonotone, and signed orders 4, 6, and 8 may also leave
+  \eqn{[0,1]}. No clipping or monotone repair is applied. At exact beta-X
+  endpoints, numerator and denominator jumps are cancelled before classifying
+  the conditional-distribution gradient. A constant Y CDF factor (in
+  particular at its exact support endpoints) gives a structural zero
+  gradient. Genuine ratio jumps are reported as signed infinities and
+  indeterminate numerical cancellations as \code{NA}, with warnings.
+  Returned infinities retain that extended-real meaning. Plot methods convert
+  them to missing geometry only in a temporary drawing copy, leaving fitted
+  and plot-data objects unchanged.
+  For ordinary conditional-distribution level plots, bootstrap intervals
+  support different continuous X- and Y-side kernel families or orders,
+  including beta on either side. Beta-containing bootstrap levels use the
+  same signed log-domain conditional ratio as the fitted estimator. With
+  non-fixed bandwidths, \code{np_boot_control(nonfixed="exact")} reconstructs
+  each duplicate-row resample and recomputes its nearest-neighbour bandwidths,
+  while \code{nonfixed="frozen"} keeps the original fitted bandwidths. In both
+  modes, resolved beta \code{"range"} support bounds are replayed from the
+  bandwidth object rather than recomputed from bootstrap counts. This
+  mixed-family level-bootstrap support does not alter the separate restrictions on gradient, quantile, or bias-corrected centers.
 
   With finite continuous response bounds, \code{npcdist} uses the
   observation-centered truncated-kernel CDF documented in
@@ -261,18 +380,91 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
   expand missing settings to the same documented preset. Explicit
   incompatible settings fail fast rather than being silently rewritten.
 
+  With a raw polynomial basis, high powers of poorly scaled continuous
+  predictors (such as uncentred calendar years) can produce severely
+  ill-conditioned systems. Conditional local-polynomial fits do not apply
+  the design-conditioning rejection used by \code{npreg}; they may return
+  inaccurate finite values without a warning, with or without a ridge
+  adjustment. Centre or scale such predictors before fitting and apply the
+  same transformation to all evaluation or prediction data. The explicit
+  \code{bernstein.basis = TRUE} representation is another option for
+  improving conditioning. Check numerical stability for the chosen data,
+  degree and bandwidths. \code{proper = TRUE} enforces probability-shape
+  constraints; it does not repair an ill-conditioned polynomial solve.
+
   With \code{regtype = "lp"}, \code{gradients = TRUE} and
   \code{gradient.order} greater than one expose higher-order derivative
   estimates with respect to continuous explanatory variables. These
   derivatives use the same local-polynomial basis, degree, Bernstein
   option, bandwidths, and kernels as the fitted conditional
-  distribution. Asymptotic standard errors for these higher-order
-  derivative columns are not currently reported; the corresponding
-  entries of \code{congerr} are \code{NA}. Use bootstrap intervals when
-  inference on higher-order derivatives is required.
+  distribution. See \code{\link{npreg}} for the complete heterogeneous
+  GLP multi-index and Bernstein-representation definitions shared by these
+  routes. With \code{se = TRUE}, available higher-order derivative
+  columns for fixed and adaptive nearest-neighbour bandwidths also have
+  standard errors. These combine the existing local pseudo-response
+  variance with the squared norm of the actual derivative weighting row,
+  including its accepted ridge adjustment. They condition on the selected
+  bandwidths, neighbour radii and local-polynomial map; they do not account
+  for their selection uncertainty. Generalized nearest-neighbour higher-order
+  point derivatives remain subject to the existing hat-operator restriction.
+  Bootstrap inference remains recommended.
+
+  With positive-degree local-polynomial fits (including local-linear fits),
+  numerical ridging follows the policies described in \code{\link{npreg}}
+  (Seifert and Gasser, 2000). The conditional pseudo-response uncertainty
+  formulas here are distinct from ordinary regression's residual normalization.
+
+  With positive-degree local-polynomial fits (including local-linear fits),
+  categorical first-difference standard errors use paired endpoint influence
+  calculations. The covariance between the two category endpoints is retained,
+  not replaced by the sum of their marginal variances. These calculations
+  condition on the selected basis, smoothing parameters and realized neighbour
+  radii for all three bandwidth types. They run only when both
+  \code{gradients = TRUE} and \code{se = TRUE} request them. A nonsmooth
+  regularization boundary or nonfinite influence gives \code{NA} uncertainty
+  with a notice, without changing the point contrast.
+
+  For ordinary scalar fits, leading interior standard errors use the squared
+  X-kernel moment; conditional density errors additionally use the independent
+  Y-kernel moment. Analytic first-derivative errors for fixed and generalized
+  nearest-neighbour bandwidths with Gaussian or Epanechnikov kernels use the
+  squared derivative-kernel moment and the X bandwidth. These formulas do not
+  establish uniform-kernel derivative inference or full adaptive-NN inference
+  with estimated random radii. Positive-degree local-polynomial fits use
+  their separate covariance calculation.
+
+  For fixed and generalized nearest-neighbour scalar fits with categorical
+  variables, these leading moments retain squared categorical kernel factors
+  and the joint training-category frequencies. Conditional distributions,
+  and conditional densities with no continuous response, retain the
+  numerator--denominator covariance of the ratio estimator. In particular,
+  a constant response-kernel contribution has zero conditional variance.
+  Purely categorical fits use this ratio covariance without a continuous
+  bandwidth factor, including nearest-neighbour-labelled bandwidth objects.
+  Beta-kernel and positive-degree local-polynomial covariance calculations
+  retain their separate targets.
+
+  For scalar adaptive nearest-neighbour fits with any continuous variable,
+  requested level and available continuous first-derivative standard errors
+  use the complete empirical influence of the conditional ratio. They retain
+  the actual normalized X weights and continuous/categorical Y contributions,
+  including numerator and denominator derivatives. This working covariance
+  holds the selected model, observed X geometry and realized response
+  nearest-neighbour radii fixed; it does not account for their sampling or
+  selection uncertainty. Local-constant-equivalent degree-zero fits share
+  this calculation, including continuous responses with categorical-only X.
+  Positive-degree local-polynomial, beta-kernel and paired categorical-
+  contrast errors retain their separate covariance calculations. With
+  \code{se = FALSE}, the additional uncertainty pass is not performed.
 
 }
 \value{
+  The \code{se} component records whether uncertainty was requested.
+  \code{conderr} and \code{congerr} are \code{NULL} when \code{se = FALSE}.
+  \code{se()} and \code{gradients(..., se = TRUE)} only extract stored
+  results and give a no-search refit message when the errors were omitted.
+  \code{predict(..., se.fit = TRUE)} explicitly requests the needed errors.
+
   \code{npcdist} returns a \code{condistribution} object. The generic
   accessor functions \code{\link{fitted}}, \code{\link{se}}, and
   \code{\link{gradients}}, extract estimated values, asymptotic standard
@@ -289,18 +481,22 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
   \item{xeval}{ the evaluation points of the explanatory data }
   \item{yeval}{ the evaluation points of the dependent data }
   \item{condist}{ estimates of the conditional cumulative
-    distribution at the evaluation points }
-  \item{conderr}{ standard errors of the cumulative conditional distribution
-    estimates }
+    distribution at the evaluation points. An evaluation row whose required
+    explanatory normalization is exactly zero or non-finite is returned as
+    \code{NA}; other rows remain available. }
+  \item{conderr}{ when \code{se = TRUE}, standard errors of the cumulative conditional distribution
+    estimates. Undefined normalization rows are returned as \code{NA}. }
   \item{congrad}{ if invoked with \code{gradients = TRUE}, estimates of
     the gradients at the evaluation points. For local-polynomial fits,
     continuous-coordinate derivative orders are controlled by
-    \code{gradient.order}. }
-  \item{congerr}{ if invoked with \code{gradients = TRUE}, standard
-    errors of the gradients at the evaluation points. Higher-order
-    continuous-coordinate derivative standard errors are currently
-    returned as \code{NA}; bootstrap inference is preferred for those
-    targets. }
+    \code{gradient.order}. Undefined normalization rows are returned as
+    \code{NA}. }
+  \item{congerr}{ if invoked with \code{gradients = TRUE} and
+    \code{se = TRUE}, standard
+    errors of the gradients at the evaluation points, including available
+    higher-order continuous derivatives under the working-covariance
+    assumptions described above. Undefined normalization or uncertainty
+    rows are returned as \code{NA}. }
   \item{log_likelihood}{ log likelihood of the cumulative conditional distribution estimate }
 
 }
@@ -314,6 +510,19 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
   conditional CDFs are also the object inverted by \code{\link{npqreg}}
   when computing conditional quantiles.
 
+  Scalar conditional fits involving beta kernels use the empirical
+  observation-influence covariance. For normalized explanatory weights
+  \eqn{a_i}, response-kernel contributions \eqn{z_i}, and fitted value
+  \eqn{m}, the level variance is
+  \eqn{\{n/(n-1)\}\sum_i [a_i(z_i-m)]^2}, using the full training count
+  \eqn{n}. Supported continuous-derivative errors use the corresponding
+  differentiated influence. Categorical contrasts use the difference of the
+  two endpoints' observation influences inside the same squared norm, thereby
+  retaining their covariance; self-contrasts have zero variance.
+  These calculations hold the selected bandwidth
+  state fixed; they do not add bandwidth-selection or random-NN-radius
+  uncertainty, and do not replace positive-degree LP covariance.
+
   For book-length derivations, see Li and Racine (2007), Chapter 6
   \emph{Conditional CDF and Quantile Estimation}, especially Sections 6.1,
   6.2, and 6.5, together with Chapter 5 \emph{Conditional Density
@@ -326,6 +535,19 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
 
   Aitchison, J. and C.G.G. Aitken (1976), \dQuote{Multivariate binary
     discrimination by the kernel method,} Biometrika, 63, 413-420.
+
+  Chen, S.X. (1999), \dQuote{Beta kernel estimators for density functions,}
+  Computational Statistics & Data Analysis, 31(2), 131--145.
+  doi:10.1016/S0167-9473(99)00010-9.
+
+  Igarashi, G. and Kakizawa, Y. (2020), \dQuote{Higher-order bias corrections
+  for asymmetric kernel density estimators,} Journal of Nonparametric
+  Statistics, 32(3), 716--752. doi:10.1080/10485252.2020.1770754.
+
+  Mansouri, B., Rastin, A., and Allah Mombeni, H. (2024), \dQuote{Beta Kernel
+  Estimator for a Cumulative Distribution Function with Bounded Support,}
+  Journal of Sciences, Islamic Republic of Iran, 34(4), 349--361.
+  doi:10.22059/jsciences.2024.367933.1007836.
 
   Hall, P. and J.S. Racine and Q. Li (2004), \dQuote{Cross-validation and the
     estimation of conditional probability densities,} Journal of the
@@ -368,13 +590,40 @@ Further arguments are passed to \code{\link{npcdistbw}} when bandwidths are comp
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
+}
+
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{
@@ -411,8 +660,11 @@ summary(Fhat)
 ## Variations on local polynomial conditional distribution estimation
 ## with proper = TRUE.
 
+# Work in years relative to 1975 to condition the raw polynomial basis.
+# Calendar year = model year + year.offset, also for prediction data.
+year.offset <- 1975
 Italy2 <- within(Italy, {
-  year <- as.numeric(as.character(year))
+  year <- as.numeric(as.character(year)) - year.offset
 })
 
 ## Plot only: make the plotted surface proper on the plot evaluation grid.
@@ -451,7 +703,7 @@ g.grid <- seq(min(Italy2$gdp), max(Italy2$gdp), length.out = 200)
 
 nd_grid <- expand.grid(
   gdp = g.grid,
-  year = c(1955, 1975, 1995)
+  year = c(1955, 1975, 1995) - year.offset
 )
 
 pred_grid <- predict(Fhat, newdata = nd_grid, proper = TRUE)
@@ -465,8 +717,8 @@ g2 <- seq(quantile(Italy2$gdp, 0.30),
           quantile(Italy2$gdp, 0.90), length.out = 35)
 
 nd_slice <- rbind(
-  data.frame(gdp = g1, year = rep(1960, length(g1))),
-  data.frame(gdp = g2, year = rep(1985, length(g2)))
+  data.frame(gdp = g1, year = rep(1960 - year.offset, length(g1))),
+  data.frame(gdp = g2, year = rep(1985 - year.offset, length(g2)))
 )
 
 pred_slice <- predict(

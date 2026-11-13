@@ -1,3 +1,27 @@
+.np_conditional_replay_proper <- function(object, dots, prediction = FALSE) {
+  if (is.null(dots[["proper", exact = TRUE]]) &&
+      isTRUE(object[["proper.requested", exact = TRUE]]))
+    dots$proper <- TRUE
+  if (!isTRUE(dots[["proper", exact = TRUE]]))
+    return(dots)
+  supplied.control <- dots[["proper.control", exact = TRUE]]
+  if (is.null(supplied.control))
+    dots$proper.control <- object[["proper.control", exact = TRUE]]
+  if (is.null(dots[["proper.method", exact = TRUE]]))
+    dots$proper.method <- object[["proper.method", exact = TRUE]]
+  if (prediction) {
+    ctrl <- dots[["proper.control", exact = TRUE]]
+    if (is.null(ctrl)) ctrl <- list()
+    # Fitting may allow unsupported correction; prediction remains fail-closed
+    # unless this prediction explicitly chooses otherwise.
+    if (is.null(supplied.control) ||
+        (is.list(supplied.control) && is.null(supplied.control$fail.on.unsupported)))
+      ctrl$fail.on.unsupported <- TRUE
+    dots$proper.control <- ctrl
+  }
+  dots
+}
+
 .np_condens_proper_shadow_enabled <- function() {
   isTRUE(getOption("np.condens.proper.shadow", FALSE))
 }
@@ -197,11 +221,9 @@
 }
 
 .np_condens_numeric_equal <- function(a, b, tol) {
-  if (anyNA(c(a, b)))
-    return(isTRUE(all.equal(a, b, tolerance = 0, check.attributes = FALSE)))
-  if (!is.finite(a) || !is.finite(b))
-    return(identical(a, b))
-  abs(a - b) <= tol + tol * max(abs(a), abs(b), 1)
+  # Conditioning identity is exact, not a numerical convergence criterion.
+  # An arbitrary coordinate origin must not merge distinct model slices.
+  identical(a, b)
 }
 
 .np_condens_x_rows_match <- function(xeval, i, j, tol) {
@@ -417,9 +439,70 @@
   )
 }
 
+.np_conditional_proper_row_flags <- function(object, n, base = TRUE) {
+  key <- if (base) ".np.empty.base.rows" else ".np.empty.rows"
+  flags <- attr(object, key, exact = TRUE)
+  if (is.null(flags)) return(NULL)
+  if (!is.integer(flags) || length(flags) != n ||
+      anyNA(flags) || any(!flags %in% 0:1))
+    stop("invalid conditional proper empty-row metadata", call. = FALSE)
+  if (any(flags == 1L)) flags else NULL
+}
+
+.np_conditional_proper_empty_slices <- function(object, slices, n) {
+  flags <- .np_conditional_proper_row_flags(object, n)
+  if (is.null(flags)) return(NULL)
+  empty <- vapply(slices, function(idx) {
+    values <- flags[idx]
+    if (!length(values) || any(values != values[[1L]]))
+      stop("conflicting base support within a conditional proper X slice",
+           call. = FALSE)
+    values[[1L]]
+  }, integer(1))
+  if (any(empty == 1L)) empty else NULL
+}
+
+.np_conditional_proper_projection_slices <- function(values, plan, empty.slices) {
+  if (!is.null(dim(values)))
+    stop("empty-slice permission is not valid for matrix/bootstrap projection",
+         call. = FALSE)
+  if (!is.integer(empty.slices) ||
+      length(empty.slices) != length(plan$slices) ||
+      anyNA(empty.slices) || any(!empty.slices %in% 0:1))
+    stop("invalid conditional proper empty-slice permission", call. = FALSE)
+  for (idx in plan$slices[empty.slices == 1L]) {
+    if (any(!is.na(values[idx])))
+      stop("non-missing values contradict conditional proper empty-slice status",
+           call. = FALSE)
+  }
+  plan$slices[empty.slices == 0L]
+}
+
+.np_conditional_proper_slice_rows <- function(object, grid.fit, grid.eval, n) {
+  source <- .np_conditional_proper_empty_slices(object, grid.eval$groups, n)
+  child <- .np_conditional_proper_empty_slices(
+    grid.fit, grid.eval$grid.slices, nrow(grid.eval$exdat))
+  if (!identical(unname(source), unname(child)))
+    stop("conditional proper slice evaluation changed base-X support",
+         call. = FALSE)
+  out <- list()
+  for (base in c(TRUE, FALSE)) {
+    flags <- .np_conditional_proper_row_flags(
+      grid.fit, nrow(grid.eval$exdat), base)
+    if (is.null(flags)) next
+    mapped <- integer(n)
+    for (i in seq_along(grid.eval$groups))
+      if (any(flags[grid.eval$grid.slices[[i]]] == 1L))
+        mapped[grid.eval$groups[[i]]] <- 1L
+    attr(out, if (base) ".np.empty.base.rows" else ".np.empty.rows") <- mapped
+  }
+  out
+}
+
 .np_condens_project_values_with_plan <- function(values,
                                                  plan,
-                                                 progress.label = NULL) {
+                                                 progress.label = NULL,
+                                                 empty.slices = NULL) {
   if (!isTRUE(plan$supported))
     stop("proper projection plan is not supported")
 
@@ -433,6 +516,9 @@
   if (ncol(values.mat) != sum(lengths(plan$slices)))
     stop("value length mismatch for proper density projection")
 
+  slices <- plan$slices
+  if (!is.null(empty.slices))
+    slices <- .np_conditional_proper_projection_slices(values, plan, empty.slices)
   out <- values.mat
   progress <- NULL
   if (!is.vector.input && !is.null(progress.label) && nrow(values.mat) > 1L) {
@@ -443,7 +529,7 @@
     on.exit(.np_plot_progress_end(progress), add = TRUE)
   }
   for (row in seq_len(nrow(values.mat))) {
-    for (idx in plan$slices) {
+    for (idx in slices) {
       out[row, idx] <- .np_condens_project_weighted_simplex(
         f = values.mat[row, idx],
         w = plan$weights,
@@ -477,12 +563,18 @@
   }
 
   raw <- as.double(object$condens)
-  repaired <- .np_condens_project_values_with_plan(raw, plan)
+  empty.slices <- .np_conditional_proper_empty_slices(object, plan$slices, length(raw))
+  repaired <- .np_condens_project_values_with_plan(raw, plan, empty.slices = empty.slices)
   negative.count.raw <- integer(length(plan$slices))
   integral.raw <- numeric(length(plan$slices))
   projection.distance <- numeric(length(plan$slices))
 
   for (i in seq_along(plan$slices)) {
+    if (!is.null(empty.slices) && empty.slices[[i]] == 1L) {
+      negative.count.raw[i] <- NA_integer_
+      integral.raw[i] <- projection.distance[i] <- NA_real_
+      next
+    }
     idx <- plan$slices[[i]]
     f.slice <- raw[idx]
     g.slice <- repaired[idx]
@@ -491,8 +583,9 @@
     projection.distance[i] <- sqrt(sum(plan$weights * (g.slice - f.slice)^2))
   }
 
+  all.empty <- !is.null(empty.slices) && all(empty.slices == 1L)
   info <- .np_condens_make_reason_info(
-    reason = "applied",
+    reason = if (all.empty) "all_slices_empty" else "applied",
     supported = TRUE,
     slice.count = length(plan$slices),
     grid.common = TRUE,
@@ -500,6 +593,10 @@
     integral.raw = integral.raw,
     projection.distance.l2 = projection.distance
   )
+  if (!is.null(empty.slices))
+    info$empty.slice.count <- sum(empty.slices)
+  if (all.empty)
+    return(list(applied = FALSE, reason = "all_slices_empty", proper.info = info))
 
   list(
     applied = TRUE,
@@ -531,7 +628,7 @@
     proper.method = proper.method,
     proper.control = proper.control
   )
-  if (isTRUE(grid.out$applied))
+  if (isTRUE(grid.out$applied) || identical(grid.out$reason, "all_slices_empty"))
     return(grid.out)
 
   if (!identical(proper.control$mode, "slice"))
@@ -561,6 +658,7 @@
   object$proper.requested <- args$proper.requested
   object$proper.applied <- FALSE
   object$proper.method <- if (isTRUE(args$proper.requested)) args$proper.method else NULL
+  object$proper.control <- if (isTRUE(args$proper.requested)) args$proper.control else NULL
   object$condens.raw <- NULL
   object$proper.info <- .np_condens_make_reason_info(
     reason = if (isTRUE(args$proper.requested)) "pending" else "not_requested",
@@ -592,6 +690,11 @@
     proper.control = args$proper.control,
     slice.context = slice.context
   )
+  for (key in c(".np.empty.base.rows", ".np.empty.rows")) {
+    incoming <- attr(proper.out, key, exact = TRUE)
+    if (!is.null(incoming))
+      attr(object, key) <- .npreg_merge_empty_rows(attr(object, key, exact = TRUE), incoming)
+  }
 
   if (!isTRUE(proper.out$applied)) {
     object$proper.info <- proper.out$proper.info

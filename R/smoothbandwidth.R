@@ -1,7 +1,19 @@
- .np_scbandwidth_manual_nn_validate <- function(bw, nobs, where = "scbandwidth") {
-  vapply(bw, function(h) {
+ .np_scbandwidth_manual_nn_validate <- function(bw, nobs, icon = NULL,
+                                                where = "scbandwidth") {
+  if (is.null(icon)) {
+    icon <- rep_len(TRUE, length(bw))
+  } else {
+    icon <- as.logical(icon)
+    if (length(icon) != length(bw) || anyNA(icon))
+      stop(sprintf("%s: invalid nearest-neighbor coordinate map", where),
+           call. = FALSE)
+  }
+
+  out <- as.double(bw)
+  out[icon] <- vapply(out[icon], function(h) {
     .np_sibandwidth_manual_nn_validate(h = h, nobs = nobs, where = where)
   }, numeric(1))
+  out
 }
 
 scbandwidth <-
@@ -13,7 +25,7 @@ scbandwidth <-
            bwmethod = c("cv.ls", "manual"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           ckertype = c("gaussian","epanechnikov","uniform"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -64,9 +76,6 @@ scbandwidth <-
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
 
-  if (ckertype == "truncated gaussian" && ckerorder != 2)
-    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
-
   ukertype = match.arg(ukertype)
   okertype = match.arg(okertype)
 
@@ -86,23 +95,22 @@ scbandwidth <-
   if (bwtype != "fixed" && cbounds$bound != "none" && !bounded_nonfixed_supported)
     stop("finite continuous kernel bounds require bwtype = \"fixed\"")
   if (bwtype != "fixed" && (!bandwidth.compute || any(bw != 0)))
-    bw <- .np_scbandwidth_manual_nn_validate(bw = bw, nobs = nobs, where = "scbandwidth")
+    bw <- .np_scbandwidth_manual_nn_validate(
+      bw = bw, nobs = nobs, icon = tdati$icon, where = "scbandwidth"
+    )
   ncon <- sum(tdati$icon)
   degree <- npValidateGlpDegree(regtype = regtype,
                                 degree = degree,
                                 ncon = ncon)
   bernstein.basis <- npValidateGlpBernstein(regtype = regtype,
                                             bernstein.basis = bernstein.basis)
-  if (identical(regtype, "lp") && ncon > 0L && is.finite(nobs)) {
-    lp.dim <- dim_basis(basis = basis,
-                        kernel = TRUE,
-                        degree = degree,
-                        segments = rep.int(1L, ncon))
-    if (is.finite(lp.dim) && lp.dim > (nobs - 1.0))
-      stop(sprintf("LP basis dimension (%s) exceeds nobs - 1 (%s); reduce degree",
-                   format(lp.dim, trim = TRUE, scientific = FALSE),
-                   format(nobs - 1.0, trim = TRUE, scientific = FALSE)))
-  }
+  if (identical(regtype, "lp") && ncon > 0L && is.finite(nobs))
+    npValidateLpBasisAdmission(
+      basis = basis,
+      degree = degree,
+      nobs = nobs,
+      where = "smoothbandwidth"
+    )
 
   porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
 
@@ -207,20 +215,29 @@ scbandwidth <-
                 okertype = okertype,
                 pokertype = mybw$pokertype))
 
-  zorx <- if (is.null(zdati)) "x" else "z"
-  names(mybw$sfactor) <- zorx
-  names(mybw$bandwidth) <- zorx 
-  names(mybw$sumNum) <- zorx
-  names(mybw$klist) <- zorx
+  mybw <- .np_scbandwidth_role_metadata(mybw)
   
   if(!bandwidth.compute)
     mybw$pmethod <- "Manual"
 
   class(mybw) = "scbandwidth"
+  mybw <- .np_ordered_bandwidth_contract(mybw)
   if(!any(is.na(mybw$bandwidth)))
     validateBandwidth(mybw)
   mybw
   
+}
+
+# One reporting-role owner for construction and a native z=x refit. This
+# changes labels and parallel reporting lists only; smoothing coordinates,
+# bandwidth values and computational admission stay with their existing owner.
+.np_scbandwidth_role_metadata <- function(bws) {
+  role <- if (is.null(bws[["zdati", exact = TRUE]])) "x" else "z"
+  for (field in c("sfactor", "bandwidth", "sumNum", "klist"))
+    names(bws[[field]]) <- role
+  bws$dati <- list(x = bws[["xdati", exact = TRUE]], y = bws[["ydati", exact = TRUE]], z = bws[["zdati", exact = TRUE]])
+  bws$varnames <- list(x = bws[["xnames", exact = TRUE]], y = bws[["ynames", exact = TRUE]], z = bws[["znames", exact = TRUE]])
+  bws
 }
 
 as.double.scbandwidth <- function(x, ...){

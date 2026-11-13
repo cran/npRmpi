@@ -4,14 +4,14 @@ conbandwidth <-
            bwmethod = c("cv.ml","cv.ls","normal-reference", "manual"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           cxkertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           cxkertype = c("gaussian","epanechnikov","uniform","beta"),
            cxkerorder = c(2,4,6,8),
            cxkerbound = c("none","range","fixed"),
            cxkerlb = NULL,
            cxkerub = NULL,
            uxkertype = c("aitchisonaitken","liracine"),
            oxkertype = c("liracine","wangvanryzin","racineliyan"),
-           cykertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           cykertype = c("gaussian","epanechnikov","uniform","beta"),
            cykerorder = c(2,4,6,8),
            cykerbound = c("none","range","fixed"),
            cykerlb = NULL,
@@ -66,38 +66,34 @@ conbandwidth <-
 
   if(missing(cxkerorder))
     cxkerorder = 2
-  else if (cxkertype == "uniform")
-    .np_warning("ignoring kernel order specified with uniform kernel type")
-  else {
+  else if (cxkertype != "uniform") {
     kord = c(2,4,6,8) 
     if (!any(kord == cxkerorder))
       stop("cxkerorder must be one of ", paste(kord,collapse=" "))
   }
 
-  if (cxkertype == "truncated gaussian" && cxkerorder != 2)
-    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
-
+  if (bwmethod == "normal-reference" && identical(cxkertype, "beta"))
+    stop("beta conditional density does not support normal-reference bandwidth selection",
+         call. = FALSE)
   if (bwmethod == "normal-reference" && (cxkertype != "gaussian" || bwtype != "fixed")){    
-    .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+    .npRmpi_defer_named_warning(.np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth"))
     bwtype = "fixed"
     cxkertype = "gaussian"
   }
 
   if(missing(cykerorder))
     cykerorder = 2
-  else if (cykertype == "uniform")
-    .np_warning("ignoring kernel order specified with uniform kernel type")
-  else {
+  else if (cykertype != "uniform") {
     kord = c(2,4,6,8) 
     if (!any(kord == cykerorder))
       stop("cykerorder must be one of ", paste(kord,collapse=" "))
   }
 
-  if (cykertype == "truncated gaussian" && cykerorder != 2)
-    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
-
+  if (bwmethod == "normal-reference" && identical(cykertype, "beta"))
+    stop("beta conditional density does not support normal-reference bandwidth selection",
+         call. = FALSE)
   if (bwmethod == "normal-reference" && (cykertype != "gaussian" || bwtype != "fixed")){    
-    .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+    .npRmpi_defer_named_warning(.np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth"))
     bwtype = "fixed"
     cykertype = "gaussian"
   }
@@ -105,30 +101,68 @@ conbandwidth <-
   if (cxkerorder != cykerorder && bwscaling)
     stop("scale factors with different order kernels for dependent and explanatory variables is unsupported")
   
-  uxkertype = match.arg(uxkertype)
-  uykertype = match.arg(uykertype)
+  uxkertype = .np_match_arg_named(
+    uxkertype, c("aitchisonaitken", "liracine"), "uxkertype"
+  )
+  uykertype = .np_match_arg_named(
+    uykertype, c("aitchisonaitken", "liracine"), "uykertype"
+  )
   
-  oxkertype = match.arg(oxkertype)
-  oykertype = match.arg(oykertype)
+  oxkertype = .np_match_arg_named(
+    oxkertype, c("liracine", "wangvanryzin", "racineliyan"), "oxkertype"
+  )
+  oykertype = .np_match_arg_named(
+    oykertype, c("liracine", "wangvanryzin", "racineliyan"), "oykertype"
+  )
   cxbounds <- npKernelBoundsResolve(
     dati = xdati,
     varnames = xnames,
     kerbound = cxkerbound,
     kerlb = cxkerlb,
     kerub = cxkerub,
-    argprefix = "cxker")
+    argprefix = "cxker",
+    range.policy = if (identical(cxkertype, "beta"))
+      "beta_half_spacing" else "exact")
   cybounds <- npKernelBoundsResolve(
     dati = ydati,
     varnames = ynames,
     kerbound = cykerbound,
     kerlb = cykerlb,
     kerub = cykerub,
-    argprefix = "cyker")
+    argprefix = "cyker",
+    range.policy = if (identical(cykertype, "beta"))
+      "beta_half_spacing" else "exact")
+  beta.prototype <- list(
+    cxkertype = cxkertype, cxkerorder = cxkerorder,
+    cxkerbound = cxbounds$bound, cxkerlb = cxbounds$lb,
+    cxkerub = cxbounds$ub, cykertype = cykertype,
+    cykerorder = cykerorder, cykerbound = cybounds$bound,
+    cykerlb = cybounds$lb, cykerub = cybounds$ub,
+    type = bwtype, xbw = xbw, ybw = ybw,
+    xdati = xdati, ydati = ydati,
+    xnuno = sum(xdati$iuno), xnord = sum(xdati$iord),
+    ynuno = sum(ydati$iuno), ynord = sum(ydati$iord),
+    regtype = regtype
+  )
+  npValidateConditionalBetaBandwidthObject(
+    beta.prototype, where = "conditional density",
+    bandwidth.compute = bandwidth.compute,
+    allow.automatic.full = TRUE
+  )
   bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
   if (bwtype != "fixed" &&
       (cxbounds$bound != "none" || cybounds$bound != "none") &&
       !bounded_nonfixed_supported)
     stop("finite continuous kernel bounds require bwtype = \"fixed\"")
+
+  if (identical(regtype.engine, "lp") && sum(xdati$icon) > 0L &&
+      is.finite(nobs))
+    npValidateLpBasisAdmission(
+      basis = basis.engine,
+      degree = degree.engine,
+      nobs = nobs,
+      where = "conbandwidth"
+    )
 
   pxorder = switch( cxkerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
   pyorder = switch( cykerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
@@ -275,6 +309,7 @@ conbandwidth <-
 
 
   class(mybw) = "conbandwidth"
+  mybw <- .np_ordered_bandwidth_contract(mybw)
   if(!any(is.na(mybw$bandwidth)))
     validateBandwidth(mybw)
   mybw
@@ -290,7 +325,7 @@ print.conbandwidth <- function(x, digits=NULL, ...){
   print(matrix(x$xbw,ncol=x$xndim,dimnames=list(paste("Exp. Var. ",x$pscaling,":",sep=""),x$xnames)))
 
   cat(genBwSelStr(x))
-  cat(genBwKerStrsXY(x))
+  cat(genBwKerStrs(x))
   
   cat("\n\n")
   if(!missing(...))

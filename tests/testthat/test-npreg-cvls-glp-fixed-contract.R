@@ -20,90 +20,8 @@ fixed_cvls_objective <- function(xdat,
       bandwidth.compute = FALSE
     )
   ))
-
-  xmat <- get("toMatrix", ns)(xdat)
-  runo <- xmat[, bw0$iuno, drop = FALSE]
-  rcon <- xmat[, bw0$icon, drop = FALSE]
-  rord <- xmat[, bw0$iord, drop = FALSE]
-  mysd <- get("EssDee", ns)(rcon)
-  n <- nrow(xdat)
-  nconfac <- n^(-1.0 / (2.0 * bw0$ckerorder + bw0$ncon))
-  ncatfac <- n^(-2.0 / (2.0 * bw0$ckerorder + bw0$ncon))
-  reg.c <- get("npRegtypeToC", ns)(
-    regtype = bw0$regtype,
-    degree = bw0$degree,
-    ncon = bw0$ncon,
-    context = "npregbw"
-  )
-
-  myopti <- as.integer(list(
-    n,
-    get("IMULTI_FALSE", ns),
-    1L,
-    get("USE_START_YES", ns),
-    if (bw0$scaling) get("SF_NORMAL", ns) else get("SF_ARB", ns),
-    get("BW_FIXED", ns),
-    0L,
-    get("RE_MIN_FALSE", ns),
-    get("IO_MIN_TRUE", ns),
-    get("BWM_CVLS", ns),
-    get("CKER_GAUSS", ns) + bw0$ckerorder / 2 - 1,
-    get("UKER_AIT", ns),
-    get("OKER_WANG", ns),
-    bw0$nuno,
-    bw0$nord,
-    bw0$ncon,
-    reg.c$code,
-    get("DO_TREE_NO", ns),
-    FALSE,
-    3L,
-    FALSE
-  ))
-  myoptd <- as.double(list(
-    1.490116e-07,
-    1.490116e-04,
-    1.490116e-05,
-    0.5,
-    2.5 * (3.0 - sqrt(5)),
-    1.0,
-    0.1,
-    1,
-    0.25 * (3.0 - sqrt(5)),
-    1.0,
-    0.1,
-    2.0,
-    0.5,
-    0.1,
-    0.9,
-    0.375,
-    nconfac,
-    ncatfac,
-    0.1
-  ))
-  ck <- get("npKernelBoundsMarshal", ns)(bw0$ckerlb[bw0$icon], bw0$ckerub[bw0$icon])
-
-  out <- get(".npRmpi_with_local_regression", ns)(.Call(
-    "C_np_regression_bw_eval",
-    as.double(runo),
-    as.double(rord),
-    as.double(rcon),
-    as.double(ydat),
-    as.double(mysd),
-    myopti,
-    myoptd,
-    as.double(c(bw0$bw[bw0$icon], bw0$bw[bw0$iuno], bw0$bw[bw0$iord])),
-    as.integer(1L),
-    as.integer(1L),
-    as.double(10),
-    as.integer(if (bw0$ncon > 0) bw0$degree else integer(1)),
-    as.integer(isTRUE(bw0$bernstein.basis)),
-    as.integer(get("npLpBasisCode", ns)(bw0$basis)),
-    as.double(ck$lb),
-    as.double(ck$ub),
-    PACKAGE = "npRmpi"
-  ))
-
-  unname(out$fval[1])
+  out <- get(".npregbw_eval_only", ns)(xdat, ydat, bw0, localize = TRUE)
+  unname(out$objective[1L])
 }
 
 test_that("fixed cv.ls is exact on in-class local polynomial fixtures", {
@@ -209,4 +127,95 @@ test_that("fixed cv.ls keeps ll and canonical lp degree-1 aligned off-model", {
   )
 
   expect_equal(obj2.ll, obj2.lp, tolerance = 1e-12)
+})
+
+test_that("fixed width-three LP tree uses canonical support and objective", {
+  skip_if_not(spawn_mpi_slaves(1), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260809)
+  n <- 128L
+  x <- data.frame(x1 = runif(n), x2 = runif(n))
+  y <- sin(2 * pi * x$x1) * cos(2 * pi * x$x2) + rnorm(n, sd = 0.1)
+  bw <- npRmpi::npregbw(
+    xdat = x,
+    ydat = y,
+    bws = c(0.24, 0.21),
+    regtype = "ll",
+    degree = c(1L, 1L),
+    ckertype = "epanechnikov",
+    bwmethod = "cv.ls",
+    bandwidth.compute = FALSE
+  )
+
+  old_opts <- options(np.tree = TRUE, np.categorical.compress = FALSE)
+  old_oracle <- Sys.getenv("NP_LP_TREE_ORACLE", unset = NA_character_)
+  on.exit({
+    options(old_opts)
+    if(is.na(old_oracle)) Sys.unsetenv("NP_LP_TREE_ORACLE")
+    else Sys.setenv(NP_LP_TREE_ORACLE = old_oracle)
+  }, add = TRUE)
+
+  Sys.setenv(NP_LP_TREE_ORACLE = "1")
+  tree_message <- capture.output(
+    tree_objective <- npRmpi:::.npregbw_eval_only(
+      x, y, bw, localize = TRUE
+    )$objective,
+    type = "message"
+  )
+  expect_true(any(grepl(
+    "NP_LP_TREE_ORACLE .*missing=0 mismatch=0",
+    tree_message
+  )))
+
+  Sys.unsetenv("NP_LP_TREE_ORACLE")
+  options(np.tree = "auto")
+  auto_objective <- npRmpi:::.npregbw_eval_only(
+    x, y, bw, localize = TRUE
+  )$objective
+  expect_identical(auto_objective, tree_objective)
+
+  options(np.tree = FALSE)
+  dense_objective <- npRmpi:::.npregbw_eval_only(
+    x, y, bw, localize = TRUE
+  )$objective
+  expect_equal(tree_objective, dense_objective, tolerance = 1e-12)
+})
+
+test_that("fixed sparse width-six LP agrees with the independent hat oracle", {
+  skip_if_not(spawn_mpi_slaves(1), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(), add = TRUE)
+
+  set.seed(20260812)
+  n <- 128L
+  x <- data.frame(x1 = runif(n), x2 = runif(n))
+  y <- sin(4 * pi * x$x1) * cos(2 * pi * x$x2) + rnorm(n, sd = 0.1)
+  evaluate <- getFromNamespace(".npregbw_eval_only", "npRmpi")
+  old_opts <- options(np.tree = TRUE, np.categorical.compress = FALSE)
+  on.exit(options(old_opts), add = TRUE)
+
+  for (bernstein in c(FALSE, TRUE)) {
+    bw <- npRmpi::npregbw(
+      xdat = x,
+      ydat = y,
+      bws = c(0.22, 0.19),
+      regtype = "lp",
+      degree = c(2L, 3L),
+      basis = "additive",
+      bernstein.basis = bernstein,
+      ckertype = "epanechnikov",
+      bwmethod = "cv.ls",
+      bandwidth.compute = FALSE
+    )
+
+    native <- evaluate(x, y, bw, localize = TRUE)$objective
+    hat <- suppressWarnings(npRmpi::npreghat(
+      bws = bw, txdat = x, output = "matrix"
+    ))
+    fitted <- drop(hat %*% y)
+    reference <- mean(((y - fitted) / (1.0 - diag(hat)))^2)
+
+    expect_equal(native, reference, tolerance = 2e-10,
+                 info = paste("Bernstein", bernstein))
+  }
 })

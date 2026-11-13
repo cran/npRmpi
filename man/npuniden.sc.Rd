@@ -66,12 +66,13 @@ These arguments set optional lower and upper density bounds used with \code{cons
 }
 
 \item{lb}{
-  a scalar lower bound (\eqn{\ge 0}) to be used in conjunction with
+  an optional scalar lower bound (\eqn{\ge 0}) to be used in conjunction with
   \code{constraint="density"}
 }
 
 \item{ub}{
-  a scalar upper bound (\eqn{\ge 0} and \eqn{\ge} \code{lb}) to be used
+  an optional scalar upper bound (\eqn{\ge 0} and, when supplied,
+  \eqn{\ge} \code{lb}) to be used
   in conjunction with \code{constraint="density"}
 }
 
@@ -95,7 +96,10 @@ These arguments control grid construction, distance metric, and mass preservatio
 \item{integral.equal}{
   a logical value, that, if \code{TRUE}, adjusts the constrained estimate
   to have the same probability mass over the range \code{X}, \code{Y},
-  and the additional grid points
+  and the additional grid points, taking the integral at the rightmost
+  coordinate regardless of input order. Raw density derivatives receive the
+  same normalization; derivatives of the log-density do not change under
+  multiplication of the density by a constant.
 }
 
 
@@ -123,6 +127,24 @@ This argument chooses the monotonicity, convexity, or log-shape constraint.
 
 }
 \details{
+  Reported standard errors use the number of training observations in
+  \code{X}, not the number of requested evaluation points.
+
+  Numerical integration collapses duplicate integration coordinates, not
+  training observations, and restores the evaluation order and multiplicity.
+  Sampled total integrals use a uniform-grid endpoint correction only when
+  the distinct coordinates are uniformly spaced; otherwise they use the
+  nonuniform trapezoidal rule. The \code{F} and \code{F.sc} calculations instead
+  integrate the retained fitted density functions from the declared support
+  lower bound, including infinite support. Integration does not add QP
+  constraint nodes or refit the coefficients. The sampled-range normalization
+  selected by \code{integral.equal} is preserved; these distribution integrals
+  do not separately force whole-support unit mass or impose shape constraints
+  away from the QP grid. Log-shaped fits are integrated on the density scale.
+  Accurate absolute integration can add noticeable work when only a few
+  evaluation points are requested; its adaptive representation is reused
+  across points and failed convergence is reported explicitly.
+
   Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template. For interactive and cluster batch workflows, see \code{\link{npRmpi.init}}.
 
   Typical usages are (see below for a complete list of options and also

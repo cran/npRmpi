@@ -11,8 +11,6 @@ NP_DEMO_CASES ?=
 NP_DEMO_MATRIX ?=
 RPROFILE ?= $(if $(wildcard $(DEMO_SRC)/../inst/Rprofile),$(DEMO_SRC)/../inst/Rprofile,$(if $(wildcard $(DEMO_SRC)/../.Rprofile),$(DEMO_SRC)/../.Rprofile,$(shell Rscript -e 'cat(system.file("Rprofile", package="npRmpi"))')))
 RSCRIPT_BIN ?= $(shell R RHOME)/bin/Rscript
-SETSID_BIN ?= $(shell command -v setsid 2>/dev/null)
-SESSION_LAUNCH = $(if $(SETSID_BIN),$(SETSID_BIN),)
 MPI_ENV_NP_DEMO_N = $(if $(NP_DEMO_N),-env NP_DEMO_N $(NP_DEMO_N),)
 MPI_ENV_NP_DEMO_N_FRAC = $(if $(NP_DEMO_N_FRAC),-env NP_DEMO_N_FRAC $(NP_DEMO_N_FRAC),)
 MPI_ENV_NP_DEMO_SRC = -env NP_DEMO_SRC $(DEMO_SRC)
@@ -69,22 +67,23 @@ run-profile:
 	@for d in $(DEMOS); do \
 		echo "[profile][np=$(NP)] $$d"; \
 		out_file=$${d}_npRmpi_profile.Rout; \
-		batch_file=$${out_file}.batch; \
+		batch_base=$${out_file}.batch; \
+		master_batch=$${batch_base}.rank0; \
 		tmp_file=$${out_file}.tmp; \
-		if /opt/local/bin/timeout $(TIMEOUT_SEC) mpiexec -env R_PROFILE_USER $(RPROFILE) -env R_PROFILE '' -env NP_RMPI_PROFILE_RECV_TIMEOUT_SEC $(TIMEOUT_SEC) $(MPI_ENV_FI) $(MPI_ENV_NP_DEMO_SRC) $(MPI_ENV_NP_DEMO_TIER) $(MPI_ENV_NP_DEMO_CASES) $(MPI_ENV_NP_DEMO_MATRIX) $(MPI_ENV_NP_DEMO_N) $(MPI_ENV_NP_DEMO_N_FRAC) -n $(NP) R CMD BATCH --no-save $(DEMO_SRC)/$${d}_npRmpi_profile.R "$$batch_file" > "$$tmp_file" 2>&1; then \
-			if test ! -s "$$batch_file"; then \
+		if /opt/local/bin/timeout $(TIMEOUT_SEC) mpiexec -env R_PROFILE_USER $(RPROFILE) -env R_PROFILE '' -env NP_RMPI_PROFILE_RECV_TIMEOUT_SEC $(TIMEOUT_SEC) $(MPI_ENV_FI) $(MPI_ENV_NP_DEMO_SRC) $(MPI_ENV_NP_DEMO_TIER) $(MPI_ENV_NP_DEMO_CASES) $(MPI_ENV_NP_DEMO_MATRIX) $(MPI_ENV_NP_DEMO_N) $(MPI_ENV_NP_DEMO_N_FRAC) -n $(NP) /bin/sh -c 'rank=$${PMI_RANK:-$${PMIX_RANK:-$${OMPI_COMM_WORLD_RANK:-$$$$}}}; exec R CMD BATCH --no-save "$$1" "$$2.rank$${rank}"' npRmpi-profile $(DEMO_SRC)/$${d}_npRmpi_profile.R "$$batch_base" > "$$tmp_file" 2>&1; then \
+			if test ! -s "$$master_batch"; then \
 				{ $(PROVENANCE_CMD); test -s "$$tmp_file" && cat "$$tmp_file"; echo "DEMO_STATUS demo=$$d mode=profile np=$(NP) status=failed exit_code=empty_batch timeout_sec=$(TIMEOUT_SEC)"; } > "$$out_file"; \
-				rm -f "$$tmp_file" "$$batch_file"; \
+				rm -f "$$tmp_file" "$$batch_base".rank*; \
 				echo "[profile][np=$(NP)] $$d FAILED (empty batch transcript)"; \
 				if test "$(CONTINUE_ON_ERROR)" = "true"; then continue; else exit 1; fi; \
 			fi; \
-			{ $(PROVENANCE_CMD); cat "$$batch_file"; if test -s "$$tmp_file"; then cat "$$tmp_file"; fi; } > "$$out_file"; \
-			rm -f "$$tmp_file" "$$batch_file"; \
+			{ $(PROVENANCE_CMD); cat "$$master_batch"; if test -s "$$tmp_file"; then cat "$$tmp_file"; fi; } > "$$out_file"; \
+			rm -f "$$tmp_file" "$$batch_base".rank*; \
 			: ; \
 		else \
 			status=$$?; \
-			{ $(PROVENANCE_CMD); test -s "$$batch_file" && cat "$$batch_file"; test -s "$$tmp_file" && cat "$$tmp_file"; echo "DEMO_STATUS demo=$$d mode=profile np=$(NP) status=failed exit_code=$$status timeout_sec=$(TIMEOUT_SEC)"; } > "$$out_file"; \
-			rm -f "$$tmp_file" "$$batch_file"; \
+			{ $(PROVENANCE_CMD); for rank_batch in "$$batch_base".rank*; do test -s "$$rank_batch" && cat "$$rank_batch"; done; test -s "$$tmp_file" && cat "$$tmp_file"; echo "DEMO_STATUS demo=$$d mode=profile np=$(NP) status=failed exit_code=$$status timeout_sec=$(TIMEOUT_SEC)"; } > "$$out_file"; \
+			rm -f "$$tmp_file" "$$batch_base".rank*; \
 			echo "[profile][np=$(NP)] $$d FAILED"; \
 			if test "$(CONTINUE_ON_ERROR)" = "true"; then continue; else exit 1; fi; \
 		fi; \
@@ -99,16 +98,14 @@ run-session:
 			echo "[session][nslaves=$(NSLAVES)] $$d SKIPPED (no session demo script)"; \
 			continue; \
 		fi; \
-		if $(SESSION_LAUNCH) env NP_DEMO_SRC=$(DEMO_SRC) NP_DEMO_TIER=$(NP_DEMO_TIER) NP_DEMO_CASES="$(NP_DEMO_CASES)" NP_DEMO_MATRIX="$(NP_DEMO_MATRIX)" NP_DEMO_N=$(NP_DEMO_N) NP_DEMO_N_FRAC=$(NP_DEMO_N_FRAC) NP_DEMO_NSLAVES=$(NSLAVES) $(RSCRIPT_BIN) --vanilla $(DEMO_SRC)/$${d}_npRmpi_session.R > "$$tmp_file" 2>&1; then \
+		if env NP_DEMO_SRC=$(DEMO_SRC) NP_DEMO_TIER=$(NP_DEMO_TIER) NP_DEMO_CASES="$(NP_DEMO_CASES)" NP_DEMO_MATRIX="$(NP_DEMO_MATRIX)" NP_DEMO_N=$(NP_DEMO_N) NP_DEMO_N_FRAC=$(NP_DEMO_N_FRAC) NP_DEMO_NSLAVES=$(NSLAVES) $(RSCRIPT_BIN) --vanilla $(DEMO_SRC)/$${d}_npRmpi_session.R > "$$tmp_file" 2>&1; then \
 			{ $(PROVENANCE_CMD); cat "$$tmp_file"; } > "$$out_file"; \
 			rm -f "$$tmp_file"; \
-			pgrep -f 'slavedaemon\.R|Rslaves\.sh' | xargs kill >/dev/null 2>&1 || true; \
 			: ; \
 		else \
 			status=$$?; \
 			{ $(PROVENANCE_CMD); test -s "$$tmp_file" && cat "$$tmp_file"; echo "DEMO_STATUS demo=$$d mode=session nslaves=$(NSLAVES) status=failed exit_code=$$status timeout_sec=NA"; } > "$$out_file"; \
 			rm -f "$$tmp_file"; \
-			pgrep -f 'slavedaemon\.R|Rslaves\.sh' | xargs kill >/dev/null 2>&1 || true; \
 			echo "[session][nslaves=$(NSLAVES)] $$d FAILED"; \
 			if test "$(CONTINUE_ON_ERROR)" = "true"; then continue; else exit 1; fi; \
 		fi; \

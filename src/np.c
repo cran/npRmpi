@@ -1,22 +1,36 @@
 /* Copyright (C) Jeff Racine, 1995-2004 */
 
 #include <float.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include <R.h>
+#include <Rmath.h>
 #include <R_ext/Arith.h>
 #include <R_ext/Memory.h>
 #include <R_ext/Rdynload.h>
+#include <R_ext/Utils.h>
 #include <Rinternals.h>
+#include <Rversion.h>
 #include <stdint.h>
 
 #include <crs_nomad_native.h>
+#include "np_nomad_callback_error.h"
+
+/* Failure-only bridge for the R progress dispatcher; no successful-path work. */
+SEXP C_np_nomad_condition_raise(SEXP condition)
+{
+  np_nomad_condition_raise(condition);
+  return R_NilValue;
+}
+
 
 #ifdef MPI2
 #include "mpi.h"
@@ -42,10 +56,174 @@ extern MPI_Comm	*comm;
 /* headers.h has all definitions of routines used by main() and related modules */
 
 #include "headers.h"
+#include "conditional_search.h"
+#include "conditional_failure.h"
+#include "nn_radius_error.h"
+#include "np_native_safety.h"
+#include "beta_bandwidth.h"
+#include "continuous_kernel_row.h"
+#include "beta_scaled_row.h"
+#include "kernel_registry.h"
+#include "np_native_safety.h"
 #include "tree.h"
+#include "conditional_literal.h"
+
+/* Failure-only advice, after the existing cleanup. Do not infer the cause of
+ * every invalid candidate, or modify starts, objectives or successful paths. */
+static void np_bandwidth_candidate_error(const char *message, const int bwtype)
+{
+  if((bwtype == BW_GEN_NN || bwtype == BW_ADAP_NN) &&
+     strstr(message,"bandwidth candidate") != NULL)
+    error("%s. With nearest-neighbor bandwidths, repeated observations (including bootstrap duplicates) can give zero radii. Inspect ties and NN counts, or use fixed bandwidths (bwtype='fixed').",
+          message);
+  error("%s",message);
+}
+
+/* Conditional trial rejection has several causes; ties are not a diagnosis. */
+static void np_conditional_bandwidth_candidate_error(const char *message, const int bwtype)
+{
+  if((bwtype == BW_GEN_NN || bwtype == BW_ADAP_NN) &&
+     strstr(message,"bandwidth candidate") != NULL)
+    error("%s. Conditional trials can be rejected for inadequate kernel support or numerical accuracy. Inspect the data and bandwidth settings, including ties and nearest-neighbor counts.",
+          message);
+  error("%s",message);
+}
+
+/* Declared categorical support is preparation metadata, never inferred from
+ * the observed subset. The transient view is rooted by the .Call argument;
+ * native contexts copy values before returning and own their usual matrices. */
+typedef struct {
+  int columns;
+  int max_levels;
+  const double **values;
+  int *counts;
+} NPCategoricalSupport;
+
+static NPCategoricalSupport np_categorical_support_parse(
+  SEXP support, const int n, const int dimensions[4], const SEXP data[4])
+{
+  NPCategoricalSupport out = {0};
+  R_xlen_t columns = 0;
+  if(n < 1)
+    error("native categorical support requires positive training size");
+  for(int group = 0; group < 4; ++group) {
+    if(dimensions[group] < 0)
+      error("native categorical support has invalid dimensions");
+    columns += dimensions[group];
+    if(dimensions[group] > 0 &&
+       (TYPEOF(data[group]) != REALSXP ||
+        XLENGTH(data[group]) != (R_xlen_t)n*dimensions[group]))
+      error("native categorical support does not match training dimensions");
+  }
+  if(columns > INT_MAX || TYPEOF(support) != VECSXP ||
+     XLENGTH(support) != columns)
+    error("native categorical support does not match categorical dimensions");
+  out.columns = (int)columns;
+  out.max_levels = n;
+  if(columns == 0)
+    return out;
+  out.values = (const double **)R_alloc((size_t)columns, sizeof(double *));
+  out.counts = (int *)R_alloc((size_t)columns, sizeof(int));
+  int column = 0;
+  for(int group = 0; group < 4; ++group) {
+    for(int d = 0; d < dimensions[group]; ++d, ++column) {
+      SEXP levels = VECTOR_ELT(support, column);
+      const R_xlen_t count = XLENGTH(levels);
+      if(TYPEOF(levels) != REALSXP || count < 1 || count > INT_MAX)
+        error("native categorical support requires nonempty numeric levels");
+      const double *v = REAL(levels);
+      for(int k = 0; k < count; ++k)
+        if(!R_FINITE(v[k]) || (k > 0 && v[k] <= v[k-1]))
+          error("native categorical support levels must be finite and increasing");
+      const double *observed = REAL(data[group]) + (size_t)d*n;
+      for(int i = 0; i < n; ++i) {
+        int lo = 0, hi = (int)count;
+        const double value = observed[i];
+        while(lo < hi) {
+          const int mid = lo + (hi-lo)/2;
+          if(v[mid] < value) lo = mid+1; else hi = mid;
+        }
+        if(!R_FINITE(value) || lo == count || v[lo] != value)
+          error("native training value is outside declared categorical support");
+      }
+      out.values[column] = v;
+      out.counts[column] = (int)count;
+      out.max_levels = MAX(out.max_levels, (int)count);
+    }
+  }
+  return out;
+}
+
+static void np_categorical_support_copy(const NPCategoricalSupport *support,
+                                        int *counts, double **values)
+{
+  for(int d = 0; d < support->columns; ++d) {
+    counts[d] = support->counts[d];
+    memcpy(values[d], support->values[d],
+           (size_t)support->counts[d]*sizeof(double));
+  }
+}
+
+static np_continuous_kernel_descriptor
+np_continuous_kernel_descriptor_or_error(int family,
+                                         int code,
+                                         int order,
+                                         const char *where);
+
+typedef enum {
+  NP_BETA_BW_CONTINUOUS_ONLY = 0,
+  NP_BETA_BW_ALLOW_CATEGORICAL = 1
+} NPBetaBandwidthCategoricalPolicy;
+
+static np_continuous_kernel_descriptor
+np_bandwidth_kernel_descriptor_or_error(int family,
+                                        int code,
+                                        int order,
+                                        int ncon,
+                                        int nuno,
+                                        int nord,
+                                        NPBetaBandwidthCategoricalPolicy
+                                          categorical_policy,
+                                        const double *lower,
+                                        const double *upper,
+                                        const char *where);
+
+static int np_real_buffer_has_matrix(SEXP value, int nrow, int ncol);
 
 // categorical hashing
 #include "hash.h"
+
+#ifdef MPI2
+static int
+np_mpi_padded_count_or_error(int count, const char *where)
+{
+  int stride;
+  int padded_count;
+
+  if(!np_int_padded_count_nonnegative(count,
+                                      iNum_Processors,
+                                      1,
+                                      &stride,
+                                      &padded_count))
+    error("%s: evaluation partition exceeds native integer limits", where);
+  return padded_count;
+}
+
+static int
+np_mpi_partition_stride_or_error(int count, const char *where)
+{
+  int stride;
+  int padded_count;
+
+  if(!np_int_padded_count_nonnegative(count,
+                                      iNum_Processors,
+                                      1,
+                                      &stride,
+                                      &padded_count))
+    error("%s: evaluation partition exceeds native integer limits", where);
+  return stride;
+}
+#endif
 
 static void *np_nomad_callback_calloc(size_t count, size_t size)
 {
@@ -61,6 +239,11 @@ static void *np_nomad_callback_calloc(size_t count, size_t size)
 #define NP_NOMAD_CALLBACK_CALLOC(count, type) \
   ((type *) np_nomad_callback_calloc((size_t)(count), sizeof(type)))
 #define NP_NOMAD_CALLBACK_FREE(ptr) free(ptr)
+
+#ifndef NP_BWM_CACHE_MAX_BYTES
+#define NP_BWM_CACHE_MAX_BYTES \
+  ((size_t)64U*(size_t)1024U*(size_t)1024U)
+#endif
 
 
 int int_DEBUG;
@@ -79,10 +262,32 @@ int int_SIMULATION;
 
 int int_RESTART_FROM_MIN;
 
+typedef struct {
+  int degree_offset;
+  int ndegree;
+  const int *best_degree;
+  const double *best_objective;
+  const int *accepted_evaluations;
+} np_nomad_progress_spec;
+
+static crs_nomad_observer_poll_fn np_crs_nomad_observer_poll = NULL;
+static int nomad_c_callback_active = 0;
+static int np_mpi_interrupt_pending = 0;
+static volatile sig_atomic_t np_mpi_sigint_seen = 0;
+static int np_mpi_sigint_scope_depth = 0;
+static void (*np_mpi_previous_sigint_handler)(int) = SIG_DFL;
+
+static int np_nomad_solve_with_progress(const crs_nomad_problem *problem,
+                                        crs_nomad_eval_fn eval,
+                                        void *user_data,
+                                        const np_nomad_progress_spec *progress_spec,
+                                        crs_nomad_result *result, SEXP callback_error);
+
 int int_TREE_X;
 int int_TREE_Y;
 int int_TREE_XY;
 int int_TREE_PROFILE_X;
+int int_TREE_OUTER_BLAS;
 int int_nn_k_min_extern = 1;
 
 static int np_int_product_overflows(int a, int b)
@@ -90,10 +295,50 @@ static int np_int_product_overflows(int a, int b)
   return (a < 0) || (b < 0) || ((a > 0) && (b > INT_MAX / a));
 }
 
+static int np_regression_engine_or_error(int code, const char *where)
+{
+  if ((code != NP_LP_ENGINE_SCALAR) && (code != NP_LP_ENGINE_GENERAL))
+    error("%s: invalid internal regression engine code %d", where, code);
+  return code;
+}
+
+static int np_canonical_lp_engine_for_degree(const int *degree, const int ncon)
+{
+  int i;
+
+  if(ncon <= 0)
+    return NP_LP_ENGINE_SCALAR;
+  if(degree == NULL)
+    return -1;
+  for(i = 0; i < ncon; i++)
+    if(degree[i] != 0)
+      return NP_LP_ENGINE_GENERAL;
+  return NP_LP_ENGINE_SCALAR;
+}
+
 static int np_int_product3_overflows(int a, int b, int c)
 {
   return np_int_product_overflows(a, b) ||
     np_int_product_overflows(a * b, c);
+}
+
+/*
+ * Decode categorical NOMAD coordinates in the same operation order as the
+ * canonical R point-to-storage helper.  Replacing the divisions with a
+ * precomputed reciprocal is not byte-equivalent.
+ */
+static int np_nomad_decode_categorical_bandwidth(
+  const double raw_point,
+  const int scaling,
+  const double ncatfac,
+  double * const bandwidth)
+{
+  const double external = raw_point/1.0e4;
+
+  if(bandwidth == NULL || (scaling && ncatfac == 0.0))
+    return 1;
+  *bandwidth = scaling ? external/ncatfac : external;
+  return 0;
 }
 
 static void np_load_crs_namespace(void)
@@ -107,6 +352,17 @@ static void np_load_crs_namespace(void)
   UNPROTECT(2);
 }
 
+static int np_namespace_has(SEXP environment, const char *name)
+{
+  if (environment == R_NilValue || name == NULL)
+    return 0;
+#if R_VERSION >= R_Version(4, 2, 0)
+  return R_existsVarInFrame(environment, Rf_install(name));
+#else
+  return Rf_findVarInFrame(environment, Rf_install(name)) != R_UnboundValue;
+#endif
+}
+
 static int np_mpi_local_regression_mode = 0;
 #ifdef MPI2
 static int np_mpi_local_regression_saved_rank = 0;
@@ -117,15 +373,109 @@ static int np_mpi_active_comm_saved_rank = 0;
 static int np_mpi_active_comm_saved_nproc = 1;
 static MPI_Comm np_mpi_active_comm_saved_comm1 = MPI_COMM_NULL;
 #endif
+
+static int np_mpi_distributed_interrupt_active(void)
+{
+#ifdef MPI2
+  return !np_mpi_local_regression_mode &&
+    comm != NULL && comm[1] != MPI_COMM_NULL && iNum_Processors > 1;
+#else
+  return 0;
+#endif
+}
+
+static void np_mpi_sigint_handler(int signal_number)
+{
+  (void) signal_number;
+  np_mpi_sigint_seen = 1;
+}
+
+static void np_user_interrupt_probe(void *data)
+{
+  (void) data;
+  R_CheckUserInterrupt();
+}
+
+void np_check_user_interrupt(void)
+{
+  if (!np_mpi_distributed_interrupt_active()) {
+    R_CheckUserInterrupt();
+    return;
+  }
+#ifdef MPI2
+  if (my_rank != 0 || np_mpi_interrupt_pending)
+    return;
+  if (!R_ToplevelExec(np_user_interrupt_probe, NULL))
+    np_mpi_interrupt_pending = 1;
+#endif
+}
 static int fit_progress_active = 0;
 static int fit_progress_total = 0;
+static int fit_progress_supplement_display_total = 0;
 static int fit_progress_offset = 0;
 static clock_t fit_progress_last_signal_clock = 0;
 static int fit_progress_last_signal_eval = 0;
 static int nomad_degree_progress_active = 0;
 
+/* Progress must not consume interrupts. Serial callers unwind normally;
+ * active MPI commands retain the existing deferred-interrupt owner; NOMAD
+ * observers return an explicit outcome through their C ABI. */
+typedef struct {
+  SEXP call;
+  SEXP environment;
+  int *error;
+  int *interrupt;
+} NPProgressEvaluation;
+
+static SEXP np_progress_evaluate_body(void *data)
+{
+  NPProgressEvaluation *evaluation = (NPProgressEvaluation *)data;
+  return Rf_eval(evaluation->call, evaluation->environment);
+}
+
+static SEXP np_progress_evaluate_condition(SEXP condition, void *data)
+{
+  NPProgressEvaluation *evaluation = (NPProgressEvaluation *)data;
+  if (Rf_inherits(condition, "interrupt")) {
+    if (evaluation->interrupt != NULL)
+      *evaluation->interrupt = 1;
+#ifdef MPI2
+    else if (np_mpi_distributed_interrupt_active())
+      np_mpi_interrupt_pending = 1;
+#endif
+  } else {
+    *evaluation->error = 1;
+  }
+  return R_NilValue;
+}
+
+static SEXP np_progress_evaluate(SEXP call, SEXP environment, int *error,
+                                 int *interrupt)
+{
+  NPProgressEvaluation evaluation = {call, environment, error, interrupt};
+  int defer_interrupt = interrupt != NULL;
+  *error = 0;
+  if (interrupt != NULL)
+    *interrupt = 0;
+#ifdef MPI2
+  defer_interrupt |= np_mpi_distributed_interrupt_active();
+#endif
+  if (!defer_interrupt)
+    return R_tryCatchError(np_progress_evaluate_body, &evaluation,
+                          np_progress_evaluate_condition, &evaluation);
+  SEXP classes = PROTECT(Rf_allocVector(STRSXP, 2));
+  SET_STRING_ELT(classes, 0, Rf_mkChar("interrupt"));
+  SET_STRING_ELT(classes, 1, Rf_mkChar("error"));
+  SEXP value = R_tryCatch(np_progress_evaluate_body, &evaluation, classes,
+                         np_progress_evaluate_condition, &evaluation,
+                         NULL, NULL);
+  UNPROTECT(1);
+  return value;
+}
+
 static void np_progress_signal(const char *event, const char *surface, const int current, const int total)
 {
+  SEXP package = R_NilValue;
   SEXP ns = R_NilValue;
   SEXP fn = R_NilValue;
   SEXP event_s = R_NilValue;
@@ -138,14 +488,15 @@ static void np_progress_signal(const char *event, const char *surface, const int
   if (event == NULL || surface == NULL)
     return;
 
-  PROTECT(ns = R_FindNamespace(Rf_ScalarString(Rf_mkChar("npRmpi"))));
+  PROTECT(package = Rf_mkString("npRmpi"));
+  PROTECT(ns = R_FindNamespace(package));
   if (ns == R_NilValue) {
-    UNPROTECT(1);
+    UNPROTECT(2);
     return;
   }
 
-  if (!R_existsVarInFrame(ns, Rf_install(".np_progress_signal_from_c"))) {
-    UNPROTECT(1);
+  if (!np_namespace_has(ns, ".np_progress_signal_from_c")) {
+    UNPROTECT(2);
     return;
   }
 
@@ -156,8 +507,8 @@ static void np_progress_signal(const char *event, const char *surface, const int
   PROTECT(current_s = Rf_ScalarInteger(current));
   PROTECT(total_s = Rf_ScalarInteger(total));
   PROTECT(call = Rf_lang5(fn, event_s, surface_s, current_s, total_s));
-  R_tryEval(call, ns, &err);
-  UNPROTECT(7);
+  (void) np_progress_evaluate(call, ns, &err, NULL);
+  UNPROTECT(8);
 }
 
 static int np_nomad_degree_progress_due(const int current_eval,
@@ -203,6 +554,7 @@ static void np_progress_nomad_degree_step(const int current_eval,
                                           clock_t *last_clock,
                                           time_t *last_wall)
 {
+  SEXP package = R_NilValue;
   SEXP ns = R_NilValue;
   SEXP fn = R_NilValue;
   SEXP iter_s = R_NilValue;
@@ -215,14 +567,15 @@ static void np_progress_nomad_degree_step(const int current_eval,
   if (!np_nomad_degree_progress_due(current_eval, last_eval, last_clock, last_wall))
     return;
 
-  PROTECT(ns = R_FindNamespace(Rf_ScalarString(Rf_mkChar("npRmpi"))));
+  PROTECT(package = Rf_mkString("npRmpi"));
+  PROTECT(ns = R_FindNamespace(package));
   if (ns == R_NilValue) {
-    UNPROTECT(1);
+    UNPROTECT(2);
     return;
   }
 
-  if (!R_existsVarInFrame(ns, Rf_install(".np_progress_nomad_native_step_from_c"))) {
-    UNPROTECT(1);
+  if (!np_namespace_has(ns, ".np_progress_nomad_native_step_from_c")) {
+    UNPROTECT(2);
     return;
   }
 
@@ -236,12 +589,704 @@ static void np_progress_nomad_degree_step(const int current_eval,
     INTEGER(best_degree_s)[i] = best_degree == NULL ? NA_INTEGER : best_degree[i];
   PROTECT(best_objective_s = Rf_ScalarReal(best_objective));
   PROTECT(call = Rf_lang5(fn, iter_s, current_degree_s, best_degree_s, best_objective_s));
-  R_tryEval(call, ns, &err);
-  UNPROTECT(7);
+  (void) np_progress_evaluate(call, ns, &err, NULL);
+  UNPROTECT(8);
 
   *last_eval = current_eval;
   *last_clock = clock();
   *last_wall = time(NULL);
+}
+
+static int np_nomad_progress_observer_config(double *interval_sec)
+{
+  SEXP package = R_NilValue;
+  SEXP ns = R_NilValue;
+  SEXP fn = R_NilValue;
+  SEXP call = R_NilValue;
+  SEXP value = R_NilValue;
+  SEXP numeric = R_NilValue;
+  int err = 0;
+  int enabled = 0;
+
+  if (interval_sec == NULL)
+    return 0;
+  *interval_sec = 2.0;
+
+  PROTECT(package = Rf_mkString("npRmpi"));
+  PROTECT(ns = R_FindNamespace(package));
+  if (ns == R_NilValue ||
+      !np_namespace_has(ns, ".np_progress_nomad_native_observer_config")) {
+    UNPROTECT(2);
+    return 0;
+  }
+  PROTECT(fn = Rf_findFun(
+    Rf_install(".np_progress_nomad_native_observer_config"), ns));
+  PROTECT(call = Rf_lang1(fn));
+  value = np_progress_evaluate(call, ns, &err, NULL);
+  if (err || value == R_NilValue) {
+    UNPROTECT(4);
+    return 0;
+  }
+  PROTECT(value);
+  PROTECT(numeric = Rf_coerceVector(value, REALSXP));
+  if (XLENGTH(numeric) >= 2) {
+    enabled = R_FINITE(REAL(numeric)[0]) && REAL(numeric)[0] != 0.0;
+    if (R_FINITE(REAL(numeric)[1]) && REAL(numeric)[1] >= 0.0)
+      *interval_sec = REAL(numeric)[1];
+  }
+  UNPROTECT(6);
+  return enabled;
+}
+
+static int np_nomad_progress_observer_call(
+  const crs_nomad_observer_event *event,
+  void *user_data,
+  char *message,
+  size_t message_size,
+  int propagate)
+{
+  const np_nomad_progress_spec *spec =
+    (const np_nomad_progress_spec *) user_data;
+  SEXP package = R_NilValue;
+  SEXP ns = R_NilValue;
+  SEXP fn = R_NilValue;
+  SEXP iteration = R_NilValue;
+  SEXP current_degree = R_NilValue;
+  SEXP best_degree = R_NilValue;
+  SEXP best_objective = R_NilValue;
+  SEXP call = R_NilValue;
+  SEXP value = R_NilValue;
+  int nprotect = 0;
+  int err = 0;
+  int status = CRS_NOMAD_OBSERVER_OUTCOME_ERROR;
+  int interrupted = 0;
+  int j;
+
+  if (event == NULL) {
+    if (message != NULL && message_size > 0)
+      snprintf(message, message_size, "npRmpi NOMAD progress event is unavailable");
+    return CRS_NOMAD_OBSERVER_OUTCOME_ERROR;
+  }
+
+  PROTECT(package = Rf_mkString("npRmpi")); nprotect++;
+  PROTECT(ns = R_FindNamespace(package)); nprotect++;
+  if (ns == R_NilValue ||
+      !np_namespace_has(ns, ".np_progress_nomad_native_observer_dispatch")) {
+    if (message != NULL && message_size > 0)
+      snprintf(message, message_size, "npRmpi NOMAD progress dispatcher is unavailable");
+    UNPROTECT(nprotect);
+    return CRS_NOMAD_OBSERVER_OUTCOME_ERROR;
+  }
+  PROTECT(fn = Rf_findFun(
+    Rf_install(".np_progress_nomad_native_observer_dispatch"), ns)); nprotect++;
+  PROTECT(iteration = Rf_ScalarInteger(event->evaluation)); nprotect++;
+
+  if (spec != NULL && spec->ndegree > 0 && spec->degree_offset >= 0 &&
+      event->x != NULL && spec->degree_offset + spec->ndegree <= event->n) {
+    PROTECT(current_degree = Rf_allocVector(INTSXP, spec->ndegree)); nprotect++;
+    for (j = 0; j < spec->ndegree; j++)
+      INTEGER(current_degree)[j] =
+        (int) nearbyint(event->x[spec->degree_offset + j]);
+  } else {
+    PROTECT(current_degree = Rf_allocVector(INTSXP, 0)); nprotect++;
+  }
+
+  if (spec != NULL && spec->ndegree > 0 && spec->best_degree != NULL &&
+      spec->accepted_evaluations != NULL && *spec->accepted_evaluations > 0) {
+    PROTECT(best_degree = Rf_allocVector(INTSXP, spec->ndegree)); nprotect++;
+    for (j = 0; j < spec->ndegree; j++)
+      INTEGER(best_degree)[j] = spec->best_degree[j];
+  } else {
+    PROTECT(best_degree = Rf_allocVector(INTSXP, 0)); nprotect++;
+  }
+  PROTECT(best_objective = Rf_ScalarReal(
+    spec != NULL && spec->best_objective != NULL &&
+    spec->accepted_evaluations != NULL && *spec->accepted_evaluations > 0 ?
+      *spec->best_objective : NA_REAL)); nprotect++;
+  if (propagate) {
+    SEXP propagate_r = PROTECT(Rf_ScalarLogical(1)); nprotect++;
+    PROTECT(call = Rf_lang6(fn, iteration, current_degree, best_degree,
+                            best_objective, propagate_r)); nprotect++;
+    /* The contained observer owns the catch around this entire invocation. */
+    value = Rf_eval(call, ns);
+  } else {
+    PROTECT(call = Rf_lang5(fn, iteration, current_degree, best_degree,
+                            best_objective)); nprotect++;
+    value = np_progress_evaluate(call, ns, &err, &interrupted);
+  }
+  if (interrupted) {
+    status = CRS_NOMAD_OBSERVER_OUTCOME_INTERRUPT;
+    goto observer_done;
+  }
+  if (err || value == R_NilValue || !Rf_isNewList(value) || XLENGTH(value) < 2) {
+    if (message != NULL && message_size > 0)
+      snprintf(message, message_size, "npRmpi NOMAD progress dispatcher failed");
+    UNPROTECT(nprotect);
+    return CRS_NOMAD_OBSERVER_OUTCOME_ERROR;
+  }
+  PROTECT(value); nprotect++;
+  status = Rf_asInteger(VECTOR_ELT(value, 0));
+  if (status < CRS_NOMAD_OBSERVER_OUTCOME_OK ||
+      status > CRS_NOMAD_OBSERVER_OUTCOME_INTERRUPT)
+    status = CRS_NOMAD_OBSERVER_OUTCOME_ERROR;
+  if (message != NULL && message_size > 0 &&
+      VECTOR_ELT(value, 1) != R_NilValue && XLENGTH(VECTOR_ELT(value, 1)) > 0) {
+    SEXP message_char = Rf_asChar(VECTOR_ELT(value, 1));
+    if (message_char != NA_STRING)
+      snprintf(message, message_size, "%s", CHAR(message_char));
+  }
+observer_done:
+  if (status == CRS_NOMAD_OBSERVER_OUTCOME_INTERRUPT &&
+      np_mpi_distributed_interrupt_active()) {
+    np_mpi_interrupt_pending = 1;
+    status = CRS_NOMAD_OBSERVER_OUTCOME_OK;
+  }
+  UNPROTECT(nprotect);
+  return status;
+}
+
+static int np_nomad_progress_observer(
+  const crs_nomad_observer_event *event, void *data, char *message, size_t size)
+{
+  return np_nomad_progress_observer_call(event, data, message, size, 0);
+}
+
+static int np_nomad_progress_observer_contained(
+  const crs_nomad_observer_event *event, void *data, char *message, size_t size)
+{
+  return np_nomad_progress_observer_call(event, data, message, size, 1);
+}
+
+static void np_nomad_progress_observer_report(const char *message)
+{
+  SEXP package = R_NilValue;
+  SEXP ns = R_NilValue;
+  SEXP fn = R_NilValue;
+  SEXP message_s = R_NilValue;
+  SEXP call = R_NilValue;
+  int err = 0;
+
+  PROTECT(package = Rf_mkString("npRmpi"));
+  PROTECT(ns = R_FindNamespace(package));
+  if (ns == R_NilValue ||
+      !np_namespace_has(ns, ".np_progress_nomad_native_observer_report")) {
+    UNPROTECT(2);
+    return;
+  }
+  PROTECT(fn = Rf_findFun(
+    Rf_install(".np_progress_nomad_native_observer_report"), ns));
+  PROTECT(message_s = Rf_mkString(
+    message != NULL && message[0] != '\0' ? message : "unknown observer error"));
+  PROTECT(call = Rf_lang2(fn, message_s));
+  (void) np_progress_evaluate(call, ns, &err, NULL);
+  UNPROTECT(5);
+}
+
+static int np_nomad_option_name_equal(const char *name, const char *expected)
+{
+  const char *end;
+  size_t i, name_len, expected_len;
+
+  if (name == NULL || expected == NULL)
+    return 0;
+  while (*name != '\0' && isspace((unsigned char)*name))
+    name++;
+  end = name + strlen(name);
+  while (end > name && isspace((unsigned char)end[-1]))
+    end--;
+  name_len = (size_t)(end - name);
+  expected_len = strlen(expected);
+  if (name_len != expected_len)
+    return 0;
+  for (i = 0; i < name_len; i++)
+    if (toupper((unsigned char)name[i]) !=
+        toupper((unsigned char)expected[i]))
+      return 0;
+  return 1;
+}
+
+static const crs_nomad_problem *
+np_nomad_fixed_degree_problem(const crs_nomad_problem *problem,
+                              const np_nomad_progress_spec *progress_spec,
+                              crs_nomad_problem *effective_problem)
+{
+  crs_nomad_option *effective_options;
+  double *effective_lower;
+  double *effective_upper;
+  char *fixed_option;
+  size_t fixed_option_capacity, used;
+  int i, j, fixed_count, wrote;
+
+  if (progress_spec == NULL || progress_spec->ndegree <= 0)
+    return problem;
+  if (problem == NULL || effective_problem == NULL || problem->n <= 0 ||
+      progress_spec->degree_offset < 0 ||
+      progress_spec->degree_offset > problem->n - progress_spec->ndegree ||
+      problem->lower == NULL || problem->upper == NULL ||
+      problem->x0 == NULL || problem->bb_input_type == NULL)
+    error("internal NOMAD fixed-degree metadata is inconsistent");
+
+  fixed_count = 0;
+  for (j = 0; j < progress_spec->ndegree; j++) {
+    i = progress_spec->degree_offset + j;
+    if (problem->lower[i] == problem->upper[i])
+      fixed_count++;
+  }
+  if (fixed_count == 0)
+    return problem;
+  if (fixed_count == progress_spec->ndegree)
+    error("internal NOMAD degree search received an all-fixed degree vector; the singleton bypass should have handled it");
+
+  if (problem->option_count < 0 ||
+      (problem->option_count > 0 && problem->options == NULL) ||
+      problem->option_count == INT_MAX)
+    error("internal NOMAD option metadata is inconsistent");
+  for (i = 0; i < problem->option_count; i++)
+    if (np_nomad_option_name_equal(problem->options[i].name,
+                                   "FIXED_VARIABLE"))
+      error("'FIXED_VARIABLE' is reserved internally when NOMAD searches mixed fixed/free degree bounds");
+
+  for (j = 0; j < progress_spec->ndegree; j++) {
+    double value;
+    int start;
+
+    i = progress_spec->degree_offset + j;
+    if (problem->lower[i] != problem->upper[i])
+      continue;
+    value = problem->lower[i];
+    if (!R_FINITE(value) || value < 0.0 || value > (double)INT_MAX ||
+        value != nearbyint(value) ||
+        problem->bb_input_type[i] != CRS_NOMAD_INPUT_INTEGER)
+      error("internal NOMAD fixed degree is not a valid integer coordinate");
+    if (problem->x0[i] != value)
+      error("internal NOMAD initial point does not preserve a fixed degree");
+    if (problem->starts != NULL) {
+      if (problem->start_count <= 0)
+        error("internal NOMAD explicit start metadata is inconsistent");
+      for (start = 0; start < problem->start_count; start++)
+        if (problem->starts[(size_t)start*(size_t)problem->n + (size_t)i] != value)
+          error("internal NOMAD start does not preserve a fixed degree");
+    }
+  }
+
+  effective_lower = (double *)R_alloc((size_t)problem->n, sizeof(double));
+  effective_upper = (double *)R_alloc((size_t)problem->n, sizeof(double));
+  for (i = 0; i < problem->n; i++) {
+    effective_lower[i] = problem->lower[i];
+    effective_upper[i] = problem->upper[i];
+  }
+  for (j = 0; j < progress_spec->ndegree; j++) {
+    const double value = problem->lower[progress_spec->degree_offset + j];
+
+    i = progress_spec->degree_offset + j;
+    if (value != problem->upper[i])
+      continue;
+    if (value == 0.0) {
+      effective_lower[i] = 0.0;
+      effective_upper[i] = 1.0;
+    } else {
+      effective_lower[i] = value - 1.0;
+      effective_upper[i] = value;
+    }
+  }
+
+  if ((size_t)problem->n > (SIZE_MAX - (size_t)8)/(size_t)16)
+    error("internal NOMAD fixed-variable option is too large");
+  fixed_option_capacity = (size_t)problem->n*(size_t)16 + (size_t)8;
+  fixed_option = (char *)R_alloc(fixed_option_capacity, sizeof(char));
+  used = 0;
+  fixed_option[used++] = '(';
+  fixed_option[used] = '\0';
+  for (i = 0; i < problem->n; i++) {
+    if (i >= progress_spec->degree_offset &&
+        i < progress_spec->degree_offset + progress_spec->ndegree &&
+        problem->lower[i] == problem->upper[i]) {
+      wrote = snprintf(fixed_option + used, fixed_option_capacity - used,
+                       " %d", (int)nearbyint(problem->lower[i]));
+    } else {
+      wrote = snprintf(fixed_option + used, fixed_option_capacity - used, " -");
+    }
+    if (wrote < 0 || (size_t)wrote >= fixed_option_capacity - used)
+      error("failed to format internal NOMAD fixed-variable option");
+    used += (size_t)wrote;
+  }
+  wrote = snprintf(fixed_option + used, fixed_option_capacity - used, " )");
+  if (wrote < 0 || (size_t)wrote >= fixed_option_capacity - used)
+    error("failed to format internal NOMAD fixed-variable option");
+
+  effective_options = (crs_nomad_option *)R_alloc(
+    (size_t)problem->option_count + (size_t)1, sizeof(crs_nomad_option));
+  for (i = 0; i < problem->option_count; i++)
+    effective_options[i] = problem->options[i];
+  effective_options[problem->option_count].name = "FIXED_VARIABLE";
+  effective_options[problem->option_count].value = fixed_option;
+
+  *effective_problem = *problem;
+  effective_problem->lower = effective_lower;
+  effective_problem->upper = effective_upper;
+  effective_problem->option_count = problem->option_count + 1;
+  effective_problem->options = effective_options;
+  return effective_problem;
+}
+
+static int
+np_nomad_fixed_degree_solution_status(const crs_nomad_problem *problem,
+                                      const np_nomad_progress_spec *progress_spec,
+                                      crs_nomad_result *result,
+                                      int status)
+{
+  int i, j;
+
+  if (status != CRS_NOMAD_OK || result == NULL ||
+      result->status != CRS_NOMAD_OK || progress_spec == NULL ||
+      progress_spec->ndegree <= 0)
+    return status;
+  if (result->solution == NULL || result->solution_len < problem->n) {
+    result->status = CRS_NOMAD_INTERNAL_ERROR;
+    snprintf(result->message, sizeof(result->message),
+             "native NOMAD returned a malformed fixed-degree solution");
+    return CRS_NOMAD_INTERNAL_ERROR;
+  }
+
+  for (j = 0; j < progress_spec->ndegree; j++) {
+    double expected, observed;
+
+    i = progress_spec->degree_offset + j;
+    if (problem->lower[i] != problem->upper[i])
+      continue;
+    expected = problem->lower[i];
+    observed = result->solution[i];
+    if (!R_FINITE(observed) || observed != expected) {
+      result->status = CRS_NOMAD_INTERNAL_ERROR;
+      snprintf(result->message, sizeof(result->message),
+               "native NOMAD violated fixed-degree coordinate %d: requested %.17g, returned %.17g",
+               i + 1, expected, observed);
+      return CRS_NOMAD_INTERNAL_ERROR;
+    }
+  }
+
+  return status;
+}
+
+static SEXP np_nomad_callback_error_state(void)
+{
+  /* A callback-wide catch cannot skip an unfinished collective. */
+  if (np_mpi_distributed_interrupt_active())
+    return R_NilValue;
+  return np_nomad_unwind_state();
+}
+
+/* A broadcast can run independent native replicas under COMM_SELF. Keep its
+ * established progress handling even though objective evaluation is local.
+ * The command context, unlike pool existence or the temporary communicator,
+ * distinguishes these replicas from an explicitly local call with idle slaves.
+ * Objective unwind containment remains independent of this observer policy. */
+static int np_nomad_progress_observer_can_propagate(void)
+{
+  return Rf_asLogical(Rf_GetOption1(
+    Rf_install("npRmpi.manual.bcast.context"))) != TRUE;
+}
+
+static int np_nomad_solve_with_progress(const crs_nomad_problem *problem,
+                                        crs_nomad_eval_fn eval,
+                                        void *user_data,
+                                        const np_nomad_progress_spec *progress_spec,
+                                        crs_nomad_result *result, SEXP callback_error)
+{
+  crs_nomad_solve_observed_fn solve_observed;
+  crs_nomad_observer_poll_fn observer_poll;
+  crs_nomad_problem fixed_degree_problem;
+  crs_nomad_problem distributed_problem;
+  const crs_nomad_problem *solve_problem;
+  crs_nomad_observer observer;
+  NPNomadCallbackError error_owner;
+  const int contain_errors = callback_error != R_NilValue &&
+    !np_mpi_distributed_interrupt_active();
+  crs_nomad_observer_poll_fn previous_poll = np_crs_nomad_observer_poll;
+  double interval_sec = 2.0;
+  int observer_enabled;
+  int previous_callback_state;
+  int status;
+
+  np_load_crs_namespace();
+  solve_observed = (crs_nomad_solve_observed_fn)
+    R_GetCCallable("crs", "crs_nomad_solve_observed");
+  observer_poll = (crs_nomad_observer_poll_fn)
+    R_GetCCallable("crs", "crs_nomad_observer_poll");
+  if (solve_observed == NULL || observer_poll == NULL)
+    error("required crs 0.15-46 native NOMAD observer capability is unavailable");
+  np_crs_nomad_observer_poll = observer_poll;
+
+  solve_problem = np_nomad_fixed_degree_problem(
+    problem, progress_spec, &fixed_degree_problem);
+
+  if (solve_problem != NULL && np_mpi_distributed_interrupt_active()) {
+    distributed_problem = *solve_problem;
+    distributed_problem.reserved_int1 = CRS_NOMAD_INTERRUPT_OWNERSHIP_EXTERNAL;
+    solve_problem = &distributed_problem;
+  }
+
+  observer_enabled = np_nomad_progress_observer_config(&interval_sec);
+#ifdef MPI2
+  if (my_rank != 0)
+    observer_enabled = 0;
+#endif
+  memset(&observer, 0, sizeof(observer));
+  if (observer_enabled) {
+    observer.api_version = CRS_NOMAD_OBSERVER_API_VERSION;
+    observer.struct_size = sizeof(observer);
+    observer.observe = contain_errors && np_nomad_progress_observer_can_propagate() ?
+      np_nomad_progress_observer_contained :
+      np_nomad_progress_observer;
+    observer.user_data = (void *) progress_spec;
+    observer.interval_sec = interval_sec;
+  }
+
+  if (contain_errors)
+    np_nomad_error_observer_init(&error_owner, &observer, observer_poll,
+                                eval, user_data, callback_error);
+  previous_callback_state = nomad_c_callback_active;
+  if (solve_problem != NULL &&
+      solve_problem->callback_mode == CRS_NOMAD_CALLBACK_C)
+    nomad_c_callback_active = 1;
+  status = solve_observed(solve_problem,
+                          contain_errors ? np_nomad_callback_contained : eval,
+                          contain_errors ? &error_owner : user_data,
+                          (observer_enabled || contain_errors) ? &observer : NULL,
+                          result);
+  nomad_c_callback_active = previous_callback_state;
+  np_crs_nomad_observer_poll = previous_poll;
+  if (np_nomad_error_pending(callback_error))
+    return status;
+  if (contain_errors && error_owner.progress_error[0] != '\0')
+    np_nomad_progress_observer_report(error_owner.progress_error);
+  status = np_nomad_fixed_degree_solution_status(
+    problem, progress_spec, result, status);
+
+  if (observer_enabled &&
+      observer.outcome == CRS_NOMAD_OBSERVER_OUTCOME_ERROR)
+    np_nomad_progress_observer_report(observer.message);
+
+  return status;
+}
+
+/* Conditional numerical failures keep their separate stop metadata. R errors
+ * use the callback condition owner and do not alter invalid-trial policy. */
+enum { NP_CONDITIONAL_NATIVE_STOP = 2 };
+typedef struct {
+  crs_nomad_observer observer;
+  crs_nomad_observer_poll_fn poll;
+  const np_nomad_progress_spec *progress;
+  NPConditionalFailure saved_failure;
+  int terminal;
+  int progress_enabled;
+  int contain_errors;
+  char progress_error[256];
+} np_conditional_nomad_stop_context;
+
+typedef struct {
+  const crs_nomad_observer_event *event;
+  np_conditional_nomad_stop_context *stop;
+  char *message;
+  size_t message_size;
+  int status;
+} np_conditional_nomad_progress_call;
+
+static void np_conditional_nomad_progress_call_body(void *data)
+{
+  np_conditional_nomad_progress_call *call = data;
+  call->status = np_nomad_progress_observer_call(call->event,
+    (void *)call->stop->progress, call->message, call->message_size,
+    call->stop->contain_errors);
+}
+
+static int np_conditional_nomad_observer(
+  const crs_nomad_observer_event *event, void *data,
+  char *message, size_t message_size)
+{
+  np_conditional_nomad_stop_context *stop = data;
+  if (stop->terminal)
+    return CRS_NOMAD_OBSERVER_OUTCOME_INTERRUPT;
+  if (stop->progress_enabled) {
+    np_conditional_nomad_progress_call call = {
+      event, stop, message, message_size, CRS_NOMAD_OBSERVER_OUTCOME_ERROR
+    };
+    int ok = 1;
+    if (stop->contain_errors)
+      np_conditional_nomad_progress_call_body(&call);
+    else
+      ok = R_ToplevelExec(np_conditional_nomad_progress_call_body, &call);
+    if (ok && call.status == CRS_NOMAD_OBSERVER_OUTCOME_INTERRUPT)
+      return call.status;
+    if (!ok || call.status != CRS_NOMAD_OBSERVER_OUTCOME_OK) {
+      /* Reporting failure must never disable numerical-error transport. */
+      snprintf(stop->progress_error, sizeof(stop->progress_error), "%s",
+        message != NULL && message[0] != '\0' ? message :
+        "conditional NOMAD progress dispatcher failed");
+      stop->progress_enabled = 0;
+      stop->observer.interval_sec = DBL_MAX;
+    }
+  }
+  return CRS_NOMAD_OBSERVER_OUTCOME_OK;
+}
+
+static void np_conditional_nomad_stop(np_conditional_nomad_stop_context *stop)
+{
+  if (!stop->terminal) {
+    np_conditional_failure_save(&stop->saved_failure);
+    stop->terminal = 1;
+  }
+  /* Poll synchronously, before crs can turn callback failure into a score. */
+  stop->observer.interval_sec = 0.0;
+  stop->poll();
+}
+
+static int np_conditional_nomad_solve(
+  const crs_nomad_problem *problem, crs_nomad_eval_fn eval, void *user_data,
+  const np_nomad_progress_spec *progress, crs_nomad_result *result,
+  np_conditional_nomad_stop_context *stop, SEXP callback_error)
+{
+  crs_nomad_solve_observed_fn solve;
+  NPNomadCallbackError error_owner;
+  const int contain_errors = callback_error != R_NilValue &&
+    !np_mpi_distributed_interrupt_active();
+  crs_nomad_problem fixed_problem;
+  crs_nomad_problem distributed_problem;
+  const crs_nomad_problem *solve_problem;
+  const int previous_callback = nomad_c_callback_active;
+  crs_nomad_observer_poll_fn previous_poll = np_crs_nomad_observer_poll;
+  double interval = 2.0;
+  int status;
+
+  np_load_crs_namespace();
+  solve = (crs_nomad_solve_observed_fn)
+    R_GetCCallable("crs", "crs_nomad_solve_observed");
+  stop->poll = (crs_nomad_observer_poll_fn)
+    R_GetCCallable("crs", "crs_nomad_observer_poll");
+  if (solve == NULL || stop->poll == NULL)
+    error("required crs 0.15-46 native NOMAD observer capability is unavailable");
+  solve_problem = np_nomad_fixed_degree_problem(problem, progress, &fixed_problem);
+  if (solve_problem != NULL && np_mpi_distributed_interrupt_active()) {
+    distributed_problem = *solve_problem;
+    distributed_problem.reserved_int1 = CRS_NOMAD_INTERRUPT_OWNERSHIP_EXTERNAL;
+    solve_problem = &distributed_problem;
+  }
+  stop->progress = progress;
+  stop->contain_errors = contain_errors &&
+    np_nomad_progress_observer_can_propagate();
+  stop->progress_enabled = np_nomad_progress_observer_config(&interval);
+#ifdef MPI2
+  if (my_rank != 0)
+    stop->progress_enabled = 0;
+#endif
+  stop->observer.api_version = CRS_NOMAD_OBSERVER_API_VERSION;
+  stop->observer.struct_size = sizeof(stop->observer);
+  stop->observer.observe = np_conditional_nomad_observer;
+  stop->observer.user_data = stop;
+  stop->observer.interval_sec = stop->progress_enabled ? interval : DBL_MAX;
+
+  if (contain_errors)
+    np_nomad_error_observer_init(&error_owner, &stop->observer, stop->poll,
+                                eval, user_data, callback_error);
+  np_crs_nomad_observer_poll = stop->poll;
+  if (solve_problem != NULL && solve_problem->callback_mode == CRS_NOMAD_CALLBACK_C)
+    nomad_c_callback_active = 1;
+  status = solve(solve_problem,
+                 contain_errors ? np_nomad_callback_contained : eval,
+                 contain_errors ? &error_owner : user_data,
+                 &stop->observer, result);
+  nomad_c_callback_active = previous_callback;
+  np_crs_nomad_observer_poll = previous_poll;
+  if (np_nomad_error_pending(callback_error))
+    return status;
+  if (!stop->terminal) {
+    status = np_nomad_fixed_degree_solution_status(problem, progress, result, status);
+    if (stop->progress_error[0] != '\0')
+      np_nomad_progress_observer_report(stop->progress_error);
+  }
+  return status;
+}
+
+static void np_conditional_nomad_raise(np_conditional_nomad_stop_context *stop)
+{
+  np_conditional_failure_restore(&stop->saved_failure);
+  np_conditional_failure_raise();
+  error("conditional NOMAD terminal failure metadata is unavailable");
+}
+
+
+
+SEXP C_np_mpi_interrupt_state(SEXP action)
+{
+  const int action_i = Rf_asInteger(action);
+  int pending = np_mpi_interrupt_pending != 0;
+
+  if (action_i == 3)
+    return ScalarLogical(np_mpi_distributed_interrupt_active());
+
+  if (action_i == 4) {
+#ifdef MPI2
+    if (np_mpi_distributed_interrupt_active() && my_rank == 0 &&
+        !np_mpi_interrupt_pending &&
+        !R_ToplevelExec(np_user_interrupt_probe, NULL))
+      np_mpi_interrupt_pending = 1;
+#endif
+    pending = np_mpi_interrupt_pending != 0;
+    np_mpi_interrupt_pending = 0;
+    return ScalarLogical(pending);
+  }
+
+  if (action_i == 2) {
+    if (np_mpi_distributed_interrupt_active())
+      np_mpi_interrupt_pending = 1;
+  } else if (action_i == 1) {
+    np_mpi_interrupt_pending = 0;
+  } else if (action_i != 0) {
+    error("C_np_mpi_interrupt_state: action must be 0 (query), 1 (consume), 2 (set), 3 (active), or 4 (poll and consume)");
+  }
+
+  return ScalarLogical(pending);
+}
+
+SEXP C_np_mpi_interrupt_scope(SEXP action)
+{
+  const int action_i = Rf_asInteger(action);
+  int signaled = 0;
+
+  if (action_i == 1) {
+    if (!np_mpi_distributed_interrupt_active())
+      return ScalarLogical(0);
+#ifdef MPI2
+    if (my_rank != 0)
+      return ScalarLogical(0);
+#endif
+    if (np_mpi_sigint_scope_depth == 0) {
+      void (*previous_handler)(int);
+      np_mpi_sigint_seen = 0;
+      previous_handler = signal(SIGINT, np_mpi_sigint_handler);
+      if (previous_handler == SIG_ERR)
+        error("unable to install the MPI command SIGINT handler");
+      np_mpi_previous_sigint_handler = previous_handler;
+    }
+    np_mpi_sigint_scope_depth++;
+    return ScalarLogical(1);
+  }
+
+  if (action_i == 2) {
+    if (np_mpi_sigint_scope_depth <= 0)
+      return ScalarLogical(0);
+    np_mpi_sigint_scope_depth--;
+    if (np_mpi_sigint_scope_depth == 0) {
+      (void) signal(SIGINT, np_mpi_previous_sigint_handler);
+      signaled = np_mpi_sigint_seen != 0 || np_mpi_interrupt_pending != 0;
+      np_mpi_sigint_seen = 0;
+      np_mpi_interrupt_pending = 0;
+    }
+    return ScalarLogical(signaled);
+  }
+
+  error("C_np_mpi_interrupt_scope: action must be 1 (begin) or 2 (end)");
+  return R_NilValue;
 }
 
 SEXP C_np_progress_signal(SEXP event, SEXP surface, SEXP current, SEXP total)
@@ -281,7 +1326,6 @@ SEXP C_np_nomad_r_callback_native_search(SEXP eval_f,
   SEXP x0_r = R_NilValue, bbin_i = R_NilValue, lower_r = R_NilValue;
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
   crs_nomad_r_callback r_callback;
@@ -332,15 +1376,6 @@ SEXP C_np_nomad_r_callback_native_search(SEXP eval_f,
     error("native NOMAD R callback search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
-
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(nprotect);
-    error("failed to resolve crs final native NOMAD callable");
-  }
 
   solution = R_Calloc(n, double);
   if (solution == NULL) {
@@ -395,7 +1430,11 @@ SEXP C_np_nomad_r_callback_native_search(SEXP eval_f,
   result.outputs = crs_outputs;
   result.outputs_len = 1;
 
-  status = solve(&problem, NULL, &r_callback, &result);
+  status = np_nomad_solve_with_progress(&problem,
+                                        NULL,
+                                        &r_callback,
+                                        NULL,
+                                        &result, R_NilValue);
 
   PROTECT(out = allocVector(VECSXP, 13)); nprotect++;
   PROTECT(names = allocVector(STRSXP, 13)); nprotect++;
@@ -450,7 +1489,8 @@ static void np_progress_bandwidth_multistart_step(const int done, const int tota
 
 static void np_progress_bandwidth_activity_step(const int done)
 {
-  if (done < 1)
+  /* Zero is a heartbeat during an uncounted reference evaluation. */
+  if (done < 0)
     return;
 
   np_progress_signal("bandwidth_activity_step", "bandwidth", done, 0);
@@ -460,6 +1500,7 @@ static void np_progress_fit_clear_state(void)
 {
   fit_progress_active = 0;
   fit_progress_total = 0;
+  fit_progress_supplement_display_total = 0;
   fit_progress_offset = 0;
   fit_progress_last_signal_clock = 0;
   fit_progress_last_signal_eval = 0;
@@ -486,7 +1527,65 @@ void np_progress_fit_set_offset(const int offset)
   fit_progress_last_signal_eval = fit_progress_offset;
 }
 
-static void np_progress_fit_maybe_signal(const int global_done)
+/* A requested inference pass extends only this invocation's progress.  Unlike
+   a new fit stage, replay offsets must preserve the existing throttle state. */
+void np_progress_conditional_se_begin(NPConditionalSEProgressScope *scope,
+                                      const int additional)
+{
+  memset(scope, 0, sizeof(*scope));
+  if(!fit_progress_active || additional <= 0 ||
+     additional > INT_MAX - fit_progress_total)
+    return;
+  scope->active = 1;
+  scope->total = fit_progress_total;
+  scope->offset = fit_progress_offset;
+  scope->last_eval = fit_progress_last_signal_eval;
+  scope->last_clock = fit_progress_last_signal_clock;
+  scope->display_total = fit_progress_supplement_display_total;
+  scope->base = fit_progress_total;
+  if(fit_progress_supplement_display_total == 0)
+    fit_progress_supplement_display_total = fit_progress_total;
+  fit_progress_total += additional;
+  fit_progress_offset = scope->base;
+}
+
+void np_progress_conditional_se_offset(const NPConditionalSEProgressScope *scope,
+                                       const int done)
+{
+  if(scope->active)
+    fit_progress_offset = scope->base + done;
+}
+
+void np_progress_conditional_se_end(NPConditionalSEProgressScope *scope)
+{
+  if(!scope->active)
+    return;
+  fit_progress_total = scope->total;
+  fit_progress_offset = scope->offset;
+  fit_progress_last_signal_eval = scope->last_eval;
+  fit_progress_last_signal_clock = scope->last_clock;
+  fit_progress_supplement_display_total = scope->display_total;
+  scope->active = 0;
+}
+
+typedef struct {
+  int current;
+  int total;
+} NPProgressFitSignalCall;
+
+static SEXP np_progress_fit_signal_execute(void *data)
+{
+  const NPProgressFitSignalCall * const call =
+    (const NPProgressFitSignalCall *)data;
+
+  np_progress_signal("fit_step", "bandwidth", call->current, call->total);
+  return R_NilValue;
+}
+
+static void np_progress_fit_maybe_signal_owned(
+  const int global_done,
+  NPProgressUnwindCleanup cleanup,
+  void *cleanup_data)
 {
   const clock_t now = clock();
   const double signal_after_sec = 0.5;
@@ -515,14 +1614,57 @@ static void np_progress_fit_maybe_signal(const int global_done)
     }
   }
 
-  np_progress_signal("fit_step", "bandwidth", bounded_done, fit_progress_total);
+  /* R retains its original display total. Only a requested supplement maps
+     the extended work counter back to that display; throttle state stays in
+     work units. The existing R fit-finish owns global completion: fixed MPI
+     peers and output collectives may still be active after a local pass. */
+  const int signal_total = fit_progress_supplement_display_total > 0 ?
+    fit_progress_supplement_display_total : fit_progress_total;
+  const int signal_done = fit_progress_supplement_display_total > 0 ?
+    MIN(signal_total-1,
+        (int)(((int64_t)bounded_done*signal_total)/fit_progress_total)) : bounded_done;
+  if(cleanup != NULL) {
+    const NPProgressFitSignalCall call = {
+      .current = signal_done,
+      .total = signal_total
+    };
+
+    R_UnwindProtect(
+      np_progress_fit_signal_execute, (void *)&call,
+      cleanup, cleanup_data, NULL);
+  } else {
+    np_progress_signal("fit_step", "bandwidth", signal_done, signal_total);
+  }
   fit_progress_last_signal_eval = bounded_done;
   fit_progress_last_signal_clock = now;
+}
+
+static void np_progress_fit_maybe_signal(const int global_done)
+{
+  np_progress_fit_maybe_signal_owned(global_done, NULL, NULL);
 }
 
 void np_progress_fit_step(const int done)
 {
   np_progress_fit_maybe_signal(done);
+}
+
+/* Activity during an entropy block is not completed fit/replication work.
+   Reuse the active compiled scope and dispatcher without advancing counters.
+   Call only from existing interrupt checkpoints, never each kernel pair. */
+void np_progress_fit_heartbeat(void)
+{
+  clock_t now;
+  if (!fit_progress_active || fit_progress_total < 1)
+    return;
+  now = clock();
+  if (fit_progress_last_signal_clock > 0 &&
+      now >= fit_progress_last_signal_clock &&
+      (double)(now - fit_progress_last_signal_clock) / CLOCKS_PER_SEC < 0.5)
+    return;
+  np_progress_signal("fit_step", "bandwidth",
+                     fit_progress_last_signal_eval, fit_progress_total);
+  fit_progress_last_signal_clock = now;
 }
 
 void np_progress_fit_loop_step(const int done, const int natural_total)
@@ -534,6 +1676,22 @@ void np_progress_fit_loop_step(const int done, const int natural_total)
     return;
 
   np_progress_fit_maybe_signal(fit_progress_offset + done);
+}
+
+void np_progress_fit_loop_step_owned(
+  const int done,
+  const int natural_total,
+  NPProgressUnwindCleanup cleanup,
+  void *cleanup_data)
+{
+  if (!fit_progress_active || natural_total <= 1)
+    return;
+
+  if ((fit_progress_offset + natural_total) > fit_progress_total)
+    return;
+
+  np_progress_fit_maybe_signal_owned(
+    fit_progress_offset + done, cleanup, cleanup_data);
 }
 
 int np_progress_fit_is_active(void)
@@ -631,6 +1789,117 @@ double **matrix_Y_continuous_eval_extern;
 double **matrix_Y_unordered_eval_extern;
 double **matrix_Y_ordered_eval_extern;
 
+static int *vector_X_support_count_extern = NULL;
+static int *vector_Y_support_count_extern = NULL;
+
+enum {
+  NP_SUPPORT_FAILURE_NONE = 0,
+  NP_SUPPORT_FAILURE_X = 1,
+  NP_SUPPORT_FAILURE_Y = 2
+};
+
+static int *np_compute_support_counts(int num_obs, int ncon,
+                                      double **matrix_continuous)
+{
+  int j;
+  int *counts = NULL;
+
+  if ((ncon <= 0) || (matrix_continuous == NULL))
+    return NULL;
+
+  counts = alloc_vecu(ncon);
+  for (j = 0; j < ncon; j++)
+    counts[j] = simple_unique(num_obs, matrix_continuous[j]);
+
+  return counts;
+}
+
+static void np_clear_support_counts_extern(void)
+{
+  if (vector_X_support_count_extern != NULL) {
+    safe_free(vector_X_support_count_extern);
+    vector_X_support_count_extern = NULL;
+  }
+  if (vector_Y_support_count_extern != NULL) {
+    safe_free(vector_Y_support_count_extern);
+    vector_Y_support_count_extern = NULL;
+  }
+}
+
+static void np_refresh_support_counts_extern(void)
+{
+  np_clear_support_counts_extern();
+
+  if ((num_obs_train_extern > 0) && (num_reg_continuous_extern > 0))
+    vector_X_support_count_extern =
+      np_compute_support_counts(num_obs_train_extern,
+                                num_reg_continuous_extern,
+                                matrix_X_continuous_train_extern);
+
+  if ((num_obs_train_extern > 0) && (num_var_continuous_extern > 0))
+    vector_Y_support_count_extern =
+      np_compute_support_counts(num_obs_train_extern,
+                                num_var_continuous_extern,
+                                matrix_Y_continuous_train_extern);
+}
+
+static int np_nonfixed_support_failure_extern(const int bandwidth)
+{
+  int j;
+
+  if (bandwidth == BW_FIXED)
+    return NP_SUPPORT_FAILURE_NONE;
+
+  for (j = 0; j < num_reg_continuous_extern; j++) {
+    if ((vector_X_support_count_extern == NULL) ||
+        (vector_X_support_count_extern[j] <= 1))
+      return NP_SUPPORT_FAILURE_X;
+  }
+
+  for (j = 0; j < num_var_continuous_extern; j++) {
+    if ((vector_Y_support_count_extern == NULL) ||
+        (vector_Y_support_count_extern[j] <= 1))
+      return NP_SUPPORT_FAILURE_Y;
+  }
+
+  return NP_SUPPORT_FAILURE_NONE;
+}
+
+/* All participating ranks receive the same complete training input. Reject
+ * constant support before owner allocation or collective evaluation, without
+ * changing the existing prepared conditional-density status protocol. */
+static void np_validate_nonfixed_support_input(const char *where,
+                                               const int bandwidth,
+                                               const int nobs,
+                                               const int nx,
+                                               const double *x,
+                                               const int ny,
+                                               const double *y)
+{
+  int side, j, i;
+  if (bandwidth == BW_FIXED)
+    return;
+  for (side = 0; side < 2; side++) {
+    const int ncon = side == 0 ? nx : ny;
+    const double *data = side == 0 ? x : y;
+    for (j = 0; j < ncon; j++) {
+      int distinct = 0;
+      if (data != NULL && nobs > 1) {
+        const double *column = data + (size_t)j * (size_t)nobs;
+        for (i = 1; i < nobs; i++) {
+          if (column[i] != column[0]) {
+            distinct = 1;
+            break;
+          }
+        }
+      }
+      if (!distinct)
+        error("%s: nonfixed nearest-neighbour bandwidths require at least two distinct continuous %s values per dimension",
+              where, side == 0 ? "regressor" : "variable");
+    }
+  }
+}
+
 /* these are data which are sorted into an 'alternate' order */
 /* this allows us to support 2 trees simultaneously !*/
 
@@ -669,9 +1938,13 @@ static int bwm_nn_cache_bandwidth_key_len = 0;
 static int bwm_nn_cache_integer_extra_params = 0;
 static size_t bwm_nn_cache_capacity = 0;
 static size_t bwm_nn_cache_size = 0;
+static size_t bwm_nn_cache_growth_size = 0;
 static int *bwm_nn_cache_keys = NULL;
 static double *bwm_nn_cache_values = NULL;
 static unsigned char *bwm_nn_cache_used = NULL;
+static int *bwm_nn_cache_dynamic_key = NULL;
+static int bwm_nn_cache_requested = 0;
+static int bwm_nn_cache_insert_enabled = 0;
 static double bwm_nn_cache_visits = 0.0;
 static double bwm_nn_cache_unique = 0.0;
 static double bwm_nn_cache_repeats = 0.0;
@@ -683,9 +1956,12 @@ static int bwm_objective_cache_active = 0;
 static int bwm_objective_cache_key_len = 0;
 static size_t bwm_objective_cache_capacity = 0;
 static size_t bwm_objective_cache_size = 0;
+static size_t bwm_objective_cache_growth_size = 0;
 static double *bwm_objective_cache_keys = NULL;
 static double *bwm_objective_cache_values = NULL;
 static unsigned char *bwm_objective_cache_used = NULL;
+static int bwm_objective_cache_requested = 0;
+static int bwm_objective_cache_insert_enabled = 0;
 static double bwm_objective_cache_visits = 0.0;
 static double bwm_objective_cache_unique = 0.0;
 static double bwm_objective_cache_repeats = 0.0;
@@ -698,36 +1974,160 @@ static int bwm_objective_cache_callback_option_value = 1;
 
 typedef struct {
   int active;
-  int owned;
   int num_var;
-  int num_reg_continuous;
-  int num_reg_unordered;
-  int num_reg_ordered;
-  int *ipt;
-  int *glp_degree;
+  int num_unordered;
+  int num_ordered;
+  int num_continuous;
+  double **matrix_x_unordered;
+  double **matrix_x_ordered;
+  double **matrix_x_continuous;
+  int *num_categories;
+  double **matrix_categorical_vals;
+  double *continuous_stddev;
+  double *extendednn_upper;
+  double **powell_directions;
+  double *scale_factor;
+  double *scale_factor_startbest;
+  double *powell_step;
+  int *tree_permutation;
+  KDT *tree;
+} NPDensityPreparedCtx;
+
+static int np_density_prepared_context_prepare(
+  NPDensityPreparedCtx *context,
+  double *myuno, double *myord, double *mycon, double *mysd,
+  int *myopti, double *myoptd, const double *bw,
+  int penalty_mode, double penalty_mult,
+  double *ckerlb, double *ckerub, const NPCategoricalSupport *support);
+static int np_density_prepared_context_eval(
+  NPDensityPreparedCtx *context, const double *bw,
+  int penalty_mode, double penalty_mult, double out[5]);
+static void np_density_prepared_context_destroy(NPDensityPreparedCtx *context);
+
+typedef struct {
+  int active;
+  int num_var;
+  int num_unordered;
+  int num_ordered;
+  int num_continuous;
+  int cdfontrain;
+  double **matrix_x_unordered_train;
+  double **matrix_x_ordered_train;
+  double **matrix_x_continuous_train;
+  double **matrix_x_unordered_eval;
+  double **matrix_x_ordered_eval;
+  double **matrix_x_continuous_eval;
+  int *num_categories;
+  double **matrix_categorical_vals;
+  double *continuous_stddev;
+  double *extendednn_upper;
+  double **powell_directions;
+  double *scale_factor;
+  double *scale_factor_multistart;
+  double *scale_factor_startbest;
+  double *powell_step;
+  int *tree_permutation_train;
+  int *tree_permutation_eval;
+  KDT *tree;
+} NPDistributionPreparedCtx;
+
+static int np_distribution_prepared_context_prepare(
+  NPDistributionPreparedCtx *context,
+  double *myuno, double *myord, double *mycon,
+  double *myeuno, double *myeord, double *myecon, double *mysd,
+  int *myopti, double *myoptd, const double *bw,
+  int penalty_mode, double penalty_mult,
+  double *ckerlb, double *ckerub, const NPCategoricalSupport *support);
+static int np_distribution_prepared_context_eval(
+  NPDistributionPreparedCtx *context, const double *bw,
+  int penalty_mode, double penalty_mult, double out[5]);
+static void np_distribution_prepared_context_destroy(
+  NPDistributionPreparedCtx *context);
+
+typedef struct {
+  int active;
+  int num_var;
+  int num_search_var;
+  int num_unordered;
+  int num_ordered;
+  int num_continuous;
+  int degree_search;
+  int degree_state_ready;
+  int degree_key_len;
+  int requested_bernstein;
+  int requested_basis;
+  double **matrix_x_unordered;
+  double **matrix_x_ordered;
+  double **matrix_x_continuous;
+  double *response;
+  double *lsq_scale;
+  double *lsq_q;
+  int *num_categories;
+  double **matrix_categorical_vals;
+  double *continuous_stddev;
+  double *extendednn_upper;
+  double **powell_directions;
+  double *scale_factor;
+  double *scale_factor_startbest;
+  double *powell_step;
+  int *degree;
   double *ckerlb;
   double *ckerub;
-  double *vector_scale_factor;
-  double *extendednn_upper;
-} NPRegressionNomadShadowCtx;
+  int *tree_permutation;
+  int *tree_lookup;
+  KDT *tree;
+} NPRegressionPreparedCtx;
 
-static NPRegressionNomadShadowCtx np_regression_nomad_shadow =
-  {0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL};
+static void np_regression_prepared_context_destroy(
+  NPRegressionPreparedCtx *context);
+static int np_regression_prepared_context_refresh_degree(
+  NPRegressionPreparedCtx *context, const int *degree);
+static int np_regression_prepared_context_eval(
+  NPRegressionPreparedCtx *context, const double *bw,
+  const int *degree, const int raw_only, double out[3]);
+static void np_regression_bw_mode(
+  double *runo, double *rord, double *rcon, double *y,
+  double *mysd, int *myopti, double *myoptd, double *rbw, double *fval,
+  double *objective_function_values, double *objective_function_evals,
+  double *objective_function_invalid, double *timing,
+  double *objective_function_fast,
+  int *penalty_mode, double *penalty_mult,
+  int *glp_degree, int *glp_bernstein, int *glp_basis,
+  double *ckerlb, double *ckerub,
+  int eval_only, int lsq_check_mode, double *lsq_scale,
+  double lsq_tau, double lsq_delta_start,
+  double lsq_delta_lower, double lsq_delta_upper,
+  double *lsq_delta_out,
+  NPRegressionPreparedCtx *retained_context,
+  int prepare_only, int degree_search,
+                                  const NPCategoricalSupport *support);
+
+static NPRegressionPreparedCtx np_regression_prepared = {0};
 
 typedef struct {
   int active;
   int owned;
   int num_all_var;
   int num_reg_continuous;
+  int degree_key_len;
   int num_var_continuous;
   int num_reg_unordered;
   int num_var_unordered;
   int num_reg_ordered;
   int num_var_ordered;
   int need_y_side;
-  int old_cdens;
   int penalty_mode;
+  int penalty_ready;
+  int glp_original_order;
+  int degree_search;
+  int degree_state_ready;
+  int requested_glp_bernstein;
+  int requested_glp_basis;
+  int tree_x_ready;
+  int tree_y_ready;
+  int tree_xy_ready;
   double penalty_multiplier;
+  double penalty_value;
   int *glp_degree;
   int *ipt_x;
   int *ipt_y;
@@ -736,6 +2136,8 @@ typedef struct {
   int *ipt_lookup_y;
   int *ipt_lookup_xy;
   double *vector_scale_factor;
+  double *eval_bandwidth;
+  int *eval_degree;
   double *cxkerlb;
   double *cxkerub;
   double *cykerlb;
@@ -743,15 +2145,145 @@ typedef struct {
   double *cxykerlb;
   double *cxykerub;
   double *extendednn_upper;
-} NPConditionalDensityNomadShadowCtx;
+  double **powell_directions;
+  double *scale_factor_startbest;
+  double *powell_step;
+  double **matrix_y_unordered_original;
+  double **matrix_y_ordered_original;
+  double **matrix_y_continuous_original;
+  double **matrix_y_unordered_tree;
+  double **matrix_y_ordered_tree;
+  double **matrix_y_continuous_tree;
+  double **matrix_xy_unordered_original;
+  double **matrix_xy_ordered_original;
+  double **matrix_xy_continuous_original;
+  double **matrix_xy_unordered_tree;
+  double **matrix_xy_ordered_tree;
+  double **matrix_xy_continuous_tree;
+} NPConditionalDensityPreparedCtx;
 
-static NPConditionalDensityNomadShadowCtx np_conditional_density_nomad_shadow =
-  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, NULL, NULL, NULL, NULL, NULL, NULL,
-   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+typedef struct {
+  int active;
+  int cdfontrain;
+  int degree_search;
+  int degree_key_len;
+  int degree_state_ready;
+  int requested_glp_bernstein;
+  int requested_glp_basis;
+  int tree_x_ready;
+  int tree_y_ready;
+  int tree_xy_ready;
+  int penalty_mode;
+  int num_all_var;
+  int num_all_cvar;
+  int num_all_uvar;
+  int num_all_ovar;
+  int num_obs_alt;
+  int num_var_unordered;
+  int num_var_ordered;
+  int num_var_continuous;
+  int num_reg_unordered;
+  int num_reg_ordered;
+  int num_reg_continuous;
+  double **matrix_y_unordered_train;
+  double **matrix_y_ordered_train;
+  double **matrix_y_continuous_train;
+  double **matrix_y_unordered_eval;
+  double **matrix_y_ordered_eval;
+  double **matrix_y_continuous_eval;
+  double **matrix_x_unordered_train;
+  double **matrix_x_ordered_train;
+  double **matrix_x_continuous_train;
+  double **matrix_xy_unordered_train;
+  double **matrix_xy_ordered_train;
+  double **matrix_xy_continuous_train;
+  double **matrix_y_unordered_tree;
+  double **matrix_y_ordered_tree;
+  double **matrix_y_continuous_tree;
+  double **matrix_xy_unordered_tree;
+  double **matrix_xy_ordered_tree;
+  double **matrix_xy_continuous_tree;
+  double **matrix_categorical_vals;
+  double **matrix_categorical_vals_x;
+  double **matrix_categorical_vals_y;
+  double **matrix_categorical_vals_xy;
+  double **powell_directions;
+  double *scale_factor;
+  double *eval_bandwidth;
+  int *eval_degree;
+  int *glp_degree;
+  double *scale_factor_startbest;
+  double *powell_step;
+  double *scale_factor_multistart;
+  double *cxy_lower;
+  double *cxy_upper;
+  double *extendednn_upper;
+  double penalty_multiplier;
+  int *num_categories;
+  int *num_categories_x;
+  int *num_categories_y;
+  int *num_categories_xy;
+  int *ipt_x;
+  int *ipt_y;
+  int *ipt_xy;
+  int *ipt_lookup_x;
+  int *ipt_lookup_y;
+  int *ipt_lookup_xy;
+} NPConditionalDistributionPreparedCtx;
 
-static void np_regression_nomad_shadow_clear_internal(void);
-static void np_conditional_density_nomad_shadow_clear_internal(void);
-static void np_conditional_density_nomad_shadow_refresh_penalty(void);
+static int np_conditional_distribution_prepared_context_eval(
+  NPConditionalDistributionPreparedCtx *context,
+  const double *bandwidth,
+  const int *degree,
+  const int defer_failure,
+  double out[5]);
+static void np_conditional_distribution_prepared_context_destroy(
+  NPConditionalDistributionPreparedCtx *context);
+static void np_distribution_conditional_bw_mode(
+  double *c_uno, double *c_ord, double *c_con,
+  double *u_uno, double *u_ord, double *u_con,
+  double *cg_uno, double *cg_ord, double *cg_con, double *mysd,
+  int *myopti, double *myoptd, double *myans, double *fval,
+  double *objective_function_values, double *objective_function_evals,
+  double *objective_function_invalid, double *timing,
+  double *objective_function_fast,
+  int *penalty_mode, double *penalty_mult,
+  int *glp_degree, int *glp_bernstein, int *glp_basis, int *regtype,
+  double *cxkerlb, double *cxkerub, double *cykerlb, double *cykerub,
+  int eval_only, NPConditionalDistributionPreparedCtx *retained_context,
+  int prepare_only, int degree_search,
+                                    const NPCategoricalSupport *support);
+
+static NPConditionalDensityPreparedCtx np_conditional_density_prepared_context =
+  {0};
+
+static void np_regression_prepared_clear_internal(void);
+static void np_conditional_density_prepared_context_clear_internal(void);
+static void np_conditional_density_prepared_context_refresh_penalty(void);
+static int np_conditional_density_prepared_context_prepare_internal(double *c_uno,
+                                                               double *c_ord,
+                                                               double *c_con,
+                                                               double *u_uno,
+                                                               double *u_ord,
+                                                               double *u_con,
+                                                               double *mysd,
+                                                               int *myopti,
+                                                               double *myoptd,
+                                                               double *rbw,
+                                                               int *penalty_mode,
+                                                               double *penalty_mult,
+                                                               int *glp_degree,
+                                                               int *glp_bernstein,
+                                                               int *glp_basis,
+                                                               int *regtype,
+                                                               double *cxkerlb,
+                                                               double *cxkerub,
+                                                               double *cykerlb,
+                                                               double *cykerub,
+                                                               int retain_powell_geometry,
+                                                               int eval_only,
+                                                               int *support_failure,
+                                                               const NPCategoricalSupport *support);
 
 static int np_mpi_comm1_all_ok(const int local_ok)
 {
@@ -762,6 +2294,18 @@ static int np_mpi_comm1_all_ok(const int local_ok)
   return global_ok;
 #else
   return local_ok ? 1 : 0;
+#endif
+}
+
+static int np_mpi_comm1_max_int(const int local_value)
+{
+#ifdef MPI2
+  int global_value = local_value;
+  if (comm != NULL && comm[1] != MPI_COMM_NULL)
+    MPI_Allreduce(MPI_IN_PLACE, &global_value, 1, MPI_INT, MPI_MAX, comm[1]);
+  return global_value;
+#else
+  return local_value;
 #endif
 }
 
@@ -821,7 +2365,24 @@ static void np_reset_y_side_extern(void)
   matrix_categorical_vals_extern_Y = NULL;
 }
 
-static void np_shadow_matrix_dims(SEXP x, int *nrow, int *ncol)
+/*
+ * Keep Y-side workspace ownership aligned with the objective engine that will
+ * actually run.  Automatic degree search must own the capability envelope,
+ * not only the engine selected by its initial degree: a later positive-degree
+ * CVML candidate activates the general-LP stream and consumes the same Y-only
+ * categorical metadata as an initially general-LP route.
+ */
+static int np_conditional_density_objective_needs_y_side(
+  const int objective,
+  const int degree_search)
+{
+  return (objective == CBWM_CVLS) ||
+    ((objective == CBWM_CVML) &&
+     (degree_search ||
+      np_conditional_density_cvml_stream_engine_supported()));
+}
+
+static void np_matrix_dims_or_zero(SEXP x, int *nrow, int *ncol)
 {
   SEXP dim = getAttrib(x, R_DimSymbol);
   if(dim == R_NilValue || XLENGTH(dim) != 2){
@@ -833,7 +2394,7 @@ static void np_shadow_matrix_dims(SEXP x, int *nrow, int *ncol)
   *ncol = INTEGER(dim)[1];
 }
 
-static void np_shadow_fill_matrix(double **dest, const double *src, int nrow, int ncol)
+static void np_fill_column_major_matrix(double **dest, const double *src, int nrow, int ncol)
 {
   int i, j;
   for(j = 0; j < ncol; j++)
@@ -845,16 +2406,139 @@ static int bwm_use_transform = 0;
 static int bwm_num_reg_continuous = 0;
 static int bwm_num_reg_unordered = 0;
 static int bwm_num_reg_ordered = 0;
+static int bwm_num_y_unordered = 0;
+static int bwm_num_y_ordered = 0;
 static int bwm_num_extra_params = 0;
 static int bwm_kernel_unordered = 0;
 static int *bwm_num_categories = NULL;
+static int *bwm_kernel_unordered_vec = NULL;
+static int bwm_kernel_unordered_len = 0;
+/* Maximum in optimizer units; physical reference-point caps stay unchanged. */
+static double bwm_categorical_transform_scale = 1.0;
+extern double ncatfac_extern;
 static double *bwm_transform_buf = NULL;
 static int bwm_transform_buf_len = 0;
-static int nomad_c_callback_active = 0;
 
 static void bwm_nn_cache_free(void);
 static void bwm_objective_cache_free(void);
 extern void np_accel_gauss_release_buffers(void);
+
+/*
+ * Own every dimension, categorical-kernel, and borrowed category-count field
+ * used by bandwidth coordinate transforms.  Initial starts must install this
+ * context before external bandwidths are converted to optimizer coordinates;
+ * no transform may depend on state left by an earlier search owner.
+ */
+static void bwm_search_context_release(void)
+{
+  /* Pointer-keyed geometry belongs to this immutable search data owner. */
+  np_cont_largeh_cache_clear_extern();
+  safe_free(bwm_kernel_unordered_vec);
+  bwm_kernel_unordered_vec = NULL;
+  bwm_kernel_unordered_len = 0;
+  bwm_categorical_transform_scale = 1.0;
+  bwm_num_reg_continuous = 0;
+  bwm_num_reg_unordered = 0;
+  bwm_num_reg_ordered = 0;
+  bwm_num_y_unordered = 0;
+  bwm_num_y_ordered = 0;
+  bwm_num_extra_params = 0;
+  bwm_kernel_unordered = 0;
+  bwm_num_categories = NULL;
+}
+
+static void bwm_search_context_configure_uniform(
+  const int num_continuous,
+  const int num_unordered,
+  const int num_ordered,
+  const int num_extra_params,
+  const int kernel_unordered,
+  int * const num_categories)
+{
+  bwm_search_context_release();
+  bwm_num_reg_continuous = num_continuous;
+  bwm_num_reg_unordered = num_unordered;
+  bwm_num_reg_ordered = num_ordered;
+  bwm_num_y_unordered = num_unordered;
+  bwm_num_extra_params = num_extra_params;
+  bwm_kernel_unordered = kernel_unordered;
+  bwm_num_categories = num_categories;
+  if (bwm_use_transform && int_LARGE_SF == SF_NORMAL &&
+      (num_unordered > 0 || num_ordered > 0))
+    bwm_categorical_transform_scale = 1.0 / ncatfac_extern;
+}
+
+static void bwm_search_context_configure_split(
+  const int num_continuous,
+  const int num_y_unordered,
+  const int num_x_unordered,
+  const int num_y_ordered,
+  const int num_x_ordered,
+  const int num_extra_params,
+  const int kernel_y_unordered,
+  const int kernel_x_unordered,
+  int * const num_categories)
+{
+  int i;
+  const int num_unordered = num_y_unordered + num_x_unordered;
+
+  bwm_search_context_configure_uniform(
+    num_continuous, num_unordered, num_y_ordered + num_x_ordered, num_extra_params,
+    kernel_y_unordered, num_categories);
+  bwm_num_y_unordered = num_y_unordered;
+  bwm_num_y_ordered = num_y_ordered;
+  bwm_kernel_unordered_len = num_unordered;
+  if (num_unordered <= 0)
+    return;
+
+  bwm_kernel_unordered_vec = alloc_vecu(num_unordered);
+  for (i = 0; i < num_y_unordered; i++)
+    bwm_kernel_unordered_vec[i] = kernel_y_unordered;
+  for (i = 0; i < num_x_unordered; i++)
+    bwm_kernel_unordered_vec[num_y_unordered + i] = kernel_x_unordered;
+}
+
+/* Category ordinals follow the raw decoder: Yu, Yo, Xu, Xo.  Uniform
+ * owners set Yu to all unordered and Yo to zero, retaining U, O order. */
+static int bwm_unordered_category_index(const int i)
+{
+  return i + (i < bwm_num_y_unordered ? 0 : bwm_num_y_ordered);
+}
+
+static int bwm_ordered_category_index(const int i)
+{
+  return i + (i < bwm_num_y_ordered ?
+              bwm_num_y_unordered : bwm_num_reg_unordered);
+}
+
+static double bwm_unordered_maximum(const int i)
+{
+  const int kernel = (bwm_kernel_unordered_vec != NULL &&
+                      i < bwm_kernel_unordered_len) ?
+    bwm_kernel_unordered_vec[i] : bwm_kernel_unordered;
+  return bwm_num_categories != NULL ?
+    max_unordered_bw(bwm_num_categories[bwm_unordered_category_index(i)], kernel) :
+    1.0;
+}
+
+static double bwm_unordered_transform_maximum(const int i)
+{
+  return bwm_unordered_maximum(i) * bwm_categorical_transform_scale;
+}
+
+static void bwm_set_categorical_midpoints(double * const p)
+{
+  int i;
+  for (i = 0; i < bwm_num_reg_unordered; ++i) {
+    const double midpoint = 0.5 * bwm_unordered_maximum(i);
+    /* Raw probes use scale factors, not transformed or physical lambda. */
+    p[bwm_num_reg_continuous + 1 + bwm_unordered_category_index(i)] =
+      int_LARGE_SF == SF_NORMAL ? midpoint / ncatfac_extern : midpoint;
+  }
+  for (i = 0; i < bwm_num_reg_ordered; ++i)
+    p[bwm_num_reg_continuous + 1 + bwm_ordered_category_index(i)] =
+      int_LARGE_SF == SF_NORMAL ? 0.5 / ncatfac_extern : 0.5;
+}
 
 static int bwm_reserve_transform_buf(int needed_len)
 {
@@ -889,17 +2573,281 @@ void np_release_static_buffers(int *unused)
   bwm_transform_buf_len = 0;
   bwm_nn_cache_free();
   bwm_objective_cache_free();
+  bwm_search_context_release();
   np_accel_gauss_release_buffers();
 }
 static int bwm_penalty_mode = 0;
 static double bwm_penalty_value = DBL_MAX;
-static int *bwm_kernel_unordered_vec = NULL;
-static int bwm_kernel_unordered_len = 0;
 static double bwm_scale_factor_lower_bound = 0.1;
 double *vector_extendednn_upper_extern = NULL;
 int int_extendednn_upper_num_extern = 0;
-int int_conditional_nomad_shadow_extern = 0;
+int int_conditional_prepared_context_extern = 0;
 static const char *bwm_deferred_error = NULL;
+
+static int np_minimized_nonnegative_reference_penalty(
+  const double reference,
+  const double multiplier,
+  double * const penalty)
+{
+  double candidate;
+
+  if (penalty == NULL)
+    return 0;
+  *penalty = DBL_MAX;
+  if (!R_FINITE(reference) || reference < 0.0 ||
+      !R_FINITE(multiplier) || multiplier < 1.0)
+    return 0;
+
+  candidate = multiplier * reference;
+  if (candidate == reference)
+    candidate = nextafter(reference, INFINITY);
+  if (!R_FINITE(candidate) || candidate <= reference || candidate >= DBL_MAX)
+    return 0;
+
+  *penalty = candidate;
+  return 1;
+}
+
+typedef struct {
+  double breakpoint;
+  double weight;
+  int index;
+} NPCvcCheckNullEntry;
+
+static int np_cvc_check_null_entry_compare(const void *left,
+                                           const void *right)
+{
+  const NPCvcCheckNullEntry *x = (const NPCvcCheckNullEntry *)left;
+  const NPCvcCheckNullEntry *y = (const NPCvcCheckNullEntry *)right;
+
+  if (x->breakpoint < y->breakpoint) return -1;
+  if (x->breakpoint > y->breakpoint) return 1;
+  if (x->weight < y->weight) return -1;
+  if (x->weight > y->weight) return 1;
+  if (x->index < y->index) return -1;
+  if (x->index > y->index) return 1;
+  return 0;
+}
+
+static int np_cvc_check_null_reference(
+  const double * const response,
+  const double * const scale,
+  const int n,
+  const double tau,
+  const double delta_lower,
+  const double delta_upper,
+  double * const reference)
+{
+  NPCvcCheckNullEntry *entry = NULL;
+  size_t allocation_bytes;
+  double response_sum = 0.0;
+  double response_mean;
+  double leave_one_factor;
+  double running_suffix = 0.0;
+  double running_prefix = 0.0;
+  double total_weight = 0.0;
+  double cumulative_weight = 0.0;
+  double threshold;
+  double selected_breakpoint = 0.0;
+  double z_lower;
+  double z_upper;
+  double z;
+  double loss_sum = 0.0;
+  int selected = 0;
+  int ok = 0;
+  int i;
+
+  if (reference == NULL)
+    return 0;
+  *reference = DBL_MAX;
+  if (response == NULL || scale == NULL || n <= 1 ||
+      !R_FINITE(tau) || tau <= 0.0 || tau >= 1.0 ||
+      !R_FINITE(delta_lower) || !R_FINITE(delta_upper) ||
+      delta_lower <= 0.0 || delta_upper >= 1.0 ||
+      delta_lower >= delta_upper ||
+      !np_size_mul_checked((size_t)n, sizeof(*entry), &allocation_bytes))
+    return 0;
+
+  entry = (NPCvcCheckNullEntry *)malloc(allocation_bytes);
+  if (entry == NULL)
+    return 0;
+
+  for (i = 0; i < n; i++) {
+    if (!R_FINITE(response[i]))
+      goto cleanup;
+    response_sum += response[i];
+    if (!R_FINITE(response_sum))
+      goto cleanup;
+  }
+  response_mean = response_sum/(double)n;
+  leave_one_factor = (double)n/((double)n - 1.0);
+  if (!R_FINITE(response_mean) || !R_FINITE(leave_one_factor))
+    goto cleanup;
+
+  for (i = n - 1; i >= 0; i--) {
+    if (!R_FINITE(scale[i]) || scale[i] <= 0.0)
+      goto cleanup;
+    entry[i].weight = running_suffix;
+    running_suffix += scale[i];
+    if (!R_FINITE(running_suffix))
+      goto cleanup;
+  }
+
+  for (i = 0; i < n; i++) {
+    const double leave_one_sum = running_prefix + entry[i].weight;
+    const double weight = leave_one_sum/((double)n - 1.0);
+    const double centered_response =
+      leave_one_factor*(response[i] - response_mean);
+    double breakpoint = centered_response/weight;
+
+    if (!R_FINITE(leave_one_sum) || !R_FINITE(weight) || weight <= 0.0 ||
+        !R_FINITE(centered_response) || !R_FINITE(breakpoint))
+      goto cleanup;
+    if (breakpoint == 0.0)
+      breakpoint = 0.0;
+    entry[i].breakpoint = breakpoint;
+    entry[i].weight = weight;
+    entry[i].index = i;
+    running_prefix += scale[i];
+    if (!R_FINITE(running_prefix))
+      goto cleanup;
+  }
+
+  qsort(entry, (size_t)n, sizeof(*entry), np_cvc_check_null_entry_compare);
+
+  for (i = 0; i < n; i++) {
+    total_weight += entry[i].weight;
+    if (!R_FINITE(total_weight))
+      goto cleanup;
+  }
+  threshold = tau*total_weight;
+  if (!R_FINITE(total_weight) || total_weight <= 0.0 ||
+      !R_FINITE(threshold) || threshold <= 0.0)
+    goto cleanup;
+  for (i = 0; i < n; i++) {
+    cumulative_weight += entry[i].weight;
+    if (!R_FINITE(cumulative_weight))
+      goto cleanup;
+    if (!selected && cumulative_weight >= threshold) {
+      selected_breakpoint = entry[i].breakpoint;
+      selected = 1;
+      break;
+    }
+  }
+  if (!selected)
+    goto cleanup;
+
+  z_lower = qnorm(delta_lower, 0.0, 1.0, 1, 0);
+  z_upper = qnorm(delta_upper, 0.0, 1.0, 1, 0);
+  if (!R_FINITE(z_lower) || !R_FINITE(z_upper))
+    goto cleanup;
+  if (z_lower > z_upper) {
+    const double temporary = z_lower;
+    z_lower = z_upper;
+    z_upper = temporary;
+  }
+  z = MIN(z_upper, MAX(z_lower, selected_breakpoint));
+  if (!R_FINITE(z))
+    goto cleanup;
+
+  for (i = 0; i < n; i++) {
+    const int index = entry[i].index;
+    const double centered_response =
+      leave_one_factor*(response[index] - response_mean);
+    const double residual = centered_response - entry[i].weight*z;
+    const double loss = residual*(tau - (residual < 0.0 ? 1.0 : 0.0));
+
+    if (!R_FINITE(centered_response) || !R_FINITE(residual) ||
+        !R_FINITE(loss) || loss < 0.0)
+      goto cleanup;
+    loss_sum += loss;
+    if (!R_FINITE(loss_sum))
+      goto cleanup;
+  }
+  loss_sum /= (double)n;
+  if (!R_FINITE(loss_sum) || loss_sum < 0.0)
+    goto cleanup;
+
+  *reference = loss_sum;
+  ok = 1;
+
+cleanup:
+  free(entry);
+  return ok;
+}
+
+static int np_cvks_null_reference(const double * const response,
+                                  const int n,
+                                  double * const reference)
+{
+  int i;
+  int ones = 0;
+  int zeros;
+  const double floor = sqrt(DBL_EPSILON);
+  double loss_sum = 0.0;
+
+  if (reference == NULL)
+    return 0;
+  *reference = DBL_MAX;
+  if (response == NULL || n <= 1)
+    return 0;
+
+  for (i = 0; i < n; i++) {
+    if (!R_FINITE(response[i]) ||
+        (response[i] != 0.0 && response[i] != 1.0))
+      return 0;
+    if (response[i] == 1.0)
+      ones++;
+  }
+  zeros = n - ones;
+
+  if (zeros > 0) {
+    double probability = (double)ones/(double)(n - 1);
+    const double loss = -log1p(-MIN(1.0 - floor,
+                                    MAX(floor, probability)));
+    if (!R_FINITE(loss) || loss < 0.0)
+      return 0;
+    loss_sum = (double)zeros*loss;
+  }
+  if (ones > 0) {
+    double probability = (double)(ones - 1)/(double)(n - 1);
+    const double loss = -log(MIN(1.0 - floor,
+                                 MAX(floor, probability)));
+    if (!R_FINITE(loss) || loss < 0.0)
+      return 0;
+    loss_sum += (double)ones*loss;
+  }
+  loss_sum /= (double)n;
+  if (!R_FINITE(loss_sum) || loss_sum < 0.0)
+    return 0;
+
+  *reference = loss_sum;
+  return 1;
+}
+
+static int np_minimized_cvaic_reference_penalty(
+  const double reference,
+  const double multiplier,
+  double * const penalty)
+{
+  double candidate;
+
+  if (penalty == NULL)
+    return 0;
+  *penalty = DBL_MAX;
+  if (!R_FINITE(reference) ||
+      !R_FINITE(multiplier) || multiplier < 1.0)
+    return 0;
+
+  candidate = reference + log(multiplier);
+  if (candidate == reference)
+    candidate = nextafter(reference, INFINITY);
+  if (!R_FINITE(candidate) || candidate <= reference || candidate >= DBL_MAX)
+    return 0;
+
+  *penalty = candidate;
+  return 1;
+}
 
 void np_bwm_set_deferred_error(const char *msg)
 {
@@ -1084,6 +3032,22 @@ static double *np_continuous_extendednn_upper_alloc(
   return upper;
 }
 
+/* An evaluation envelope must contain both the raw initialization coordinate
+ * and the integer decoded by the NN radius owner. Search-derived bounds keep
+ * their existing contract. Call only from extended-NN evaluation setup. */
+static double np_extendednn_eval_upper(double candidate, const double base_k)
+{
+  const double hard_upper = (double)INT_MAX / 4.0;
+  if (!R_FINITE(candidate) || candidate < base_k)
+    candidate = base_k;
+  if (candidate > hard_upper)
+    candidate = hard_upper;
+  const double rounded = (double)np_fround(candidate);
+  if (rounded > candidate && rounded <= hard_upper)
+    candidate = rounded;
+  return candidate;
+}
+
 static double *np_continuous_extendednn_eval_upper_alloc(
   const int bandwidth,
   const int num_obs,
@@ -1091,7 +3055,6 @@ static double *np_continuous_extendednn_eval_upper_alloc(
   const double *rbw)
 {
   const int base_k = num_obs - 1;
-  const double hard_upper = (double)INT_MAX / 4.0;
   double *upper = NULL;
   int i;
 
@@ -1105,12 +3068,7 @@ static double *np_continuous_extendednn_eval_upper_alloc(
 
   upper = alloc_vecd(num_continuous);
   for (i = 0; i < num_continuous; i++) {
-    double candidate = rbw[i];
-    if (!R_FINITE(candidate) || candidate < (double)base_k)
-      candidate = (double)base_k;
-    if (candidate > hard_upper)
-      candidate = hard_upper;
-    upper[i] = candidate;
+    upper[i] = np_extendednn_eval_upper(rbw[i], (double)base_k);
   }
 
   return upper;
@@ -1256,6 +3214,53 @@ static void np_dim_basis_two_dimen(const int d1, const int d2, double *nd1, doub
   *pd12 = d12;
 }
 
+static double np_complete_lp_count_bounded(const int *degree,
+                                           const int ndegree,
+                                           const double cap)
+{
+  int j, total, value, dmax = 0;
+  double answer = 0.0;
+  double *count = NULL;
+  double *next = NULL;
+  const double ceiling = cap + 1.0;
+
+  if (ndegree <= 0)
+    return 1.0;
+  for (j = 0; j < ndegree; j++)
+    if (degree[j] > dmax) dmax = degree[j];
+
+  count = (double *)calloc((size_t)(dmax + 1), sizeof(double));
+  next = (double *)calloc((size_t)(dmax + 1), sizeof(double));
+  if ((count == NULL) || (next == NULL)) {
+    free(count);
+    free(next);
+    error("np_complete_lp_count_bounded: memory allocation failed");
+  }
+  count[0] = 1.0;
+
+  for (j = 0; j < ndegree; j++) {
+    memset(next, 0, (size_t)(dmax + 1)*sizeof(double));
+    for (total = 0; total <= dmax; total++) {
+      if (count[total] == 0.0) continue;
+      for (value = 0; value <= MIN(degree[j], dmax - total); value++) {
+        const int idx = total + value;
+        next[idx] = MIN(ceiling, next[idx] + count[total]);
+      }
+    }
+    {
+      double *swap = count;
+      count = next;
+      next = swap;
+    }
+  }
+
+  for (total = 0; total <= dmax; total++)
+    answer = MIN(ceiling, answer + count[total]);
+  free(count);
+  free(next);
+  return answer;
+}
+
 void np_dim_basis(int *basis_code,
                   int *kernel,
                   int *degree,
@@ -1296,6 +3301,28 @@ void np_dim_basis(int *basis_code,
       error("np_dim_basis: memory allocation failed");
     for (i = 0; i < ndeg; i++)
       rows[i] = degree[i] + segments[i];
+  }
+
+  if (use_kernel && (basis == 1)) {
+    int unit_segments = 1;
+    for (i = 0; i < ndeg; i++) {
+      if (segments[i] != 1) {
+        unit_segments = 0;
+        break;
+      }
+    }
+    if (unit_segments) {
+      const double full_count =
+        np_complete_lp_count_bounded(degree, ndeg, 100000.0);
+      if (full_count > 100000.0) {
+        free(rows);
+        error("LP basis dimension exceeds supported term capacity (100000)");
+      }
+      ncol_bs = MAX(0.0, full_count - 1.0);
+      free(rows);
+      *result = ncol_bs;
+      return;
+    }
   }
 
   if (use_kernel){
@@ -1421,11 +3448,16 @@ static void bwm_nn_cache_free(void)
   safe_free(bwm_nn_cache_keys);
   safe_free(bwm_nn_cache_values);
   safe_free(bwm_nn_cache_used);
+  safe_free(bwm_nn_cache_dynamic_key);
   bwm_nn_cache_keys = NULL;
   bwm_nn_cache_values = NULL;
   bwm_nn_cache_used = NULL;
+  bwm_nn_cache_dynamic_key = NULL;
   bwm_nn_cache_capacity = 0;
   bwm_nn_cache_size = 0;
+  bwm_nn_cache_growth_size = 0;
+  bwm_nn_cache_requested = 0;
+  bwm_nn_cache_insert_enabled = 0;
 }
 
 static void bwm_nn_cache_reset_stats(void)
@@ -1449,6 +3481,9 @@ static void bwm_objective_cache_free(void)
   bwm_objective_cache_used = NULL;
   bwm_objective_cache_capacity = 0;
   bwm_objective_cache_size = 0;
+  bwm_objective_cache_growth_size = 0;
+  bwm_objective_cache_requested = 0;
+  bwm_objective_cache_insert_enabled = 0;
 }
 
 static void bwm_objective_cache_reset_stats(void)
@@ -1491,24 +3526,95 @@ static void bwm_objective_cache_callback_option_end(void)
   bwm_objective_cache_callback_option_active = 0;
 }
 
-static int bwm_nn_cache_collective_enabled(int local_enabled)
+static int bwm_cache_key_length_checked(int first,
+                                        int second,
+                                        int third,
+                                        int fourth,
+                                        int *result)
 {
-#ifdef MPI2
-  int global_enabled = local_enabled ? 1 : 0;
-  if (comm[1] != MPI_COMM_NULL)
-    MPI_Allreduce(MPI_IN_PLACE, &global_enabled, 1, MPI_INT, MPI_MIN, comm[1]);
-  return global_enabled;
-#else
-  return local_enabled ? 1 : 0;
-#endif
+  size_t total;
+
+  if ((result == NULL) || (first < 0) || (second < 0) ||
+      (third < 0) || (fourth < 0) ||
+      !np_size_add_checked((size_t)first, (size_t)second, &total) ||
+      !np_size_add_checked(total, (size_t)third, &total) ||
+      !np_size_add_checked(total, (size_t)fourth, &total) ||
+      !np_size_to_int_checked(total, result))
+    return 0;
+  return 1;
+}
+
+static int bwm_cache_allocate_arrays(size_t capacity,
+                                     int key_len,
+                                     size_t key_element_size,
+                                     size_t fixed_bytes,
+                                     void **keys,
+                                     double **values,
+                                     unsigned char **used)
+{
+  size_t key_count;
+  size_t table_bytes;
+  NPNativeAllocStatus keys_status;
+  NPNativeAllocStatus values_status;
+  NPNativeAllocStatus used_status;
+
+  if ((keys == NULL) || (values == NULL) || (used == NULL))
+    return 0;
+  *keys = NULL;
+  *values = NULL;
+  *used = NULL;
+  if ((key_len <= 0) || (capacity == 0U) ||
+      ((capacity & (capacity - 1U)) != 0U) ||
+      !np_native_cache_table_bytes(capacity,
+                                   (size_t)key_len,
+                                   key_element_size,
+                                   fixed_bytes,
+                                   &table_bytes) ||
+      (table_bytes > NP_BWM_CACHE_MAX_BYTES) ||
+      !np_size_mul_checked(capacity, (size_t)key_len, &key_count))
+    return 0;
+
+  keys_status = np_native_calloc_array(keys, key_count, key_element_size);
+  values_status = keys_status == NP_NATIVE_ALLOC_OK
+    ? np_native_calloc_array((void **)values,
+                             capacity,
+                             sizeof(**values))
+    : keys_status;
+  used_status = values_status == NP_NATIVE_ALLOC_OK
+    ? np_native_calloc_array((void **)used,
+                             capacity,
+                             sizeof(**used))
+    : values_status;
+  if ((keys_status != NP_NATIVE_ALLOC_OK) ||
+      (values_status != NP_NATIVE_ALLOC_OK) ||
+      (used_status != NP_NATIVE_ALLOC_OK)) {
+    safe_free(*keys);
+    safe_free(*values);
+    safe_free(*used);
+    *keys = NULL;
+    *values = NULL;
+    *used = NULL;
+    return 0;
+  }
+  return 1;
 }
 
 static int bwm_nn_cache_collective_hit(int local_hit)
 {
 #ifdef MPI2
   int global_hit = local_hit ? 1 : 0;
-  if (bwm_nn_cache_active && comm[1] != MPI_COMM_NULL)
-    MPI_Allreduce(MPI_IN_PLACE, &global_hit, 1, MPI_INT, MPI_MIN, comm[1]);
+
+  /*
+   * Eligibility is rank-common. Keep every eligible rank in the incumbent
+   * one-integer hit consensus even if one rank could not allocate its table.
+   */
+  if (bwm_nn_cache_requested && comm[1] != MPI_COMM_NULL)
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &global_hit,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  comm[1]);
   return global_hit;
 #else
   return local_hit ? 1 : 0;
@@ -1519,8 +3625,14 @@ static int bwm_objective_cache_collective_hit(int local_hit)
 {
 #ifdef MPI2
   int global_hit = local_hit ? 1 : 0;
+
   if (comm[1] != MPI_COMM_NULL)
-    MPI_Allreduce(MPI_IN_PLACE, &global_hit, 1, MPI_INT, MPI_MIN, comm[1]);
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &global_hit,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  comm[1]);
   return global_hit;
 #else
   return local_hit ? 1 : 0;
@@ -1552,65 +3664,122 @@ static int bwm_nn_cache_key_equal(const int *stored, const int *key, int key_len
 
 static int bwm_nn_cache_alloc_table(size_t capacity)
 {
-  size_t nkey;
-  if (bwm_nn_cache_key_len <= 0)
-    return 0;
-  nkey = capacity * (size_t)bwm_nn_cache_key_len;
-  bwm_nn_cache_keys = (int *)calloc(nkey, sizeof(int));
-  bwm_nn_cache_values = (double *)calloc(capacity, sizeof(double));
-  bwm_nn_cache_used = (unsigned char *)calloc(capacity, sizeof(unsigned char));
-  if ((bwm_nn_cache_keys == NULL) ||
-      (bwm_nn_cache_values == NULL) ||
-      (bwm_nn_cache_used == NULL)) {
-    bwm_nn_cache_free();
+  int *keys = NULL;
+  double *values = NULL;
+  unsigned char *used = NULL;
+  int *dynamic_key = NULL;
+  size_t dynamic_key_bytes = 0U;
+  size_t growth_size;
+  int local_available;
+
+  if (!np_native_cache_growth_size(capacity, &growth_size) ||
+      ((bwm_nn_cache_key_len > 16) &&
+       !np_size_array_bytes_checked((size_t)bwm_nn_cache_key_len,
+                                    sizeof(*dynamic_key),
+                                    &dynamic_key_bytes)))
+    local_available = 0;
+  else
+    local_available =
+      bwm_cache_allocate_arrays(capacity,
+                                bwm_nn_cache_key_len,
+                                sizeof(*keys),
+                                dynamic_key_bytes,
+                                (void **)&keys,
+                                &values,
+                                &used);
+  if (local_available && (dynamic_key_bytes > 0U))
+    local_available =
+      np_native_malloc_array((void **)&dynamic_key,
+                             (size_t)bwm_nn_cache_key_len,
+                             sizeof(*dynamic_key)) == NP_NATIVE_ALLOC_OK;
+  if (!local_available) {
+    safe_free(keys);
+    safe_free(values);
+    safe_free(used);
+    safe_free(dynamic_key);
     bwm_nn_cache_alloc_failed = 1;
     bwm_nn_cache_active = 0;
     return 0;
   }
+
+  bwm_nn_cache_keys = keys;
+  bwm_nn_cache_values = values;
+  bwm_nn_cache_used = used;
+  bwm_nn_cache_dynamic_key = dynamic_key;
   bwm_nn_cache_capacity = capacity;
   bwm_nn_cache_size = 0;
+  bwm_nn_cache_growth_size = growth_size;
+  bwm_nn_cache_insert_enabled = 1;
   return 1;
 }
 
 static int bwm_nn_cache_rehash(size_t new_capacity)
 {
-  int *old_keys = bwm_nn_cache_keys;
-  double *old_values = bwm_nn_cache_values;
-  unsigned char *old_used = bwm_nn_cache_used;
-  size_t old_capacity = bwm_nn_cache_capacity;
+  int *new_keys = NULL;
+  double *new_values = NULL;
+  unsigned char *new_used = NULL;
+  size_t peak_bytes;
   size_t i;
+  size_t dynamic_key_bytes = 0U;
+  size_t new_growth_size;
+  int local_available;
 
-  bwm_nn_cache_keys = NULL;
-  bwm_nn_cache_values = NULL;
-  bwm_nn_cache_used = NULL;
-  bwm_nn_cache_capacity = 0;
-  bwm_nn_cache_size = 0;
-  if (!bwm_nn_cache_alloc_table(new_capacity)) {
-    safe_free(old_keys);
-    safe_free(old_values);
-    safe_free(old_used);
+  if (!np_native_cache_growth_size(new_capacity, &new_growth_size) ||
+      ((bwm_nn_cache_key_len > 16) &&
+       !np_size_array_bytes_checked((size_t)bwm_nn_cache_key_len,
+                                    sizeof(*bwm_nn_cache_dynamic_key),
+                                    &dynamic_key_bytes)))
+    local_available = 0;
+  else
+    local_available =
+      np_native_cache_rehash_peak_bytes(bwm_nn_cache_capacity,
+                                        new_capacity,
+                                        (size_t)bwm_nn_cache_key_len,
+                                        sizeof(*new_keys),
+                                        dynamic_key_bytes,
+                                        &peak_bytes) &&
+      (peak_bytes <= NP_BWM_CACHE_MAX_BYTES) &&
+      bwm_cache_allocate_arrays(new_capacity,
+                                bwm_nn_cache_key_len,
+                                sizeof(*new_keys),
+                                0U,
+                                (void **)&new_keys,
+                                &new_values,
+                                &new_used);
+
+  if (!local_available) {
+    safe_free(new_keys);
+    safe_free(new_values);
+    safe_free(new_used);
+    bwm_nn_cache_alloc_failed = 1;
+    bwm_nn_cache_insert_enabled = 0;
     return 0;
   }
 
-  for (i = 0; i < old_capacity; i++) {
-    if (old_used[i]) {
-      const int *key = old_keys + i * (size_t)bwm_nn_cache_key_len;
+  for (i = 0; i < bwm_nn_cache_capacity; i++) {
+    if (bwm_nn_cache_used[i]) {
+      const int *key =
+        bwm_nn_cache_keys + i * (size_t)bwm_nn_cache_key_len;
       uint64_t h = bwm_nn_cache_hash_key(key, bwm_nn_cache_key_len);
-      size_t slot = (size_t)(h & (uint64_t)(bwm_nn_cache_capacity - 1));
-      while (bwm_nn_cache_used[slot])
-        slot = (slot + 1) & (bwm_nn_cache_capacity - 1);
-      memcpy(bwm_nn_cache_keys + slot * (size_t)bwm_nn_cache_key_len,
+      size_t slot = (size_t)(h & (uint64_t)(new_capacity - 1U));
+      while (new_used[slot])
+        slot = (slot + 1U) & (new_capacity - 1U);
+      memcpy(new_keys + slot * (size_t)bwm_nn_cache_key_len,
              key,
              (size_t)bwm_nn_cache_key_len * sizeof(int));
-      bwm_nn_cache_values[slot] = old_values[i];
-      bwm_nn_cache_used[slot] = 1;
-      bwm_nn_cache_size++;
+      new_values[slot] = bwm_nn_cache_values[i];
+      new_used[slot] = 1;
     }
   }
 
-  safe_free(old_keys);
-  safe_free(old_values);
-  safe_free(old_used);
+  safe_free(bwm_nn_cache_keys);
+  safe_free(bwm_nn_cache_values);
+  safe_free(bwm_nn_cache_used);
+  bwm_nn_cache_keys = new_keys;
+  bwm_nn_cache_values = new_values;
+  bwm_nn_cache_used = new_used;
+  bwm_nn_cache_capacity = new_capacity;
+  bwm_nn_cache_growth_size = new_growth_size;
   return 1;
 }
 
@@ -1641,12 +3810,26 @@ static int bwm_nn_cache_insert(const int *key, double value)
 {
   uint64_t h;
   size_t slot;
+  size_t new_capacity;
 
   if (!bwm_nn_cache_active || bwm_nn_cache_capacity == 0)
     return 0;
+  if (!bwm_nn_cache_insert_enabled)
+    return 0;
 
-  if ((bwm_nn_cache_size + 1) * 10 >= bwm_nn_cache_capacity * 7) {
-    if (!bwm_nn_cache_rehash(bwm_nn_cache_capacity * 2))
+  if ((bwm_nn_cache_growth_size >= bwm_nn_cache_capacity) ||
+      (bwm_nn_cache_size > bwm_nn_cache_growth_size)) {
+    bwm_nn_cache_alloc_failed = 1;
+    bwm_nn_cache_insert_enabled = 0;
+    return 0;
+  }
+  if (bwm_nn_cache_size == bwm_nn_cache_growth_size) {
+    if (!np_size_mul_checked(bwm_nn_cache_capacity, 2U, &new_capacity)) {
+      bwm_nn_cache_alloc_failed = 1;
+      bwm_nn_cache_insert_enabled = 0;
+      return 0;
+    }
+    if (!bwm_nn_cache_rehash(new_capacity))
       return 0;
   }
 
@@ -1694,65 +3877,98 @@ static int bwm_objective_cache_key_equal(const double *stored,
 
 static int bwm_objective_cache_alloc_table(size_t capacity)
 {
-  size_t nkey;
-  if (bwm_objective_cache_key_len <= 0)
-    return 0;
-  nkey = capacity * (size_t)bwm_objective_cache_key_len;
-  bwm_objective_cache_keys = (double *)calloc(nkey, sizeof(double));
-  bwm_objective_cache_values = (double *)calloc(capacity, sizeof(double));
-  bwm_objective_cache_used = (unsigned char *)calloc(capacity, sizeof(unsigned char));
-  if ((bwm_objective_cache_keys == NULL) ||
-      (bwm_objective_cache_values == NULL) ||
-      (bwm_objective_cache_used == NULL)) {
-    bwm_objective_cache_free();
+  double *keys = NULL;
+  double *values = NULL;
+  unsigned char *used = NULL;
+  size_t growth_size;
+  const int local_available =
+    np_native_cache_growth_size(capacity, &growth_size) &&
+    bwm_cache_allocate_arrays(capacity,
+                              bwm_objective_cache_key_len,
+                              sizeof(*keys),
+                              0U,
+                              (void **)&keys,
+                              &values,
+                              &used);
+
+  if (!local_available) {
+    safe_free(keys);
+    safe_free(values);
+    safe_free(used);
     bwm_objective_cache_alloc_failed = 1;
     bwm_objective_cache_active = 0;
     return 0;
   }
+
+  bwm_objective_cache_keys = keys;
+  bwm_objective_cache_values = values;
+  bwm_objective_cache_used = used;
   bwm_objective_cache_capacity = capacity;
   bwm_objective_cache_size = 0;
+  bwm_objective_cache_growth_size = growth_size;
+  bwm_objective_cache_insert_enabled = 1;
   return 1;
 }
 
 static int bwm_objective_cache_rehash(size_t new_capacity)
 {
-  double *old_keys = bwm_objective_cache_keys;
-  double *old_values = bwm_objective_cache_values;
-  unsigned char *old_used = bwm_objective_cache_used;
-  size_t old_capacity = bwm_objective_cache_capacity;
+  double *new_keys = NULL;
+  double *new_values = NULL;
+  unsigned char *new_used = NULL;
+  size_t peak_bytes;
   size_t i;
+  size_t new_growth_size;
+  const int local_available =
+    np_native_cache_growth_size(new_capacity, &new_growth_size) &&
+    np_native_cache_rehash_peak_bytes(bwm_objective_cache_capacity,
+                                      new_capacity,
+                                      (size_t)bwm_objective_cache_key_len,
+                                      sizeof(*new_keys),
+                                      0U,
+                                      &peak_bytes) &&
+    (peak_bytes <= NP_BWM_CACHE_MAX_BYTES) &&
+    bwm_cache_allocate_arrays(new_capacity,
+                              bwm_objective_cache_key_len,
+                              sizeof(*new_keys),
+                              0U,
+                              (void **)&new_keys,
+                              &new_values,
+                              &new_used);
 
-  bwm_objective_cache_keys = NULL;
-  bwm_objective_cache_values = NULL;
-  bwm_objective_cache_used = NULL;
-  bwm_objective_cache_capacity = 0;
-  bwm_objective_cache_size = 0;
-  if (!bwm_objective_cache_alloc_table(new_capacity)) {
-    safe_free(old_keys);
-    safe_free(old_values);
-    safe_free(old_used);
+  if (!local_available) {
+    safe_free(new_keys);
+    safe_free(new_values);
+    safe_free(new_used);
+    bwm_objective_cache_alloc_failed = 1;
+    bwm_objective_cache_insert_enabled = 0;
     return 0;
   }
 
-  for (i = 0; i < old_capacity; i++) {
-    if (old_used[i]) {
-      const double *key = old_keys + i * (size_t)bwm_objective_cache_key_len;
+  for (i = 0; i < bwm_objective_cache_capacity; i++) {
+    if (bwm_objective_cache_used[i]) {
+      const double *key =
+        bwm_objective_cache_keys +
+        i * (size_t)bwm_objective_cache_key_len;
       uint64_t h = bwm_objective_cache_hash_key(key, bwm_objective_cache_key_len);
-      size_t slot = (size_t)(h & (uint64_t)(bwm_objective_cache_capacity - 1));
-      while (bwm_objective_cache_used[slot])
-        slot = (slot + 1) & (bwm_objective_cache_capacity - 1);
-      memcpy(bwm_objective_cache_keys + slot * (size_t)bwm_objective_cache_key_len,
+      size_t slot = (size_t)(h & (uint64_t)(new_capacity - 1U));
+      while (new_used[slot])
+        slot = (slot + 1U) & (new_capacity - 1U);
+      memcpy(new_keys + slot * (size_t)bwm_objective_cache_key_len,
              key,
              (size_t)bwm_objective_cache_key_len * sizeof(double));
-      bwm_objective_cache_values[slot] = old_values[i];
-      bwm_objective_cache_used[slot] = 1;
-      bwm_objective_cache_size++;
+      new_values[slot] = bwm_objective_cache_values[i];
+      new_used[slot] = 1;
     }
   }
 
-  safe_free(old_keys);
-  safe_free(old_values);
-  safe_free(old_used);
+  safe_free(bwm_objective_cache_keys);
+  safe_free(bwm_objective_cache_values);
+  safe_free(bwm_objective_cache_used);
+  bwm_objective_cache_keys = new_keys;
+  bwm_objective_cache_values = new_values;
+  bwm_objective_cache_used = new_used;
+  bwm_objective_cache_capacity = new_capacity;
+  bwm_objective_cache_growth_size = new_growth_size;
   return 1;
 }
 
@@ -1783,12 +3999,31 @@ static int bwm_objective_cache_insert(const double *key, double value)
 {
   uint64_t h;
   size_t slot;
+  size_t new_capacity;
 
   if (!bwm_objective_cache_active || bwm_objective_cache_capacity == 0)
     return 0;
+  if (!bwm_objective_cache_insert_enabled)
+    return 0;
 
-  if ((bwm_objective_cache_size + 1) * 10 >= bwm_objective_cache_capacity * 7) {
-    if (!bwm_objective_cache_rehash(bwm_objective_cache_capacity * 2))
+  if ((bwm_objective_cache_growth_size >=
+       bwm_objective_cache_capacity) ||
+      (bwm_objective_cache_size >
+       bwm_objective_cache_growth_size)) {
+    bwm_objective_cache_alloc_failed = 1;
+    bwm_objective_cache_insert_enabled = 0;
+    return 0;
+  }
+  if (bwm_objective_cache_size ==
+      bwm_objective_cache_growth_size) {
+    if (!np_size_mul_checked(bwm_objective_cache_capacity,
+                             2U,
+                             &new_capacity)) {
+      bwm_objective_cache_alloc_failed = 1;
+      bwm_objective_cache_insert_enabled = 0;
+      return 0;
+    }
+    if (!bwm_objective_cache_rehash(new_capacity))
       return 0;
   }
 
@@ -1841,16 +4076,22 @@ static void bwm_nn_cache_configure_for_powell(
   bwm_objective_cache_active = 0;
   bwm_objective_cache_key_len = 0;
 
-  objective_cache_enabled =
-    bwm_nn_cache_collective_enabled(bwm_objective_cache_user_enabled());
+  objective_cache_enabled = bwm_objective_cache_user_enabled();
 
   if (!eval_only && objective_cache_enabled) {
-    objective_key_len = num_continuous + num_unordered + num_ordered + extra_params;
-    if (objective_key_len > 0) {
+    bwm_objective_cache_requested = 1;
+    if (bwm_cache_key_length_checked(num_continuous,
+                                     num_unordered,
+                                     num_ordered,
+                                     extra_params,
+                                     &objective_key_len) &&
+        (objective_key_len > 0)) {
       bwm_objective_cache_key_len = objective_key_len;
       bwm_objective_cache_active = 1;
       if (!bwm_objective_cache_alloc_table(2048))
         bwm_objective_cache_key_len = 0;
+    } else {
+      bwm_objective_cache_alloc_failed = 1;
     }
   }
 
@@ -1860,6 +4101,7 @@ static void bwm_nn_cache_configure_for_powell(
   if (!objective_cache_enabled)
     return;
 
+  bwm_nn_cache_requested = 1;
   bwm_nn_cache_key_len = num_continuous;
   bwm_nn_cache_bandwidth_key_len = num_continuous;
   bwm_nn_cache_active = 1;
@@ -1882,16 +4124,29 @@ static void bwm_nn_cache_configure_for_degree_search(
                                     num_unordered,
                                     num_ordered);
 
-  if (eval_only || degree_params <= 0 || !bwm_objective_cache_active)
+  if (eval_only || degree_params <= 0 ||
+      !bwm_objective_cache_requested)
     return;
   if (!((bandwidth == BW_GEN_NN) || (bandwidth == BW_ADAP_NN)))
     return;
   if (num_continuous <= 0 || num_unordered != 0 || num_ordered != 0)
     return;
 
+  bwm_nn_cache_requested = 1;
+  if (!bwm_objective_cache_active)
+    return;
+
   bwm_nn_cache_bandwidth_key_len = num_continuous;
   bwm_nn_cache_integer_extra_params = degree_params;
-  bwm_nn_cache_key_len = num_continuous + degree_params;
+  if (!bwm_cache_key_length_checked(num_continuous,
+                                    degree_params,
+                                    0,
+                                    0,
+                                    &bwm_nn_cache_key_len)) {
+    bwm_nn_cache_alloc_failed = 1;
+    bwm_nn_cache_active = 0;
+    return;
+  }
   bwm_nn_cache_active = 1;
   if (!bwm_nn_cache_alloc_table(2048))
     return;
@@ -1900,16 +4155,11 @@ static void bwm_nn_cache_configure_for_degree_search(
 static int bwm_nn_cache_make_key(double *p, int **key_out, int *stack_key)
 {
   int i;
-  int *key = stack_key;
+  int *key =
+    (bwm_nn_cache_key_len > 16) ? bwm_nn_cache_dynamic_key : stack_key;
 
-  if (bwm_nn_cache_key_len > 16) {
-    key = (int *)malloc((size_t)bwm_nn_cache_key_len * sizeof(int));
-    if (key == NULL) {
-      bwm_nn_cache_alloc_failed = 1;
-      bwm_nn_cache_active = 0;
-      return 0;
-    }
-  }
+  if (key == NULL)
+    return 0;
 
   for (i = 0; i < bwm_nn_cache_bandwidth_key_len; i++)
     key[i] = np_fround(p[i + 1]);
@@ -1923,8 +4173,8 @@ static int bwm_nn_cache_make_key(double *p, int **key_out, int *stack_key)
 
 static void bwm_nn_cache_free_key(int *key, int *stack_key)
 {
-  if (key != stack_key)
-    free(key);
+  (void)key;
+  (void)stack_key;
 }
 
 static void bwm_nn_cache_note_raw_eval(void)
@@ -2038,8 +4288,29 @@ static void bwm_objective_cache_put(const double *p, double value)
   bwm_objective_cache_insert(p + 1, value);
 }
 
+static void bwm_cache_sync_failure_stats(void)
+{
+#ifdef MPI2
+  int failed[2];
+
+  /* Report any rank's failure once, without widening the hot-loop reduction. */
+  failed[0] = bwm_nn_cache_alloc_failed ? 1 : 0;
+  failed[1] = bwm_objective_cache_alloc_failed ? 1 : 0;
+  if (comm[1] != MPI_COMM_NULL)
+    MPI_Allreduce(MPI_IN_PLACE,
+                  failed,
+                  2,
+                  MPI_INT,
+                  MPI_MAX,
+                  comm[1]);
+  bwm_nn_cache_alloc_failed = failed[0];
+  bwm_objective_cache_alloc_failed = failed[1];
+#endif
+}
+
 static void bwm_nn_cache_write_stats(double *out)
 {
+  bwm_cache_sync_failure_stats();
   out[0] = bwm_nn_cache_active ? 1.0 : 0.0;
   out[1] = (double)bwm_nn_cache_key_len;
   out[2] = bwm_nn_cache_visits;
@@ -2069,10 +4340,16 @@ static void bwm_maybe_signal_activity(void)
   double since_last = 0.0;
   double wall_since_last = 0.0;
 
-  if (current_eval < 1)
+  if (current_eval < 1 && !bwm_progress_eval_active)
     return;
 
-  if (nomad_c_callback_active || nomad_degree_progress_active)
+  if (nomad_c_callback_active) {
+    if (np_crs_nomad_observer_poll != NULL)
+      np_crs_nomad_observer_poll();
+    return;
+  }
+
+  if (nomad_degree_progress_active)
     return;
 
   if ((bwm_progress_last_signal_clock > 0) && (now > bwm_progress_last_signal_clock))
@@ -2098,6 +4375,11 @@ void np_progress_bandwidth_loop_step(void)
     return;
 
   bwm_maybe_signal_activity();
+}
+
+int np_progress_bandwidth_is_active(void)
+{
+  return bwm_progress_eval_active;
 }
 
 static inline void bwm_snapshot_fast_counters(void)
@@ -2150,21 +4432,14 @@ static void bwm_apply_transform(const double *p, double *out, int n)
 
   /* unordered categorical */
   for (i = 0; i < bwm_num_reg_unordered; i++) {
-    idx = bwm_num_reg_continuous + 1 + i;
-    if (bwm_num_categories != NULL) {
-    int kern = (bwm_kernel_unordered_vec != NULL && i < bwm_kernel_unordered_len) ?
-      bwm_kernel_unordered_vec[i] : bwm_kernel_unordered;
-    double maxbw = max_unordered_bw(bwm_num_categories[i], kern);
-      out[idx] = bwm_sigmoid(p[idx]) * maxbw;
-    } else {
-      out[idx] = bwm_sigmoid(p[idx]);
-    }
+    idx = bwm_num_reg_continuous + 1 + bwm_unordered_category_index(i);
+    out[idx] = bwm_sigmoid(p[idx]) * bwm_unordered_transform_maximum(i);
   }
 
-  /* ordered categorical (0..1) */
+  /* ordered categorical: physical maximum 1, expressed in optimizer units */
   for (i = 0; i < bwm_num_reg_ordered; i++) {
-    idx = bwm_num_reg_continuous + bwm_num_reg_unordered + 1 + i;
-    out[idx] = bwm_sigmoid(p[idx]);
+    idx = bwm_num_reg_continuous + 1 + bwm_ordered_category_index(i);
+    out[idx] = bwm_sigmoid(p[idx]) * bwm_categorical_transform_scale;
   }
 }
 
@@ -2195,10 +4470,8 @@ static int bwm_to_unconstrained(double *p, int n)
 
   /* unordered */
   for (i = 0; i < bwm_num_reg_unordered; i++) {
-    idx = bwm_num_reg_continuous + 1 + i;
-    int kern = (bwm_kernel_unordered_vec != NULL && i < bwm_kernel_unordered_len) ?
-      bwm_kernel_unordered_vec[i] : bwm_kernel_unordered;
-    double maxbw = (bwm_num_categories != NULL) ? max_unordered_bw(bwm_num_categories[i], kern) : 1.0;
+    idx = bwm_num_reg_continuous + 1 + bwm_unordered_category_index(i);
+    double maxbw = bwm_unordered_transform_maximum(i);
     double v = bwm_transform_buf[idx];
     if (maxbw <= 0.0) {
       p[idx] = 0.0;
@@ -2210,8 +4483,8 @@ static int bwm_to_unconstrained(double *p, int n)
 
   /* ordered */
   for (i = 0; i < bwm_num_reg_ordered; i++) {
-    idx = bwm_num_reg_continuous + bwm_num_reg_unordered + 1 + i;
-    p[idx] = bwm_logit(bwm_transform_buf[idx]);
+    idx = bwm_num_reg_continuous + 1 + bwm_ordered_category_index(i);
+    p[idx] = bwm_logit(bwm_transform_buf[idx] / bwm_categorical_transform_scale);
   }
 
   return 0;
@@ -2240,7 +4513,8 @@ static int np_bw_candidate_is_admissible_with_floor(
   int n,
   int use_transform,
   int KERNEL,
-  int KERNEL_unordered_liracine,
+  int KERNEL_var_unordered_liracine,
+  int KERNEL_reg_unordered_liracine,
   int BANDWIDTH,
   int BANDWIDTH_den_ml,
   int REGRESSION_ML,
@@ -2259,7 +4533,8 @@ static int bwm_floor_context_active = 0;
 static int bwm_floor_context_n = 0;
 static int bwm_floor_context_use_transform = 0;
 static int bwm_floor_context_kernel = 0;
-static int bwm_floor_context_kernel_unordered = 0;
+static int bwm_floor_context_kernel_var_unordered = 0;
+static int bwm_floor_context_kernel_reg_unordered = 0;
 static int bwm_floor_context_bandwidth = 0;
 static int bwm_floor_context_bandwidth_den_ml = 0;
 static int bwm_floor_context_regression_ml = 0;
@@ -2284,7 +4559,8 @@ static void bwm_set_floor_context(
   int n,
   int use_transform,
   int KERNEL,
-  int KERNEL_unordered_liracine,
+  int KERNEL_var_unordered_liracine,
+  int KERNEL_reg_unordered_liracine,
   int BANDWIDTH,
   int BANDWIDTH_den_ml,
   int REGRESSION_ML,
@@ -2302,7 +4578,8 @@ static void bwm_set_floor_context(
   bwm_floor_context_n = n;
   bwm_floor_context_use_transform = use_transform;
   bwm_floor_context_kernel = KERNEL;
-  bwm_floor_context_kernel_unordered = KERNEL_unordered_liracine;
+  bwm_floor_context_kernel_var_unordered = KERNEL_var_unordered_liracine;
+  bwm_floor_context_kernel_reg_unordered = KERNEL_reg_unordered_liracine;
   bwm_floor_context_bandwidth = BANDWIDTH;
   bwm_floor_context_bandwidth_den_ml = BANDWIDTH_den_ml;
   bwm_floor_context_regression_ml = REGRESSION_ML;
@@ -2326,7 +4603,8 @@ static int bwm_active_floor_candidate_ok(double *p)
     bwm_floor_context_n,
     bwm_floor_context_use_transform,
     bwm_floor_context_kernel,
-    bwm_floor_context_kernel_unordered,
+    bwm_floor_context_kernel_var_unordered,
+    bwm_floor_context_kernel_reg_unordered,
     bwm_floor_context_bandwidth,
     bwm_floor_context_bandwidth_den_ml,
     bwm_floor_context_regression_ml,
@@ -2340,6 +4618,37 @@ static int bwm_active_floor_candidate_ok(double *p)
     bwm_floor_context_num_categories,
     p,
     bwm_floor_context_coeff);
+}
+
+/* Reference/verification evaluations use the same numerical objective but
+ * need activity before the first counted optimizer evaluation. Do not invent
+ * an evaluation count. Restore the entry state on both return and R unwind. */
+typedef struct {
+  double *point;
+  double value;
+  int prior_active;
+} NPBandwidthActivityCall;
+
+static SEXP bwm_raw_activity_execute(void *data)
+{
+  NPBandwidthActivityCall *call=(NPBandwidthActivityCall *)data;
+  call->value=bwmfunc_raw(call->point);
+  return R_NilValue;
+}
+
+static void bwm_raw_activity_cleanup(void *data)
+{
+  NPBandwidthActivityCall *call=(NPBandwidthActivityCall *)data;
+  bwm_progress_eval_active=call->prior_active;
+}
+
+static double bwmfunc_raw_activity(double *point)
+{
+  if(bwm_progress_eval_active)return bwmfunc_raw(point);
+  NPBandwidthActivityCall call={point,DBL_MAX,bwm_progress_eval_active};
+  bwm_progress_eval_active=1;
+  R_ExecWithCleanup(bwm_raw_activity_execute,&call,bwm_raw_activity_cleanup,&call);
+  return call.value;
 }
 
 static double bwmfunc_wrapper(double *p)
@@ -2401,7 +4710,7 @@ static double bwmfunc_wrapper(double *p)
   if (!cache_hit) {
     guarded_before = np_guarded_cvml_hits_get();
     bwm_progress_eval_active = 1;
-    val = bwmfunc_raw(use_p);
+    val = bwmfunc_raw_activity(use_p);
     bwm_progress_eval_active = 0;
     bwm_nn_cache_note_raw_eval();
     bwm_objective_cache_note_raw_eval();
@@ -2416,10 +4725,18 @@ static double bwmfunc_wrapper(double *p)
     bwm_invalid_count += 1.0;
     if (bwm_penalty_mode == 1 && R_FINITE(bwm_penalty_value))
       return bwm_penalty_value;
+    return DBL_MAX;
   }
 
   return val;
 }
+static double np_conditional_bwmfunc_wrapper(double *p)
+{
+  const double value=bwmfunc_wrapper(p);
+  np_conditional_failure_raise();
+  return value;
+}
+
 
 static void np_copy_scale_factor(double *dest, const double *src, int n)
 {
@@ -2427,6 +4744,59 @@ static void np_copy_scale_factor(double *dest, const double *src, int n)
 
   for (i = 1; i <= n; i++)
     dest[i] = src[i];
+}
+
+static int np_ordinary_nn_joint_advance(double *candidate,
+                                        const int num_continuous,
+                                        const int maximum_k)
+{
+  int i;
+  int advanced = 0;
+
+  if (candidate == NULL || num_continuous <= 0 || maximum_k < 1)
+    return 0;
+
+  for (i = 1; i <= num_continuous; ++i) {
+    const int lookup_k = (int)candidate[i];
+    int next_k = maximum_k;
+
+    if (lookup_k < maximum_k) {
+      const int incremented_k = lookup_k + 1;
+      const int doubled_k = (lookup_k <= maximum_k/2) ?
+        2*lookup_k : maximum_k;
+
+      next_k = MIN(maximum_k, MAX(incremented_k, doubled_k));
+    }
+
+    if (next_k > lookup_k) {
+      candidate[i] = (double)next_k;
+      advanced = 1;
+    }
+  }
+
+  return advanced;
+}
+
+static int np_minimized_seed_dominating_penalty(
+  const double finite_seed,
+  const double multiplier,
+  double * const penalty)
+{
+  double candidate;
+
+  if (penalty == NULL || !R_FINITE(finite_seed) || finite_seed == DBL_MAX ||
+      !R_FINITE(multiplier) || multiplier < 1.0)
+    return 0;
+
+  candidate = finite_seed + (fabs(finite_seed) + 1.0)*multiplier;
+  if (candidate == finite_seed)
+    candidate = nextafter(finite_seed, INFINITY);
+  if (!R_FINITE(candidate) || candidate <= finite_seed ||
+      candidate >= DBL_MAX)
+    return 0;
+
+  *penalty = candidate;
+  return 1;
 }
 
 static int np_copy_scale_factor_for_raw(double *dest, const double *src, int n)
@@ -2445,7 +4815,7 @@ static double bwmfunc_raw_current_scale(double *vector_scale_factor, int n)
   int i;
 
   if (!bwm_use_transform)
-    return bwmfunc_raw(vector_scale_factor);
+    return bwmfunc_raw_activity(vector_scale_factor);
 
   double *tmp = bwm_alloc_transform_tmp(n + bwm_num_extra_params + 1);
   if (tmp == NULL)
@@ -2456,9 +4826,91 @@ static double bwmfunc_raw_current_scale(double *vector_scale_factor, int n)
   }
   for (i = 1; i <= bwm_num_extra_params; i++)
     tmp[n + i] = vector_scale_factor[n + i];
-  val = bwmfunc_raw(tmp);
+  val = bwmfunc_raw_activity(tmp);
   safe_free(tmp);
   return val;
+}
+
+static int np_ordinary_nn_find_finite_raw_seed_domain(
+  double *candidate,
+  const int num_continuous,
+  const int num_obs,
+  const int maximum_k,
+  const int num_raw_var,
+  const int recover_fold_boundary,
+  double * const objective)
+{
+  int i;
+  int probe;
+  int probe_limit = 1;
+  int remaining = maximum_k;
+  int boundary_probe = 0;
+
+  if (candidate == NULL || objective == NULL || num_continuous <= 0 ||
+      num_obs < 3 || maximum_k < 1 || num_raw_var < num_continuous)
+    return 0;
+
+  np_progress_signal("bandwidth_nn_recovery", "bandwidth", 0, 0);
+
+  for (i = 1; i <= num_continuous; ++i) {
+    int lookup_k = 0;
+    int is_extended = 0;
+    double distance_scale = 0.0;
+
+    if (np_nn_lookup_from_scale(
+          num_obs, 1, candidate[i],
+          &lookup_k, &distance_scale, &is_extended) != 0 ||
+        is_extended || lookup_k < 1 ||
+        (lookup_k > maximum_k && !recover_fold_boundary))
+      return 0;
+    if (lookup_k > maximum_k)
+      boundary_probe = 1;
+    candidate[i] = (double)MIN(lookup_k, maximum_k);
+  }
+
+  while (remaining > 1) {
+    ++probe_limit;
+    remaining = (remaining + 1)/2;
+  }
+  if (boundary_probe)
+    ++probe_limit;
+
+  for (probe = 0; probe < probe_limit; ++probe) {
+    double value;
+
+    if (!(probe == 0 && boundary_probe) &&
+        !np_ordinary_nn_joint_advance(
+          candidate, num_continuous, maximum_k))
+      break;
+
+    bwm_progress_eval_active = 1;
+    value = bwmfunc_raw_current_scale(candidate, num_raw_var);
+    bwm_progress_eval_active = 0;
+    bwm_eval_count += 1.0;
+    if (!R_FINITE(value) || value == DBL_MAX)
+      bwm_invalid_count += 1.0;
+    bwm_maybe_signal_activity();
+    if (R_FINITE(value) && value != DBL_MAX) {
+      *objective = value;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+/* Existing callers retain their ordinary-domain admission. Only an owner
+ * with a distinct deleted-sample cap opts into the boundary probe above. */
+static int np_ordinary_nn_find_finite_raw_seed(
+  double *candidate,
+  const int num_continuous,
+  const int num_obs,
+  const int maximum_k,
+  const int num_raw_var,
+  double * const objective)
+{
+  return np_ordinary_nn_find_finite_raw_seed_domain(
+    candidate, num_continuous, num_obs, maximum_k, num_raw_var, 0, objective);
 }
 
 extern double *vector_continuous_stddev_extern;
@@ -2548,7 +5000,8 @@ static int np_bw_candidate_is_admissible_with_floor(
   int n,
   int use_transform,
   int KERNEL,
-  int KERNEL_unordered_liracine,
+  int KERNEL_var_unordered_liracine,
+  int KERNEL_reg_unordered_liracine,
   int BANDWIDTH,
   int BANDWIDTH_den_ml,
   int REGRESSION_ML,
@@ -2581,7 +5034,8 @@ static int np_bw_candidate_is_admissible_with_floor(
 
   invalid = check_valid_scale_factor_cv(
     KERNEL,
-    KERNEL_unordered_liracine,
+    KERNEL_var_unordered_liracine,
+    KERNEL_reg_unordered_liracine,
     BANDWIDTH,
     BANDWIDTH_den_ml,
     REGRESSION_ML,
@@ -2616,7 +5070,8 @@ static int np_bw_candidate_is_admissible(
   int n,
   int use_transform,
   int KERNEL,
-  int KERNEL_unordered_liracine,
+  int KERNEL_var_unordered_liracine,
+  int KERNEL_reg_unordered_liracine,
   int BANDWIDTH,
   int BANDWIDTH_den_ml,
   int REGRESSION_ML,
@@ -2634,7 +5089,8 @@ static int np_bw_candidate_is_admissible(
     n,
     use_transform,
     KERNEL,
-    KERNEL_unordered_liracine,
+    KERNEL_var_unordered_liracine,
+    KERNEL_reg_unordered_liracine,
     BANDWIDTH,
     BANDWIDTH_den_ml,
     REGRESSION_ML,
@@ -2676,7 +5132,7 @@ double np_lsq_delta_lower_extern=DBL_EPSILON;
 double np_lsq_delta_upper_extern=1.0-DBL_EPSILON;
 
 
-int int_ll_extern=0;
+int np_lp_engine_extern=0;
 int *vector_glp_degree_extern=NULL;
 int *vector_glp_gradient_order_extern=NULL;
 int int_glp_bernstein_extern=0;
@@ -2694,8 +5150,47 @@ int KERNEL_reg_ordered_extern=0;
 int KERNEL_den_extern=0;
 int KERNEL_den_unordered_extern=0;
 int KERNEL_den_ordered_extern=0;
+int np_beta_bw_order_extern=2;
+int np_regression_bw_categorical_compress_extern=0;
+int np_density_bw_categorical_compress_extern=0;
+int np_distribution_bw_categorical_compress_extern=0;
+int np_conditional_density_bw_categorical_compress_extern=0;
+int np_conditional_distribution_bw_categorical_compress_extern=0;
+int np_beta_cx_bw_order_extern=2;
+int np_beta_cy_bw_order_extern=2;
 int BANDWIDTH_reg_extern;
 int BANDWIDTH_den_extern;
+
+static void np_regression_bw_kernel_state_reset(void)
+{
+  np_beta_bw_order_extern = 2;
+  np_regression_bw_categorical_compress_extern = 0;
+}
+
+static void np_regression_bw_kernel_state_configure_or_error(
+  const int *options,
+  const double *lower,
+  const double *upper,
+  const char *where)
+{
+  np_regression_bw_kernel_state_reset();
+
+  if(KERNEL_reg_extern != NP_CKERNEL_COORDINATE_CODE)
+    return;
+
+  np_beta_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+    options[RBW_CKFAMILYI], KERNEL_reg_extern, options[RBW_CKORDERI],
+    num_reg_continuous_extern, num_reg_unordered_extern,
+    num_reg_ordered_extern, NP_BETA_BW_ALLOW_CATEGORICAL,
+    lower, upper, where).order;
+  np_regression_bw_categorical_compress_extern = options[RBW_CATCOMPI];
+  if(np_regression_bw_categorical_compress_extern != 0 &&
+     np_regression_bw_categorical_compress_extern != 1)
+    error("%s: categorical compression must be TRUE or FALSE", where);
+
+  int_TREE_X = 0;
+  int_TREE_PROFILE_X = 0;
+}
 
 // cdf algorithm extern
 double dbl_memfac_ccdf_extern = 1.0;
@@ -2731,51 +5226,9 @@ KDT * kdt_extern_XY = NULL;
 double * vector_continuous_stddev_extern = NULL;
 double nconfac_extern = 0.0;
 double ncatfac_extern = 0.0;
-static int np_shadow_state_active = 0;
-
-double np_tgauss2_b = 3.0, np_tgauss2_alpha = 1.030174731161562;
-double np_tgauss2_c0 = .004565578246317041;
-
-double np_tgauss2_a0 = 0.2993759121518507, np_tgauss2_a1 = 2.0844504723243343E-5;
-double np_tgauss2_a2 = -2.0*0.002351671671248367;
-
-double np_tgauss2_k = 2.90113075268188e-01, np_tgauss2_k2 = 9.17819591566274e-01;
-double np_tgauss2_k22 = 1.40866160472795e-01, np_tgauss2_km = 2.23983611906613e-01;
-
-extern double cksup[OP_NCFUN][2];
+static int np_native_estimator_state_active = 0;
 
 double timing_extern  = -1.0;
-
-void np_set_tgauss2(double * coefficients){
-  np_tgauss2_b = coefficients[TG2_B];
-  np_tgauss2_alpha = coefficients[TG2_ALPHA];
-  np_tgauss2_c0 = coefficients[TG2_C0];
-
-  np_tgauss2_a0 = coefficients[TG2_A0];
-  np_tgauss2_a1 = coefficients[TG2_A1];
-  np_tgauss2_a2 = coefficients[TG2_A2];
-
-  np_tgauss2_k = coefficients[TG2_K];
-  np_tgauss2_k2 = coefficients[TG2_K2];
-  np_tgauss2_k22 = coefficients[TG2_K22];
-  np_tgauss2_km = coefficients[TG2_KM];
-
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_NORMAL]][0] = -np_tgauss2_b;
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_NORMAL]][1] = np_tgauss2_b;
-
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_CONVOLUTION]][0] = -2.0*np_tgauss2_b;
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_CONVOLUTION]][1] = 2.0*np_tgauss2_b;
-
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_DERIVATIVE]][0] = -np_tgauss2_b;
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_DERIVATIVE]][1] = np_tgauss2_b;
-
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_INTEGRAL]][0] = -np_tgauss2_b;
-  cksup[CK_TGAUSS2 + OP_CFUN_OFFSETS[OP_INTEGRAL]][1] = DBL_MAX;
-}
-
-void spinner(int num) {
-  (void) num;
-}
 
 void np_set_seed(int * num){
   int_RANDOM_SEED = *num;
@@ -2855,20 +5308,6 @@ SEXP C_np_set_seed(SEXP seed)
   return R_NilValue;
 }
 
-SEXP C_np_set_tgauss2(SEXP coefficients)
-{
-  SEXP coef_r = R_NilValue;
-
-  PROTECT(coef_r = coerceVector(coefficients, REALSXP));
-  if (XLENGTH(coef_r) != 10)
-    error("C_np_set_tgauss2: coefficients must have length 10");
-
-  np_set_tgauss2(REAL(coef_r));
-
-  UNPROTECT(1);
-  return R_NilValue;
-}
-
 SEXP C_np_set_local_regression_mode(SEXP active)
 {
   const int requested = asLogical(active);
@@ -2939,7 +5378,7 @@ SEXP C_np_release_static_buffers(void)
   return R_NilValue;
 }
 
-static void np_shadow_reset_state_internal(void)
+static void np_reset_native_estimator_state_internal(void)
 {
   double **yuno_train = matrix_Y_unordered_train_extern;
   double **yord_train = matrix_Y_ordered_train_extern;
@@ -2966,10 +5405,10 @@ static void np_shadow_reset_state_internal(void)
   int rord = num_reg_ordered_extern;
   int rcon = num_reg_continuous_extern;
 
-  np_regression_nomad_shadow_clear_internal();
-  np_conditional_density_nomad_shadow_clear_internal();
+  np_regression_prepared_clear_internal();
+  np_conditional_density_prepared_context_clear_internal();
 
-  if (!np_shadow_state_active)
+  if (!np_native_estimator_state_active)
     return;
 
   if (kdt_extern_X != NULL) free_kdtree(&kdt_extern_X);
@@ -3008,6 +5447,7 @@ static void np_shadow_reset_state_internal(void)
   if (matrix_categorical_vals_extern_Y != NULL) free_mat(matrix_categorical_vals_extern_Y, nuno + nord);
   if (matrix_categorical_vals_extern_XY != NULL) free_mat(matrix_categorical_vals_extern_XY, nuno + nord + runo + rord);
 
+  bwm_search_context_release();
   safe_free(num_categories_extern);
   safe_free(num_categories_extern_X);
   safe_free(num_categories_extern_Y);
@@ -3050,7 +5490,7 @@ static void np_shadow_reset_state_internal(void)
   num_reg_unordered_extern = 0;
   num_reg_ordered_extern = 0;
   num_reg_continuous_extern = 0;
-  int_ll_extern = LL_LC;
+  np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
   vector_glp_degree_extern = NULL;
   vector_glp_gradient_order_extern = NULL;
   int_glp_bernstein_extern = 0;
@@ -3070,10 +5510,12 @@ static void np_shadow_reset_state_internal(void)
   KERNEL_den_ordered_extern = 0;
   BANDWIDTH_den_extern = 0;
   cdfontrain_extern = 0;
+  np_conditional_density_bw_categorical_compress_extern = 0;
+  np_conditional_distribution_bw_categorical_compress_extern = 0;
 
   np_glp_cv_clear_extern();
   np_reg_cv_core_clear_extern();
-  np_shadow_state_active = 0;
+  np_native_estimator_state_active = 0;
 }
 
 static void np_clear_estimator_extern_aliases(void)
@@ -3118,73 +5560,19 @@ static void np_clear_estimator_extern_aliases(void)
   kdt_extern_XY = NULL;
 }
 
-SEXP C_np_shadow_reset_state(void)
+SEXP C_np_reset_native_estimator_state(void)
 {
-  np_shadow_reset_state_internal();
+  np_reset_native_estimator_state_internal();
   return R_NilValue;
 }
 
-static void np_regression_nomad_shadow_clear_internal(void)
+static void np_regression_prepared_clear_internal(void)
 {
-  if (!np_regression_nomad_shadow.active && !np_regression_nomad_shadow.owned)
-    return;
-
-  if (kdt_extern_X != NULL)
-    free_kdtree(&kdt_extern_X);
-  int_TREE_X = NP_TREE_FALSE;
-
-  if (matrix_X_unordered_train_extern != NULL)
-    free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  if (matrix_X_ordered_train_extern != NULL)
-    free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  if (matrix_X_continuous_train_extern != NULL)
-    free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  if (matrix_categorical_vals_extern != NULL)
-    free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  safe_free(vector_Y_extern);
-  safe_free(num_categories_extern);
-  safe_free(vector_continuous_stddev_extern);
-  safe_free(np_regression_nomad_shadow.ipt);
-  safe_free(np_regression_nomad_shadow.glp_degree);
-  safe_free(np_regression_nomad_shadow.ckerlb);
-  safe_free(np_regression_nomad_shadow.ckerub);
-  safe_free(np_regression_nomad_shadow.vector_scale_factor);
-  safe_free(np_regression_nomad_shadow.extendednn_upper);
-  safe_free(bwm_kernel_unordered_vec);
-
-  matrix_X_unordered_train_extern = NULL;
-  matrix_X_ordered_train_extern = NULL;
-  matrix_X_continuous_train_extern = NULL;
-  matrix_X_unordered_eval_extern = NULL;
-  matrix_X_ordered_eval_extern = NULL;
-  matrix_X_continuous_eval_extern = NULL;
-  matrix_categorical_vals_extern = NULL;
-  vector_Y_extern = NULL;
-  num_categories_extern = NULL;
-  vector_continuous_stddev_extern = NULL;
-  bwm_num_categories = NULL;
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
+  np_regression_prepared_context_destroy(&np_regression_prepared);
   bwmfunc_raw = NULL;
   bwm_penalty_mode = 0;
   bwm_penalty_value = DBL_MAX;
   bwm_use_transform = 0;
-  bwm_num_reg_continuous = 0;
-  bwm_num_reg_unordered = 0;
-  bwm_num_reg_ordered = 0;
-  bwm_num_extra_params = 0;
-  bwm_kernel_unordered = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  int_cker_bound_extern = 0;
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
-  vector_glp_degree_extern = NULL;
-  vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
-  int_nn_k_min_extern = 1;
   BANDWIDTH_reg_extern = 0;
   BANDWIDTH_den_extern = 0;
   KERNEL_reg_extern = 0;
@@ -3194,469 +5582,62 @@ static void np_regression_nomad_shadow_clear_internal(void)
   num_reg_continuous_extern = 0;
   num_reg_unordered_extern = 0;
   num_reg_ordered_extern = 0;
-  np_reset_y_side_extern();
-  np_glp_cv_clear_extern();
-  np_reg_cv_core_clear_extern();
-
-  np_regression_nomad_shadow.active = 0;
-  np_regression_nomad_shadow.owned = 0;
-  np_regression_nomad_shadow.num_var = 0;
-  np_regression_nomad_shadow.num_reg_continuous = 0;
-  np_regression_nomad_shadow.num_reg_unordered = 0;
-  np_regression_nomad_shadow.num_reg_ordered = 0;
 }
 
-static int np_regression_nomad_shadow_refresh_degree(const int *degree)
+static int np_regression_prepared_prepare_internal(
+  double *runo, double *rord, double *rcon, double *y,
+  double *mysd, int *myopti, double *myoptd, double *rbw,
+  int *penalty_mode, double *penalty_mult,
+  int *glp_degree, int *glp_bernstein, int *glp_basis,
+  int *degree_search, double *ckerlb, double *ckerub,
+  const NPCategoricalSupport *support)
 {
-  int i;
-  int changed = 0;
+  double fval[3] = {R_NaN, R_NaN, R_NaN};
+  double history[1] = {R_NaN};
+  double eval_history[1] = {R_NaN};
+  double invalid_history[1] = {R_NaN};
+  double timing[1] = {R_NaN};
+  double fast[1] = {R_NaN};
 
-  if (np_regression_nomad_shadow.num_reg_continuous <= 0)
-    return 1;
-  if (degree == NULL || np_regression_nomad_shadow.glp_degree == NULL)
+  np_regression_prepared_clear_internal();
+  np_regression_bw_mode(
+    runo, rord, rcon, y, mysd, myopti, myoptd, rbw, fval,
+    history, eval_history, invalid_history, timing, fast,
+    penalty_mode, penalty_mult, glp_degree, glp_bernstein, glp_basis,
+    ckerlb, ckerub,
+    1, 0, NULL, 0.5, 0.5, DBL_EPSILON,
+    1.0 - DBL_EPSILON, NULL,
+    &np_regression_prepared, 1, degree_search[0], support);
+
+  if (!np_regression_prepared.active)
     return 0;
-
-  if ((int_ll_extern == LL_LP) &&
-      (!np_glp_cv_degree_admissible_extern(num_obs_train_extern,
-                                           num_reg_continuous_extern,
-                                           degree,
-                                           int_glp_basis_extern)))
-    return 0;
-
-  for (i = 0; i < np_regression_nomad_shadow.num_reg_continuous; i++) {
-    if (np_regression_nomad_shadow.glp_degree[i] != degree[i]) {
-      changed = 1;
-      break;
-    }
-  }
-
-  if (!changed)
-    return 1;
-
-  for (i = 0; i < np_regression_nomad_shadow.num_reg_continuous; i++)
-    np_regression_nomad_shadow.glp_degree[i] = degree[i];
-
-  vector_glp_degree_extern = np_regression_nomad_shadow.glp_degree;
-  np_glp_cv_clear_extern();
-
-  if ((int_ll_extern == LL_LP) &&
-      (!np_glp_cv_prepare_extern(int_ll_extern,
-                                 num_obs_train_extern,
-                                 num_reg_continuous_extern,
-                                 matrix_X_continuous_train_extern)))
-    return 0;
-
   return 1;
 }
 
-static int np_regression_nomad_shadow_prepare_internal(double *runo,
-                                                       double *rord,
-                                                       double *rcon,
-                                                       double *y,
-                                                       double *mysd,
-                                                       int *myopti,
-                                                       double *myoptd,
-                                                       double *rbw,
-                                                       int *penalty_mode,
-                                                       double *penalty_mult,
-                                                       int *glp_degree,
-                                                       int *glp_bernstein,
-                                                       int *glp_basis,
-                                                       double *ckerlb,
-                                                       double *ckerub)
-{
-  int i, j;
-  int num_var;
-  int scale_cat;
-  int int_use_starting_values;
-  int degree_key_len;
-  int *ipt = NULL;
-  int dfc_dir;
-  double lbc_dir, c_dir, initc_dir;
-  double lbd_dir, hbd_dir, d_dir, initd_dir;
-  double lbc_init, hbc_init, c_init;
-  double lbd_init, hbd_init, d_init;
-  double **matrix_y = NULL;
-  double *vsfh = NULL;
-
-  np_regression_nomad_shadow_clear_internal();
-  np_regression_nomad_shadow.owned = 1;
-  num_reg_continuous_extern = myopti[RBW_NCONI];
-  num_reg_unordered_extern = myopti[RBW_NUNOI];
-  num_reg_ordered_extern = myopti[RBW_NORDI];
-  np_reset_y_side_extern();
-
-  num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
-
-  num_obs_train_extern = myopti[RBW_NOBSI];
-  KERNEL_reg_extern = myopti[RBW_CKRNEVI];
-  KERNEL_reg_unordered_extern = myopti[RBW_UKRNEVI];
-  KERNEL_reg_ordered_extern = myopti[RBW_OKRNEVI];
-
-  np_regression_nomad_shadow.num_var = num_var;
-  np_regression_nomad_shadow.num_reg_continuous = num_reg_continuous_extern;
-  np_regression_nomad_shadow.num_reg_unordered = num_reg_unordered_extern;
-  np_regression_nomad_shadow.num_reg_ordered = num_reg_ordered_extern;
-  if (num_reg_continuous_extern > 0) {
-    np_regression_nomad_shadow.ckerlb = alloc_vecd(num_reg_continuous_extern);
-    np_regression_nomad_shadow.ckerub = alloc_vecd(num_reg_continuous_extern);
-    if (np_regression_nomad_shadow.ckerlb == NULL ||
-        np_regression_nomad_shadow.ckerub == NULL)
-      goto fail;
-    for (i = 0; i < num_reg_continuous_extern; i++) {
-      np_regression_nomad_shadow.ckerlb[i] = ckerlb[i];
-      np_regression_nomad_shadow.ckerub[i] = ckerub[i];
-    }
-    vector_ckerlb_extern = np_regression_nomad_shadow.ckerlb;
-    vector_ckerub_extern = np_regression_nomad_shadow.ckerub;
-  } else {
-    vector_ckerlb_extern = NULL;
-    vector_ckerub_extern = NULL;
-  }
-  int_cker_bound_extern = np_has_finite_cker_bounds(vector_ckerlb_extern,
-                                                    vector_ckerub_extern,
-                                                    num_reg_continuous_extern);
-
-  int_use_starting_values = myopti[RBW_USTARTI];
-  int_LARGE_SF = myopti[RBW_LSFI];
-
-  BANDWIDTH_reg_extern = myopti[RBW_REGI];
-  BANDWIDTH_den_extern = 0;
-
-  int_RESTART_FROM_MIN = RE_MIN_FALSE;
-  int_MINIMIZE_IO = IO_MIN_TRUE;
-
-  int_ll_extern = myopti[RBW_LL];
-  degree_key_len = (int_ll_extern == LL_LP) ? num_reg_continuous_extern : 0;
-  bwm_num_extra_params = degree_key_len;
-  vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = *glp_bernstein;
-  int_glp_basis_extern = *glp_basis;
-  int_nn_k_min_extern =
-    ((BANDWIDTH_reg_extern != BW_FIXED) && (num_reg_continuous_extern > 0)) ? 2 : 1;
-
-  if (num_reg_continuous_extern > 0) {
-    np_regression_nomad_shadow.glp_degree = alloc_vecu(num_reg_continuous_extern);
-    if (np_regression_nomad_shadow.glp_degree == NULL)
-      goto fail;
-    for (i = 0; i < num_reg_continuous_extern; i++)
-      np_regression_nomad_shadow.glp_degree[i] = glp_degree[i];
-    vector_glp_degree_extern = np_regression_nomad_shadow.glp_degree;
-  } else {
-    vector_glp_degree_extern = NULL;
-  }
-
-  int_TREE_PROFILE_X = myopti[RBW_DOTREEI];
-  int_TREE_X = myopti[RBW_DOTREEI];
-  scale_cat = myopti[RBW_SCATI];
-  bwm_use_transform = myopti[RBW_TBNDI];
-  if (BANDWIDTH_reg_extern != BW_FIXED)
-    bwm_use_transform = 0;
-
-  nconfac_extern = myoptd[RBW_NCONFD];
-  ncatfac_extern = myoptd[RBW_NCATFD];
-  bwm_set_scale_factor_lower_bound(myoptd[RBW_SFLOORD]);
-  dfc_dir = myopti[RBW_DFC_DIRI];
-  lbc_dir = myoptd[RBW_LBC_DIRD];
-  c_dir = myoptd[RBW_C_DIRD];
-  initc_dir = myoptd[RBW_INITC_DIRD];
-  lbd_dir = myoptd[RBW_LBD_DIRD];
-  hbd_dir = myoptd[RBW_HBD_DIRD];
-  d_dir = myoptd[RBW_D_DIRD];
-  initd_dir = myoptd[RBW_INITD_DIRD];
-  lbc_init = myoptd[RBW_LBC_INITD];
-  hbc_init = myoptd[RBW_HBC_INITD];
-  c_init = myoptd[RBW_C_INITD];
-  lbd_init = myoptd[RBW_LBD_INITD];
-  hbd_init = myoptd[RBW_HBD_INITD];
-  d_init = myoptd[RBW_D_INITD];
-
-  imsnum = 0;
-  imstot = 0;
-
-  matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
-  vector_Y_extern = alloc_vecd(num_obs_train_extern);
-  num_categories_extern = alloc_vecu(num_reg_unordered_extern + num_reg_ordered_extern);
-  matrix_categorical_vals_extern = alloc_matd(num_obs_train_extern,
-                                              num_reg_unordered_extern + num_reg_ordered_extern);
-  vector_continuous_stddev_extern = alloc_vecd(num_reg_continuous_extern);
-  np_regression_nomad_shadow.vector_scale_factor =
-    alloc_vecd(num_var + degree_key_len + 1);
-  matrix_y = alloc_matd(num_var + 1, num_var + 1);
-  vsfh = alloc_vecd(num_var + 1);
-
-  if (((num_reg_unordered_extern > 0) && (matrix_X_unordered_train_extern == NULL)) ||
-      ((num_reg_ordered_extern > 0) && (matrix_X_ordered_train_extern == NULL)) ||
-      ((num_reg_continuous_extern > 0) && (matrix_X_continuous_train_extern == NULL)) ||
-      (vector_Y_extern == NULL) ||
-      (((num_reg_unordered_extern + num_reg_ordered_extern) > 0) && (num_categories_extern == NULL)) ||
-      (((num_reg_unordered_extern + num_reg_ordered_extern) > 0) && (matrix_categorical_vals_extern == NULL)) ||
-      ((num_reg_continuous_extern > 0) && (vector_continuous_stddev_extern == NULL)) ||
-      (np_regression_nomad_shadow.vector_scale_factor == NULL) ||
-      (matrix_y == NULL) ||
-      (vsfh == NULL))
-    goto fail;
-
-  for (j = 0; j < num_reg_continuous_extern; j++)
-    vector_continuous_stddev_extern[j] = mysd[j];
-
-  if (int_use_starting_values) {
-    for (i = 0; i < num_var; i++)
-      np_regression_nomad_shadow.vector_scale_factor[i + 1] = rbw[i];
-  }
-
-  for (j = 0; j < num_reg_unordered_extern; j++)
-    for (i = 0; i < num_obs_train_extern; i++)
-      matrix_X_unordered_train_extern[j][i] = runo[j * num_obs_train_extern + i];
-
-  for (j = 0; j < num_reg_ordered_extern; j++)
-    for (i = 0; i < num_obs_train_extern; i++)
-      matrix_X_ordered_train_extern[j][i] = rord[j * num_obs_train_extern + i];
-
-  for (j = 0; j < num_reg_continuous_extern; j++)
-    for (i = 0; i < num_obs_train_extern; i++)
-      matrix_X_continuous_train_extern[j][i] = rcon[j * num_obs_train_extern + i];
-
-  np_regression_nomad_shadow.extendednn_upper =
-    np_continuous_extendednn_upper_alloc(
-      BANDWIDTH_reg_extern,
-      KERNEL_reg_extern,
-      num_obs_train_extern,
-      num_obs_train_extern,
-      num_reg_continuous_extern,
-      1,
-      matrix_X_continuous_train_extern,
-      matrix_X_continuous_train_extern);
-  vector_extendednn_upper_extern = np_regression_nomad_shadow.extendednn_upper;
-  int_extendednn_upper_num_extern =
-    (vector_extendednn_upper_extern != NULL) ? num_reg_continuous_extern : 0;
-
-  for (i = 0; i < num_obs_train_extern; i++)
-    vector_Y_extern[i] = y[i];
-  bwm_penalty_mode = 0;
-  bwm_penalty_value = DBL_MAX;
-  if (penalty_mode[0] == 1) {
-    double pmult = penalty_mult[0];
-    double y_mean = 0.0;
-    double mse0 = 0.0;
-    if (pmult < 1.0) pmult = 1.0;
-    for (i = 0; i < num_obs_train_extern; i++)
-      y_mean += vector_Y_extern[i];
-    y_mean /= (double) num_obs_train_extern;
-    for (i = 0; i < num_obs_train_extern; i++) {
-      const double dy = vector_Y_extern[i] - y_mean;
-      mse0 += dy * dy;
-    }
-    mse0 /= (double) num_obs_train_extern;
-    if (mse0 <= 0.0) mse0 = DBL_MIN;
-    if (myopti[RBW_MI] == RBWM_CVAIC) {
-      const double denom = 1.0 - 2.0 / ((double) num_obs_train_extern);
-      if (denom > 0.0) {
-        const double base_aic = log(mse0) + (1.0 / denom);
-        bwm_penalty_value = base_aic + log(pmult);
-      }
-    } else {
-      bwm_penalty_value = pmult * mse0;
-    }
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
-  }
-
-  ipt = (int *)malloc((size_t)num_obs_train_extern * sizeof(int));
-  if (ipt == NULL)
-    goto fail;
-  for (i = 0; i < num_obs_train_extern; i++)
-    ipt[i] = i;
-
-  int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE);
-  if (int_TREE_X == NP_TREE_TRUE) {
-    build_kdtree(matrix_X_continuous_train_extern,
-                 num_obs_train_extern,
-                 num_reg_continuous_extern,
-                 4 * num_reg_continuous_extern,
-                 ipt,
-                 &kdt_extern_X);
-
-    for (j = 0; j < num_reg_unordered_extern; j++)
-      for (i = 0; i < num_obs_train_extern; i++)
-        matrix_X_unordered_train_extern[j][i] = runo[j * num_obs_train_extern + ipt[i]];
-
-    for (j = 0; j < num_reg_ordered_extern; j++)
-      for (i = 0; i < num_obs_train_extern; i++)
-        matrix_X_ordered_train_extern[j][i] = rord[j * num_obs_train_extern + ipt[i]];
-
-    for (j = 0; j < num_reg_continuous_extern; j++)
-      for (i = 0; i < num_obs_train_extern; i++)
-        matrix_X_continuous_train_extern[j][i] = rcon[j * num_obs_train_extern + ipt[i]];
-
-    for (i = 0; i < num_obs_train_extern; i++)
-      vector_Y_extern[i] = y[ipt[i]];
-  }
-
-  determine_categorical_vals(num_obs_train_extern,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
-
-  if ((int_ll_extern == LL_LP) &&
-      (!np_glp_cv_prepare_extern(int_ll_extern,
-                                 num_obs_train_extern,
-                                 num_reg_continuous_extern,
-                                 matrix_X_continuous_train_extern)))
-    goto fail;
-
-  initialize_nr_vector_scale_factor(BANDWIDTH_reg_extern,
-                                    0,
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    0,
-                                    0,
-                                    0,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    0,
-                                    KERNEL_reg_unordered_extern,
-                                    int_use_starting_values,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev_extern,
-                                    np_regression_nomad_shadow.vector_scale_factor,
-                                    lbc_init, hbc_init, c_init,
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
-
-  for (i = 0; i < degree_key_len; i++)
-    np_regression_nomad_shadow.vector_scale_factor[num_var + i + 1] =
-      (double)np_regression_nomad_shadow.glp_degree[i];
-
-  initialize_nr_vector_scale_factor(BANDWIDTH_reg_extern,
-                                    0,
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    0,
-                                    0,
-                                    0,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    0,
-                                    KERNEL_reg_unordered_extern,
-                                    0,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev_extern,
-                                    vsfh,
-                                    lbc_init, hbc_init, c_init,
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
-
-  initialize_nr_directions(BANDWIDTH_reg_extern,
-                           num_obs_train_extern,
-                           num_reg_continuous_extern,
-                           num_reg_unordered_extern,
-                           num_reg_ordered_extern,
-                           0,
-                           0,
-                           0,
-                           vsfh,
-                           num_categories_extern,
-                           matrix_y,
-                           0, int_RANDOM_SEED,
-                           lbc_dir, dfc_dir, c_dir, initc_dir,
-                           lbd_dir, hbd_dir, d_dir, initd_dir,
-                           matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
-
-  switch (myopti[RBW_MI]) {
-    case RBWM_CVAIC:
-      bwmfunc_raw = cv_func_regression_categorical_aic_c;
-      break;
-    case RBWM_CVLS:
-      bwmfunc_raw = cv_func_regression_categorical_ls;
-      break;
-    default:
-      error("np.c: invalid bandwidth selection method.");
-  }
-
-  bwm_num_reg_continuous = num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_reg_ordered_extern;
-  bwm_kernel_unordered = KERNEL_reg_unordered_extern;
-  bwm_num_categories = num_categories_extern;
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
-  if (bwm_use_transform) {
-    int n = bwm_num_reg_continuous + bwm_num_reg_unordered + bwm_num_reg_ordered;
-    bwm_reserve_transform_buf(n + degree_key_len + 1);
-  }
-  /* Shadow evaluators call bwmfunc_wrapper(), so prepare owns a fresh
-     bandwidth-objective cache lifecycle just like ordinary searches. */
-  bwm_nn_cache_configure_for_degree_search(BANDWIDTH_reg_extern,
-                                           0,
-                                           degree_key_len,
-                                           bwm_num_reg_continuous,
-                                           bwm_num_reg_unordered,
-                                           bwm_num_reg_ordered);
-  bwm_reset_counters();
-
-  if (np_mpi_rank_failure_injected("NP_RMPI_INJECT_REG_SHADOW_PREPARE_FAIL_RANK"))
-    goto fail;
-
-  np_regression_nomad_shadow.ipt = ipt;
-  ipt = NULL;
-  free_mat(matrix_y, num_var + 1);
-  safe_free(vsfh);
-  np_regression_nomad_shadow.active = 1;
-  return 1;
-
-fail:
-  if (matrix_y != NULL)
-    free_mat(matrix_y, num_var + 1);
-  safe_free(vsfh);
-  safe_free(ipt);
-  np_regression_nomad_shadow_clear_internal();
-  return 0;
-}
-
-SEXP C_np_regression_nomad_shadow_prepare(SEXP runo,
-                                          SEXP rord,
-                                          SEXP rcon,
-                                          SEXP y,
-                                          SEXP mysd,
-                                          SEXP myopti,
-                                          SEXP myoptd,
-                                          SEXP rbw,
-                                          SEXP penalty_mode,
-                                          SEXP penalty_mult,
-                                          SEXP glp_degree,
-                                          SEXP glp_bernstein,
-                                          SEXP glp_basis,
-                                          SEXP ckerlb,
-                                          SEXP ckerub)
+SEXP C_np_regression_prepared_prepare(SEXP runo,
+                                      SEXP rord,
+                                      SEXP rcon,
+                                      SEXP y,
+                                      SEXP mysd,
+                                      SEXP myopti,
+                                      SEXP myoptd,
+                                      SEXP rbw,
+                                      SEXP penalty_mode,
+                                      SEXP penalty_mult,
+                                      SEXP glp_degree,
+                                      SEXP glp_bernstein,
+                                      SEXP glp_basis,
+                                      SEXP degree_search,
+                                      SEXP ckerlb,
+                                      SEXP ckerub,
+                                      SEXP declared_support)
 {
   SEXP runo_r = R_NilValue, rord_r = R_NilValue, rcon_r = R_NilValue, y_r = R_NilValue;
   SEXP mysd_r = R_NilValue, myopti_i = R_NilValue, myoptd_r = R_NilValue;
   SEXP rbw_r = R_NilValue;
   SEXP penalty_mode_i = R_NilValue, penalty_mult_r = R_NilValue;
   SEXP glp_degree_i = R_NilValue, glp_bernstein_i = R_NilValue, glp_basis_i = R_NilValue;
+  SEXP degree_search_i = R_NilValue;
   SEXP ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
   int ok;
 
@@ -3673,188 +5654,131 @@ SEXP C_np_regression_nomad_shadow_prepare(SEXP runo,
   PROTECT(glp_degree_i = coerceVector(glp_degree, INTSXP));
   PROTECT(glp_bernstein_i = coerceVector(glp_bernstein, INTSXP));
   PROTECT(glp_basis_i = coerceVector(glp_basis, INTSXP));
+  PROTECT(degree_search_i = coerceVector(degree_search, INTSXP));
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
 
-  if (XLENGTH(myoptd_r) <= RBW_SFLOORD) {
+  if (XLENGTH(myopti_i) < RBW_OPTIONS_COUNT ||
+      XLENGTH(myoptd_r) <= RBW_SFLOORD ||
+      XLENGTH(glp_bernstein_i) < 1 ||
+      XLENGTH(glp_basis_i) < 1 ||
+      XLENGTH(degree_search_i) < 1 ||
+      INTEGER(myopti_i)[RBW_NCONI] < 0 ||
+      (INTEGER(myopti_i)[RBW_NCONI] > 0 &&
+       XLENGTH(glp_degree_i) != INTEGER(myopti_i)[RBW_NCONI])) {
     ok = 0;
   } else {
-    ok = np_regression_nomad_shadow_prepare_internal(REAL(runo_r),
-                                                     REAL(rord_r),
-                                                     REAL(rcon_r),
-                                                     REAL(y_r),
-                                                     REAL(mysd_r),
-                                                     INTEGER(myopti_i),
-                                                     REAL(myoptd_r),
-                                                     REAL(rbw_r),
-                                                     INTEGER(penalty_mode_i),
-                                                     REAL(penalty_mult_r),
-                                                     INTEGER(glp_degree_i),
-                                                     INTEGER(glp_bernstein_i),
-                                                     INTEGER(glp_basis_i),
-                                                     REAL(ckerlb_r),
-                                                     REAL(ckerub_r));
+  int support_dimensions[4] = {0, 0, INTEGER(myopti_i)[RBW_NUNOI],
+    INTEGER(myopti_i)[RBW_NORDI]};
+  SEXP support_data[4] = {R_NilValue, R_NilValue, runo_r, rord_r};
+  NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[RBW_NOBSI],
+    support_dimensions, support_data);
+    ok = np_regression_prepared_prepare_internal(REAL(runo_r),
+                                                 REAL(rord_r),
+                                                 REAL(rcon_r),
+                                                 REAL(y_r),
+                                                 REAL(mysd_r),
+                                                 INTEGER(myopti_i),
+                                                 REAL(myoptd_r),
+                                                 REAL(rbw_r),
+                                                 INTEGER(penalty_mode_i),
+                                                 REAL(penalty_mult_r),
+                                                 INTEGER(glp_degree_i),
+                                                 INTEGER(glp_bernstein_i),
+                                                 INTEGER(glp_basis_i),
+                                                 INTEGER(degree_search_i),
+                                                 REAL(ckerlb_r),
+                                                 REAL(ckerub_r), &support);
   }
 
   ok = np_mpi_comm1_all_ok(ok);
   if (!ok)
-    np_regression_nomad_shadow_clear_internal();
+    np_regression_prepared_clear_internal();
 
-  UNPROTECT(15);
+  UNPROTECT(16);
 
   return ScalarLogical(ok ? 1 : 0);
 }
 
-static int np_regression_nomad_shadow_eval_native_raw(const double *rbw,
-                                                      const int *glp_degree,
-                                                      double out[3])
+static int np_regression_prepared_eval_native_raw(const double *rbw,
+                                                  const int *glp_degree,
+                                                  double *rbw_work,
+                                                  int *degree_work,
+                                                  const int raw_only,
+                                                  double out[3])
 {
-  double *rbw_work = NULL;
-  int *degree_work = NULL;
-  int i, degree_ok, bw_ok;
-  double val, fast = 0.0, fast_before = 0.0;
+  int i;
+  int status;
 
-  if (!np_regression_nomad_shadow.active || rbw == NULL ||
-      glp_degree == NULL || out == NULL)
+  if (!np_regression_prepared.active || rbw == NULL ||
+      rbw_work == NULL ||
+      (np_regression_prepared.num_continuous > 0 &&
+       (glp_degree == NULL || degree_work == NULL)) || out == NULL)
     return 1;
 
-  rbw_work = NP_NOMAD_CALLBACK_CALLOC(np_regression_nomad_shadow.num_var, double);
-  degree_work = NP_NOMAD_CALLBACK_CALLOC(np_regression_nomad_shadow.num_reg_continuous, int);
-  if (rbw_work == NULL || degree_work == NULL) {
-    if (rbw_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(rbw_work);
-    if (degree_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree_work);
-    return 1;
-  }
-
-  for (i = 0; i < np_regression_nomad_shadow.num_var; i++)
+  for (i = 0; i < np_regression_prepared.num_var; i++)
     rbw_work[i] = rbw[i];
-  for (i = 0; i < np_regression_nomad_shadow.num_reg_continuous; i++)
+  for (i = 0; i < np_regression_prepared.num_continuous; i++)
     degree_work[i] = glp_degree[i];
 
 #ifdef MPI2
   if (comm != NULL && comm[1] != MPI_COMM_NULL) {
     MPI_Bcast(rbw_work,
-              np_regression_nomad_shadow.num_var,
+              np_regression_prepared.num_var,
               MPI_DOUBLE,
               0,
               comm[1]);
     MPI_Bcast(degree_work,
-              np_regression_nomad_shadow.num_reg_continuous,
+              np_regression_prepared.num_continuous,
               MPI_INT,
               0,
               comm[1]);
   }
 #endif
 
-  degree_ok = np_regression_nomad_shadow_refresh_degree(degree_work) ? 1 : 0;
-#ifdef MPI2
-  if (comm != NULL && comm[1] != MPI_COMM_NULL)
-    MPI_Allreduce(MPI_IN_PLACE, &degree_ok, 1, MPI_INT, MPI_MIN, comm[1]);
-#endif
-
-  if (!degree_ok) {
-    bwm_eval_count += 1.0;
-    bwm_invalid_count += 1.0;
-    bwm_maybe_signal_activity();
-    val = (bwm_penalty_mode == 1 && isfinite(bwm_penalty_value)) ? bwm_penalty_value : DBL_MAX;
-    out[0] = val;
-    out[1] = 1.0;
-    out[2] = 0.0;
-    NP_NOMAD_CALLBACK_FREE(rbw_work);
-    NP_NOMAD_CALLBACK_FREE(degree_work);
-    return 0;
-  }
-
-  for (i = 0; i < np_regression_nomad_shadow.num_var; i++)
-    np_regression_nomad_shadow.vector_scale_factor[i + 1] = rbw_work[i];
-  for (i = 0; i < np_regression_nomad_shadow.num_reg_continuous; i++)
-    np_regression_nomad_shadow.vector_scale_factor[
-      np_regression_nomad_shadow.num_var + i + 1] =
-      (double)degree_work[i];
-
-  bw_ok = np_bw_candidate_is_admissible(
-    np_regression_nomad_shadow.num_var,
-    bwm_use_transform,
-    KERNEL_reg_extern,
-    KERNEL_reg_unordered_extern,
-    BANDWIDTH_reg_extern,
-    BANDWIDTH_reg_extern,
-    0,
-    num_obs_train_extern,
-    0,
-    0,
-    0,
-    num_reg_continuous_extern,
-    num_reg_unordered_extern,
-    num_reg_ordered_extern,
-    num_categories_extern,
-    np_regression_nomad_shadow.vector_scale_factor
-  ) ? 1 : 0;
-#ifdef MPI2
-  if (comm != NULL && comm[1] != MPI_COMM_NULL)
-    MPI_Allreduce(MPI_IN_PLACE, &bw_ok, 1, MPI_INT, MPI_MIN, comm[1]);
-#endif
-
-  if (!bw_ok) {
-    bwm_eval_count += 1.0;
-    bwm_invalid_count += 1.0;
-    bwm_maybe_signal_activity();
-    val = (bwm_penalty_mode == 1 && isfinite(bwm_penalty_value)) ? bwm_penalty_value : DBL_MAX;
-    out[0] = val;
-    out[1] = 1.0;
-    out[2] = 0.0;
-    NP_NOMAD_CALLBACK_FREE(rbw_work);
-    NP_NOMAD_CALLBACK_FREE(degree_work);
-    return 0;
-  }
-
-  fast_before = np_fastcv_alllarge_hits_get();
-  val = bwmfunc_wrapper(np_regression_nomad_shadow.vector_scale_factor);
-  fast = np_fastcv_alllarge_hits_get() - fast_before;
-  if (fast < 0.0)
-    fast = 0.0;
-#ifdef MPI2
-  if (comm != NULL && comm[1] != MPI_COMM_NULL) {
-    MPI_Bcast(&val, 1, MPI_DOUBLE, 0, comm[1]);
-    MPI_Bcast(&fast, 1, MPI_DOUBLE, 0, comm[1]);
-  }
-#endif
-
-  out[0] = val;
-  out[1] = 1.0;
-  out[2] = fast;
-  NP_NOMAD_CALLBACK_FREE(rbw_work);
-  NP_NOMAD_CALLBACK_FREE(degree_work);
-  return 0;
+  status = np_regression_prepared_context_eval(
+    &np_regression_prepared, rbw_work, degree_work, raw_only, out);
+  return status;
 }
 
-SEXP C_np_regression_nomad_shadow_eval(SEXP rbw, SEXP glp_degree)
+static SEXP np_regression_prepared_eval_entry(SEXP rbw, SEXP glp_degree,
+                                              const int raw_only)
 {
   SEXP rbw_r = R_NilValue, degree_i = R_NilValue, out = R_NilValue;
+  double *rbw_work;
+  int *degree_work = NULL;
   double eval_out[3];
 
-  if (!np_regression_nomad_shadow.active)
-    error("resident npreg NOMAD shadow state is not active");
+  if (!np_regression_prepared.active)
+    error("prepared npreg objective state is not active");
 
   PROTECT(rbw_r = coerceVector(rbw, REALSXP));
   PROTECT(degree_i = coerceVector(glp_degree, INTSXP));
 
-  if (XLENGTH(rbw_r) != np_regression_nomad_shadow.num_var) {
+  if (XLENGTH(rbw_r) != np_regression_prepared.num_var) {
     UNPROTECT(2);
-    error("resident npreg NOMAD shadow received bandwidth vector of unexpected length");
+    error("prepared npreg objective received bandwidth vector of unexpected length");
   }
-  if (XLENGTH(degree_i) != np_regression_nomad_shadow.num_reg_continuous) {
+  if (XLENGTH(degree_i) != np_regression_prepared.num_continuous) {
     UNPROTECT(2);
-    error("resident npreg NOMAD shadow received degree vector of unexpected length");
+    error("prepared npreg objective received degree vector of unexpected length");
   }
 
-  if (np_regression_nomad_shadow_eval_native_raw(REAL(rbw_r),
-                                                 INTEGER(degree_i),
-                                                 eval_out) != 0) {
+  rbw_work = (double *)R_alloc(
+    (size_t)np_regression_prepared.num_var, sizeof(double));
+  if (np_regression_prepared.num_continuous > 0)
+    degree_work = (int *)R_alloc(
+      (size_t)np_regression_prepared.num_continuous, sizeof(int));
+
+  if (np_regression_prepared_eval_native_raw(REAL(rbw_r),
+                                             INTEGER(degree_i),
+                                             rbw_work,
+                                             degree_work,
+                                             raw_only,
+                                             eval_out) != 0) {
     UNPROTECT(2);
-    error("resident npreg NOMAD shadow native evaluator failed");
+    error("prepared npreg objective evaluator failed");
   }
 
   PROTECT(out = allocVector(REALSXP, 2));
@@ -3862,6 +5786,16 @@ SEXP C_np_regression_nomad_shadow_eval(SEXP rbw, SEXP glp_degree)
   REAL(out)[1] = eval_out[2];
   UNPROTECT(3);
   return out;
+}
+
+SEXP C_np_regression_prepared_eval(SEXP rbw, SEXP glp_degree)
+{
+  return np_regression_prepared_eval_entry(rbw, glp_degree, 0);
+}
+
+SEXP C_np_regression_prepared_eval_raw(SEXP rbw, SEXP glp_degree)
+{
+  return np_regression_prepared_eval_entry(rbw, glp_degree, 1);
 }
 
 typedef struct {
@@ -3881,16 +5815,19 @@ typedef struct {
   double best_eval[3];
   double *best_point;
   double *best_bw;
+  double *raw_point;
+  double *eval_bw;
+  int *degree_work;
   int *best_degree;
   int *first_degree;
   double first_objective;
   int progress_last_signal_eval;
   clock_t progress_last_signal_clock;
   time_t progress_last_signal_wall;
-} np_regression_shadow_native_search_context;
+} np_regression_prepared_native_search_context;
 
-static int np_regression_shadow_native_decode_bw(
-    const np_regression_shadow_native_search_context *context,
+static int np_regression_prepared_native_decode_bw(
+    const np_regression_prepared_native_search_context *context,
     const double *raw_point,
     double *eval_bw)
 {
@@ -3919,38 +5856,30 @@ static int np_regression_shadow_native_decode_bw(
   return 0;
 }
 
-static int np_regression_shadow_native_search_callback(int n,
-                                                       const double *x,
-                                                       int m,
-                                                       double *bb_outputs,
-                                                       void *user_data)
+static int np_regression_prepared_native_search_callback(int n,
+                                                         const double *x,
+                                                         int m,
+                                                         double *bb_outputs,
+                                                         void *user_data)
 {
-  np_regression_shadow_native_search_context *context =
-    (np_regression_shadow_native_search_context *) user_data;
-  double *raw_point = NULL;
-  double *eval_bw = NULL;
-  int *degree_work = NULL;
+  np_regression_prepared_native_search_context *context =
+    (np_regression_prepared_native_search_context *) user_data;
+  double *raw_point;
+  double *eval_bw;
+  int *degree_work;
   double eval_out[3];
   int j, status;
 
   if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 ||
-      n != context->n)
+      n != context->n || context->raw_point == NULL ||
+      context->eval_bw == NULL ||
+      (np_regression_prepared.num_continuous > 0 &&
+       context->degree_work == NULL))
     return 1;
 
-  raw_point = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  eval_bw = NP_NOMAD_CALLBACK_CALLOC(context->nbw, double);
-  if (context->ndegree > 0)
-    degree_work = NP_NOMAD_CALLBACK_CALLOC(context->ndegree, int);
-  if (raw_point == NULL || eval_bw == NULL ||
-      (context->ndegree > 0 && degree_work == NULL)) {
-    if (raw_point != NULL)
-      NP_NOMAD_CALLBACK_FREE(raw_point);
-    if (eval_bw != NULL)
-      NP_NOMAD_CALLBACK_FREE(eval_bw);
-    if (degree_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree_work);
-    return 1;
-  }
+  raw_point = context->raw_point;
+  eval_bw = context->eval_bw;
+  degree_work = context->degree_work;
 
   for (j = 0; j < context->n; j++) {
     raw_point[j] = (context->bbin[j] == 1) ? nearbyint(x[j]) : x[j];
@@ -3962,13 +5891,9 @@ static int np_regression_shadow_native_search_callback(int n,
       raw_point[j] = context->upper[j];
   }
 
-  status = np_regression_shadow_native_decode_bw(context, raw_point, eval_bw);
+  status = np_regression_prepared_native_decode_bw(context, raw_point, eval_bw);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
-    if (degree_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree_work);
     return 1;
   }
 
@@ -3976,19 +5901,19 @@ static int np_regression_shadow_native_search_callback(int n,
     for (j = 0; j < context->ndegree; j++)
       degree_work[j] = (int) nearbyint(raw_point[context->nbw + j]);
   } else {
-    degree_work = np_regression_nomad_shadow.glp_degree;
+    for (j = 0; j < np_regression_prepared.num_continuous; j++)
+      degree_work[j] = np_regression_prepared.degree[j];
   }
 
-  status = np_regression_nomad_shadow_eval_native_raw(
+  status = np_regression_prepared_eval_native_raw(
     eval_bw,
     degree_work,
+    eval_bw,
+    degree_work,
+    0,
     eval_out);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
-    if (context->ndegree > 0 && degree_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree_work);
     return 1;
   }
 
@@ -4017,43 +5942,40 @@ static int np_regression_shadow_native_search_callback(int n,
         context->best_degree[j] = degree_work[j];
   }
   bb_outputs[0] = eval_out[0];
-  NP_NOMAD_CALLBACK_FREE(raw_point);
-  NP_NOMAD_CALLBACK_FREE(eval_bw);
-  if (context->ndegree > 0 && degree_work != NULL)
-    NP_NOMAD_CALLBACK_FREE(degree_work);
   return 0;
 }
 
-SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
-                                                SEXP bbin,
-                                                SEXP lower,
-                                                SEXP upper,
-                                                SEXP decode_scale,
-                                                SEXP point_upper,
-                                                SEXP max_eval,
-                                                SEXP random_seed,
-                                                SEXP inner_start_count,
-                                                SEXP option_names,
-                                                SEXP option_values)
+SEXP C_np_regression_prepared_native_search(SEXP x0,
+                                            SEXP bbin,
+                                            SEXP lower,
+                                            SEXP upper,
+                                            SEXP decode_scale,
+                                            SEXP point_upper,
+                                            SEXP max_eval,
+                                            SEXP random_seed,
+                                            SEXP inner_start_count,
+                                            SEXP option_names,
+                                            SEXP option_values)
 {
   SEXP x0_r = R_NilValue, bbin_i = R_NilValue, lower_r = R_NilValue;
   SEXP upper_r = R_NilValue, decode_scale_r = R_NilValue, point_upper_r = R_NilValue;
   SEXP option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
   SEXP best_bw = R_NilValue, best_degree = R_NilValue, first_degree = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
+  np_nomad_progress_spec progress_spec;
   crs_nomad_option *native_options = NULL;
   int bb_output_type[1] = {CRS_NOMAD_OUTPUT_OBJ};
   double crs_outputs[1];
-  np_regression_shadow_native_search_context context;
+  np_regression_prepared_native_search_context context;
+  double final_eval[3] = {DBL_MAX, 1.0, 0.0};
   double *solution = NULL, *best_point = NULL, *best_bw_d = NULL;
   int *best_degree_i = NULL, *first_degree_i = NULL;
   int n, nbw, ndegree, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
-  if (!np_regression_nomad_shadow.active)
-    error("resident npreg NOMAD shadow state is not active");
+  if (!np_regression_prepared.active)
+    error("prepared npreg objective state is not active");
 
   PROTECT(x0_r = coerceVector(x0, REALSXP));
   PROTECT(bbin_i = coerceVector(bbin, INTSXP));
@@ -4063,64 +5985,72 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   PROTECT(point_upper_r = coerceVector(point_upper, REALSXP));
   PROTECT(option_names_s = coerceVector(option_names, STRSXP));
   PROTECT(option_values_s = coerceVector(option_values, STRSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
 
   n = (int) XLENGTH(x0_r);
-  nbw = np_regression_nomad_shadow.num_var;
+  nbw = np_regression_prepared.num_var;
   ndegree = n - nbw;
   if (n <= 0 ||
       nbw <= 0 ||
       ndegree < 0 ||
-      (ndegree > 0 && ndegree != np_regression_nomad_shadow.num_reg_continuous) ||
+      (ndegree > 0 && ndegree != np_regression_prepared.num_continuous) ||
       XLENGTH(bbin_i) != n ||
       XLENGTH(lower_r) != n ||
       XLENGTH(upper_r) != n ||
       XLENGTH(decode_scale_r) != nbw ||
       XLENGTH(point_upper_r) != nbw) {
-    UNPROTECT(8);
+    UNPROTECT(9);
     error("native npreg NOMAD search received inconsistent problem dimensions");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(8);
+    UNPROTECT(9);
     error("native npreg NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(8);
+    UNPROTECT(9);
     error("native npreg NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(8);
+    UNPROTECT(9);
     error("native npreg NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
 
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(8);
-    error("failed to resolve crs final native NOMAD callable");
-  }
+  memset(&problem, 0, sizeof(problem));
+  memset(&result, 0, sizeof(result));
+  memset(&context, 0, sizeof(context));
 
   solution = R_Calloc(n, double);
   best_point = R_Calloc(n, double);
   best_bw_d = R_Calloc(nbw, double);
+  context.raw_point = R_Calloc(n, double);
+  context.eval_bw = R_Calloc(nbw, double);
+  if (np_regression_prepared.num_continuous > 0)
+    context.degree_work = R_Calloc(
+      np_regression_prepared.num_continuous, int);
   if (ndegree > 0) {
     best_degree_i = R_Calloc(ndegree, int);
     first_degree_i = R_Calloc(ndegree, int);
   }
   if (solution == NULL || best_point == NULL || best_bw_d == NULL ||
+      context.raw_point == NULL || context.eval_bw == NULL ||
+      (np_regression_prepared.num_continuous > 0 &&
+       context.degree_work == NULL) ||
       (ndegree > 0 && (best_degree_i == NULL || first_degree_i == NULL))) {
     if (solution != NULL) R_Free(solution);
     if (best_point != NULL) R_Free(best_point);
     if (best_bw_d != NULL) R_Free(best_bw_d);
+    if (context.raw_point != NULL) R_Free(context.raw_point);
+    if (context.eval_bw != NULL) R_Free(context.eval_bw);
+    if (context.degree_work != NULL) R_Free(context.degree_work);
     if (best_degree_i != NULL) R_Free(best_degree_i);
     if (first_degree_i != NULL) R_Free(first_degree_i);
-    UNPROTECT(8);
+    UNPROTECT(9);
     error("failed to allocate native npreg NOMAD buffers");
   }
   if (n_options > 0) {
@@ -4129,9 +6059,12 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
       R_Free(solution);
       R_Free(best_point);
       R_Free(best_bw_d);
+      R_Free(context.raw_point);
+      R_Free(context.eval_bw);
+      if (context.degree_work != NULL) R_Free(context.degree_work);
       if (best_degree_i != NULL) R_Free(best_degree_i);
       if (first_degree_i != NULL) R_Free(first_degree_i);
-      UNPROTECT(8);
+      UNPROTECT(9);
       error("failed to allocate native npreg NOMAD option buffers");
     }
     for (i = 0; i < n_options; i++) {
@@ -4150,11 +6083,9 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
     first_degree_i[i] = NA_INTEGER;
   }
 
-  memset(&problem, 0, sizeof(problem));
-  memset(&result, 0, sizeof(result));
-  memset(&context, 0, sizeof(context));
   for (i = 0; i < 3; i++)
     context.best_eval[i] = R_NaN;
+  context.best_objective = DBL_MAX;
   context.first_objective = R_NaN;
 
   context.n = n;
@@ -4195,16 +6126,64 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   result.outputs = crs_outputs;
   result.outputs_len = 1;
 
+  memset(&progress_spec, 0, sizeof(progress_spec));
+  progress_spec.degree_offset = context.nbw;
+  progress_spec.ndegree = context.ndegree;
+  progress_spec.best_degree = context.best_degree;
+  progress_spec.best_objective = &context.best_objective;
+  progress_spec.accepted_evaluations = &context.callback_calls;
+
   nomad_degree_progress_active = (context.ndegree > 0);
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem,
-                 np_regression_shadow_native_search_callback,
-                 &context,
-                 &result);
-  nomad_c_callback_active = 0;
+  status = np_nomad_solve_with_progress(&problem,
+                                        np_regression_prepared_native_search_callback,
+                                        &context,
+                                        &progress_spec,
+                                        &result, callback_error);
   bwm_objective_cache_callback_option_end();
   nomad_degree_progress_active = 0;
+  if (np_nomad_error_pending(callback_error)) {
+    R_Free(context.raw_point);
+    R_Free(context.eval_bw);
+    if (context.degree_work != NULL) R_Free(context.degree_work);
+    np_regression_prepared_clear_internal();
+    R_Free(solution);
+    R_Free(best_point);
+    R_Free(best_bw_d);
+    if (best_degree_i != NULL) R_Free(best_degree_i);
+    if (first_degree_i != NULL) R_Free(first_degree_i);
+    if (native_options != NULL) R_Free(native_options);
+    np_nomad_error_raise(callback_error);
+  }
+  UNPROTECT(1);
+  if (context.callback_calls > 0) {
+    const int *final_degree = ndegree > 0 ?
+      best_degree_i : np_regression_prepared.degree;
+    int final_status = np_regression_prepared_eval_native_raw(
+      best_bw_d,
+      final_degree,
+      context.eval_bw,
+      context.degree_work,
+      1,
+      final_eval);
+    if (final_status == 0) {
+      context.total_num_feval += final_eval[1];
+      context.total_fast += final_eval[2];
+      context.best_objective = final_eval[0];
+      for (i = 0; i < 3; i++)
+        context.best_eval[i] = final_eval[i];
+    } else {
+      context.best_objective = DBL_MAX;
+      context.best_eval[0] = DBL_MAX;
+      context.best_eval[1] = 1.0;
+      context.best_eval[2] = 0.0;
+    }
+  } else {
+    context.best_objective = DBL_MAX;
+    context.best_eval[0] = DBL_MAX;
+    context.best_eval[1] = 1.0;
+    context.best_eval[2] = 0.0;
+  }
   if (context.ndegree > 0 && context.callback_calls > 0)
     np_progress_nomad_degree_step(context.callback_calls,
                                   context.best_degree,
@@ -4294,6 +6273,10 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   R_Free(solution);
   R_Free(best_point);
   R_Free(best_bw_d);
+  R_Free(context.raw_point);
+  R_Free(context.eval_bw);
+  if (context.degree_work != NULL)
+    R_Free(context.degree_work);
   if (best_degree_i != NULL)
     R_Free(best_degree_i);
   if (first_degree_i != NULL)
@@ -4305,22 +6288,26 @@ SEXP C_np_regression_nomad_shadow_native_search(SEXP x0,
   return out;
 }
 
-SEXP C_np_regression_nomad_shadow_clear(void)
+SEXP C_np_regression_prepared_clear(void)
 {
-  np_regression_nomad_shadow_clear_internal();
+  np_regression_prepared_clear_internal();
   return R_NilValue;
 }
 
-static void np_conditional_density_nomad_shadow_clear_internal(void)
+static void np_conditional_density_prepared_context_clear_internal(void)
 {
   const int num_all_cvar = num_reg_continuous_extern + num_var_continuous_extern;
   const int num_all_uvar = num_reg_unordered_extern + num_var_unordered_extern;
   const int num_all_ovar = num_reg_ordered_extern + num_var_ordered_extern;
 
+  np_conditional_profile_index_cache_clear_extern();
   np_bounded_cvls_conditional_quad_context_clear_extern();
 
-  if (!np_conditional_density_nomad_shadow.active && !np_conditional_density_nomad_shadow.owned)
+  if (!np_conditional_density_prepared_context.active && !np_conditional_density_prepared_context.owned)
     return;
+
+  bwm_clear_floor_context();
+  np_clear_support_counts_extern();
 
   if (kdt_extern_X != NULL)
     free_kdtree(&kdt_extern_X);
@@ -4332,12 +6319,24 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
   int_TREE_Y = NP_TREE_FALSE;
   int_TREE_XY = NP_TREE_FALSE;
 
-  if (matrix_Y_unordered_train_extern != NULL)
-    free_mat(matrix_Y_unordered_train_extern, num_var_unordered_extern);
-  if (matrix_Y_ordered_train_extern != NULL)
-    free_mat(matrix_Y_ordered_train_extern, num_var_ordered_extern);
-  if (matrix_Y_continuous_train_extern != NULL)
-    free_mat(matrix_Y_continuous_train_extern, num_var_continuous_extern);
+  if (np_conditional_density_prepared_context.matrix_y_unordered_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_unordered_original,
+             num_var_unordered_extern);
+  if (np_conditional_density_prepared_context.matrix_y_ordered_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_ordered_original,
+             num_var_ordered_extern);
+  if (np_conditional_density_prepared_context.matrix_y_continuous_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_continuous_original,
+             num_var_continuous_extern);
+  if (np_conditional_density_prepared_context.matrix_y_unordered_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_unordered_tree,
+             num_var_unordered_extern);
+  if (np_conditional_density_prepared_context.matrix_y_ordered_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_ordered_tree,
+             num_var_ordered_extern);
+  if (np_conditional_density_prepared_context.matrix_y_continuous_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_y_continuous_tree,
+             num_var_continuous_extern);
 
   if (matrix_X_unordered_train_extern != NULL)
     free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
@@ -4346,12 +6345,24 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
   if (matrix_X_continuous_train_extern != NULL)
     free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
 
-  if (matrix_XY_continuous_train_extern != NULL)
-    free_mat(matrix_XY_continuous_train_extern, num_all_cvar);
-  if (matrix_XY_unordered_train_extern != NULL)
-    free_mat(matrix_XY_unordered_train_extern, num_all_uvar);
-  if (matrix_XY_ordered_train_extern != NULL)
-    free_mat(matrix_XY_ordered_train_extern, num_all_ovar);
+  if (np_conditional_density_prepared_context.matrix_xy_continuous_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_continuous_original,
+             num_all_cvar);
+  if (np_conditional_density_prepared_context.matrix_xy_unordered_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_unordered_original,
+             num_all_uvar);
+  if (np_conditional_density_prepared_context.matrix_xy_ordered_original != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_ordered_original,
+             num_all_ovar);
+  if (np_conditional_density_prepared_context.matrix_xy_continuous_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_continuous_tree,
+             num_all_cvar);
+  if (np_conditional_density_prepared_context.matrix_xy_unordered_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_unordered_tree,
+             num_all_uvar);
+  if (np_conditional_density_prepared_context.matrix_xy_ordered_tree != NULL)
+    free_mat(np_conditional_density_prepared_context.matrix_xy_ordered_tree,
+             num_all_ovar);
 
   if (matrix_categorical_vals_extern != NULL)
     free_mat(matrix_categorical_vals_extern,
@@ -4366,46 +6377,70 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
              num_var_unordered_extern + num_var_ordered_extern +
              num_reg_unordered_extern + num_reg_ordered_extern);
 
+  bwm_search_context_release();
   safe_free(num_categories_extern);
   safe_free(num_categories_extern_X);
   safe_free(num_categories_extern_Y);
   safe_free(num_categories_extern_XY);
   safe_free(vector_continuous_stddev_extern);
-  safe_free(np_conditional_density_nomad_shadow.glp_degree);
-  safe_free(np_conditional_density_nomad_shadow.vector_scale_factor);
-  safe_free(np_conditional_density_nomad_shadow.cxkerlb);
-  safe_free(np_conditional_density_nomad_shadow.cxkerub);
-  safe_free(np_conditional_density_nomad_shadow.cykerlb);
-  safe_free(np_conditional_density_nomad_shadow.cykerub);
-  safe_free(np_conditional_density_nomad_shadow.cxykerlb);
-  safe_free(np_conditional_density_nomad_shadow.cxykerub);
-  safe_free(np_conditional_density_nomad_shadow.extendednn_upper);
-  safe_free(bwm_kernel_unordered_vec);
+  safe_free(np_conditional_density_prepared_context.glp_degree);
+  if (np_conditional_density_prepared_context.powell_directions != NULL)
+    free_mat(np_conditional_density_prepared_context.powell_directions,
+             np_conditional_density_prepared_context.num_all_var + 1);
+  safe_free(np_conditional_density_prepared_context.vector_scale_factor);
+  safe_free(np_conditional_density_prepared_context.eval_bandwidth);
+  safe_free(np_conditional_density_prepared_context.eval_degree);
+  safe_free(np_conditional_density_prepared_context.scale_factor_startbest);
+  safe_free(np_conditional_density_prepared_context.powell_step);
+  safe_free(np_conditional_density_prepared_context.cxkerlb);
+  safe_free(np_conditional_density_prepared_context.cxkerub);
+  safe_free(np_conditional_density_prepared_context.cykerlb);
+  safe_free(np_conditional_density_prepared_context.cykerub);
+  safe_free(np_conditional_density_prepared_context.cxykerlb);
+  safe_free(np_conditional_density_prepared_context.cxykerub);
+  safe_free(np_conditional_density_prepared_context.extendednn_upper);
 
-  safe_free(np_conditional_density_nomad_shadow.ipt_x);
-  safe_free(np_conditional_density_nomad_shadow.ipt_lookup_x);
-  if (np_conditional_density_nomad_shadow.need_y_side) {
-    safe_free(np_conditional_density_nomad_shadow.ipt_y);
-    safe_free(np_conditional_density_nomad_shadow.ipt_lookup_y);
+  safe_free(np_conditional_density_prepared_context.ipt_x);
+  safe_free(np_conditional_density_prepared_context.ipt_lookup_x);
+  if (np_conditional_density_prepared_context.need_y_side) {
+    safe_free(np_conditional_density_prepared_context.ipt_y);
+    safe_free(np_conditional_density_prepared_context.ipt_lookup_y);
   }
-  safe_free(np_conditional_density_nomad_shadow.ipt_xy);
-  safe_free(np_conditional_density_nomad_shadow.ipt_lookup_xy);
+  safe_free(np_conditional_density_prepared_context.ipt_xy);
+  safe_free(np_conditional_density_prepared_context.ipt_lookup_xy);
 
-  np_conditional_density_nomad_shadow.glp_degree = NULL;
-  np_conditional_density_nomad_shadow.vector_scale_factor = NULL;
-  np_conditional_density_nomad_shadow.cxkerlb = NULL;
-  np_conditional_density_nomad_shadow.cxkerub = NULL;
-  np_conditional_density_nomad_shadow.cykerlb = NULL;
-  np_conditional_density_nomad_shadow.cykerub = NULL;
-  np_conditional_density_nomad_shadow.cxykerlb = NULL;
-  np_conditional_density_nomad_shadow.cxykerub = NULL;
-  np_conditional_density_nomad_shadow.extendednn_upper = NULL;
-  np_conditional_density_nomad_shadow.ipt_x = NULL;
-  np_conditional_density_nomad_shadow.ipt_y = NULL;
-  np_conditional_density_nomad_shadow.ipt_xy = NULL;
-  np_conditional_density_nomad_shadow.ipt_lookup_x = NULL;
-  np_conditional_density_nomad_shadow.ipt_lookup_y = NULL;
-  np_conditional_density_nomad_shadow.ipt_lookup_xy = NULL;
+  np_conditional_density_prepared_context.glp_degree = NULL;
+  np_conditional_density_prepared_context.powell_directions = NULL;
+  np_conditional_density_prepared_context.vector_scale_factor = NULL;
+  np_conditional_density_prepared_context.eval_bandwidth = NULL;
+  np_conditional_density_prepared_context.eval_degree = NULL;
+  np_conditional_density_prepared_context.scale_factor_startbest = NULL;
+  np_conditional_density_prepared_context.powell_step = NULL;
+  np_conditional_density_prepared_context.cxkerlb = NULL;
+  np_conditional_density_prepared_context.cxkerub = NULL;
+  np_conditional_density_prepared_context.cykerlb = NULL;
+  np_conditional_density_prepared_context.cykerub = NULL;
+  np_conditional_density_prepared_context.cxykerlb = NULL;
+  np_conditional_density_prepared_context.cxykerub = NULL;
+  np_conditional_density_prepared_context.extendednn_upper = NULL;
+  np_conditional_density_prepared_context.ipt_x = NULL;
+  np_conditional_density_prepared_context.ipt_y = NULL;
+  np_conditional_density_prepared_context.ipt_xy = NULL;
+  np_conditional_density_prepared_context.ipt_lookup_x = NULL;
+  np_conditional_density_prepared_context.ipt_lookup_y = NULL;
+  np_conditional_density_prepared_context.ipt_lookup_xy = NULL;
+  np_conditional_density_prepared_context.matrix_y_unordered_original = NULL;
+  np_conditional_density_prepared_context.matrix_y_ordered_original = NULL;
+  np_conditional_density_prepared_context.matrix_y_continuous_original = NULL;
+  np_conditional_density_prepared_context.matrix_y_unordered_tree = NULL;
+  np_conditional_density_prepared_context.matrix_y_ordered_tree = NULL;
+  np_conditional_density_prepared_context.matrix_y_continuous_tree = NULL;
+  np_conditional_density_prepared_context.matrix_xy_unordered_original = NULL;
+  np_conditional_density_prepared_context.matrix_xy_ordered_original = NULL;
+  np_conditional_density_prepared_context.matrix_xy_continuous_original = NULL;
+  np_conditional_density_prepared_context.matrix_xy_unordered_tree = NULL;
+  np_conditional_density_prepared_context.matrix_xy_ordered_tree = NULL;
+  np_conditional_density_prepared_context.matrix_xy_continuous_tree = NULL;
 
   matrix_Y_unordered_train_extern = NULL;
   matrix_Y_ordered_train_extern = NULL;
@@ -4440,14 +6475,6 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
   bwm_penalty_mode = 0;
   bwm_penalty_value = DBL_MAX;
   bwm_use_transform = 0;
-  bwm_num_reg_continuous = 0;
-  bwm_num_reg_unordered = 0;
-  bwm_num_reg_ordered = 0;
-  bwm_num_extra_params = 0;
-  bwm_kernel_unordered = 0;
-  bwm_num_categories = NULL;
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
 
   int_cxker_bound_extern = 0;
   int_cyker_bound_extern = 0;
@@ -4465,12 +6492,12 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
   vector_glp_gradient_order_extern = NULL;
   vector_extendednn_upper_extern = NULL;
   int_extendednn_upper_num_extern = 0;
-  int_conditional_nomad_shadow_extern = 0;
+  int_conditional_prepared_context_extern = 0;
   int_glp_bernstein_extern = 0;
   int_glp_basis_extern = 1;
-  int_ll_extern = LL_LC;
+  np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
   int_nn_k_min_extern = 1;
-  np_conditional_density_nomad_shadow.extendednn_upper = NULL;
+  np_conditional_density_prepared_context.extendednn_upper = NULL;
   BANDWIDTH_den_extern = 0;
   BANDWIDTH_reg_extern = 0;
   KERNEL_reg_extern = 0;
@@ -4481,87 +6508,361 @@ static void np_conditional_density_nomad_shadow_clear_internal(void)
   KERNEL_den_ordered_extern = 0;
   cdfontrain_extern = 0;
   int_WEIGHTS = 0;
+  np_conditional_density_bw_categorical_compress_extern = 0;
 
   np_glp_cv_clear_extern();
   np_reset_y_side_extern();
 
-  np_conditional_density_nomad_shadow.active = 0;
-  np_conditional_density_nomad_shadow.owned = 0;
-  np_conditional_density_nomad_shadow.num_all_var = 0;
-  np_conditional_density_nomad_shadow.num_reg_continuous = 0;
-  np_conditional_density_nomad_shadow.num_var_continuous = 0;
-  np_conditional_density_nomad_shadow.num_reg_unordered = 0;
-  np_conditional_density_nomad_shadow.num_var_unordered = 0;
-  np_conditional_density_nomad_shadow.num_reg_ordered = 0;
-  np_conditional_density_nomad_shadow.num_var_ordered = 0;
-  np_conditional_density_nomad_shadow.need_y_side = 0;
-  np_conditional_density_nomad_shadow.old_cdens = 0;
-  np_conditional_density_nomad_shadow.penalty_mode = 0;
-  np_conditional_density_nomad_shadow.penalty_multiplier = 0.0;
+  np_conditional_density_prepared_context.active = 0;
+  np_conditional_density_prepared_context.owned = 0;
+  np_conditional_density_prepared_context.num_all_var = 0;
+  np_conditional_density_prepared_context.num_reg_continuous = 0;
+  np_conditional_density_prepared_context.degree_key_len = 0;
+  np_conditional_density_prepared_context.num_var_continuous = 0;
+  np_conditional_density_prepared_context.num_reg_unordered = 0;
+  np_conditional_density_prepared_context.num_var_unordered = 0;
+  np_conditional_density_prepared_context.num_reg_ordered = 0;
+  np_conditional_density_prepared_context.num_var_ordered = 0;
+  np_conditional_density_prepared_context.need_y_side = 0;
+  np_conditional_density_prepared_context.penalty_mode = 0;
+  np_conditional_density_prepared_context.penalty_ready = 0;
+  np_conditional_density_prepared_context.glp_original_order = 0;
+  np_conditional_density_prepared_context.degree_search = 0;
+  np_conditional_density_prepared_context.degree_state_ready = 0;
+  np_conditional_density_prepared_context.requested_glp_bernstein = 0;
+  np_conditional_density_prepared_context.requested_glp_basis = 1;
+  np_conditional_density_prepared_context.tree_x_ready = 0;
+  np_conditional_density_prepared_context.tree_y_ready = 0;
+  np_conditional_density_prepared_context.tree_xy_ready = 0;
+  np_conditional_density_prepared_context.penalty_multiplier = 0.0;
+  np_conditional_density_prepared_context.penalty_value = DBL_MAX;
 }
 
-static void np_conditional_density_nomad_shadow_refresh_penalty(void)
+static void np_conditional_density_prepared_context_activate_matrix_view(
+  const int lp_engine)
 {
+  const int scalar = (lp_engine == NP_LP_ENGINE_SCALAR);
+
+  matrix_Y_unordered_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_y_ready) ?
+    np_conditional_density_prepared_context.matrix_y_unordered_tree :
+    np_conditional_density_prepared_context.matrix_y_unordered_original;
+  matrix_Y_ordered_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_y_ready) ?
+    np_conditional_density_prepared_context.matrix_y_ordered_tree :
+    np_conditional_density_prepared_context.matrix_y_ordered_original;
+  matrix_Y_continuous_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_y_ready) ?
+    np_conditional_density_prepared_context.matrix_y_continuous_tree :
+    np_conditional_density_prepared_context.matrix_y_continuous_original;
+
+  matrix_XY_unordered_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_xy_ready) ?
+    np_conditional_density_prepared_context.matrix_xy_unordered_tree :
+    np_conditional_density_prepared_context.matrix_xy_unordered_original;
+  matrix_XY_ordered_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_xy_ready) ?
+    np_conditional_density_prepared_context.matrix_xy_ordered_tree :
+    np_conditional_density_prepared_context.matrix_xy_ordered_original;
+  matrix_XY_continuous_train_extern =
+    (scalar && np_conditional_density_prepared_context.tree_xy_ready) ?
+    np_conditional_density_prepared_context.matrix_xy_continuous_tree :
+    np_conditional_density_prepared_context.matrix_xy_continuous_original;
+}
+
+static void np_conditional_density_refresh_penalty_canonical(
+  double * const vector_scale_factor,
+  const int num_all_var,
+  const int penalty_mode,
+  const double penalty_multiplier,
+  const int account_probes,
+  const int allow_adaptive_lp_reseed)
+{
+  int i;
+  double baseline;
+  double pmult = penalty_multiplier;
+
   bwm_penalty_mode = 0;
   bwm_penalty_value = DBL_MAX;
 
-  if (np_conditional_density_nomad_shadow.penalty_mode != 1)
+  if (penalty_mode != 1 || vector_scale_factor == NULL ||
+      num_all_var <= 0 || bwmfunc_raw == NULL)
     return;
 
-  {
-    double pmult = np_conditional_density_nomad_shadow.penalty_multiplier;
+  if (pmult < 1.0)
+    pmult = 1.0;
 
-    if (pmult < 1.0)
-      pmult = 1.0;
-
-    bwm_penalty_value = pmult * 1.0e6;
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
+  baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_all_var);
+  if (account_probes) {
+    bwm_eval_count += 1.0;
+    if (!R_FINITE(baseline) || baseline == DBL_MAX)
+      bwm_invalid_count += 1.0;
   }
+  if (np_conditional_failure_pending())
+    return;
+  if (!R_FINITE(baseline) || baseline == DBL_MAX) {
+    double *tmp = bwm_alloc_transform_tmp(
+      num_all_var + bwm_num_extra_params + 1);
+    /* Exact adaptive LP folds can make the narrow automatic start singular
+     * in several coordinates at once. Powell cannot leave that disconnected
+     * invalid plateau by moving one coordinate. For automatic starts only,
+     * jointly enlarge ordinary integer k values until the objective certifies
+     * a finite seed. The admissible range and explicit user starts are
+     * unchanged, and every rank evaluates the same bounded probe sequence. */
+    int adaptive_lp_reseed =
+      allow_adaptive_lp_reseed &&
+      !bwm_use_transform &&
+      (BANDWIDTH_den_extern == BW_ADAP_NN) &&
+      (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) &&
+      ((num_var_continuous_extern + num_reg_continuous_extern) > 0) &&
+      (num_obs_train_extern >= 3);
+    int probe_limit = 1;
+    int probe;
+
+    if (tmp != NULL &&
+        np_copy_scale_factor_for_raw(
+          tmp, vector_scale_factor, num_all_var) == 0) {
+      for (i = 1; i <= bwm_num_extra_params; ++i)
+        tmp[num_all_var + i] = vector_scale_factor[num_all_var + i];
+      bwm_set_categorical_midpoints(tmp);
+
+      if (adaptive_lp_reseed) {
+        int remaining = num_obs_train_extern - 2;
+
+        while (remaining > 1) {
+          ++probe_limit;
+          remaining = (remaining + 1)/2;
+        }
+        for (i = 1;
+             i <= num_var_continuous_extern + num_reg_continuous_extern;
+             ++i) {
+          int lookup_k = 0;
+          int is_extended = 0;
+          double distance_scale = 0.0;
+
+          if (np_nn_lookup_from_scale(
+                num_obs_train_extern, 1, tmp[i],
+                &lookup_k, &distance_scale, &is_extended) != 0 ||
+              is_extended || lookup_k < 1 ||
+              lookup_k > num_obs_train_extern - 2) {
+            adaptive_lp_reseed = 0;
+            probe_limit = 1;
+            break;
+          }
+        }
+      }
+
+      for (probe = 0; probe < probe_limit; ++probe) {
+        int advanced = 0;
+
+        if (adaptive_lp_reseed) {
+          advanced = np_ordinary_nn_joint_advance(
+            tmp,
+            num_var_continuous_extern + num_reg_continuous_extern,
+            num_obs_train_extern - 2);
+        } else {
+          for (i = 1;
+               i <= num_var_continuous_extern + num_reg_continuous_extern;
+               ++i) {
+            tmp[i] *= 2.0;
+            advanced = 1;
+          }
+        }
+        if (!advanced)
+          break;
+
+        baseline = bwmfunc_raw_activity(tmp);
+        if (account_probes) {
+          bwm_eval_count += 1.0;
+          if (!R_FINITE(baseline) || baseline == DBL_MAX)
+            bwm_invalid_count += 1.0;
+        }
+        if (np_conditional_failure_pending())
+          break;
+        if (R_FINITE(baseline) && baseline != DBL_MAX) {
+          if (adaptive_lp_reseed)
+            np_copy_scale_factor(
+              vector_scale_factor, tmp, num_all_var);
+          break;
+        }
+      }
+    }
+    safe_free(tmp);
+  }
+
+  if (np_conditional_failure_pending())
+    return;
+  if (!R_FINITE(baseline) || baseline == DBL_MAX)
+    bwm_penalty_value = pmult * 1.0e6;
+  else
+    bwm_penalty_value = baseline + (fabs(baseline) + 1.0)*pmult;
+  if (R_FINITE(bwm_penalty_value))
+    bwm_penalty_mode = 1;
 }
 
-static int np_conditional_density_nomad_shadow_refresh_degree(const int *degree)
+static void np_conditional_density_prepared_context_refresh_penalty(void)
+{
+  np_conditional_density_refresh_penalty_canonical(
+    np_conditional_density_prepared_context.vector_scale_factor,
+    np_conditional_density_prepared_context.num_all_var,
+    np_conditional_density_prepared_context.penalty_mode,
+    np_conditional_density_prepared_context.penalty_multiplier,
+    0,
+    0);
+  np_conditional_density_prepared_context.penalty_ready = bwm_penalty_mode;
+  np_conditional_density_prepared_context.penalty_value = bwm_penalty_value;
+}
+
+static int np_conditional_density_prepared_context_refresh_degree(const int *degree)
 {
   int i;
   int changed = 0;
+  int target_engine;
+  int old_engine;
+  int old_bernstein;
+  int old_basis;
+  int old_tree_x;
+  int old_tree_y;
+  int old_tree_xy;
 
-  if (int_ll_extern != LL_LP || np_conditional_density_nomad_shadow.num_reg_continuous <= 0)
+  if (np_conditional_density_prepared_context.num_reg_continuous <= 0)
     return 1;
-  if (degree == NULL || np_conditional_density_nomad_shadow.glp_degree == NULL)
+  if (!np_conditional_density_prepared_context.degree_search &&
+      np_lp_engine_extern != NP_LP_ENGINE_GENERAL)
+    return 1;
+  if (degree == NULL || np_conditional_density_prepared_context.glp_degree == NULL)
     return 0;
 
-  if (!np_glp_cv_degree_admissible_extern(num_obs_train_extern,
-                                          num_reg_continuous_extern,
-                                          degree,
-                                          int_glp_basis_extern))
-    return 0;
+  if (np_conditional_density_prepared_context.degree_search) {
+    target_engine = np_canonical_lp_engine_for_degree(
+      degree,
+      np_conditional_density_prepared_context.num_reg_continuous);
+    if (target_engine < 0)
+      return 0;
+  } else {
+    target_engine = NP_LP_ENGINE_GENERAL;
+  }
 
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++) {
-    if (np_conditional_density_nomad_shadow.glp_degree[i] != degree[i]) {
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++) {
+    if (np_conditional_density_prepared_context.glp_degree[i] != degree[i]) {
       changed = 1;
       break;
     }
   }
 
-  if (!changed)
+  if (!changed &&
+      (np_lp_engine_extern == target_engine) &&
+      np_conditional_density_prepared_context.degree_state_ready)
     return 1;
 
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
-    np_conditional_density_nomad_shadow.glp_degree[i] = degree[i];
+  if ((target_engine == NP_LP_ENGINE_GENERAL) &&
+      !np_glp_cv_degree_admissible_extern(
+        num_obs_train_extern,
+        num_reg_continuous_extern,
+        degree,
+        np_conditional_density_prepared_context.degree_search ?
+        np_conditional_density_prepared_context.requested_glp_basis :
+        int_glp_basis_extern))
+    return 0;
 
-  vector_glp_degree_extern = np_conditional_density_nomad_shadow.glp_degree;
-  np_glp_cv_clear_extern();
+  old_engine = np_lp_engine_extern;
+  old_bernstein = int_glp_bernstein_extern;
+  old_basis = int_glp_basis_extern;
+  old_tree_x = int_TREE_X;
+  old_tree_y = int_TREE_Y;
+  old_tree_xy = int_TREE_XY;
+  np_conditional_density_prepared_context.degree_state_ready = 0;
 
-  if (!np_glp_cv_prepare_extern(int_ll_extern,
+  if (target_engine == NP_LP_ENGINE_SCALAR) {
+    np_glp_cv_clear_extern();
+    for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
+      np_conditional_density_prepared_context.glp_degree[i] = degree[i];
+    vector_glp_degree_extern = NULL;
+    int_glp_bernstein_extern = 0;
+    int_glp_basis_extern = 1;
+    int_TREE_X = np_conditional_density_prepared_context.tree_x_ready;
+    int_TREE_Y = np_conditional_density_prepared_context.tree_y_ready;
+    int_TREE_XY = np_conditional_density_prepared_context.tree_xy_ready;
+    np_conditional_density_prepared_context_activate_matrix_view(
+      NP_LP_ENGINE_SCALAR);
+    np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
+    np_conditional_density_prepared_context.degree_state_ready = 1;
+    return 1;
+  }
+
+  vector_glp_degree_extern = (int *)degree;
+  int_glp_bernstein_extern =
+    np_conditional_density_prepared_context.requested_glp_bernstein;
+  int_glp_basis_extern =
+    np_conditional_density_prepared_context.requested_glp_basis;
+  int_TREE_X = np_conditional_density_prepared_context.tree_x_ready;
+  int_TREE_Y = NP_TREE_FALSE;
+  int_TREE_XY = NP_TREE_FALSE;
+  np_conditional_density_prepared_context_activate_matrix_view(
+    NP_LP_ENGINE_GENERAL);
+
+  if (!np_glp_cv_prepare_extern(NP_LP_ENGINE_GENERAL,
                                 num_obs_train_extern,
                                 num_reg_continuous_extern,
-                                matrix_X_continuous_train_extern))
+                                matrix_X_continuous_train_extern) ||
+      (np_conditional_density_prepared_context.glp_original_order &&
+       (int_TREE_X == NP_TREE_TRUE) &&
+       (!np_glp_cv_prepare_original_order_extern(ipt_extern_X)))) {
+    np_glp_cv_clear_extern();
+    vector_glp_degree_extern =
+      (old_engine == NP_LP_ENGINE_GENERAL) ?
+      np_conditional_density_prepared_context.glp_degree : NULL;
+    int_glp_bernstein_extern = old_bernstein;
+    int_glp_basis_extern = old_basis;
+    int_TREE_X = old_tree_x;
+    int_TREE_Y = old_tree_y;
+    int_TREE_XY = old_tree_xy;
+    np_conditional_density_prepared_context_activate_matrix_view(old_engine);
+    np_lp_engine_extern = old_engine;
     return 0;
+  }
+
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
+    np_conditional_density_prepared_context.glp_degree[i] = degree[i];
+  vector_glp_degree_extern = np_conditional_density_prepared_context.glp_degree;
+  np_lp_engine_extern = NP_LP_ENGINE_GENERAL;
+  np_conditional_density_prepared_context.degree_state_ready = 1;
 
   return 1;
 }
 
-static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
+static int np_conditional_density_prepared_context_degree_refresh_needed(
+  const int *degree)
+{
+  int i;
+  int target_engine;
+
+  if (np_conditional_density_prepared_context.num_reg_continuous <= 0)
+    return 0;
+  if (!np_conditional_density_prepared_context.degree_search &&
+      np_lp_engine_extern != NP_LP_ENGINE_GENERAL)
+    return 0;
+  if (degree == NULL || np_conditional_density_prepared_context.glp_degree == NULL)
+    return 1;
+
+  target_engine = np_conditional_density_prepared_context.degree_search ?
+    np_canonical_lp_engine_for_degree(
+      degree,
+      np_conditional_density_prepared_context.num_reg_continuous) :
+    NP_LP_ENGINE_GENERAL;
+  if (target_engine < 0 ||
+      !np_conditional_density_prepared_context.degree_state_ready ||
+      np_lp_engine_extern != target_engine)
+    return 1;
+
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
+    if (np_conditional_density_prepared_context.glp_degree[i] != degree[i])
+      return 1;
+
+  return 0;
+}
+
+static int np_conditional_density_prepared_context_prepare_internal(double *c_uno,
                                                                 double *c_ord,
                                                                 double *c_con,
                                                                 double *u_uno,
@@ -4580,11 +6881,16 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                                                                 double *cxkerlb,
                                                                 double *cxkerub,
                                                                 double *cykerlb,
-                                                                double *cykerub)
+                                                                double *cykerub,
+                                                                int retain_powell_geometry,
+                                                                int eval_only,
+                                                                int *support_failure,
+                                                                const NPCategoricalSupport *support)
 {
   int i, j;
   int num_all_var, num_all_cvar, num_all_uvar, num_all_ovar;
   int int_use_starting_values, ibwmfunc, scale_cat, need_y_side;
+  int degree_search;
   int degree_key_len;
   int dfc_dir;
   int *ipt_X = NULL, *ipt_Y = NULL, *ipt_XY = NULL;
@@ -4597,8 +6903,12 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   double lbc_init, hbc_init, c_init;
   double lbd_init, hbd_init, d_init;
 
-  np_conditional_density_nomad_shadow_clear_internal();
-  np_conditional_density_nomad_shadow.owned = 1;
+  np_conditional_density_prepared_context_clear_internal();
+  /* A new invocation must not inherit a caught conditional failure. */
+  np_conditional_failure_reset();
+  if (support_failure != NULL)
+    *support_failure = NP_SUPPORT_FAILURE_NONE;
+  np_conditional_density_prepared_context.owned = 1;
 
   num_var_unordered_extern = myopti[CBW_CNUNOI];
   num_var_ordered_extern = myopti[CBW_CNORDI];
@@ -4622,26 +6932,34 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   KERNEL_reg_ordered_extern = myopti[CBW_OXKRNEVI];
   KERNEL_den_ordered_extern = myopti[CBW_OYKRNEVI];
 
-  np_conditional_density_nomad_shadow.num_all_var = num_all_var;
-  np_conditional_density_nomad_shadow.num_reg_continuous = num_reg_continuous_extern;
-  np_conditional_density_nomad_shadow.num_var_continuous = num_var_continuous_extern;
-  np_conditional_density_nomad_shadow.num_reg_unordered = num_reg_unordered_extern;
-  np_conditional_density_nomad_shadow.num_var_unordered = num_var_unordered_extern;
-  np_conditional_density_nomad_shadow.num_reg_ordered = num_reg_ordered_extern;
-  np_conditional_density_nomad_shadow.num_var_ordered = num_var_ordered_extern;
+  np_beta_cx_bw_order_extern = 2;
+  np_beta_cy_bw_order_extern = 2;
+  np_conditional_density_bw_categorical_compress_extern = 0;
+
+  np_conditional_density_prepared_context.num_all_var = num_all_var;
+  np_conditional_density_prepared_context.num_reg_continuous = num_reg_continuous_extern;
+  np_conditional_density_prepared_context.num_var_continuous = num_var_continuous_extern;
+  np_conditional_density_prepared_context.num_reg_unordered = num_reg_unordered_extern;
+  np_conditional_density_prepared_context.num_var_unordered = num_var_unordered_extern;
+  np_conditional_density_prepared_context.num_reg_ordered = num_reg_ordered_extern;
+  np_conditional_density_prepared_context.num_var_ordered = num_var_ordered_extern;
+  degree_search = myopti[CBW_DEGREE_SEARCHI];
+  if ((degree_search != 0) && (degree_search != 1))
+    goto fail;
+  np_conditional_density_prepared_context.degree_search = degree_search;
 
   if (num_reg_continuous_extern > 0) {
-    np_conditional_density_nomad_shadow.cxkerlb = alloc_vecd(num_reg_continuous_extern);
-    np_conditional_density_nomad_shadow.cxkerub = alloc_vecd(num_reg_continuous_extern);
-    if (np_conditional_density_nomad_shadow.cxkerlb == NULL ||
-        np_conditional_density_nomad_shadow.cxkerub == NULL)
+    np_conditional_density_prepared_context.cxkerlb = alloc_vecd(num_reg_continuous_extern);
+    np_conditional_density_prepared_context.cxkerub = alloc_vecd(num_reg_continuous_extern);
+    if (np_conditional_density_prepared_context.cxkerlb == NULL ||
+        np_conditional_density_prepared_context.cxkerub == NULL)
       goto fail;
     for (i = 0; i < num_reg_continuous_extern; i++) {
-      np_conditional_density_nomad_shadow.cxkerlb[i] = cxkerlb[i];
-      np_conditional_density_nomad_shadow.cxkerub[i] = cxkerub[i];
+      np_conditional_density_prepared_context.cxkerlb[i] = cxkerlb[i];
+      np_conditional_density_prepared_context.cxkerub[i] = cxkerub[i];
     }
-    vector_cxkerlb_extern = np_conditional_density_nomad_shadow.cxkerlb;
-    vector_cxkerub_extern = np_conditional_density_nomad_shadow.cxkerub;
+    vector_cxkerlb_extern = np_conditional_density_prepared_context.cxkerlb;
+    vector_cxkerub_extern = np_conditional_density_prepared_context.cxkerub;
   } else {
     vector_cxkerlb_extern = NULL;
     vector_cxkerub_extern = NULL;
@@ -4651,17 +6969,17 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                                                      num_reg_continuous_extern);
 
   if (num_var_continuous_extern > 0) {
-    np_conditional_density_nomad_shadow.cykerlb = alloc_vecd(num_var_continuous_extern);
-    np_conditional_density_nomad_shadow.cykerub = alloc_vecd(num_var_continuous_extern);
-    if (np_conditional_density_nomad_shadow.cykerlb == NULL ||
-        np_conditional_density_nomad_shadow.cykerub == NULL)
+    np_conditional_density_prepared_context.cykerlb = alloc_vecd(num_var_continuous_extern);
+    np_conditional_density_prepared_context.cykerub = alloc_vecd(num_var_continuous_extern);
+    if (np_conditional_density_prepared_context.cykerlb == NULL ||
+        np_conditional_density_prepared_context.cykerub == NULL)
       goto fail;
     for (i = 0; i < num_var_continuous_extern; i++) {
-      np_conditional_density_nomad_shadow.cykerlb[i] = cykerlb[i];
-      np_conditional_density_nomad_shadow.cykerub[i] = cykerub[i];
+      np_conditional_density_prepared_context.cykerlb[i] = cykerlb[i];
+      np_conditional_density_prepared_context.cykerub[i] = cykerub[i];
     }
-    vector_cykerlb_extern = np_conditional_density_nomad_shadow.cykerlb;
-    vector_cykerub_extern = np_conditional_density_nomad_shadow.cykerub;
+    vector_cykerlb_extern = np_conditional_density_prepared_context.cykerlb;
+    vector_cykerub_extern = np_conditional_density_prepared_context.cykerub;
   } else {
     vector_cykerlb_extern = NULL;
     vector_cykerub_extern = NULL;
@@ -4670,22 +6988,55 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                                                      vector_cykerub_extern,
                                                      num_var_continuous_extern);
 
+  if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE ||
+     KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    const int num_unordered = num_reg_unordered_extern +
+      num_var_unordered_extern;
+    const int num_ordered = num_reg_ordered_extern +
+      num_var_ordered_extern;
+
+    np_conditional_density_bw_categorical_compress_extern =
+      myopti[CBW_CATCOMPI];
+    if(np_conditional_density_bw_categorical_compress_extern != 0 &&
+       np_conditional_density_bw_categorical_compress_extern != 1)
+      goto fail;
+
+    if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE)
+      np_beta_cx_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+        myopti[CBW_CXFAMILYI], KERNEL_reg_extern, myopti[CBW_CXORDERI],
+        num_reg_continuous_extern, num_unordered, num_ordered,
+        NP_BETA_BW_ALLOW_CATEGORICAL,
+        vector_cxkerlb_extern, vector_cxkerub_extern,
+        "C_np_density_conditional_nomad_native_search (X)").order;
+    else
+      np_beta_cx_bw_order_extern = myopti[CBW_CXORDERI];
+    if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)
+      np_beta_cy_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+        myopti[CBW_CYFAMILYI], KERNEL_den_extern, myopti[CBW_CYORDERI],
+        num_var_continuous_extern, num_unordered, num_ordered,
+        NP_BETA_BW_ALLOW_CATEGORICAL,
+        vector_cykerlb_extern, vector_cykerub_extern,
+        "C_np_density_conditional_nomad_native_search (Y)").order;
+    else
+      np_beta_cy_bw_order_extern = myopti[CBW_CYORDERI];
+  }
+
   if (num_all_cvar > 0) {
-    np_conditional_density_nomad_shadow.cxykerlb = alloc_vecd(num_all_cvar);
-    np_conditional_density_nomad_shadow.cxykerub = alloc_vecd(num_all_cvar);
-    if (np_conditional_density_nomad_shadow.cxykerlb == NULL ||
-        np_conditional_density_nomad_shadow.cxykerub == NULL)
+    np_conditional_density_prepared_context.cxykerlb = alloc_vecd(num_all_cvar);
+    np_conditional_density_prepared_context.cxykerub = alloc_vecd(num_all_cvar);
+    if (np_conditional_density_prepared_context.cxykerlb == NULL ||
+        np_conditional_density_prepared_context.cxykerub == NULL)
       goto fail;
     for (i = 0; i < num_reg_continuous_extern; i++) {
-      np_conditional_density_nomad_shadow.cxykerlb[i] = vector_cxkerlb_extern[i];
-      np_conditional_density_nomad_shadow.cxykerub[i] = vector_cxkerub_extern[i];
+      np_conditional_density_prepared_context.cxykerlb[i] = vector_cxkerlb_extern[i];
+      np_conditional_density_prepared_context.cxykerub[i] = vector_cxkerub_extern[i];
     }
     for (i = 0; i < num_var_continuous_extern; i++) {
-      np_conditional_density_nomad_shadow.cxykerlb[num_reg_continuous_extern + i] = vector_cykerlb_extern[i];
-      np_conditional_density_nomad_shadow.cxykerub[num_reg_continuous_extern + i] = vector_cykerub_extern[i];
+      np_conditional_density_prepared_context.cxykerlb[num_reg_continuous_extern + i] = vector_cykerlb_extern[i];
+      np_conditional_density_prepared_context.cxykerub[num_reg_continuous_extern + i] = vector_cykerub_extern[i];
     }
-    vector_cxykerlb_extern = np_conditional_density_nomad_shadow.cxykerlb;
-    vector_cxykerub_extern = np_conditional_density_nomad_shadow.cxykerub;
+    vector_cxykerlb_extern = np_conditional_density_prepared_context.cxykerlb;
+    vector_cxykerub_extern = np_conditional_density_prepared_context.cxykerub;
     int_cxyker_bound_extern = np_has_finite_cker_bounds(vector_cxykerlb_extern,
                                                         vector_cxykerub_extern,
                                                         num_all_cvar);
@@ -4701,15 +7052,38 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   int_RESTART_FROM_MIN = RE_MIN_FALSE;
   int_MINIMIZE_IO = IO_MIN_TRUE;
   int_WEIGHTS = 0;
-  np_conditional_density_nomad_shadow.old_cdens = myopti[CBW_OLDI];
+  if (myopti[CBW_RESERVED_LEGACYI] != 0)
+    error("C_np_density_conditional_nomad_native_search: reserved legacy selector must be zero");
 
   ibwmfunc = myopti[CBW_MI];
-  int_ll_extern = ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) ? *regtype : LL_LC;
-  degree_key_len = (int_ll_extern == LL_LP) ? num_reg_continuous_extern : 0;
-  bwm_num_extra_params = degree_key_len;
+  np_conditional_density_prepared_context.glp_original_order =
+    (ibwmfunc == CBWM_CVML);
+  np_lp_engine_extern = np_regression_engine_or_error(
+    ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) ? *regtype : NP_LP_ENGINE_SCALAR,
+    "np_conditional_density_bw");
+  if (degree_search) {
+    np_lp_engine_extern = np_canonical_lp_engine_for_degree(
+      glp_degree, num_reg_continuous_extern);
+    if (np_lp_engine_extern < 0)
+      goto fail;
+  }
+  degree_key_len =
+    (degree_search || (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) ?
+    num_reg_continuous_extern : 0;
+  np_conditional_density_prepared_context.degree_key_len = degree_key_len;
   vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) && (int_ll_extern == LL_LP) ? *glp_bernstein : 0;
-  int_glp_basis_extern = ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) && (int_ll_extern == LL_LP) ? *glp_basis : 1;
+  np_conditional_density_prepared_context.requested_glp_bernstein =
+    ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) ?
+    *glp_bernstein : 0;
+  np_conditional_density_prepared_context.requested_glp_basis =
+    ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) ?
+    *glp_basis : 1;
+  int_glp_bernstein_extern =
+    (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) ?
+    np_conditional_density_prepared_context.requested_glp_bernstein : 0;
+  int_glp_basis_extern =
+    (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) ?
+    np_conditional_density_prepared_context.requested_glp_basis : 1;
   int_bounded_cvls_quadrature_grid_extern = myopti[CBW_CVLS_QUAD_GRIDI];
   if ((int_bounded_cvls_quadrature_grid_extern < 0) ||
       (int_bounded_cvls_quadrature_grid_extern > 2))
@@ -4719,24 +7093,31 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
     int_bounded_cvls_quadrature_points_extern = 0;
   int_nn_k_min_extern = 1;
 
-  if ((int_ll_extern == LL_LP) && (num_reg_continuous_extern > 0)) {
-    np_conditional_density_nomad_shadow.glp_degree = alloc_vecu(num_reg_continuous_extern);
-    if (np_conditional_density_nomad_shadow.glp_degree == NULL)
+  if ((degree_search || (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) &&
+      (num_reg_continuous_extern > 0)) {
+    np_conditional_density_prepared_context.glp_degree = alloc_vecu(num_reg_continuous_extern);
+    if (np_conditional_density_prepared_context.glp_degree == NULL)
       goto fail;
     for (i = 0; i < num_reg_continuous_extern; i++)
-      np_conditional_density_nomad_shadow.glp_degree[i] = glp_degree[i];
-    vector_glp_degree_extern = np_conditional_density_nomad_shadow.glp_degree;
+      np_conditional_density_prepared_context.glp_degree[i] = glp_degree[i];
+    vector_glp_degree_extern = np_conditional_density_prepared_context.glp_degree;
   } else {
     vector_glp_degree_extern = NULL;
   }
 
-  need_y_side = (ibwmfunc == CBWM_CVLS) || ((ibwmfunc == CBWM_CVML) && (int_ll_extern == LL_LP));
-  np_conditional_density_nomad_shadow.need_y_side = need_y_side;
-  np_conditional_density_nomad_shadow.penalty_mode = penalty_mode[0];
-  np_conditional_density_nomad_shadow.penalty_multiplier = penalty_mult[0];
+  need_y_side = np_conditional_density_objective_needs_y_side(
+    ibwmfunc, degree_search);
+  np_conditional_density_prepared_context.need_y_side = need_y_side;
+  np_conditional_density_prepared_context.penalty_mode = penalty_mode[0];
+  np_conditional_density_prepared_context.penalty_multiplier = penalty_mult[0];
 
   int_TREE_XY = int_TREE_Y = int_TREE_X = myopti[CBW_TREEI];
-  if(int_ll_extern == LL_LP){
+  int_TREE_PROFILE_X = myopti[CBW_TREEI];
+  if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE ||
+     KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)
+    int_TREE_XY = int_TREE_Y = int_TREE_X = int_TREE_PROFILE_X =
+      NP_TREE_FALSE;
+  if((np_lp_engine_extern == NP_LP_ENGINE_GENERAL) && !degree_search){
     int_TREE_Y = NP_TREE_FALSE;
     int_TREE_XY = NP_TREE_FALSE;
   }
@@ -4752,6 +7133,17 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   dbl_memfac_ccdf_extern = myoptd[CBW_MEMFACD];
   bwm_set_scale_factor_lower_bound(myoptd[CBW_SFLOORD]);
   double_bounded_cvls_quadrature_extend_factor_extern = myoptd[CBW_QUAD_EXTD];
+  double_bounded_cvls_quadrature_ratios_extern[0] = myoptd[CBW_QUAD_RATIO_UNIFORMD];
+  double_bounded_cvls_quadrature_ratios_extern[1] = myoptd[CBW_QUAD_RATIO_SAMPLED];
+  double_bounded_cvls_quadrature_ratios_extern[2] = myoptd[CBW_QUAD_RATIO_GLD];
+  for(int component = 0; component < 3; ++component)
+    if(!R_FINITE(double_bounded_cvls_quadrature_ratios_extern[component]) ||
+       double_bounded_cvls_quadrature_ratios_extern[component] < 0.0)
+      goto fail;
+  if(fabs(double_bounded_cvls_quadrature_ratios_extern[0] +
+          double_bounded_cvls_quadrature_ratios_extern[1] +
+          double_bounded_cvls_quadrature_ratios_extern[2] - 1.0) > 1.0e-8)
+    goto fail;
   if (!R_FINITE(double_bounded_cvls_quadrature_extend_factor_extern) ||
       double_bounded_cvls_quadrature_extend_factor_extern <= 0.0)
     goto fail;
@@ -4786,22 +7178,45 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   num_categories_extern_XY = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern +
                                         num_reg_unordered_extern + num_reg_ordered_extern);
   matrix_y = alloc_matd(num_all_var + 1, num_all_var + 1);
-  np_conditional_density_nomad_shadow.vector_scale_factor =
+  np_conditional_density_prepared_context.vector_scale_factor =
     alloc_vecd(num_all_var + degree_key_len + 1);
+  np_conditional_density_prepared_context.eval_bandwidth =
+    alloc_vecd(num_all_var);
+  np_conditional_density_prepared_context.eval_degree =
+    (num_reg_continuous_extern > 0) ?
+    alloc_vecu(num_reg_continuous_extern) : NULL;
   vsfh = alloc_vecd(num_all_var + 1);
+  np_conditional_density_prepared_context.powell_directions =
+    retain_powell_geometry ? matrix_y : NULL;
+  np_conditional_density_prepared_context.powell_step =
+    retain_powell_geometry ? vsfh : NULL;
+  np_conditional_density_prepared_context.scale_factor_startbest =
+    retain_powell_geometry ? alloc_vecd(num_all_var + 1) : NULL;
   matrix_categorical_vals_extern =
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern +
+    alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern +
                num_reg_unordered_extern + num_reg_ordered_extern);
   matrix_categorical_vals_extern_X =
-    alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
+    alloc_matd(support->max_levels, num_reg_unordered_extern + num_reg_ordered_extern);
   matrix_categorical_vals_extern_Y =
-    need_y_side ? alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern) : NULL;
+    need_y_side ? alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern) : NULL;
   matrix_categorical_vals_extern_XY =
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern +
+    alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern +
                num_reg_unordered_extern + num_reg_ordered_extern);
   matrix_XY_continuous_train_extern = alloc_matd(num_obs_train_extern, num_all_cvar);
   matrix_XY_unordered_train_extern = alloc_matd(num_obs_train_extern, num_all_uvar);
   matrix_XY_ordered_train_extern = alloc_matd(num_obs_train_extern, num_all_ovar);
+  np_conditional_density_prepared_context.matrix_y_unordered_original =
+    matrix_Y_unordered_train_extern;
+  np_conditional_density_prepared_context.matrix_y_ordered_original =
+    matrix_Y_ordered_train_extern;
+  np_conditional_density_prepared_context.matrix_y_continuous_original =
+    matrix_Y_continuous_train_extern;
+  np_conditional_density_prepared_context.matrix_xy_continuous_original =
+    matrix_XY_continuous_train_extern;
+  np_conditional_density_prepared_context.matrix_xy_unordered_original =
+    matrix_XY_unordered_train_extern;
+  np_conditional_density_prepared_context.matrix_xy_ordered_original =
+    matrix_XY_ordered_train_extern;
   vector_continuous_stddev = alloc_vecd(num_all_cvar);
   vector_continuous_stddev_extern = vector_continuous_stddev;
 
@@ -4816,8 +7231,13 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
       (need_y_side && ((num_var_unordered_extern + num_var_ordered_extern) > 0) && (num_categories_extern_Y == NULL)) ||
       (((num_var_unordered_extern + num_var_ordered_extern + num_reg_unordered_extern + num_reg_ordered_extern) > 0) && (num_categories_extern_XY == NULL)) ||
       (matrix_y == NULL) ||
-      (np_conditional_density_nomad_shadow.vector_scale_factor == NULL) ||
+      (np_conditional_density_prepared_context.vector_scale_factor == NULL) ||
+      (np_conditional_density_prepared_context.eval_bandwidth == NULL) ||
+      ((num_reg_continuous_extern > 0) &&
+       np_conditional_density_prepared_context.eval_degree == NULL) ||
       (vsfh == NULL) ||
+      (retain_powell_geometry &&
+       np_conditional_density_prepared_context.scale_factor_startbest == NULL) ||
       (((num_var_unordered_extern + num_var_ordered_extern + num_reg_unordered_extern + num_reg_ordered_extern) > 0) && (matrix_categorical_vals_extern == NULL)) ||
       (((num_reg_unordered_extern + num_reg_ordered_extern) > 0) && (matrix_categorical_vals_extern_X == NULL)) ||
       (need_y_side && ((num_var_unordered_extern + num_var_ordered_extern) > 0) && (matrix_categorical_vals_extern_Y == NULL)) ||
@@ -4830,7 +7250,7 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
 
   if (int_use_starting_values) {
     for (i = 0; i < num_all_var; i++)
-      np_conditional_density_nomad_shadow.vector_scale_factor[i + 1] = rbw[i];
+      np_conditional_density_prepared_context.vector_scale_factor[i + 1] = rbw[i];
   }
 
   for (j = 0; j < num_var_unordered_extern; j++)
@@ -4851,6 +7271,16 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   for (j = 0; j < num_reg_continuous_extern; j++)
     for (i = 0; i < num_obs_train_extern; i++)
       matrix_X_continuous_train_extern[j][i] = u_con[j * num_obs_train_extern + i];
+
+  /* Preserve the legacy/full-owner nonfixed support contract before any
+   * tree permutation changes the resident matrix view. */
+  if (support_failure != NULL) {
+    np_refresh_support_counts_extern();
+    *support_failure =
+      np_nonfixed_support_failure_extern(BANDWIDTH_den_extern);
+    if (*support_failure != NP_SUPPORT_FAILURE_NONE)
+      goto fail;
+  }
 
   ipt_X = (int *)malloc((size_t)num_obs_train_extern * sizeof(int));
   ipt_lookup_X = (int *)malloc((size_t)num_obs_train_extern * sizeof(int));
@@ -4893,6 +7323,9 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   int_TREE_XY = int_TREE_XY && ((num_all_cvar != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
   int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
   int_TREE_Y = int_TREE_Y && need_y_side && ((num_var_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
+  np_conditional_density_prepared_context.tree_x_ready = int_TREE_X;
+  np_conditional_density_prepared_context.tree_y_ready = int_TREE_Y;
+  np_conditional_density_prepared_context.tree_xy_ready = int_TREE_XY;
 
   if (int_TREE_X == NP_TREE_TRUE) {
     build_kdtree(matrix_X_continuous_train_extern,
@@ -4916,6 +7349,37 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   }
 
   if (int_TREE_Y == NP_TREE_TRUE) {
+    double **matrix_y_unordered_tree_view = matrix_Y_unordered_train_extern;
+    double **matrix_y_ordered_tree_view = matrix_Y_ordered_train_extern;
+    double **matrix_y_continuous_tree_view = matrix_Y_continuous_train_extern;
+
+    /*
+     * A scalar callback may use the Y tree, while a positive-degree callback
+     * uses original Y order. Degree search therefore owns both linear-size
+     * views; fixed-degree shadows retain the incumbent single in-place view.
+     */
+    if (degree_search) {
+      np_conditional_density_prepared_context.matrix_y_unordered_tree =
+        alloc_matd(num_obs_train_extern, num_var_unordered_extern);
+      np_conditional_density_prepared_context.matrix_y_ordered_tree =
+        alloc_matd(num_obs_train_extern, num_var_ordered_extern);
+      np_conditional_density_prepared_context.matrix_y_continuous_tree =
+        alloc_matd(num_obs_train_extern, num_var_continuous_extern);
+      if (((num_var_unordered_extern > 0) &&
+           (np_conditional_density_prepared_context.matrix_y_unordered_tree == NULL)) ||
+          ((num_var_ordered_extern > 0) &&
+           (np_conditional_density_prepared_context.matrix_y_ordered_tree == NULL)) ||
+          ((num_var_continuous_extern > 0) &&
+           (np_conditional_density_prepared_context.matrix_y_continuous_tree == NULL)))
+        goto fail;
+      matrix_y_unordered_tree_view =
+        np_conditional_density_prepared_context.matrix_y_unordered_tree;
+      matrix_y_ordered_tree_view =
+        np_conditional_density_prepared_context.matrix_y_ordered_tree;
+      matrix_y_continuous_tree_view =
+        np_conditional_density_prepared_context.matrix_y_continuous_tree;
+    }
+
     build_kdtree(matrix_Y_continuous_train_extern,
                  num_obs_train_extern,
                  num_var_continuous_extern,
@@ -4925,13 +7389,16 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
 
     for (j = 0; j < num_var_unordered_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_Y_unordered_train_extern[j][i] = c_uno[j * num_obs_train_extern + ipt_Y[i]];
+        matrix_y_unordered_tree_view[j][i] =
+          c_uno[j * num_obs_train_extern + ipt_Y[i]];
     for (j = 0; j < num_var_ordered_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_Y_ordered_train_extern[j][i] = c_ord[j * num_obs_train_extern + ipt_Y[i]];
+        matrix_y_ordered_tree_view[j][i] =
+          c_ord[j * num_obs_train_extern + ipt_Y[i]];
     for (j = 0; j < num_var_continuous_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_Y_continuous_train_extern[j][i] = c_con[j * num_obs_train_extern + ipt_Y[i]];
+        matrix_y_continuous_tree_view[j][i] =
+          c_con[j * num_obs_train_extern + ipt_Y[i]];
     for (i = 0; i < num_obs_train_extern; i++)
       ipt_lookup_Y[ipt_Y[i]] = i;
   }
@@ -4956,6 +7423,36 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
       matrix_XY_continuous_train_extern[j][i] = c_con[(j - num_reg_continuous_extern) * num_obs_train_extern + i];
 
   if (int_TREE_XY == NP_TREE_TRUE) {
+    double **matrix_xy_unordered_tree_view =
+      matrix_XY_unordered_train_extern;
+    double **matrix_xy_ordered_tree_view =
+      matrix_XY_ordered_train_extern;
+    double **matrix_xy_continuous_tree_view =
+      matrix_XY_continuous_train_extern;
+
+    /* See the Y-view ownership contract above. */
+    if (degree_search) {
+      np_conditional_density_prepared_context.matrix_xy_unordered_tree =
+        alloc_matd(num_obs_train_extern, num_all_uvar);
+      np_conditional_density_prepared_context.matrix_xy_ordered_tree =
+        alloc_matd(num_obs_train_extern, num_all_ovar);
+      np_conditional_density_prepared_context.matrix_xy_continuous_tree =
+        alloc_matd(num_obs_train_extern, num_all_cvar);
+      if (((num_all_uvar > 0) &&
+           (np_conditional_density_prepared_context.matrix_xy_unordered_tree == NULL)) ||
+          ((num_all_ovar > 0) &&
+           (np_conditional_density_prepared_context.matrix_xy_ordered_tree == NULL)) ||
+          ((num_all_cvar > 0) &&
+           (np_conditional_density_prepared_context.matrix_xy_continuous_tree == NULL)))
+        goto fail;
+      matrix_xy_unordered_tree_view =
+        np_conditional_density_prepared_context.matrix_xy_unordered_tree;
+      matrix_xy_ordered_tree_view =
+        np_conditional_density_prepared_context.matrix_xy_ordered_tree;
+      matrix_xy_continuous_tree_view =
+        np_conditional_density_prepared_context.matrix_xy_continuous_tree;
+    }
+
     build_kdtree(matrix_XY_continuous_train_extern,
                  num_obs_train_extern,
                  num_all_cvar,
@@ -4965,27 +7462,34 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
 
     for (j = 0; j < num_reg_unordered_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i] = u_uno[j * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_unordered_tree_view[j][i] =
+          u_uno[j * num_obs_train_extern + ipt_XY[i]];
     for (j = num_reg_unordered_extern; j < num_all_uvar; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i] = c_uno[(j - num_reg_unordered_extern) * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_unordered_tree_view[j][i] =
+          c_uno[(j - num_reg_unordered_extern) * num_obs_train_extern + ipt_XY[i]];
     for (j = 0; j < num_reg_ordered_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i] = u_ord[j * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_ordered_tree_view[j][i] =
+          u_ord[j * num_obs_train_extern + ipt_XY[i]];
     for (j = num_reg_ordered_extern; j < num_all_ovar; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i] = c_ord[(j - num_reg_ordered_extern) * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_ordered_tree_view[j][i] =
+          c_ord[(j - num_reg_ordered_extern) * num_obs_train_extern + ipt_XY[i]];
     for (j = 0; j < num_reg_continuous_extern; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i] = u_con[j * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_continuous_tree_view[j][i] =
+          u_con[j * num_obs_train_extern + ipt_XY[i]];
     for (j = num_reg_continuous_extern; j < num_all_cvar; j++)
       for (i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i] = c_con[(j - num_reg_continuous_extern) * num_obs_train_extern + ipt_XY[i]];
+        matrix_xy_continuous_tree_view[j][i] =
+          c_con[(j - num_reg_continuous_extern) * num_obs_train_extern + ipt_XY[i]];
     for (i = 0; i < num_obs_train_extern; i++)
       ipt_lookup_XY[ipt_XY[i]] = i;
   }
 
-  determine_categorical_vals(num_obs_train_extern,
+  if(int_VERBOSE == 1 || int_DEBUG == 1)
+    determine_categorical_vals(num_obs_train_extern,
                              num_var_unordered_extern,
                              num_var_ordered_extern,
                              num_reg_unordered_extern,
@@ -4997,9 +7501,12 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                              num_categories_extern,
                              matrix_categorical_vals_extern);
 
+  np_categorical_support_copy(support, num_categories_extern,
+                              matrix_categorical_vals_extern);
+
   np_splitxy_vsf_mcv_nc(num_var_unordered_extern, num_var_ordered_extern, num_var_continuous_extern,
                         num_reg_unordered_extern, num_reg_ordered_extern, num_reg_continuous_extern,
-                        np_conditional_density_nomad_shadow.vector_scale_factor + 1,
+                        np_conditional_density_prepared_context.vector_scale_factor + 1,
                         num_categories_extern,
                         matrix_categorical_vals_extern,
                         NULL, NULL, NULL,
@@ -5013,7 +7520,12 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
   for (j = 0; j < num_all_cvar; j++)
     vector_continuous_stddev_extern[j] = mysd[j];
 
-  np_conditional_density_nomad_shadow.extendednn_upper =
+  np_conditional_density_prepared_context.extendednn_upper = eval_only ?
+    np_continuous_extendednn_eval_upper_alloc(
+      BANDWIDTH_den_extern,
+      num_obs_train_extern,
+      num_reg_continuous_extern + num_var_continuous_extern,
+      rbw) :
     np_conditional_extendednn_upper_alloc(
       BANDWIDTH_den_extern,
       KERNEL_reg_extern,
@@ -5025,18 +7537,30 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
       matrix_X_continuous_train_extern,
       matrix_Y_continuous_train_extern,
       matrix_Y_continuous_train_extern);
-  vector_extendednn_upper_extern = np_conditional_density_nomad_shadow.extendednn_upper;
+  vector_extendednn_upper_extern = np_conditional_density_prepared_context.extendednn_upper;
   int_extendednn_upper_num_extern =
     (vector_extendednn_upper_extern != NULL) ? num_all_cvar : 0;
 
-  if ((int_ll_extern == LL_LP) &&
-      (!np_glp_cv_prepare_extern(int_ll_extern,
-                                 num_obs_train_extern,
-                                 num_reg_continuous_extern,
-                                 matrix_X_continuous_train_extern)))
-    goto fail;
+  if (degree_search) {
+    if (!np_conditional_density_prepared_context_refresh_degree(glp_degree))
+      goto fail;
+  } else {
+    if ((np_lp_engine_extern == NP_LP_ENGINE_GENERAL) &&
+        (!np_glp_cv_prepare_extern(np_lp_engine_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   matrix_X_continuous_train_extern)))
+      goto fail;
+    if ((np_lp_engine_extern == NP_LP_ENGINE_GENERAL) &&
+        (ibwmfunc == CBWM_CVML) &&
+        (int_TREE_X == NP_TREE_TRUE) &&
+        (!np_glp_cv_prepare_original_order_extern(ipt_extern_X)))
+      goto fail;
+    np_conditional_density_prepared_context.degree_state_ready = 1;
+  }
 
-  if ((ibwmfunc == CBWM_CVLS) && (int_ll_extern == LL_LP) &&
+  if ((ibwmfunc == CBWM_CVLS) &&
+      (degree_search || (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) &&
       (np_bounded_cvls_conditional_quad_context_prepare_extern() != 0))
     goto fail;
 
@@ -5059,15 +7583,15 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                                     nconfac_extern, ncatfac_extern,
                                     num_categories_extern,
                                     vector_continuous_stddev_extern,
-                                    np_conditional_density_nomad_shadow.vector_scale_factor,
+                                    np_conditional_density_prepared_context.vector_scale_factor,
                                     lbc_init, hbc_init, c_init,
                                     lbd_init, hbd_init, d_init,
                                     matrix_X_continuous_train_extern,
                                     matrix_Y_continuous_train_extern);
 
   for (i = 0; i < degree_key_len; i++)
-    np_conditional_density_nomad_shadow.vector_scale_factor[num_all_var + i + 1] =
-      (double)np_conditional_density_nomad_shadow.glp_degree[i];
+    np_conditional_density_prepared_context.vector_scale_factor[num_all_var + i + 1] =
+      (double)np_conditional_density_prepared_context.glp_degree[i];
 
   initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
                                     0,
@@ -5111,84 +7635,79 @@ static int np_conditional_density_nomad_shadow_prepare_internal(double *c_uno,
                            matrix_X_continuous_train_extern,
                            matrix_Y_continuous_train_extern);
 
-  if (np_conditional_density_nomad_shadow.old_cdens) {
-    switch (ibwmfunc) {
-      case CBWM_CVML:
-        bwmfunc_raw = cv_func_con_density_categorical_ml;
-        break;
-      case CBWM_CVLS:
-        bwmfunc_raw = cv_func_con_density_categorical_ls;
-        break;
-      case CBWM_NPLS:
-        bwmfunc_raw = np_cv_func_con_density_categorical_ls;
-        break;
-      default:
-        error("np.c: invalid bandwidth selection method.");
-    }
-  } else {
-    switch (ibwmfunc) {
-      case CBWM_CVML:
-        bwmfunc_raw = np_cv_func_con_density_categorical_ml;
-        break;
-      case CBWM_CVLS:
-        bwmfunc_raw = np_cv_func_con_density_categorical_ls_npksum;
-        break;
-      default:
-        error("np.c: invalid bandwidth selection method.");
-    }
+  switch (ibwmfunc) {
+    case CBWM_CVML:
+      bwmfunc_raw = np_cv_func_con_density_categorical_ml;
+      break;
+    case CBWM_CVLS:
+      bwmfunc_raw = np_cv_func_con_density_categorical_ls_npksum;
+      break;
+    default:
+      error("np.c: invalid bandwidth selection method.");
   }
 
-  bwm_num_reg_continuous = num_all_cvar;
-  bwm_num_reg_unordered = num_all_uvar;
-  bwm_num_reg_ordered = num_all_ovar;
-  bwm_kernel_unordered = KERNEL_den_unordered_extern;
-  bwm_kernel_unordered_len = bwm_num_reg_unordered;
-  if (bwm_kernel_unordered_len > 0) {
-    bwm_kernel_unordered_vec = alloc_vecu(bwm_kernel_unordered_len);
-    if (bwm_kernel_unordered_vec == NULL)
+  bwm_search_context_configure_split(
+    num_all_cvar,
+    num_var_unordered_extern,
+    num_reg_unordered_extern,
+    num_var_ordered_extern,
+    num_reg_ordered_extern,
+    degree_key_len,
+    KERNEL_den_unordered_extern,
+    KERNEL_reg_unordered_extern,
+    num_categories_extern);
+  if (retain_powell_geometry) {
+    bwm_nn_cache_configure_for_powell(
+      BANDWIDTH_den_extern,
+      eval_only,
+      0,
+      num_var_continuous_extern + num_reg_continuous_extern,
+      num_var_unordered_extern + num_reg_unordered_extern,
+      num_var_ordered_extern + num_reg_ordered_extern);
+  } else {
+    /* Repeated-candidate evaluators own a fresh cache and penalty lifecycle. */
+    bwm_nn_cache_configure_for_degree_search(BANDWIDTH_den_extern,
+                                             0,
+                                             degree_key_len,
+                                             bwm_num_reg_continuous,
+                                             bwm_num_reg_unordered,
+                                             bwm_num_reg_ordered);
+    /* Penalty construction is itself a canonical collective objective probe.
+       Admit the fully prepared rank-owned engine before running it, then
+       remove setup probes from the public evaluation counters. */
+    int_conditional_prepared_context_extern = 1;
+    bwm_reset_counters();
+    np_conditional_density_prepared_context_refresh_penalty();
+    if (np_conditional_failure_pending())
       goto fail;
-    for (i = 0; i < num_var_unordered_extern; i++)
-      bwm_kernel_unordered_vec[i] = KERNEL_den_unordered_extern;
-    for (i = 0; i < num_reg_unordered_extern; i++)
-      bwm_kernel_unordered_vec[num_var_unordered_extern + i] = KERNEL_reg_unordered_extern;
-  } else {
-    bwm_kernel_unordered_vec = NULL;
+    bwm_reset_counters();
   }
-  bwm_num_categories = num_categories_extern;
-  /* Shadow evaluators call bwmfunc_wrapper(), so prepare owns a fresh
-     bandwidth-objective cache lifecycle just like ordinary searches. */
-  bwm_nn_cache_configure_for_degree_search(BANDWIDTH_den_extern,
-                                           0,
-                                           degree_key_len,
-                                           bwm_num_reg_continuous,
-                                           bwm_num_reg_unordered,
-                                           bwm_num_reg_ordered);
-  bwm_reset_counters();
 
-  np_conditional_density_nomad_shadow_refresh_penalty();
-
-  if (np_mpi_rank_failure_injected("NP_RMPI_INJECT_CDEN_SHADOW_PREPARE_FAIL_RANK"))
+  if (np_mpi_rank_failure_injected("NP_RMPI_INJECT_CDEN_PREPARED_PREPARE_FAIL_RANK"))
     goto fail;
 
-  np_conditional_density_nomad_shadow.ipt_x = ipt_X;
-  np_conditional_density_nomad_shadow.ipt_y = need_y_side ? ipt_Y : NULL;
-  np_conditional_density_nomad_shadow.ipt_xy = ipt_XY;
-  np_conditional_density_nomad_shadow.ipt_lookup_x = ipt_lookup_X;
-  np_conditional_density_nomad_shadow.ipt_lookup_y = need_y_side ? ipt_lookup_Y : NULL;
-  np_conditional_density_nomad_shadow.ipt_lookup_xy = ipt_lookup_XY;
+  np_conditional_density_prepared_context.ipt_x = ipt_X;
+  np_conditional_density_prepared_context.ipt_y = need_y_side ? ipt_Y : NULL;
+  np_conditional_density_prepared_context.ipt_xy = ipt_XY;
+  np_conditional_density_prepared_context.ipt_lookup_x = ipt_lookup_X;
+  np_conditional_density_prepared_context.ipt_lookup_y = need_y_side ? ipt_lookup_Y : NULL;
+  np_conditional_density_prepared_context.ipt_lookup_xy = ipt_lookup_XY;
   ipt_X = ipt_Y = ipt_XY = NULL;
   ipt_lookup_X = ipt_lookup_Y = ipt_lookup_XY = NULL;
 
-  free_mat(matrix_y, num_all_var + 1);
-  safe_free(vsfh);
-  np_conditional_density_nomad_shadow.active = 1;
-  int_conditional_nomad_shadow_extern = 1;
+  if (!retain_powell_geometry) {
+    free_mat(matrix_y, num_all_var + 1);
+    safe_free(vsfh);
+  }
+  np_conditional_density_prepared_context.active = 1;
+  int_conditional_prepared_context_extern = 1;
   return 1;
 
 fail:
-  if (matrix_y != NULL)
+  if (!retain_powell_geometry && matrix_y != NULL)
     free_mat(matrix_y, num_all_var + 1);
-  safe_free(vsfh);
+  if (!retain_powell_geometry)
+    safe_free(vsfh);
   safe_free(ipt_X);
   if (ipt_Y != ipt_X)
     safe_free(ipt_Y);
@@ -5197,11 +7716,11 @@ fail:
   if (ipt_lookup_Y != ipt_lookup_X)
     safe_free(ipt_lookup_Y);
   safe_free(ipt_lookup_XY);
-  np_conditional_density_nomad_shadow_clear_internal();
+  np_conditional_density_prepared_context_clear_internal();
   return 0;
 }
 
-SEXP C_np_density_conditional_nomad_shadow_prepare(SEXP c_uno,
+SEXP C_np_density_conditional_prepared_prepare(SEXP c_uno,
                                                    SEXP c_ord,
                                                    SEXP c_con,
                                                    SEXP u_uno,
@@ -5220,8 +7739,10 @@ SEXP C_np_density_conditional_nomad_shadow_prepare(SEXP c_uno,
                                                    SEXP cxkerlb,
                                                    SEXP cxkerub,
                                                    SEXP cykerlb,
-                                                   SEXP cykerub)
+                                                   SEXP cykerub,
+                                                   SEXP declared_support)
 {
+  np_conditional_gnn_notice_reset();
   SEXP c_uno_r = R_NilValue, c_ord_r = R_NilValue, c_con_r = R_NilValue;
   SEXP u_uno_r = R_NilValue, u_ord_r = R_NilValue, u_con_r = R_NilValue;
   SEXP mysd_r = R_NilValue, myopti_i = R_NilValue, myoptd_r = R_NilValue, rbw_r = R_NilValue;
@@ -5229,6 +7750,7 @@ SEXP C_np_density_conditional_nomad_shadow_prepare(SEXP c_uno,
   SEXP glp_degree_i = R_NilValue, glp_bernstein_i = R_NilValue, glp_basis_i = R_NilValue, regtype_i = R_NilValue;
   SEXP cxkerlb_r = R_NilValue, cxkerub_r = R_NilValue, cykerlb_r = R_NilValue, cykerub_r = R_NilValue;
   int ok;
+  int support_failure = NP_SUPPORT_FAILURE_NONE;
 
   PROTECT(c_uno_r = coerceVector(c_uno, REALSXP));
   PROTECT(c_ord_r = coerceVector(c_ord, REALSXP));
@@ -5251,11 +7773,28 @@ SEXP C_np_density_conditional_nomad_shadow_prepare(SEXP c_uno,
   PROTECT(cykerlb_r = coerceVector(cykerlb, REALSXP));
   PROTECT(cykerub_r = coerceVector(cykerub, REALSXP));
 
-  if (XLENGTH(myopti_i) <= CBW_CVLS_QUAD_POINTSI ||
-      XLENGTH(myoptd_r) <= CBW_QUAD_EXTD) {
+  if (XLENGTH(myopti_i) <= CBW_CATCOMPI ||
+      XLENGTH(myoptd_r) <= CBW_QUAD_EXTD ||
+      XLENGTH(penalty_mode_i) < 1 ||
+      XLENGTH(penalty_mult_r) < 1 ||
+      XLENGTH(glp_bernstein_i) < 1 ||
+      XLENGTH(glp_basis_i) < 1 ||
+      XLENGTH(regtype_i) < 1) {
+    ok = 0;
+  } else if (INTEGER(myopti_i)[CBW_UNCONI] < 0 ||
+             ((INTEGER(myopti_i)[CBW_DEGREE_SEARCHI] != 0 ||
+               INTEGER(regtype_i)[0] == NP_LP_ENGINE_GENERAL) &&
+              XLENGTH(glp_degree_i) != INTEGER(myopti_i)[CBW_UNCONI])) {
     ok = 0;
   } else {
-    ok = np_conditional_density_nomad_shadow_prepare_internal(REAL(c_uno_r),
+    const int support_dimensions[4] = {
+      INTEGER(myopti_i)[CBW_CNUNOI], INTEGER(myopti_i)[CBW_CNORDI],
+      INTEGER(myopti_i)[CBW_UNUNOI], INTEGER(myopti_i)[CBW_UNORDI]};
+    const SEXP support_data[4] = {c_uno_r, c_ord_r, u_uno_r, u_ord_r};
+    const NPCategoricalSupport support = np_categorical_support_parse(
+      declared_support, INTEGER(myopti_i)[CBW_NOBSI],
+      support_dimensions, support_data);
+    ok = np_conditional_density_prepared_context_prepare_internal(REAL(c_uno_r),
                                                               REAL(c_ord_r),
                                                               REAL(c_con_r),
                                                               REAL(u_uno_r),
@@ -5274,64 +7813,100 @@ SEXP C_np_density_conditional_nomad_shadow_prepare(SEXP c_uno,
                                                               REAL(cxkerlb_r),
                                                               REAL(cxkerub_r),
                                                               REAL(cykerlb_r),
-                                                              REAL(cykerub_r));
+                                                              REAL(cykerub_r),
+                                                              0,
+                                                              0,
+                                                              &support_failure, &support);
   }
 
+  support_failure = np_mpi_comm1_max_int(support_failure);
   ok = np_mpi_comm1_all_ok(ok);
   if (!ok)
-    np_conditional_density_nomad_shadow_clear_internal();
+    np_conditional_density_prepared_context_clear_internal();
 
   UNPROTECT(20);
 
-  return ScalarLogical(ok ? 1 : 0);
+  /* Local preparation storage has been released before raising this error. */
+  if (np_conditional_failure_pending())
+    np_conditional_failure_raise();
+  return ScalarInteger(ok ? 1 : -(support_failure + 1));
 }
 
-static int np_density_conditional_nomad_shadow_eval_native_raw(const double *rbw,
+static int np_conditional_density_prepared_context_eval_native_raw(const double *rbw,
                                                                const int *glp_degree,
+                                                               const int raw_only,
+                                                               const int defer_failure,
                                                                double out[4])
 {
+  np_conditional_failure_reset();
   int i;
+  int degree_refresh_needed;
+  int degree_refresh_ok;
   double val, fast = 0.0, fast_before = 0.0, evals = 0.0, eval_before = 0.0;
   double guarded = 0.0, guarded_before = 0.0;
   double *rbw_work = NULL;
   int *degree_work = NULL;
 
-  if (!np_conditional_density_nomad_shadow.active)
+  if (!np_conditional_density_prepared_context.active)
     return 1;
-  if (rbw == NULL || glp_degree == NULL || out == NULL)
+  if (rbw == NULL || out == NULL)
+    return 1;
+  if (np_conditional_density_prepared_context.degree_key_len > 0 &&
+      glp_degree == NULL)
     return 1;
 
-  rbw_work = NP_NOMAD_CALLBACK_CALLOC(np_conditional_density_nomad_shadow.num_all_var, double);
-  degree_work = NP_NOMAD_CALLBACK_CALLOC(np_conditional_density_nomad_shadow.num_reg_continuous, int);
-  if (rbw_work == NULL || degree_work == NULL) {
-    if (rbw_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(rbw_work);
-    if (degree_work != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree_work);
+  rbw_work = np_conditional_density_prepared_context.eval_bandwidth;
+  degree_work = np_conditional_density_prepared_context.eval_degree;
+  if (rbw_work == NULL ||
+      (np_conditional_density_prepared_context.degree_key_len > 0 &&
+       degree_work == NULL))
     return 1;
-  }
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     rbw_work[i] = rbw[i];
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
-    degree_work[i] = glp_degree[i];
+  if (np_conditional_density_prepared_context.degree_key_len > 0) {
+    for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
+      degree_work[i] = glp_degree[i];
+  }
 
 #ifdef MPI2
   if (comm != NULL && comm[1] != MPI_COMM_NULL) {
     /* Keep collective CV evaluations on the rank-0 NOMAD candidate. */
     MPI_Bcast(rbw_work,
-              np_conditional_density_nomad_shadow.num_all_var,
+              np_conditional_density_prepared_context.num_all_var,
               MPI_DOUBLE,
               0,
               comm[1]);
-    MPI_Bcast(degree_work,
-              np_conditional_density_nomad_shadow.num_reg_continuous,
-              MPI_INT,
-              0,
-              comm[1]);
+    if (np_conditional_density_prepared_context.degree_key_len > 0)
+      MPI_Bcast(degree_work,
+                np_conditional_density_prepared_context.num_reg_continuous,
+                MPI_INT,
+                0,
+                comm[1]);
   }
 #endif
 
-  if (!np_conditional_density_nomad_shadow_refresh_degree(degree_work)) {
+  bwm_penalty_mode = raw_only ? 0 :
+    np_conditional_density_prepared_context.penalty_ready;
+  bwm_penalty_value = bwm_penalty_mode ?
+    np_conditional_density_prepared_context.penalty_value : DBL_MAX;
+  degree_refresh_needed =
+    np_conditional_density_prepared_context_degree_refresh_needed(degree_work);
+  degree_refresh_ok =
+    np_conditional_density_prepared_context_refresh_degree(degree_work);
+#ifdef MPI2
+  /*
+   * Automatic degree search must have a rank-invariant collective schedule.
+   * Refresh preparation can fail rank-locally, so whether a particular rank
+   * believes its cached state changed is not a safe condition for entering an
+   * MPI collective.  Fixed-degree shadows retain the incumbent no-collective
+   * fast return once their rank-symmetric preparation is complete.
+   */
+  if (np_conditional_density_prepared_context.degree_search ||
+      degree_refresh_needed)
+    degree_refresh_ok = np_mpi_comm1_all_ok(degree_refresh_ok);
+#endif
+
+  if (!degree_refresh_ok) {
     bwm_eval_count += 1.0;
     bwm_invalid_count += 1.0;
     bwm_maybe_signal_activity();
@@ -5340,26 +7915,25 @@ static int np_density_conditional_nomad_shadow_eval_native_raw(const double *rbw
     out[1] = 1.0;
     out[2] = 0.0;
     out[3] = 0.0;
-    NP_NOMAD_CALLBACK_FREE(rbw_work);
-    NP_NOMAD_CALLBACK_FREE(degree_work);
     return 0;
   }
 
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
-    np_conditional_density_nomad_shadow.vector_scale_factor[i + 1] = rbw_work[i];
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
-    np_conditional_density_nomad_shadow.vector_scale_factor[
-      np_conditional_density_nomad_shadow.num_all_var + i + 1] =
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
+    np_conditional_density_prepared_context.vector_scale_factor[i + 1] = rbw_work[i];
+  for (i = 0; i < np_conditional_density_prepared_context.degree_key_len; i++)
+    np_conditional_density_prepared_context.vector_scale_factor[
+      np_conditional_density_prepared_context.num_all_var + i + 1] =
       (double)degree_work[i];
 
-  if (np_conditional_density_nomad_shadow.penalty_mode == 1) {
-    bwm_penalty_mode = 0;
-    bwm_penalty_value = DBL_MAX;
-  }
   eval_before = bwm_eval_count;
   fast_before = np_fastcv_alllarge_hits_get();
   guarded_before = np_guarded_cvml_hits_get();
-  val = bwmfunc_wrapper(np_conditional_density_nomad_shadow.vector_scale_factor);
+  val = bwmfunc_wrapper(np_conditional_density_prepared_context.vector_scale_factor);
+  if (np_conditional_failure_pending()) {
+    if (defer_failure)
+      return NP_CONDITIONAL_NATIVE_STOP;
+    np_conditional_failure_raise();
+  }
   fast = np_fastcv_alllarge_hits_get() - fast_before;
   guarded = np_guarded_cvml_hits_get() - guarded_before;
   evals = bwm_eval_count - eval_before;
@@ -5370,49 +7944,40 @@ static int np_density_conditional_nomad_shadow_eval_native_raw(const double *rbw
   if (evals < 0.0)
     evals = 0.0;
 
-  if ((!isfinite(val) || val == DBL_MAX) &&
-      np_conditional_density_nomad_shadow.penalty_mode == 1) {
-    np_conditional_density_nomad_shadow_refresh_penalty();
-    val = (bwm_penalty_mode == 1 && isfinite(bwm_penalty_value)) ? bwm_penalty_value : DBL_MAX;
-    evals = bwm_eval_count - eval_before;
-    if (evals < 0.0)
-      evals = 0.0;
-  }
-
   out[0] = -val;
   out[1] = evals;
   out[2] = fast;
   out[3] = (guarded > 0.0) ? 1.0 : 0.0;
-  NP_NOMAD_CALLBACK_FREE(rbw_work);
-  NP_NOMAD_CALLBACK_FREE(degree_work);
   return 0;
 }
 
-SEXP C_np_density_conditional_nomad_shadow_eval(SEXP rbw, SEXP glp_degree)
+static SEXP np_density_conditional_prepared_eval_mode(SEXP rbw, SEXP glp_degree,
+                                                     const int raw_only)
 {
   SEXP rbw_r = R_NilValue, degree_i = R_NilValue, out = R_NilValue;
   double eval_out[4];
 
-  if (!np_conditional_density_nomad_shadow.active)
-    error("resident npcdens NOMAD shadow state is not active");
+  if (!np_conditional_density_prepared_context.active)
+    error("resident npcdens prepared objective state is not active");
 
   PROTECT(rbw_r = coerceVector(rbw, REALSXP));
   PROTECT(degree_i = coerceVector(glp_degree, INTSXP));
 
-  if (XLENGTH(rbw_r) != np_conditional_density_nomad_shadow.num_all_var) {
+  if (XLENGTH(rbw_r) != np_conditional_density_prepared_context.num_all_var) {
     UNPROTECT(2);
-    error("resident npcdens NOMAD shadow received bandwidth vector of unexpected length");
+    error("resident npcdens prepared objective received bandwidth vector of unexpected length");
   }
-  if (XLENGTH(degree_i) != np_conditional_density_nomad_shadow.num_reg_continuous) {
+  if (XLENGTH(degree_i) != np_conditional_density_prepared_context.num_reg_continuous) {
     UNPROTECT(2);
-    error("resident npcdens NOMAD shadow received degree vector of unexpected length");
+    error("resident npcdens prepared objective received degree vector of unexpected length");
   }
 
-  if (np_density_conditional_nomad_shadow_eval_native_raw(REAL(rbw_r),
+  if (np_conditional_density_prepared_context_eval_native_raw(REAL(rbw_r),
                                                           INTEGER(degree_i),
+                                                          raw_only, 0,
                                                           eval_out) != 0) {
     UNPROTECT(2);
-    error("resident npcdens NOMAD shadow native evaluator failed");
+    error("resident npcdens prepared objective native evaluator failed");
   }
 
   PROTECT(out = allocVector(REALSXP, 4));
@@ -5424,10 +7989,23 @@ SEXP C_np_density_conditional_nomad_shadow_eval(SEXP rbw, SEXP glp_degree)
   return out;
 }
 
+SEXP C_np_density_conditional_prepared_eval(SEXP rbw, SEXP glp_degree)
+{
+  return np_density_conditional_prepared_eval_mode(rbw, glp_degree, 0);
+}
+
+SEXP C_np_density_conditional_prepared_eval_raw(SEXP rbw, SEXP glp_degree)
+{
+  return np_density_conditional_prepared_eval_mode(rbw, glp_degree, 1);
+}
+
 typedef struct {
+  np_conditional_nomad_stop_context stop;
   int n;
   int nbw_point;
   int nbw_flat;
+  int ncont_point;
+  int scaling;
   int ndegree;
   int nfixed_degree;
   const int *flat_from_point;
@@ -5439,6 +8017,7 @@ typedef struct {
   double total_num_feval;
   double total_fast;
   double total_guarded;
+  double ncatfac;
   double best_min_objective;
   double best_objective;
   double best_eval[4];
@@ -5448,6 +8027,8 @@ typedef struct {
   int progress_last_signal_eval;
   clock_t progress_last_signal_clock;
   time_t progress_last_signal_wall;
+  double *callback_flat_bw;
+  int *callback_degree;
 } np_cdens_native_search_context;
 
 static int np_cdens_native_search_callback(int n,
@@ -5465,17 +8046,21 @@ static int np_cdens_native_search_callback(int n,
   int degree_len, j, status;
 
   if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 ||
-      n != context->n)
+      n != context->n || context->ncont_point < 0 ||
+      context->ncont_point > context->nbw_point)
     return 1;
 
+  context->callback_flat_bw = NULL;
+  context->callback_degree = NULL;
   degree_len = (context->ndegree > 0) ? context->ndegree : context->nfixed_degree;
-  flat_bw = NP_NOMAD_CALLBACK_CALLOC(context->nbw_flat, double);
-  degree = NP_NOMAD_CALLBACK_CALLOC(degree_len, int);
-  if (flat_bw == NULL || degree == NULL) {
-    if (flat_bw != NULL)
-      NP_NOMAD_CALLBACK_FREE(flat_bw);
-    if (degree != NULL)
-      NP_NOMAD_CALLBACK_FREE(degree);
+  flat_bw = context->callback_flat_bw = NP_NOMAD_CALLBACK_CALLOC(context->nbw_flat, double);
+  if (degree_len > 0)
+    degree = context->callback_degree = NP_NOMAD_CALLBACK_CALLOC(degree_len, int);
+  if (flat_bw == NULL || (degree_len > 0 && degree == NULL)) {
+    NP_NOMAD_CALLBACK_FREE(flat_bw);
+    NP_NOMAD_CALLBACK_FREE(degree);
+    context->callback_flat_bw = NULL;
+    context->callback_degree = NULL;
     return 1;
   }
 
@@ -5483,10 +8068,21 @@ static int np_cdens_native_search_callback(int n,
     const int idx = context->flat_from_point[j];
     if (idx < 0 || idx >= context->nbw_point) {
       NP_NOMAD_CALLBACK_FREE(flat_bw);
+      context->callback_flat_bw = NULL;
       NP_NOMAD_CALLBACK_FREE(degree);
+      context->callback_degree = NULL;
       return 1;
     }
-    if (BANDWIDTH_den_extern == BW_FIXED) {
+    if (idx >= context->ncont_point) {
+      if (np_nomad_decode_categorical_bandwidth(
+            x[idx], context->scaling, context->ncatfac, &flat_bw[j]) != 0) {
+        NP_NOMAD_CALLBACK_FREE(flat_bw);
+        context->callback_flat_bw = NULL;
+        NP_NOMAD_CALLBACK_FREE(degree);
+        context->callback_degree = NULL;
+        return 1;
+      }
+    } else if (BANDWIDTH_den_extern == BW_FIXED) {
       flat_bw[j] = x[idx];
       if (context->flat_decode_scale != NULL)
         flat_bw[j] *= context->flat_decode_scale[j];
@@ -5512,18 +8108,24 @@ static int np_cdens_native_search_callback(int n,
     if (context->nfixed_degree > 0 && context->fixed_degree == NULL) {
       context->callback_failures++;
       NP_NOMAD_CALLBACK_FREE(flat_bw);
+      context->callback_flat_bw = NULL;
       NP_NOMAD_CALLBACK_FREE(degree);
+      context->callback_degree = NULL;
       return 1;
     }
     for (j = 0; j < context->nfixed_degree; j++)
       degree[j] = context->fixed_degree[j];
   }
 
-  status = np_density_conditional_nomad_shadow_eval_native_raw(flat_bw, degree, eval_out);
+  status = np_conditional_density_prepared_context_eval_native_raw(flat_bw, degree, 0, 1, eval_out);
   if (status != 0) {
     context->callback_failures++;
     NP_NOMAD_CALLBACK_FREE(flat_bw);
+    context->callback_flat_bw = NULL;
     NP_NOMAD_CALLBACK_FREE(degree);
+    context->callback_degree = NULL;
+    if (status == NP_CONDITIONAL_NATIVE_STOP)
+      np_conditional_nomad_stop(&context->stop);
     return 1;
   }
 
@@ -5551,12 +8153,14 @@ static int np_cdens_native_search_callback(int n,
     }
   }
   NP_NOMAD_CALLBACK_FREE(flat_bw);
+  context->callback_flat_bw = NULL;
   NP_NOMAD_CALLBACK_FREE(degree);
+  context->callback_degree = NULL;
   bb_outputs[0] = min_objective;
   return 0;
 }
 
-SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
+SEXP C_np_density_conditional_prepared_native_search(SEXP x0,
                                                          SEXP bbin,
                                                          SEXP lower,
                                                          SEXP upper,
@@ -5575,9 +8179,9 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   SEXP option_names_s = R_NilValue;
   SEXP names = R_NilValue, sol = R_NilValue, best = R_NilValue;
   SEXP best_flat = R_NilValue, best_degree = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
+  np_nomad_progress_spec progress_spec;
   crs_nomad_option *native_options = NULL;
   int bb_output_type[1] = {CRS_NOMAD_OUTPUT_OBJ};
   double crs_outputs[1];
@@ -5589,8 +8193,8 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   int *best_degree_i = NULL;
   int n, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
-  if (!np_conditional_density_nomad_shadow.active)
-    error("resident npcdens NOMAD shadow state is not active");
+  if (!np_conditional_density_prepared_context.active)
+    error("resident npcdens prepared objective state is not active");
 
   PROTECT(x0_r = coerceVector(x0, REALSXP));
   PROTECT(bbin_i = coerceVector(bbin, INTSXP));
@@ -5601,6 +8205,8 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   PROTECT(point_upper_r = coerceVector(point_upper, REALSXP));
   PROTECT(option_names_s = coerceVector(option_names, STRSXP));
   PROTECT(option_values_s = coerceVector(option_values, STRSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
 
   n = (int) XLENGTH(x0_r);
   if (n <= 0 ||
@@ -5608,53 +8214,44 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
       XLENGTH(lower_r) != n ||
       XLENGTH(upper_r) != n)
   {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native NOMAD search received inconsistent problem dimensions");
   }
-  if (XLENGTH(flat_i) != np_conditional_density_nomad_shadow.num_all_var) {
-    UNPROTECT(9);
+  if (XLENGTH(flat_i) != np_conditional_density_prepared_context.num_all_var) {
+    UNPROTECT(10);
     error("native NOMAD search received invalid bandwidth map length");
   }
-  if (XLENGTH(decode_scale_r) != np_conditional_density_nomad_shadow.num_all_var) {
-    UNPROTECT(9);
+  if (XLENGTH(decode_scale_r) != np_conditional_density_prepared_context.num_all_var) {
+    UNPROTECT(10);
     error("native NOMAD search received invalid fixed decode scale length");
   }
-  if (XLENGTH(point_upper_r) != (n - np_conditional_density_nomad_shadow.num_reg_continuous)) {
-    UNPROTECT(9);
+  if (XLENGTH(point_upper_r) != (n - np_conditional_density_prepared_context.num_reg_continuous)) {
+    UNPROTECT(10);
     error("native NOMAD search received invalid point upper-bound length");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
 
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(9);
-    error("failed to resolve crs final native NOMAD callable");
-  }
-
   solution = R_Calloc(n, double);
   best_point = R_Calloc(n, double);
-  best_flat_bw = R_Calloc(np_conditional_density_nomad_shadow.num_all_var, double);
-  flat_map = R_Calloc(np_conditional_density_nomad_shadow.num_all_var, int);
-  best_degree_i = R_Calloc(np_conditional_density_nomad_shadow.num_reg_continuous, int);
+  best_flat_bw = R_Calloc(np_conditional_density_prepared_context.num_all_var, double);
+  flat_map = R_Calloc(np_conditional_density_prepared_context.num_all_var, int);
+  best_degree_i = R_Calloc(np_conditional_density_prepared_context.num_reg_continuous, int);
   if (solution == NULL || best_point == NULL || best_flat_bw == NULL ||
       flat_map == NULL || best_degree_i == NULL) {
     if (solution != NULL) R_Free(solution);
@@ -5662,7 +8259,7 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
     if (best_flat_bw != NULL) R_Free(best_flat_bw);
     if (flat_map != NULL) R_Free(flat_map);
     if (best_degree_i != NULL) R_Free(best_degree_i);
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("failed to allocate native NOMAD search buffers");
   }
   if (n_options > 0) {
@@ -5673,7 +8270,7 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
       R_Free(best_flat_bw);
       R_Free(flat_map);
       R_Free(best_degree_i);
-      UNPROTECT(9);
+      UNPROTECT(10);
       error("failed to allocate native NOMAD option buffers");
     }
     for (i = 0; i < n_options; i++) {
@@ -5685,11 +8282,11 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
     solution[i] = R_NaN;
     best_point[i] = R_NaN;
   }
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     best_flat_bw[i] = R_NaN;
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
     best_degree_i[i] = NA_INTEGER;
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     flat_map[i] = INTEGER(flat_i)[i] - 1;
 
   memset(&problem, 0, sizeof(problem));
@@ -5699,9 +8296,12 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
     context.best_eval[i] = R_NaN;
 
   context.n = n;
-  context.nbw_point = n - np_conditional_density_nomad_shadow.num_reg_continuous;
-  context.nbw_flat = np_conditional_density_nomad_shadow.num_all_var;
-  context.ndegree = np_conditional_density_nomad_shadow.num_reg_continuous;
+  context.nbw_point = n - np_conditional_density_prepared_context.num_reg_continuous;
+  context.nbw_flat = np_conditional_density_prepared_context.num_all_var;
+  context.ncont_point = num_reg_continuous_extern + num_var_continuous_extern;
+  context.scaling = (int_LARGE_SF == SF_NORMAL);
+  context.ncatfac = ncatfac_extern;
+  context.ndegree = np_conditional_density_prepared_context.num_reg_continuous;
   context.flat_from_point = flat_map;
   context.flat_decode_scale = REAL(decode_scale_r);
   context.point_upper = REAL(point_upper_r);
@@ -5734,16 +8334,39 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   result.outputs = crs_outputs;
   result.outputs_len = 1;
 
+  memset(&progress_spec, 0, sizeof(progress_spec));
+  progress_spec.degree_offset = context.nbw_point;
+  progress_spec.ndegree = context.ndegree;
+  progress_spec.best_degree = context.best_degree;
+  progress_spec.best_objective = &context.best_objective;
+  progress_spec.accepted_evaluations = &context.callback_calls;
+
   nomad_degree_progress_active = (context.ndegree > 0);
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem,
-                 np_cdens_native_search_callback,
-                 &context,
-                 &result);
-  nomad_c_callback_active = 0;
+  status = np_conditional_nomad_solve(&problem,
+                                        np_cdens_native_search_callback,
+                                        &context,
+                                        &progress_spec,
+                                        &result, &context.stop, callback_error);
   bwm_objective_cache_callback_option_end();
   nomad_degree_progress_active = 0;
+  if (np_nomad_error_pending(callback_error) || context.stop.terminal) {
+    NP_NOMAD_CALLBACK_FREE(context.callback_flat_bw);
+    NP_NOMAD_CALLBACK_FREE(context.callback_degree);
+    R_Free(solution);
+    R_Free(best_point);
+    R_Free(best_flat_bw);
+    R_Free(flat_map);
+    R_Free(best_degree_i);
+    if (native_options != NULL) R_Free(native_options);
+    np_conditional_density_prepared_context_clear_internal();
+    if (np_nomad_error_pending(callback_error))
+      np_nomad_error_raise(callback_error);
+    UNPROTECT(1);
+    UNPROTECT(9);
+    np_conditional_nomad_raise(&context.stop);
+  }
+  UNPROTECT(1);
   if (context.ndegree > 0 && context.callback_calls > 0)
     np_progress_nomad_degree_step(context.callback_calls,
                                   context.best_degree,
@@ -5759,15 +8382,15 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   PROTECT(names = allocVector(STRSXP, 24));
   PROTECT(sol = allocVector(REALSXP, n));
   PROTECT(best = allocVector(REALSXP, n));
-  PROTECT(best_flat = allocVector(REALSXP, np_conditional_density_nomad_shadow.num_all_var));
-  PROTECT(best_degree = allocVector(INTSXP, np_conditional_density_nomad_shadow.num_reg_continuous));
+  PROTECT(best_flat = allocVector(REALSXP, np_conditional_density_prepared_context.num_all_var));
+  PROTECT(best_degree = allocVector(INTSXP, np_conditional_density_prepared_context.num_reg_continuous));
   for (i = 0; i < n; i++) {
     REAL(sol)[i] = solution[i];
     REAL(best)[i] = best_point[i];
   }
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     REAL(best_flat)[i] = best_flat_bw[i];
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
     INTEGER(best_degree)[i] = best_degree_i[i];
 
   SET_VECTOR_ELT(out, 0, ScalarInteger(status));
@@ -5833,7 +8456,7 @@ SEXP C_np_density_conditional_nomad_shadow_native_search(SEXP x0,
   return out;
 }
 
-SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
+SEXP C_np_density_conditional_prepared_fixed_native_search(SEXP x0,
                                                                SEXP bbin,
                                                                SEXP lower,
                                                                SEXP upper,
@@ -5852,9 +8475,9 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   SEXP option_names_s = R_NilValue;
   SEXP names = R_NilValue, sol = R_NilValue, best = R_NilValue;
   SEXP best_flat = R_NilValue, best_degree = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
+  np_nomad_progress_spec progress_spec;
   crs_nomad_option *native_options = NULL;
   int bb_output_type[1] = {CRS_NOMAD_OUTPUT_OBJ};
   double crs_outputs[1];
@@ -5866,8 +8489,8 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   int *best_degree_i = NULL;
   int n, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
-  if (!np_conditional_density_nomad_shadow.active)
-    error("resident npcdens NOMAD shadow state is not active");
+  if (!np_conditional_density_prepared_context.active)
+    error("resident npcdens prepared objective state is not active");
 
   PROTECT(x0_r = coerceVector(x0, REALSXP));
   PROTECT(bbin_i = coerceVector(bbin, INTSXP));
@@ -5878,6 +8501,8 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   PROTECT(point_upper_r = coerceVector(point_upper, REALSXP));
   PROTECT(option_names_s = coerceVector(option_names, STRSXP));
   PROTECT(option_values_s = coerceVector(option_values, STRSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
 
   n = (int) XLENGTH(x0_r);
   if (n <= 0 ||
@@ -5885,53 +8510,44 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
       XLENGTH(lower_r) != n ||
       XLENGTH(upper_r) != n)
   {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received inconsistent problem dimensions");
   }
-  if (XLENGTH(flat_i) != np_conditional_density_nomad_shadow.num_all_var) {
-    UNPROTECT(9);
+  if (XLENGTH(flat_i) != np_conditional_density_prepared_context.num_all_var) {
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received invalid bandwidth map length");
   }
-  if (XLENGTH(decode_scale_r) != np_conditional_density_nomad_shadow.num_all_var) {
-    UNPROTECT(9);
+  if (XLENGTH(decode_scale_r) != np_conditional_density_prepared_context.num_all_var) {
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received invalid fixed decode scale length");
   }
   if (XLENGTH(point_upper_r) != n) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received invalid point upper-bound length");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("native fixed-degree NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
 
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(9);
-    error("failed to resolve crs final native NOMAD callable");
-  }
-
   solution = R_Calloc(n, double);
   best_point = R_Calloc(n, double);
-  best_flat_bw = R_Calloc(np_conditional_density_nomad_shadow.num_all_var, double);
-  flat_map = R_Calloc(np_conditional_density_nomad_shadow.num_all_var, int);
-  best_degree_i = R_Calloc(np_conditional_density_nomad_shadow.num_reg_continuous, int);
+  best_flat_bw = R_Calloc(np_conditional_density_prepared_context.num_all_var, double);
+  flat_map = R_Calloc(np_conditional_density_prepared_context.num_all_var, int);
+  best_degree_i = R_Calloc(np_conditional_density_prepared_context.num_reg_continuous, int);
   if (solution == NULL || best_point == NULL || best_flat_bw == NULL ||
       flat_map == NULL || best_degree_i == NULL) {
     if (solution != NULL) R_Free(solution);
@@ -5939,7 +8555,7 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
     if (best_flat_bw != NULL) R_Free(best_flat_bw);
     if (flat_map != NULL) R_Free(flat_map);
     if (best_degree_i != NULL) R_Free(best_degree_i);
-    UNPROTECT(9);
+    UNPROTECT(10);
     error("failed to allocate native fixed-degree NOMAD search buffers");
   }
   if (n_options > 0) {
@@ -5950,7 +8566,7 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
       R_Free(best_flat_bw);
       R_Free(flat_map);
       R_Free(best_degree_i);
-      UNPROTECT(9);
+      UNPROTECT(10);
       error("failed to allocate native fixed-degree NOMAD option buffers");
     }
     for (i = 0; i < n_options; i++) {
@@ -5962,11 +8578,11 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
     solution[i] = R_NaN;
     best_point[i] = R_NaN;
   }
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     best_flat_bw[i] = R_NaN;
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
     best_degree_i[i] = NA_INTEGER;
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     flat_map[i] = INTEGER(flat_i)[i] - 1;
 
   memset(&problem, 0, sizeof(problem));
@@ -5977,11 +8593,14 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
 
   context.n = n;
   context.nbw_point = n;
-  context.nbw_flat = np_conditional_density_nomad_shadow.num_all_var;
+  context.nbw_flat = np_conditional_density_prepared_context.num_all_var;
+  context.ncont_point = num_reg_continuous_extern + num_var_continuous_extern;
+  context.scaling = (int_LARGE_SF == SF_NORMAL);
+  context.ncatfac = ncatfac_extern;
   context.ndegree = 0;
-  context.nfixed_degree = (np_conditional_density_nomad_shadow.glp_degree != NULL) ?
-    np_conditional_density_nomad_shadow.num_reg_continuous : 0;
-  context.fixed_degree = np_conditional_density_nomad_shadow.glp_degree;
+  context.nfixed_degree = (np_conditional_density_prepared_context.glp_degree != NULL) ?
+    np_conditional_density_prepared_context.num_reg_continuous : 0;
+  context.fixed_degree = np_conditional_density_prepared_context.glp_degree;
   context.flat_from_point = flat_map;
   context.flat_decode_scale = REAL(decode_scale_r);
   context.point_upper = REAL(point_upper_r);
@@ -6014,16 +8633,39 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   result.outputs = crs_outputs;
   result.outputs_len = 1;
 
+  memset(&progress_spec, 0, sizeof(progress_spec));
+  progress_spec.degree_offset = context.nbw_point;
+  progress_spec.ndegree = context.ndegree;
+  progress_spec.best_degree = context.best_degree;
+  progress_spec.best_objective = &context.best_objective;
+  progress_spec.accepted_evaluations = &context.callback_calls;
+
   nomad_degree_progress_active = (context.ndegree > 0);
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem,
-                 np_cdens_native_search_callback,
-                 &context,
-                 &result);
-  nomad_c_callback_active = 0;
+  status = np_conditional_nomad_solve(&problem,
+                                        np_cdens_native_search_callback,
+                                        &context,
+                                        &progress_spec,
+                                        &result, &context.stop, callback_error);
   bwm_objective_cache_callback_option_end();
   nomad_degree_progress_active = 0;
+  if (np_nomad_error_pending(callback_error) || context.stop.terminal) {
+    NP_NOMAD_CALLBACK_FREE(context.callback_flat_bw);
+    NP_NOMAD_CALLBACK_FREE(context.callback_degree);
+    R_Free(solution);
+    R_Free(best_point);
+    R_Free(best_flat_bw);
+    R_Free(flat_map);
+    R_Free(best_degree_i);
+    if (native_options != NULL) R_Free(native_options);
+    np_conditional_density_prepared_context_clear_internal();
+    if (np_nomad_error_pending(callback_error))
+      np_nomad_error_raise(callback_error);
+    UNPROTECT(1);
+    UNPROTECT(9);
+    np_conditional_nomad_raise(&context.stop);
+  }
+  UNPROTECT(1);
   if (context.ndegree > 0 && context.callback_calls > 0)
     np_progress_nomad_degree_step(context.callback_calls,
                                   context.best_degree,
@@ -6039,15 +8681,15 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   PROTECT(names = allocVector(STRSXP, 24));
   PROTECT(sol = allocVector(REALSXP, n));
   PROTECT(best = allocVector(REALSXP, n));
-  PROTECT(best_flat = allocVector(REALSXP, np_conditional_density_nomad_shadow.num_all_var));
-  PROTECT(best_degree = allocVector(INTSXP, np_conditional_density_nomad_shadow.num_reg_continuous));
+  PROTECT(best_flat = allocVector(REALSXP, np_conditional_density_prepared_context.num_all_var));
+  PROTECT(best_degree = allocVector(INTSXP, np_conditional_density_prepared_context.num_reg_continuous));
   for (i = 0; i < n; i++) {
     REAL(sol)[i] = solution[i];
     REAL(best)[i] = best_point[i];
   }
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_all_var; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_all_var; i++)
     REAL(best_flat)[i] = best_flat_bw[i];
-  for (i = 0; i < np_conditional_density_nomad_shadow.num_reg_continuous; i++)
+  for (i = 0; i < np_conditional_density_prepared_context.num_reg_continuous; i++)
     INTEGER(best_degree)[i] = best_degree_i[i];
 
   SET_VECTOR_ELT(out, 0, ScalarInteger(status));
@@ -6113,10 +8755,287 @@ SEXP C_np_density_conditional_nomad_shadow_fixed_native_search(SEXP x0,
   return out;
 }
 
-SEXP C_np_density_conditional_nomad_shadow_clear(void)
+SEXP C_np_density_conditional_prepared_destroy(void)
 {
-  np_conditional_density_nomad_shadow_clear_internal();
+  np_conditional_density_prepared_context_clear_internal();
+  /* A prepared search owns one notice scope, including preparation probes.
+     Emit only after rank-local work and cleanup, never in callbacks. */
+  np_conditional_gnn_notice_emit();
   return R_NilValue;
+}
+
+static void np_regression_prepared_context_destroy(
+  NPRegressionPreparedCtx *context)
+{
+  if (context == NULL || !context->active)
+    return;
+
+  bwm_clear_floor_context();
+  bwm_nn_cache_free();
+  bwm_objective_cache_free();
+  bwm_search_context_release();
+  safe_free(context->extendednn_upper);
+
+  if (context->matrix_x_unordered != NULL)
+    free_mat(context->matrix_x_unordered, context->num_unordered);
+  if (context->matrix_x_ordered != NULL)
+    free_mat(context->matrix_x_ordered, context->num_ordered);
+  if (context->matrix_x_continuous != NULL)
+    free_mat(context->matrix_x_continuous, context->num_continuous);
+
+  safe_free(context->response);
+  safe_free(context->lsq_scale);
+  safe_free(context->lsq_q);
+  if (context->powell_directions != NULL)
+    free_mat(context->powell_directions, context->num_search_var + 1);
+  safe_free(context->scale_factor);
+  safe_free(context->scale_factor_startbest);
+  safe_free(context->powell_step);
+  safe_free(context->degree);
+  safe_free(context->ckerlb);
+  safe_free(context->ckerub);
+  safe_free(context->num_categories);
+  if (context->matrix_categorical_vals != NULL)
+    free_mat(context->matrix_categorical_vals,
+             context->num_unordered + context->num_ordered);
+  safe_free(context->continuous_stddev);
+  safe_free(context->tree_permutation);
+  safe_free(context->tree_lookup);
+  if (context->tree != NULL)
+    free_kdtree(&context->tree);
+
+  vector_extendednn_upper_extern = NULL;
+  int_extendednn_upper_num_extern = 0;
+  vector_lsq_scale_extern = NULL;
+  vector_lsq_loss_extern = NULL;
+  vector_lsq_q_extern = NULL;
+  np_lsq_tau_extern = 0.5;
+  np_lsq_delta_lower_extern = DBL_EPSILON;
+  np_lsq_delta_upper_extern = 1.0 - DBL_EPSILON;
+  ipt_extern_X = NULL;
+  ipt_lookup_extern_X = NULL;
+  kdt_extern_X = NULL;
+  int_TREE_X = NP_TREE_FALSE;
+  int_TREE_PROFILE_X = NP_TREE_FALSE;
+
+  np_glp_cv_clear_extern();
+  np_cont_largeh_cache_clear_extern();
+  np_reg_cv_core_clear_extern();
+
+  int_cker_bound_extern = 0;
+  vector_ckerlb_extern = NULL;
+  vector_ckerub_extern = NULL;
+  np_regression_bw_kernel_state_reset();
+  np_reset_y_side_extern();
+  vector_glp_degree_extern = NULL;
+  vector_glp_gradient_order_extern = NULL;
+  int_glp_bernstein_extern = 0;
+  int_glp_basis_extern = 1;
+  np_clear_estimator_extern_aliases();
+  int_nn_k_min_extern = 1;
+  memset(context, 0, sizeof(*context));
+}
+
+static int np_regression_prepared_context_refresh_degree(
+  NPRegressionPreparedCtx *context, const int *degree)
+{
+  int i;
+  int changed = 0;
+  int target_engine;
+  int old_engine;
+  int old_bernstein;
+  int old_basis;
+
+  if (context == NULL || !context->active)
+    return 0;
+  if (context->num_continuous <= 0)
+    return 1;
+  if (degree == NULL || context->degree == NULL)
+    return 0;
+  if (!context->degree_search)
+    return 1;
+
+  target_engine = np_canonical_lp_engine_for_degree(
+    degree, context->num_continuous);
+  if (target_engine < 0)
+    return 0;
+  for (i = 0; i < context->num_continuous; i++) {
+    if (context->degree[i] != degree[i]) {
+      changed = 1;
+      break;
+    }
+  }
+  if (!changed && np_lp_engine_extern == target_engine &&
+      context->degree_state_ready)
+    return 1;
+
+  if (target_engine == NP_LP_ENGINE_GENERAL &&
+      !np_glp_cv_degree_admissible_extern(
+        num_obs_train_extern,
+        context->num_continuous,
+        degree,
+        context->requested_basis))
+    return 0;
+
+  old_engine = np_lp_engine_extern;
+  old_bernstein = int_glp_bernstein_extern;
+  old_basis = int_glp_basis_extern;
+  context->degree_state_ready = 0;
+  np_glp_cv_clear_extern();
+
+  if (target_engine == NP_LP_ENGINE_SCALAR) {
+    for (i = 0; i < context->num_continuous; i++)
+      context->degree[i] = degree[i];
+    vector_glp_degree_extern = NULL;
+    int_glp_bernstein_extern = 0;
+    int_glp_basis_extern = 1;
+    np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
+    context->degree_state_ready = 1;
+    return 1;
+  }
+
+  vector_glp_degree_extern = (int *)degree;
+  int_glp_bernstein_extern = context->requested_bernstein;
+  int_glp_basis_extern = context->requested_basis;
+  np_lp_engine_extern = NP_LP_ENGINE_GENERAL;
+  if (!np_glp_cv_prepare_extern(
+        NP_LP_ENGINE_GENERAL,
+        num_obs_train_extern,
+        context->num_continuous,
+        matrix_X_continuous_train_extern)) {
+    np_glp_cv_clear_extern();
+    np_lp_engine_extern = old_engine;
+    int_glp_bernstein_extern = old_bernstein;
+    int_glp_basis_extern = old_basis;
+    vector_glp_degree_extern =
+      old_engine == NP_LP_ENGINE_GENERAL ? context->degree : NULL;
+    if (old_engine == NP_LP_ENGINE_GENERAL) {
+      context->degree_state_ready = np_glp_cv_prepare_extern(
+        NP_LP_ENGINE_GENERAL,
+        num_obs_train_extern,
+        context->num_continuous,
+        matrix_X_continuous_train_extern) ? 1 : 0;
+    } else {
+      context->degree_state_ready = 1;
+    }
+    return 0;
+  }
+
+  for (i = 0; i < context->num_continuous; i++)
+    context->degree[i] = degree[i];
+  vector_glp_degree_extern = context->degree;
+  context->degree_state_ready = 1;
+  return 1;
+}
+
+static int np_regression_prepared_context_eval(
+  NPRegressionPreparedCtx *context, const double *bw,
+  const int *degree, const int raw_only, double out[3])
+{
+  double fast = 0.0;
+  double fast_before = 0.0;
+  double value;
+  int degree_ok;
+  int bw_ok;
+  int i;
+
+  if (context == NULL || !context->active || bw == NULL || out == NULL ||
+      context->scale_factor == NULL || context->num_var <= 0)
+    return 1;
+
+  degree_ok = np_regression_prepared_context_refresh_degree(
+    context, degree) ? 1 : 0;
+#ifdef MPI2
+  if (comm != NULL && comm[1] != MPI_COMM_NULL)
+    MPI_Allreduce(MPI_IN_PLACE, &degree_ok, 1, MPI_INT, MPI_MIN, comm[1]);
+#endif
+  if (!degree_ok) {
+    bwm_eval_count += 1.0;
+    bwm_invalid_count += 1.0;
+    bwm_maybe_signal_activity();
+    value = (!raw_only && bwm_penalty_mode == 1 &&
+             isfinite(bwm_penalty_value)) ?
+      bwm_penalty_value : DBL_MAX;
+    out[0] = value;
+    out[1] = 1.0;
+    out[2] = 0.0;
+    return 0;
+  }
+
+  for (i = 0; i < context->num_var; i++)
+    context->scale_factor[i + 1] = bw[i];
+  for (i = 0; i < context->degree_key_len; i++)
+    context->scale_factor[context->num_var + i + 1] =
+      (double)context->degree[i];
+
+  bw_ok = np_bw_candidate_is_admissible(
+    context->num_var,
+    bwm_use_transform,
+    KERNEL_reg_extern,
+    KERNEL_reg_unordered_extern,
+    KERNEL_reg_unordered_extern,
+    BANDWIDTH_reg_extern,
+    BANDWIDTH_reg_extern,
+    0,
+    num_obs_train_extern,
+    0,
+    0,
+    0,
+    num_reg_continuous_extern,
+    num_reg_unordered_extern,
+    num_reg_ordered_extern,
+    num_categories_extern,
+    context->scale_factor) ? 1 : 0;
+#ifdef MPI2
+  if (comm != NULL && comm[1] != MPI_COMM_NULL)
+    MPI_Allreduce(MPI_IN_PLACE, &bw_ok, 1, MPI_INT, MPI_MIN, comm[1]);
+#endif
+  if (!bw_ok) {
+    bwm_eval_count += 1.0;
+    bwm_invalid_count += 1.0;
+    bwm_maybe_signal_activity();
+    value = (!raw_only && bwm_penalty_mode == 1 &&
+             isfinite(bwm_penalty_value)) ?
+      bwm_penalty_value : DBL_MAX;
+    out[0] = value;
+    out[1] = 1.0;
+    out[2] = 0.0;
+    return 0;
+  }
+
+  fast_before = np_fastcv_alllarge_hits_get();
+  if (raw_only) {
+    bwm_eval_count += 1.0;
+    if (!bwm_active_floor_candidate_ok(context->scale_factor)) {
+      value = DBL_MAX;
+    } else {
+      bwm_progress_eval_active = 1;
+      value = bwmfunc_raw_current_scale(
+        context->scale_factor, context->num_var);
+      bwm_progress_eval_active = 0;
+    }
+    if (!isfinite(value) || value == DBL_MAX) {
+      bwm_invalid_count += 1.0;
+      value = DBL_MAX;
+    }
+    bwm_maybe_signal_activity();
+  } else {
+    value = bwmfunc_wrapper(context->scale_factor);
+  }
+  fast = np_fastcv_alllarge_hits_get() - fast_before;
+  if (fast < 0.0)
+    fast = 0.0;
+#ifdef MPI2
+  if (comm != NULL && comm[1] != MPI_COMM_NULL) {
+    MPI_Bcast(&value, 1, MPI_DOUBLE, 0, comm[1]);
+    MPI_Bcast(&fast, 1, MPI_DOUBLE, 0, comm[1]);
+  }
+#endif
+
+  out[0] = value;
+  out[1] = 1.0;
+  out[2] = fast;
+  return 0;
 }
 
 static void np_regression_bw_mode(double * runo, double * rord, double * rcon, double * y,
@@ -6136,7 +9055,11 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
                                   const double lsq_delta_start,
                                   const double lsq_delta_lower,
                                   const double lsq_delta_upper,
-                                  double * lsq_delta_out);
+                                  double * lsq_delta_out,
+                                  NPRegressionPreparedCtx *retained_context,
+                                  const int prepare_only,
+                                  const int degree_search,
+                                  const NPCategoricalSupport *support);
 
 void np_regression(double * tuno, double * tord, double * tcon, double * ty,
                    double * euno, double * eord, double * econ, double * ey,
@@ -6150,7 +9073,14 @@ void np_regression(double * tuno, double * tord, double * tcon, double * ty,
                    int * glp_basis,
                    double * cm, double * cmerr, double * g, double *gerr,
                    double * xtra,
-                   double * ckerlb, double * ckerub);
+                   double * ckerlb, double * ckerub,
+                   const NPContinuousKernelRoute *kernel_route,
+                   NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                   int categorical_compress,
+                   NPRegressionLPEmptyRows *empty_rows,
+                   const NPRegressionGradientRequest *gradient_request,
+                   int *variance_unavailable, int **gradient_zero_out,
+                   NPRegressionFitProjection *fit_projection);
 
 void np_density(double * tuno, double * tord, double * tcon,
                 double * euno, double * eord, double * econ,
@@ -6159,7 +9089,10 @@ void np_density(double * tuno, double * tord, double * tcon,
                 double * nconfac, double * ncatfac, double * mysd,
                 int * myopti,
                 double * mydens, double * myderr, double * ll,
-                double * ckerlb, double * ckerub);
+                double * ckerlb, double * ckerub,
+                const NPContinuousKernelRoute *kernel_route,
+                NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                int categorical_compress);
 
 void np_density_conditional(double * tyuno, double * tyord, double * tycon,
                             double * txuno, double * txord, double * txcon,
@@ -6172,7 +9105,19 @@ void np_density_conditional(double * tyuno, double * tyord, double * tycon,
                             double * cmean, double * cmean_stderr,
                             double * gradients, double * gradients_stderr, double * ll,
                             double * cxkerlb, double * cxkerub,
-                            double * cykerlb, double * cykerub);
+                            double * cykerlb, double * cykerub,
+                            const NPContinuousKernelRoute *kernel_route,
+                            NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                            const NPContinuousKernelRoute *response_kernel_route,
+                            NPContinuousKernelDerivativeDiagnostics *response_kernel_route_diagnostics,
+                            int categorical_compress,
+                            const NPConditionalLPFirstSERequest *first_se_request,
+                            const int *cat_se_mask,
+                            double *variance_metadata,
+                            NPRegressionLPEmptyRows *empty_rows,
+                            int gnn_lp_fit_tree,
+                            NPRegressionFitProjection *fit_projection,
+                            int *projection_constant, NPConditionalPlotCapture *plot_capture);
 void np_density_bw(double * myuno, double * myord, double * mycon,
                    double * mysd, int * myopti, double * myoptd, double * myans, double * fval,
                    double * objective_function_values, double * objective_function_evals,
@@ -6181,7 +9126,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
                    double * objective_function_guarded,
                    int * penalty_mode, double * penalty_mult,
                    double * ckerlb, double * ckerub,
-                   const int eval_only);
+                   const int eval_only, const NPCategoricalSupport *support);
 void np_distribution_bw(double * myuno, double * myord, double * mycon,
                         double * myeuno, double * myeord, double * myecon, double * mysd,
                         int * myopti, double * myoptd, double * myans, double * fval,
@@ -6190,7 +9135,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
                         double * objective_function_fast,
                         int * penalty_mode, double * penalty_mult,
                         double * ckerlb, double * ckerub,
-                        const int eval_only);
+                        const int eval_only, const NPCategoricalSupport *support);
 void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                double * u_uno, double * u_ord, double * u_con,
                                double * mysd,
@@ -6206,7 +9151,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                int * regtype,
                                double * cxkerlb, double * cxkerub,
                                double * cykerlb, double * cykerub,
-                               const int eval_only);
+                               const int eval_only, const NPCategoricalSupport *support);
 void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                     double * u_uno, double * u_ord, double * u_con,
                                     double * cg_uno, double * cg_ord, double * cg_con, double * mysd,
@@ -6221,7 +9166,18 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                     int * regtype,
                                     double * cxkerlb, double * cxkerub,
                                     double * cykerlb, double * cykerub,
-                                    const int eval_only);
+                                    const int eval_only,
+                                    const NPCategoricalSupport *support);
+static void np_kernelsum_common(double *tuno, double *tord, double *tcon,
+                                double *ty, double *weights,
+                                double *euno, double *eord, double *econ,
+                                double *bw, double *mcv, double *padnum,
+                                int *operator, int *myopti, double *kpow,
+                                double *weighted_sum, double *weighted_sum_power2,
+                                double *weighted_p_sum, double *kernel_weights,
+                                double *permutation_kernel_weights,
+                                double *ckerlb, double *ckerub,
+                                const int *eval_to_train, int fold_requested);
 void np_kernelsum(double * tuno, double * tord, double * tcon,
                   double * ty, double * weights,
                   double * euno, double * eord, double * econ,
@@ -6233,6 +9189,19 @@ void np_kernelsum(double * tuno, double * tord, double * tcon,
                   double * kernel_weights,
                   double * permutation_kernel_weights,
                   double * ckerlb, double * ckerub);
+void np_kernelsum_power12(double * tuno, double * tord, double * tcon,
+                          double * ty, double * weights,
+                          double * euno, double * eord, double * econ,
+                          double * bw,
+                          double * mcv, double * padnum,
+                          int * operator,
+                          int * myopti, double * kpow,
+                          double * weighted_sum,
+                          double * weighted_sum_power2,
+                          double * weighted_p_sum,
+                          double * kernel_weights,
+                          double * permutation_kernel_weights,
+                          double * ckerlb, double * ckerub);
 void np_quantile_conditional(double * tc_con,
                              double * tu_uno, double * tu_ord, double * tu_con,
                              double * eu_uno, double * eu_ord, double * eu_con,
@@ -6242,6 +9211,12 @@ void np_quantile_conditional(double * tc_con,
                              double * nconfac, double * ncatfac, double * mysd,
                              int * myopti, double * myoptd,
                              double * yq, double * yqerr, double *yg);
+
+/* An eval-only invocation writes one history entry, irrespective of nmulti. */
+static int np_bw_history_length(SEXP hist_len, const int eval_only)
+{
+  return eval_only ? 1 : asInteger(hist_len);
+}
 
 static SEXP C_np_regression_bw_common(SEXP runo,
                                       SEXP rord,
@@ -6259,6 +9234,7 @@ static SEXP C_np_regression_bw_common(SEXP runo,
                                       SEXP glp_basis,
                                       SEXP ckerlb,
                                       SEXP ckerub,
+                                      SEXP declared_support,
                                       const int eval_only)
 {
   SEXP runo_r = R_NilValue, rord_r = R_NilValue, rcon_r = R_NilValue;
@@ -6268,7 +9244,7 @@ static SEXP C_np_regression_bw_common(SEXP runo,
   SEXP out_bw = R_NilValue, out_fval = R_NilValue, out_fval_hist = R_NilValue;
   SEXP out_eval_hist = R_NilValue, out_invalid_hist = R_NilValue, out_timing = R_NilValue;
   SEXP out_fast = R_NilValue, out_nn_cache = R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int bern = asInteger(glp_bernstein);
@@ -6294,8 +9270,27 @@ static SEXP C_np_regression_bw_common(SEXP runo,
 
   if (XLENGTH(myoptd_r) <= RBW_SFLOORD)
     error("C_np_regression_bw: myoptd is missing scale.factor.lower.bound");
+  if (XLENGTH(myopti_i) <= RBW_CKORDERI &&
+      INTEGER(myopti_i)[RBW_CKRNEVI] == NP_CKERNEL_COORDINATE_CODE)
+    error("C_np_regression_bw: continuous-kernel descriptor is missing");
+  if (XLENGTH(myopti_i) <= RBW_CATCOMPI &&
+      INTEGER(myopti_i)[RBW_CKRNEVI] == NP_CKERNEL_COORDINATE_CODE)
+    error("C_np_regression_bw: categorical-compression state is missing");
+  if (XLENGTH(myopti_i) <= RBW_NNMINI)
+    error("C_np_regression_bw: regression NN minimum is missing");
 
-  ncon = (int)INTEGER(myopti_i)[REG_NCONI];
+  int support_dimensions[4] = {0, 0, INTEGER(myopti_i)[RBW_NUNOI],
+    INTEGER(myopti_i)[RBW_NORDI]};
+  SEXP support_data[4] = {R_NilValue, R_NilValue, runo_r, rord_r};
+  NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[RBW_NOBSI],
+    support_dimensions, support_data);
+
+  ncon = (int)INTEGER(myopti_i)[RBW_NCONI];
+  if (ncon < 0)
+    error("C_np_regression_bw: invalid number of continuous regressors");
+  if (ncon > 0 && XLENGTH(degree_i) != (R_xlen_t)ncon)
+    error("C_np_regression_bw: glp_degree length mismatch");
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
 
   PROTECT(out_bw = allocVector(REALSXP, XLENGTH(rbw_r)));
@@ -6315,7 +9310,7 @@ static SEXP C_np_regression_bw_common(SEXP runo,
                         REAL(out_fast),
                         &pmode, &pmult, INTEGER(degree_i), &bern, &basis, ckerlb_p, ckerub_p,
                         eval_only, 0, NULL, 0.5, 0.5, DBL_EPSILON,
-                        1.0 - DBL_EPSILON, NULL);
+                        1.0 - DBL_EPSILON, NULL, NULL, 0, 0, &support);
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
   PROTECT(out = allocVector(VECSXP, 8));
@@ -6358,14 +9353,15 @@ SEXP C_np_regression_bw(SEXP runo,
                         SEXP glp_bernstein,
                         SEXP glp_basis,
                         SEXP ckerlb,
-                        SEXP ckerub)
+                        SEXP ckerub,
+                        SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
 
   return C_np_regression_bw_common(runo, rord, rcon, y, mysd, myopti, myoptd,
                                    rbw, hist_len, penalty_mode, penalty_mult,
                                    glp_degree, glp_bernstein, glp_basis,
-                                   ckerlb, ckerub, 0);
+                                   ckerlb, ckerub, declared_support, 0);
 }
 
 SEXP C_np_regression_bw_eval(SEXP runo,
@@ -6383,12 +9379,13 @@ SEXP C_np_regression_bw_eval(SEXP runo,
                              SEXP glp_bernstein,
                              SEXP glp_basis,
                              SEXP ckerlb,
-                             SEXP ckerub)
+                             SEXP ckerub,
+                        SEXP declared_support)
 {
   return C_np_regression_bw_common(runo, rord, rcon, y, mysd, myopti, myoptd,
                                    rbw, hist_len, penalty_mode, penalty_mult,
                                    glp_degree, glp_bernstein, glp_basis,
-                                   ckerlb, ckerub, 1);
+                                   ckerlb, ckerub, declared_support, 1);
 }
 
 static SEXP C_np_lsqregression_bw_common(SEXP runo,
@@ -6411,7 +9408,8 @@ static SEXP C_np_lsqregression_bw_common(SEXP runo,
                                          SEXP glp_basis,
                                          SEXP ckerlb,
                                          SEXP ckerub,
-                                         const int eval_only)
+                                         SEXP declared_support,
+                                      const int eval_only)
 {
   SEXP runo_r = R_NilValue, rord_r = R_NilValue, rcon_r = R_NilValue;
   SEXP y_r = R_NilValue, scale_r = R_NilValue, mysd_r = R_NilValue;
@@ -6423,7 +9421,7 @@ static SEXP C_np_lsqregression_bw_common(SEXP runo,
   SEXP out_fval_hist = R_NilValue, out_eval_hist = R_NilValue;
   SEXP out_invalid_hist = R_NilValue, out_timing = R_NilValue;
   SEXP out_fast = R_NilValue, out_nn_cache = R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int bern = asInteger(glp_bernstein);
@@ -6456,6 +9454,15 @@ static SEXP C_np_lsqregression_bw_common(SEXP runo,
     error("C_np_lsqregression_bw: delta_bounds must have length 2");
   if (XLENGTH(scale_r) != XLENGTH(y_r))
     error("C_np_lsqregression_bw: scale length must match y length");
+  if (XLENGTH(myopti_i) < RBW_OPTIONS_COUNT)
+    error("C_np_lsqregression_bw: regression NN minimum is missing");
+
+  int support_dimensions[4] = {0, 0, INTEGER(myopti_i)[RBW_NUNOI],
+    INTEGER(myopti_i)[RBW_NORDI]};
+  SEXP support_data[4] = {R_NilValue, R_NilValue, runo_r, rord_r};
+  NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[RBW_NOBSI],
+    support_dimensions, support_data);
 
   ncon = (int)INTEGER(myopti_i)[RBW_NCONI];
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
@@ -6478,7 +9485,8 @@ static SEXP C_np_lsqregression_bw_common(SEXP runo,
                         REAL(out_fast),
                         &pmode, &pmult, INTEGER(degree_i), &bern, &basis, ckerlb_p, ckerub_p,
                         eval_only, 1, REAL(scale_r), asReal(tau), asReal(delta_start),
-                        REAL(delta_bounds_r)[0], REAL(delta_bounds_r)[1], &delta_out);
+                        REAL(delta_bounds_r)[0], REAL(delta_bounds_r)[1], &delta_out,
+                        NULL, 0, 0, &support);
   REAL(out_delta)[0] = delta_out;
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
@@ -6528,14 +9536,15 @@ SEXP C_np_lsqregression_bw(SEXP runo,
                            SEXP glp_bernstein,
                            SEXP glp_basis,
                            SEXP ckerlb,
-                           SEXP ckerub)
+                           SEXP ckerub,
+                        SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
   return C_np_lsqregression_bw_common(runo, rord, rcon, y, scale, tau,
                                       delta_start, delta_bounds, mysd, myopti,
                                       myoptd, rbw, hist_len, penalty_mode,
                                       penalty_mult, glp_degree, glp_bernstein,
-                                      glp_basis, ckerlb, ckerub, 0);
+                                      glp_basis, ckerlb, ckerub, declared_support, 0);
 }
 
 SEXP C_np_lsqregression_bw_eval(SEXP runo,
@@ -6557,120 +9566,18 @@ SEXP C_np_lsqregression_bw_eval(SEXP runo,
                                 SEXP glp_bernstein,
                                 SEXP glp_basis,
                                 SEXP ckerlb,
-                                SEXP ckerub)
+                                SEXP ckerub,
+                        SEXP declared_support)
 {
   return C_np_lsqregression_bw_common(runo, rord, rcon, y, scale, tau,
                                       delta_start, delta_bounds, mysd, myopti,
                                       myoptd, rbw, hist_len, penalty_mode,
                                       penalty_mult, glp_degree, glp_bernstein,
-                                      glp_basis, ckerlb, ckerub, 1);
+                                      glp_basis, ckerlb, ckerub, declared_support, 1);
 }
 
-SEXP C_np_regression(SEXP tuno,
-                     SEXP tord,
-                     SEXP tcon,
-                     SEXP ty,
-                     SEXP euno,
-                     SEXP eord,
-                     SEXP econ,
-                     SEXP ey,
-                     SEXP rbw,
-                     SEXP mcv,
-                     SEXP padnum,
-                     SEXP nconfac,
-                     SEXP ncatfac,
-                     SEXP mysd,
-                     SEXP myopti,
-                     SEXP glp_degree,
-                     SEXP glp_gradient_order,
-                     SEXP glp_bernstein,
-                     SEXP glp_basis,
-                     SEXP enrow,
-                     SEXP ncol,
-                     SEXP gradients,
-                     SEXP ckerlb,
-                     SEXP ckerub)
-{
-  SEXP tuno_r = R_NilValue, tord_r = R_NilValue, tcon_r = R_NilValue, ty_r = R_NilValue;
-  SEXP euno_r = R_NilValue, eord_r = R_NilValue, econ_r = R_NilValue, ey_r = R_NilValue;
-  SEXP rbw_r = R_NilValue, mcv_r = R_NilValue, padnum_r = R_NilValue;
-  SEXP nconfac_r = R_NilValue, ncatfac_r = R_NilValue, mysd_r = R_NilValue, myopti_i = R_NilValue;
-  SEXP degree_i = R_NilValue, gradient_order_i = R_NilValue, ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
-  SEXP out = R_NilValue, out_names = R_NilValue;
-  SEXP out_mean = R_NilValue, out_merr = R_NilValue, out_g = R_NilValue, out_gerr = R_NilValue, out_xtra = R_NilValue;
-  int bern = asInteger(glp_bernstein);
-  int basis = asInteger(glp_basis);
-  int en = asInteger(enrow);
-  int nc = asInteger(ncol);
-  int do_grad = asLogical(gradients);
-  int ncon = 0;
-  double * ckerlb_p = NULL;
-  double * ckerub_p = NULL;
-  R_xlen_t gsize;
-
-  if (en < 0) en = 0;
-  if (nc < 0) nc = 0;
-  if (do_grad == NA_LOGICAL) do_grad = 0;
-  gsize = (do_grad ? ((R_xlen_t)en * (R_xlen_t)nc) : 1);
-
-  PROTECT(tuno_r = coerceVector(tuno, REALSXP));
-  PROTECT(tord_r = coerceVector(tord, REALSXP));
-  PROTECT(tcon_r = coerceVector(tcon, REALSXP));
-  PROTECT(ty_r = coerceVector(ty, REALSXP));
-  PROTECT(euno_r = coerceVector(euno, REALSXP));
-  PROTECT(eord_r = coerceVector(eord, REALSXP));
-  PROTECT(econ_r = coerceVector(econ, REALSXP));
-  PROTECT(ey_r = coerceVector(ey, REALSXP));
-  PROTECT(rbw_r = coerceVector(rbw, REALSXP));
-  PROTECT(mcv_r = coerceVector(mcv, REALSXP));
-  PROTECT(padnum_r = coerceVector(padnum, REALSXP));
-  PROTECT(nconfac_r = coerceVector(nconfac, REALSXP));
-  PROTECT(ncatfac_r = coerceVector(ncatfac, REALSXP));
-  PROTECT(mysd_r = coerceVector(mysd, REALSXP));
-  PROTECT(myopti_i = coerceVector(myopti, INTSXP));
-  PROTECT(degree_i = coerceVector(glp_degree, INTSXP));
-  PROTECT(gradient_order_i = coerceVector(glp_gradient_order, INTSXP));
-  PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
-  PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
-
-  ncon = (int)INTEGER(myopti_i)[REG_NCONI];
-  resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
-
-  PROTECT(out_mean = allocVector(REALSXP, en));
-  PROTECT(out_merr = allocVector(REALSXP, en));
-  PROTECT(out_g = allocVector(REALSXP, gsize));
-  PROTECT(out_gerr = allocVector(REALSXP, gsize));
-  PROTECT(out_xtra = allocVector(REALSXP, 6));
-  for(R_xlen_t ii = 0; ii < gsize; ii++)
-    REAL(out_gerr)[ii] = 0.0;
-
-  np_regression(REAL(tuno_r), REAL(tord_r), REAL(tcon_r), REAL(ty_r),
-                REAL(euno_r), REAL(eord_r), REAL(econ_r), REAL(ey_r),
-                REAL(rbw_r), REAL(mcv_r), REAL(padnum_r),
-                REAL(nconfac_r), REAL(ncatfac_r), REAL(mysd_r),
-                INTEGER(myopti_i),
-                INTEGER(degree_i), INTEGER(gradient_order_i), &bern, &basis,
-                REAL(out_mean), REAL(out_merr), REAL(out_g), REAL(out_gerr), REAL(out_xtra),
-                ckerlb_p, ckerub_p);
-
-  PROTECT(out = allocVector(VECSXP, 5));
-  SET_VECTOR_ELT(out, 0, out_mean);
-  SET_VECTOR_ELT(out, 1, out_merr);
-  SET_VECTOR_ELT(out, 2, out_g);
-  SET_VECTOR_ELT(out, 3, out_gerr);
-  SET_VECTOR_ELT(out, 4, out_xtra);
-
-  PROTECT(out_names = allocVector(STRSXP, 5));
-  SET_STRING_ELT(out_names, 0, mkChar("mean"));
-  SET_STRING_ELT(out_names, 1, mkChar("merr"));
-  SET_STRING_ELT(out_names, 2, mkChar("g"));
-  SET_STRING_ELT(out_names, 3, mkChar("gerr"));
-  SET_STRING_ELT(out_names, 4, mkChar("xtra"));
-  setAttrib(out, R_NamesSymbol, out_names);
-
-  UNPROTECT(26);
-  return out;
-}
+#include "conditional_literal/entry_C_np_regression.inc"
+#line 9875 "np.c"
 
 SEXP C_np_density(SEXP tuno,
                   SEXP tord,
@@ -6687,7 +9594,8 @@ SEXP C_np_density(SEXP tuno,
                   SEXP myopti,
                   SEXP enrow,
                   SEXP ckerlb,
-                  SEXP ckerub)
+                  SEXP ckerub,
+                  SEXP se_request)
 {
   SEXP tuno_r=R_NilValue, tord_r=R_NilValue, tcon_r=R_NilValue;
   SEXP euno_r=R_NilValue, eord_r=R_NilValue, econ_r=R_NilValue;
@@ -6696,9 +9604,19 @@ SEXP C_np_density(SEXP tuno,
   SEXP ckerlb_r=R_NilValue, ckerub_r=R_NilValue;
   SEXP out=R_NilValue, out_names=R_NilValue, out_dens=R_NilValue, out_derr=R_NilValue, out_ll=R_NilValue;
   int en = asInteger(enrow);
+  if(TYPEOF(se_request) != LGLSXP || XLENGTH(se_request) != 1 ||
+     LOGICAL(se_request)[0] == NA_LOGICAL)
+    error("C_np_density: se must be TRUE or FALSE");
+  const int compute_se = LOGICAL(se_request)[0];
   int ncon = 0;
+  int categorical_compress = 0;
   double * ckerlb_p = NULL;
   double * ckerub_p = NULL;
+  np_continuous_kernel_descriptor descriptor;
+  NPContinuousKernelRoute beta_route;
+  NPContinuousKernelDerivativeDiagnostics beta_diagnostics;
+  const NPContinuousKernelRoute *active_route = NULL;
+  NPContinuousKernelDerivativeDiagnostics *active_diagnostics = NULL;
 
   if (en < 0) en = 0;
 
@@ -6718,12 +9636,83 @@ SEXP C_np_density(SEXP tuno,
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
 
+  if(XLENGTH(myopti_i) <= DEN_CKORDERI)
+    error("C_np_density: continuous-kernel descriptor is missing");
   ncon = (int)INTEGER(myopti_i)[DEN_NCONI];
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
+  descriptor = np_continuous_kernel_descriptor_or_error(
+    INTEGER(myopti_i)[DEN_CKFAMILYI],
+    INTEGER(myopti_i)[DEN_CKRNEVI],
+    INTEGER(myopti_i)[DEN_CKORDERI],
+    "C_np_density");
+  if(XLENGTH(myopti_i) > DEN_CATCOMPI)
+    categorical_compress = INTEGER(myopti_i)[DEN_CATCOMPI];
+  if(categorical_compress != 0 && categorical_compress != 1)
+    error("C_np_density: categorical compression must be TRUE or FALSE");
 
   PROTECT(out_dens = allocVector(REALSXP, en));
-  PROTECT(out_derr = allocVector(REALSXP, en));
+  PROTECT(out_derr = allocVector(REALSXP, compute_se ? en : 0));
   PROTECT(out_ll = allocVector(REALSXP, 1));
+
+  if(descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    const int num_train = INTEGER(myopti_i)[DEN_TNOBSI];
+    const int num_eval = INTEGER(myopti_i)[DEN_ENOBSI];
+    const int train_is_eval = INTEGER(myopti_i)[DEN_TISEI];
+    const int dens_or_dist = INTEGER(myopti_i)[DEN_DODENI];
+    const int beta_bandwidth_code = INTEGER(myopti_i)[DEN_DENI];
+    const int num_unordered = INTEGER(myopti_i)[DEN_NUNOI];
+    const int num_ordered = INTEGER(myopti_i)[DEN_NORDI];
+    const int max_levels = INTEGER(myopti_i)[DEN_MLEVI];
+    int num_categorical;
+
+    if(num_unordered < 0 || num_ordered < 0 ||
+       num_unordered > INT_MAX - num_ordered || ncon < 0)
+      error("C_np_density: invalid beta categorical dimensions");
+    num_categorical = num_unordered + num_ordered;
+    if(ncon > INT_MAX - num_categorical)
+      error("C_np_density: invalid beta total dimension");
+    if(beta_bandwidth_code != BW_FIXED &&
+       beta_bandwidth_code != BW_GEN_NN &&
+       beta_bandwidth_code != BW_ADAP_NN)
+      error("C_np_density: invalid beta bandwidth mode");
+    if(dens_or_dist != NP_DO_DENS && dens_or_dist != NP_DO_DIST)
+      error("C_np_density: invalid beta density/distribution operator");
+    if(num_categorical > 0 &&
+       (max_levels <= 0 ||
+        !np_real_buffer_has_matrix(
+          mcv_r, max_levels, num_categorical)))
+      error("C_np_density: beta categorical level buffer is too short");
+    if(num_train <= 0 || num_eval <= 0 || ncon <= 0 || en != num_eval ||
+       (train_is_eval != 0 && train_is_eval != 1))
+      error("C_np_density: invalid beta density/distribution dimensions");
+    if(!np_real_buffer_has_matrix(tcon_r, num_train, ncon) ||
+       (!train_is_eval &&
+        !np_real_buffer_has_matrix(econ_r, num_eval, ncon)) ||
+       !np_real_buffer_has_matrix(tuno_r, num_train, num_unordered) ||
+       !np_real_buffer_has_matrix(tord_r, num_train, num_ordered) ||
+       (!train_is_eval &&
+        (!np_real_buffer_has_matrix(euno_r, num_eval, num_unordered) ||
+         !np_real_buffer_has_matrix(eord_r, num_eval, num_ordered))) ||
+       XLENGTH(rbw_r) < ncon + num_categorical ||
+       XLENGTH(padnum_r) < 1 || XLENGTH(nconfac_r) < 1 ||
+       XLENGTH(ncatfac_r) < 1 || XLENGTH(mysd_r) < ncon ||
+       XLENGTH(ckerlb_r) < ncon ||
+       XLENGTH(ckerub_r) < ncon)
+      error("C_np_density: beta density/distribution input buffer is too short");
+
+    beta_route.segment_count = 1;
+    beta_route.segment[0].descriptor = descriptor;
+    beta_route.segment[0].coordinate_offset = 0;
+    beta_route.segment[0].coordinate_count = ncon;
+    beta_route.segment[0].lower = ckerlb_p;
+    beta_route.segment[0].upper = ckerub_p;
+    beta_diagnostics.bad_coordinate = -1;
+    beta_diagnostics.bad_observation = -1;
+    beta_diagnostics.undefined_count = 0;
+    beta_diagnostics.beta_status = NP_BETA_OK;
+    active_route = &beta_route;
+    active_diagnostics = &beta_diagnostics;
+  }
 
   np_density(REAL(tuno_r), REAL(tord_r), REAL(tcon_r),
              REAL(euno_r), REAL(eord_r), REAL(econ_r),
@@ -6731,8 +9720,9 @@ SEXP C_np_density(SEXP tuno,
              REAL(mcv_r), REAL(padnum_r),
              REAL(nconfac_r), REAL(ncatfac_r), REAL(mysd_r),
              INTEGER(myopti_i),
-             REAL(out_dens), REAL(out_derr), REAL(out_ll),
-             ckerlb_p, ckerub_p);
+             REAL(out_dens), compute_se ? REAL(out_derr) : NULL, REAL(out_ll),
+             ckerlb_p, ckerub_p,
+             active_route, active_diagnostics, categorical_compress);
 
   PROTECT(out = allocVector(VECSXP, 3));
   SET_VECTOR_ELT(out, 0, out_dens);
@@ -6749,7 +9739,614 @@ SEXP C_np_density(SEXP tuno,
   return out;
 }
 
-SEXP C_np_density_conditional(SEXP tyuno,
+enum {
+  NP_COUNT_CAT_TRAIN_UNORDERED = 0,
+  NP_COUNT_CAT_TRAIN_ORDERED,
+  NP_COUNT_CAT_EVAL_UNORDERED,
+  NP_COUNT_CAT_EVAL_ORDERED,
+  NP_COUNT_CAT_KERNEL_UNORDERED,
+  NP_COUNT_CAT_KERNEL_ORDERED,
+  NP_COUNT_CAT_LAMBDA,
+  NP_COUNT_CAT_NUM_CATEGORIES,
+  NP_COUNT_CAT_CATEGORY_VALUES,
+  NP_COUNT_CAT_LENGTH
+};
+
+static SEXP np_conditional_count_category_component(
+  SEXP state,
+  int component,
+  const char *where)
+{
+  if(TYPEOF(state) != VECSXP || XLENGTH(state) != NP_COUNT_CAT_LENGTH ||
+     component < 0 || component >= NP_COUNT_CAT_LENGTH)
+    error("%s: invalid categorical side state", where);
+  return VECTOR_ELT(state, component);
+}
+
+static double **np_conditional_count_matrix_columns(
+  SEXP matrix,
+  int expected_rows,
+  int *columns,
+  const char *where)
+{
+  int rows = 0;
+  int cols = 0;
+  double **view = NULL;
+  int column;
+
+  if(TYPEOF(matrix) != REALSXP)
+    error("%s: categorical matrices must use double storage", where);
+  np_matrix_dims_or_zero(matrix, &rows, &cols);
+  if(rows != expected_rows || cols < 0)
+    error("%s: categorical matrix dimensions are inconsistent", where);
+  if(columns != NULL)
+    *columns = cols;
+  if(cols == 0)
+    return NULL;
+  view = (double **)R_alloc((size_t)cols, sizeof(double *));
+  for(column = 0; column < cols; ++column)
+    view[column] = REAL(matrix) + (size_t)column*(size_t)rows;
+  return view;
+}
+
+static double **np_conditional_count_category_values(
+  SEXP values,
+  const int *num_categories,
+  int dimensions,
+  const char *where)
+{
+  double **view = NULL;
+  int dimension;
+
+  if(dimensions == 0) {
+    if(TYPEOF(values) != VECSXP || XLENGTH(values) != 0)
+      error("%s: empty categorical state has nonempty support", where);
+    return NULL;
+  }
+  if(TYPEOF(values) != VECSXP || XLENGTH(values) != dimensions ||
+     num_categories == NULL)
+    error("%s: categorical support dimensions are inconsistent", where);
+  view = (double **)R_alloc((size_t)dimensions, sizeof(double *));
+  for(dimension = 0; dimension < dimensions; ++dimension) {
+    SEXP support = VECTOR_ELT(values, dimension);
+
+    if(TYPEOF(support) != REALSXP || num_categories[dimension] <= 0 ||
+       XLENGTH(support) != num_categories[dimension])
+      error("%s: categorical support is invalid", where);
+    view[dimension] = REAL(support);
+  }
+  return view;
+}
+
+typedef struct {
+  int nunordered;
+  int nordered;
+  int ntotal;
+  double **train_unordered;
+  double **train_ordered;
+  double **eval_unordered;
+  double **eval_ordered;
+  const int *kernel_unordered;
+  const int *kernel_ordered;
+  const double *lambda;
+  const int *num_categories;
+  double **category_values;
+} NPConditionalCountCategoricalIngress;
+
+static void np_conditional_count_categorical_ingress(
+  SEXP state,
+  int num_train,
+  int num_eval,
+  const char *where,
+  NPConditionalCountCategoricalIngress *ingress)
+{
+  int eval_columns = 0;
+  SEXP kernel_u;
+  SEXP kernel_o;
+  SEXP lambda;
+  SEXP num_categories;
+  SEXP category_values;
+
+  if(where == NULL || ingress == NULL)
+    error("C_np_conditional_count_levels: invalid categorical ingress");
+  memset(ingress, 0, sizeof(*ingress));
+  if(state == R_NilValue)
+    return;
+
+  ingress->train_unordered = np_conditional_count_matrix_columns(
+    np_conditional_count_category_component(
+      state, NP_COUNT_CAT_TRAIN_UNORDERED, where),
+    num_train, &ingress->nunordered, where);
+  ingress->train_ordered = np_conditional_count_matrix_columns(
+    np_conditional_count_category_component(
+      state, NP_COUNT_CAT_TRAIN_ORDERED, where),
+    num_train, &ingress->nordered, where);
+  ingress->eval_unordered = np_conditional_count_matrix_columns(
+    np_conditional_count_category_component(
+      state, NP_COUNT_CAT_EVAL_UNORDERED, where),
+    num_eval, &eval_columns, where);
+  if(eval_columns != ingress->nunordered)
+    error("%s: unordered training and evaluation dimensions differ", where);
+  ingress->eval_ordered = np_conditional_count_matrix_columns(
+    np_conditional_count_category_component(
+      state, NP_COUNT_CAT_EVAL_ORDERED, where),
+    num_eval, &eval_columns, where);
+  if(eval_columns != ingress->nordered)
+    error("%s: ordered training and evaluation dimensions differ", where);
+  if(ingress->nunordered > INT_MAX - ingress->nordered)
+    error("%s: categorical dimensions overflow", where);
+  ingress->ntotal = ingress->nunordered + ingress->nordered;
+
+  kernel_u = np_conditional_count_category_component(
+    state, NP_COUNT_CAT_KERNEL_UNORDERED, where);
+  kernel_o = np_conditional_count_category_component(
+    state, NP_COUNT_CAT_KERNEL_ORDERED, where);
+  lambda = np_conditional_count_category_component(
+    state, NP_COUNT_CAT_LAMBDA, where);
+  num_categories = np_conditional_count_category_component(
+    state, NP_COUNT_CAT_NUM_CATEGORIES, where);
+  category_values = np_conditional_count_category_component(
+    state, NP_COUNT_CAT_CATEGORY_VALUES, where);
+  if(TYPEOF(kernel_u) != INTSXP ||
+     XLENGTH(kernel_u) != ingress->nunordered ||
+     TYPEOF(kernel_o) != INTSXP ||
+     XLENGTH(kernel_o) != ingress->nordered ||
+     TYPEOF(lambda) != REALSXP || XLENGTH(lambda) != ingress->ntotal ||
+     TYPEOF(num_categories) != INTSXP ||
+     XLENGTH(num_categories) != ingress->ntotal)
+    error("%s: invalid categorical metadata", where);
+
+  ingress->kernel_unordered = INTEGER(kernel_u);
+  ingress->kernel_ordered = INTEGER(kernel_o);
+  ingress->lambda = REAL(lambda);
+  ingress->num_categories = INTEGER(num_categories);
+  ingress->category_values = np_conditional_count_category_values(
+    category_values, ingress->num_categories, ingress->ntotal, where);
+}
+
+SEXP C_np_conditional_count_levels(SEXP txcon,
+                                   SEXP tycon,
+                                   SEXP excon,
+                                   SEXP eycon,
+                                   SEXP rbwx,
+                                   SEXP rbwy,
+                                   SEXP ckerlbx,
+                                   SEXP ckerubx,
+                                   SEXP ckerlby,
+                                   SEXP ckeruby,
+                                   SEXP familyx,
+                                   SEXP codex,
+                                   SEXP orderx,
+                                   SEXP familyy,
+                                   SEXP codey,
+                                   SEXP ordery,
+                                   SEXP bandwidth_mode_sexp,
+                                   SEXP do_distribution_sexp,
+                                   SEXP x_categorical,
+                                   SEXP y_categorical,
+                                   SEXP categorical_compress_sexp,
+                                   SEXP counts)
+{
+  SEXP txcon_r = R_NilValue, tycon_r = R_NilValue;
+  SEXP excon_r = R_NilValue, eycon_r = R_NilValue;
+  SEXP rbwx_r = R_NilValue, rbwy_r = R_NilValue;
+  SEXP ckerlbx_r = R_NilValue, ckerubx_r = R_NilValue;
+  SEXP ckerlby_r = R_NilValue, ckeruby_r = R_NilValue;
+  SEXP counts_r = R_NilValue, out = R_NilValue;
+  int num_train_x, num_x, num_train_y, num_y;
+  int num_eval_x, num_eval_x_columns;
+  int num_eval_y, num_eval_y_columns;
+  int num_x_unordered, num_x_ordered;
+  int num_y_unordered, num_y_ordered;
+  int num_x_categorical, num_y_categorical;
+  int counts_rows, num_replicates;
+  int bandwidth_mode_code = asInteger(bandwidth_mode_sexp);
+  int do_distribution = asLogical(do_distribution_sexp);
+  int categorical_compress = asLogical(categorical_compress_sexp);
+  np_beta_bandwidth_mode bandwidth_mode;
+  np_continuous_kernel_descriptor x_descriptor;
+  np_continuous_kernel_descriptor y_descriptor;
+  const double *bandwidth_eval_x;
+  const double *bandwidth_train_x;
+  const double *bandwidth_eval_y;
+  const double *bandwidth_train_y;
+  double **train_x_columns;
+  double **train_y_columns;
+  double **eval_x_columns;
+  double **eval_y_columns;
+  double **train_x_unordered_columns;
+  double **train_x_ordered_columns;
+  double **eval_x_unordered_columns;
+  double **eval_x_ordered_columns;
+  double **train_y_unordered_columns;
+  double **train_y_ordered_columns;
+  double **eval_y_unordered_columns;
+  double **eval_y_ordered_columns;
+  double **bandwidth_eval_x_columns;
+  double **bandwidth_train_x_columns;
+  double **bandwidth_eval_y_columns;
+  double **bandwidth_train_y_columns;
+  int *operator_x;
+  int *operator_y;
+  const int *kernel_x_unordered;
+  const int *kernel_x_ordered;
+  const int *kernel_y_unordered;
+  const int *kernel_y_ordered;
+  const double *lambda_x;
+  const double *lambda_y;
+  const int *num_categories_x;
+  const int *num_categories_y;
+  double **category_values_x;
+  double **category_values_y;
+  NPContinuousKernelRoute x_route;
+  NPContinuousKernelRoute y_route;
+  NPContinuousKernelDerivativeDiagnostics x_diagnostics;
+  NPContinuousKernelDerivativeDiagnostics y_diagnostics;
+  NPConditionalCountPlan count_plan;
+  int count_status;
+  int bad_evaluation = -1;
+  int bad_replicate = -1;
+  int bad_dimension = -1;
+  int replicate_index;
+
+  PROTECT(txcon_r = coerceVector(txcon, REALSXP));
+  PROTECT(tycon_r = coerceVector(tycon, REALSXP));
+  PROTECT(excon_r = coerceVector(excon, REALSXP));
+  PROTECT(eycon_r = coerceVector(eycon, REALSXP));
+  PROTECT(rbwx_r = coerceVector(rbwx, REALSXP));
+  PROTECT(rbwy_r = coerceVector(rbwy, REALSXP));
+  PROTECT(ckerlbx_r = coerceVector(ckerlbx, REALSXP));
+  PROTECT(ckerubx_r = coerceVector(ckerubx, REALSXP));
+  PROTECT(ckerlby_r = coerceVector(ckerlby, REALSXP));
+  PROTECT(ckeruby_r = coerceVector(ckeruby, REALSXP));
+  PROTECT(counts_r = coerceVector(counts, REALSXP));
+
+  np_matrix_dims_or_zero(txcon_r, &num_train_x, &num_x);
+  np_matrix_dims_or_zero(tycon_r, &num_train_y, &num_y);
+  np_matrix_dims_or_zero(excon_r, &num_eval_x, &num_eval_x_columns);
+  np_matrix_dims_or_zero(eycon_r, &num_eval_y, &num_eval_y_columns);
+  np_matrix_dims_or_zero(counts_r, &counts_rows, &num_replicates);
+  if(num_train_x <= 0 || num_x < 0 || num_train_y != num_train_x ||
+     num_y < 0 || num_eval_x <= 0 || num_eval_y != num_eval_x ||
+     num_eval_x_columns != num_x || num_eval_y_columns != num_y ||
+     counts_rows != num_train_x || num_replicates <= 0)
+    error("C_np_conditional_count_levels: invalid matrix dimensions");
+
+  {
+    NPConditionalCountCategoricalIngress x_ingress;
+    NPConditionalCountCategoricalIngress y_ingress;
+
+    np_conditional_count_categorical_ingress(
+      x_categorical, num_train_x, num_eval_x,
+      "C_np_conditional_count_levels x side", &x_ingress);
+    np_conditional_count_categorical_ingress(
+      y_categorical, num_train_y, num_eval_y,
+      "C_np_conditional_count_levels y side", &y_ingress);
+
+    num_x_unordered = x_ingress.nunordered;
+    num_x_ordered = x_ingress.nordered;
+    num_x_categorical = x_ingress.ntotal;
+    train_x_unordered_columns = x_ingress.train_unordered;
+    train_x_ordered_columns = x_ingress.train_ordered;
+    eval_x_unordered_columns = x_ingress.eval_unordered;
+    eval_x_ordered_columns = x_ingress.eval_ordered;
+    kernel_x_unordered = x_ingress.kernel_unordered;
+    kernel_x_ordered = x_ingress.kernel_ordered;
+    lambda_x = x_ingress.lambda;
+    num_categories_x = x_ingress.num_categories;
+    category_values_x = x_ingress.category_values;
+
+    num_y_unordered = y_ingress.nunordered;
+    num_y_ordered = y_ingress.nordered;
+    num_y_categorical = y_ingress.ntotal;
+    train_y_unordered_columns = y_ingress.train_unordered;
+    train_y_ordered_columns = y_ingress.train_ordered;
+    eval_y_unordered_columns = y_ingress.eval_unordered;
+    eval_y_ordered_columns = y_ingress.eval_ordered;
+    kernel_y_unordered = y_ingress.kernel_unordered;
+    kernel_y_ordered = y_ingress.kernel_ordered;
+    lambda_y = y_ingress.lambda;
+    num_categories_y = y_ingress.num_categories;
+    category_values_y = y_ingress.category_values;
+  }
+
+  if(num_x > INT_MAX - num_x_categorical ||
+     num_y > INT_MAX - num_y_categorical)
+    error("C_np_conditional_count_levels: total side dimensions overflow");
+  if(num_x + num_x_categorical <= 0 || num_y + num_y_categorical <= 0)
+    error("C_np_conditional_count_levels: each side requires a variable");
+  if(XLENGTH(rbwx_r) != num_x || XLENGTH(rbwy_r) != num_y ||
+     XLENGTH(ckerlbx_r) != num_x || XLENGTH(ckerubx_r) != num_x ||
+     XLENGTH(ckerlby_r) != num_y || XLENGTH(ckeruby_r) != num_y)
+    error("C_np_conditional_count_levels: bandwidth or bound length does not match its continuous side");
+  if(do_distribution == NA_LOGICAL || categorical_compress == NA_LOGICAL)
+    error("C_np_conditional_count_levels: logical flags must be TRUE or FALSE");
+  if((R_xlen_t)num_replicates > R_XLEN_T_MAX / (R_xlen_t)num_eval_x)
+    error("C_np_conditional_count_levels: result dimensions overflow R's vector limit");
+  if((size_t)num_x > SIZE_MAX / (size_t)num_eval_x ||
+     (size_t)num_x > SIZE_MAX / (size_t)num_train_x ||
+     (size_t)num_y > SIZE_MAX / (size_t)num_eval_y ||
+     (size_t)num_y > SIZE_MAX / (size_t)num_train_y)
+    error("C_np_conditional_count_levels: bandwidth workspace dimensions overflow");
+
+  x_descriptor = np_continuous_kernel_descriptor_or_error(
+    asInteger(familyx), asInteger(codex), asInteger(orderx),
+    "C_np_conditional_count_levels x kernel");
+  y_descriptor = np_continuous_kernel_descriptor_or_error(
+    asInteger(familyy), asInteger(codey), asInteger(ordery),
+    "C_np_conditional_count_levels y kernel");
+  if(x_descriptor.family != NP_CKERNEL_FAMILY_BETA &&
+     y_descriptor.family != NP_CKERNEL_FAMILY_BETA)
+    error("C_np_conditional_count_levels: at least one continuous side must use the beta family");
+  if((x_descriptor.family == NP_CKERNEL_FAMILY_BETA && num_x <= 0) ||
+     (y_descriptor.family == NP_CKERNEL_FAMILY_BETA && num_y <= 0))
+    error("C_np_conditional_count_levels: a beta family requires a continuous coordinate");
+
+  if(bandwidth_mode_code == NP_BETA_BANDWIDTH_FIXED)
+    bandwidth_mode = NP_BETA_BANDWIDTH_FIXED;
+  else if(bandwidth_mode_code == NP_BETA_BANDWIDTH_GENERALIZED_NN)
+    bandwidth_mode = NP_BETA_BANDWIDTH_GENERALIZED_NN;
+  else if(bandwidth_mode_code == NP_BETA_BANDWIDTH_ADAPTIVE_NN)
+    bandwidth_mode = NP_BETA_BANDWIDTH_ADAPTIVE_NN;
+  else
+    error("C_np_conditional_count_levels: invalid bandwidth mode");
+
+  for(replicate_index = 0; replicate_index < num_replicates;
+      ++replicate_index) {
+    double count_sum = 0.0;
+    int observation_index;
+    for(observation_index = 0; observation_index < num_train_x;
+        ++observation_index) {
+      const double count = REAL(counts_r)[
+        (size_t)observation_index +
+        (size_t)num_train_x * (size_t)replicate_index];
+      if(!R_FINITE(count) || count < 0.0 || count != floor(count) ||
+         count > (double)num_train_x)
+        error("C_np_conditional_count_levels: counts must be finite nonnegative integer multiplicities");
+      if(bandwidth_mode != NP_BETA_BANDWIDTH_FIXED && count != 1.0)
+        error("C_np_conditional_count_levels: nonfixed bandwidths require an expanded sample with unit counts");
+      count_sum += count;
+    }
+    if(count_sum != (double)num_train_x)
+      error("C_np_conditional_count_levels: every count column must sum to the training sample size");
+  }
+
+  bandwidth_eval_x = REAL(rbwx_r);
+  bandwidth_train_x = REAL(rbwx_r);
+  bandwidth_eval_y = REAL(rbwy_r);
+  bandwidth_train_y = REAL(rbwy_r);
+  if(bandwidth_mode != NP_BETA_BANDWIDTH_FIXED) {
+    const int need_eval = bandwidth_mode == NP_BETA_BANDWIDTH_GENERALIZED_NN;
+    const int need_train = bandwidth_mode == NP_BETA_BANDWIDTH_ADAPTIVE_NN;
+    double *bandwidth_eval_x_storage = need_eval ?
+      (double *)R_alloc((size_t)num_x * (size_t)num_eval_x,
+                        sizeof(double)) : NULL;
+    double *bandwidth_train_x_storage = need_train ?
+      (double *)R_alloc((size_t)num_x * (size_t)num_train_x,
+                        sizeof(double)) : NULL;
+    double *bandwidth_eval_y_storage = need_eval ?
+      (double *)R_alloc((size_t)num_y * (size_t)num_eval_y,
+                        sizeof(double)) : NULL;
+    double *bandwidth_train_y_storage = need_train ?
+      (double *)R_alloc((size_t)num_y * (size_t)num_train_y,
+                        sizeof(double)) : NULL;
+    np_beta_bandwidth_prepare_status bandwidth_status;
+
+    /*
+     * Bootstrap replicate chunks are evaluated rank-locally.  Suppress the
+     * collective NN bandwidth path so neither the master center calculation
+     * nor a worker payload attempts nested MPI participation.
+     */
+    if(num_x > 0) {
+      bandwidth_status = np_beta_bandwidth_prepare(
+        bandwidth_mode, REAL(txcon_r), REAL(excon_r), REAL(rbwx_r),
+        num_train_x, num_eval_x, num_x, 0,
+        need_eval, need_train, 1,
+        bandwidth_eval_x_storage, bandwidth_train_x_storage);
+      if(bandwidth_status == NP_BETA_BANDWIDTH_PREPARE_ERR_ZERO_RADIUS) {
+        const NPNNZeroRadiusInfo info = np_nn_zero_radius_info_flat(
+          need_eval ? BW_GEN_NN : BW_ADAP_NN, num_train_x, num_eval_x, num_x,
+          REAL(txcon_r), REAL(excon_r), REAL(rbwx_r), NULL, 0);
+        np_nn_zero_radius_error(&info);
+      }
+      if(bandwidth_status != NP_BETA_BANDWIDTH_PREPARE_OK)
+        error("C_np_conditional_count_levels: x-side %s",
+              np_beta_bandwidth_prepare_status_message(bandwidth_status));
+    }
+    if(num_y > 0) {
+      bandwidth_status = np_beta_bandwidth_prepare(
+        bandwidth_mode, REAL(tycon_r), REAL(eycon_r), REAL(rbwy_r),
+        num_train_y, num_eval_y, num_y, 0,
+        need_eval, need_train, 1,
+        bandwidth_eval_y_storage, bandwidth_train_y_storage);
+      if(bandwidth_status == NP_BETA_BANDWIDTH_PREPARE_ERR_ZERO_RADIUS) {
+        const NPNNZeroRadiusInfo info = np_nn_zero_radius_info_flat(
+          need_eval ? BW_GEN_NN : BW_ADAP_NN, num_train_y, num_eval_y, num_y,
+          REAL(tycon_r), REAL(eycon_r), REAL(rbwy_r), NULL, num_x);
+        np_nn_zero_radius_error(&info);
+      }
+      if(bandwidth_status != NP_BETA_BANDWIDTH_PREPARE_OK)
+        error("C_np_conditional_count_levels: y-side %s",
+              np_beta_bandwidth_prepare_status_message(bandwidth_status));
+    }
+
+    bandwidth_eval_x = bandwidth_eval_x_storage;
+    bandwidth_train_x = bandwidth_train_x_storage;
+    bandwidth_eval_y = bandwidth_eval_y_storage;
+    bandwidth_train_y = bandwidth_train_y_storage;
+  }
+
+  train_x_columns = num_x > 0 ?
+    (double **)R_alloc((size_t)num_x, sizeof(double *)) : NULL;
+  train_y_columns = num_y > 0 ?
+    (double **)R_alloc((size_t)num_y, sizeof(double *)) : NULL;
+  eval_x_columns = num_x > 0 ?
+    (double **)R_alloc((size_t)num_x, sizeof(double *)) : NULL;
+  eval_y_columns = num_y > 0 ?
+    (double **)R_alloc((size_t)num_y, sizeof(double *)) : NULL;
+  bandwidth_eval_x_columns = num_x > 0 ?
+    (double **)R_alloc((size_t)num_x, sizeof(double *)) : NULL;
+  bandwidth_train_x_columns = num_x > 0 ?
+    (double **)R_alloc((size_t)num_x, sizeof(double *)) : NULL;
+  bandwidth_eval_y_columns = num_y > 0 ?
+    (double **)R_alloc((size_t)num_y, sizeof(double *)) : NULL;
+  bandwidth_train_y_columns = num_y > 0 ?
+    (double **)R_alloc((size_t)num_y, sizeof(double *)) : NULL;
+  operator_x = (int *)R_alloc(
+    (size_t)(num_x + num_x_categorical), sizeof(int));
+  operator_y = (int *)R_alloc(
+    (size_t)(num_y + num_y_categorical), sizeof(int));
+
+  for(int dimension = 0; dimension < num_x; ++dimension) {
+    train_x_columns[dimension] =
+      REAL(txcon_r) + (size_t)dimension*(size_t)num_train_x;
+    eval_x_columns[dimension] =
+      REAL(excon_r) + (size_t)dimension*(size_t)num_eval_x;
+    bandwidth_eval_x_columns[dimension] =
+      (double *)bandwidth_eval_x +
+      (bandwidth_mode == NP_BETA_BANDWIDTH_GENERALIZED_NN ?
+       (size_t)dimension*(size_t)num_eval_x : dimension);
+    bandwidth_train_x_columns[dimension] =
+      (double *)bandwidth_train_x +
+      (bandwidth_mode == NP_BETA_BANDWIDTH_FIXED ? dimension :
+       (bandwidth_mode == NP_BETA_BANDWIDTH_ADAPTIVE_NN ?
+        (size_t)dimension*(size_t)num_train_x : dimension));
+    operator_x[dimension] = OP_NORMAL;
+  }
+  for(int dimension = 0; dimension < num_y; ++dimension) {
+    train_y_columns[dimension] =
+      REAL(tycon_r) + (size_t)dimension*(size_t)num_train_y;
+    eval_y_columns[dimension] =
+      REAL(eycon_r) + (size_t)dimension*(size_t)num_eval_y;
+    bandwidth_eval_y_columns[dimension] =
+      (double *)bandwidth_eval_y +
+      (bandwidth_mode == NP_BETA_BANDWIDTH_GENERALIZED_NN ?
+       (size_t)dimension*(size_t)num_eval_y : dimension);
+    bandwidth_train_y_columns[dimension] =
+      (double *)bandwidth_train_y +
+      (bandwidth_mode == NP_BETA_BANDWIDTH_FIXED ? dimension :
+       (bandwidth_mode == NP_BETA_BANDWIDTH_ADAPTIVE_NN ?
+        (size_t)dimension*(size_t)num_train_y : dimension));
+    operator_y[dimension] = do_distribution ? OP_INTEGRAL : OP_NORMAL;
+  }
+  for(int dimension = num_x; dimension < num_x + num_x_categorical;
+      ++dimension)
+    operator_x[dimension] = OP_NORMAL;
+  for(int dimension = num_y; dimension < num_y + num_y_categorical;
+      ++dimension)
+    operator_y[dimension] = do_distribution ? OP_INTEGRAL : OP_NORMAL;
+
+  memset(&x_route, 0, sizeof(x_route));
+  memset(&y_route, 0, sizeof(y_route));
+  memset(&x_diagnostics, 0, sizeof(x_diagnostics));
+  memset(&y_diagnostics, 0, sizeof(y_diagnostics));
+  if(x_descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    x_route.segment_count = 1;
+    x_route.segment[0].descriptor = x_descriptor;
+    x_route.segment[0].coordinate_offset = 0;
+    x_route.segment[0].coordinate_count = num_x;
+    x_route.segment[0].lower = REAL(ckerlbx_r);
+    x_route.segment[0].upper = REAL(ckerubx_r);
+  }
+  if(y_descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    y_route.segment_count = 1;
+    y_route.segment[0].descriptor = y_descriptor;
+    y_route.segment[0].coordinate_offset = 0;
+    y_route.segment[0].coordinate_count = num_y;
+    y_route.segment[0].lower = REAL(ckerlby_r);
+    y_route.segment[0].upper = REAL(ckeruby_r);
+  }
+
+  PROTECT(out = allocMatrix(REALSXP, num_replicates, num_eval_x));
+  memset(&count_plan, 0, sizeof(count_plan));
+  count_plan.bandwidth_mode = bandwidth_mode;
+  count_plan.do_distribution = do_distribution;
+  count_plan.categorical_compress = categorical_compress;
+  count_plan.num_train = num_train_x;
+  count_plan.num_eval = num_eval_x;
+  count_plan.num_x_continuous = num_x;
+  count_plan.num_x_unordered = num_x_unordered;
+  count_plan.num_x_ordered = num_x_ordered;
+  count_plan.num_y_continuous = num_y;
+  count_plan.num_y_unordered = num_y_unordered;
+  count_plan.num_y_ordered = num_y_ordered;
+  count_plan.num_replicates = num_replicates;
+  count_plan.train_x = train_x_columns;
+  count_plan.train_y = train_y_columns;
+  count_plan.eval_x = eval_x_columns;
+  count_plan.eval_y = eval_y_columns;
+  count_plan.train_x_unordered = train_x_unordered_columns;
+  count_plan.train_x_ordered = train_x_ordered_columns;
+  count_plan.eval_x_unordered = eval_x_unordered_columns;
+  count_plan.eval_x_ordered = eval_x_ordered_columns;
+  count_plan.train_y_unordered = train_y_unordered_columns;
+  count_plan.train_y_ordered = train_y_ordered_columns;
+  count_plan.eval_y_unordered = eval_y_unordered_columns;
+  count_plan.eval_y_ordered = eval_y_ordered_columns;
+  count_plan.bandwidth_eval_x = bandwidth_eval_x_columns;
+  count_plan.bandwidth_train_x = bandwidth_train_x_columns;
+  count_plan.bandwidth_eval_y = bandwidth_eval_y_columns;
+  count_plan.bandwidth_train_y = bandwidth_train_y_columns;
+  count_plan.lower_x = REAL(ckerlbx_r);
+  count_plan.upper_x = REAL(ckerubx_r);
+  count_plan.lower_y = REAL(ckerlby_r);
+  count_plan.upper_y = REAL(ckeruby_r);
+  count_plan.operator_x = operator_x;
+  count_plan.operator_y = operator_y;
+  count_plan.kernel_x_unordered = kernel_x_unordered;
+  count_plan.kernel_x_ordered = kernel_x_ordered;
+  count_plan.kernel_y_unordered = kernel_y_unordered;
+  count_plan.kernel_y_ordered = kernel_y_ordered;
+  count_plan.lambda_x = lambda_x;
+  count_plan.lambda_y = lambda_y;
+  count_plan.num_categories_x = num_categories_x;
+  count_plan.num_categories_y = num_categories_y;
+  count_plan.category_values_x = category_values_x;
+  count_plan.category_values_y = category_values_y;
+  count_plan.descriptor_x = x_descriptor;
+  count_plan.descriptor_y = y_descriptor;
+  count_plan.route_x = x_descriptor.family == NP_CKERNEL_FAMILY_BETA ?
+    &x_route : NULL;
+  count_plan.diagnostics_x =
+    x_descriptor.family == NP_CKERNEL_FAMILY_BETA ? &x_diagnostics : NULL;
+  count_plan.route_y = y_descriptor.family == NP_CKERNEL_FAMILY_BETA ?
+    &y_route : NULL;
+  count_plan.diagnostics_y =
+    y_descriptor.family == NP_CKERNEL_FAMILY_BETA ? &y_diagnostics : NULL;
+  count_plan.counts = REAL(counts_r);
+  count_plan.levels = REAL(out);
+  count_status = np_conditional_count_levels(
+    &count_plan, &bad_evaluation, &bad_replicate, &bad_dimension);
+
+  if(count_status == NP_CONTINUOUS_ROW_ERR_KERNEL) {
+    const NPContinuousKernelDerivativeDiagnostics *diagnostics = NULL;
+
+    if(bad_dimension >= 0 && bad_dimension < num_x &&
+       x_descriptor.family == NP_CKERNEL_FAMILY_BETA)
+      diagnostics = &x_diagnostics;
+    else if(bad_dimension >= num_x &&
+            y_descriptor.family == NP_CKERNEL_FAMILY_BETA)
+      diagnostics = &y_diagnostics;
+    error("C_np_conditional_count_levels: scalar kernel failed at evaluation %d, continuous dimension %d: %s",
+          bad_evaluation + 1, bad_dimension + 1,
+          diagnostics == NULL || diagnostics->beta_status == NP_BETA_OK ?
+            np_continuous_kernel_row_status_message(count_status) :
+            np_beta_status_message(diagnostics->beta_status));
+  }
+  if(count_status != NP_CONTINUOUS_ROW_OK) {
+    if(bad_replicate >= 0 && bad_evaluation >= 0)
+      error("C_np_conditional_count_levels: %s at bootstrap replicate %d, evaluation %d",
+            np_continuous_kernel_row_status_message(count_status),
+            bad_replicate + 1, bad_evaluation + 1);
+    error("C_np_conditional_count_levels: %s",
+          np_continuous_kernel_row_status_message(count_status));
+  }
+
+  UNPROTECT(12);
+  return out;
+}
+
+static SEXP np_density_conditional_call(SEXP tyuno,
                               SEXP tyord,
                               SEXP tycon,
                               SEXP txuno,
@@ -6779,7 +10376,12 @@ SEXP C_np_density_conditional(SEXP tyuno,
                               SEXP regtype,
                               SEXP glp_degree,
                               SEXP glp_bernstein,
-                              SEXP glp_basis)
+                              SEXP glp_basis,
+                              SEXP first_se,
+                              SEXP cat_se_request,
+                              SEXP se_request,
+                              SEXP allow_external,
+                              int export_variance, SEXP projection_request)
 {
   SEXP tyuno_r=R_NilValue, tyord_r=R_NilValue, tycon_r=R_NilValue;
   SEXP txuno_r=R_NilValue, txord_r=R_NilValue, txcon_r=R_NilValue;
@@ -6791,6 +10393,23 @@ SEXP C_np_density_conditional(SEXP tyuno,
   SEXP regtype_i=R_NilValue, glp_degree_i=R_NilValue, glp_bernstein_i=R_NilValue, glp_basis_i=R_NilValue;
   SEXP out=R_NilValue, out_names=R_NilValue;
   SEXP out_cond=R_NilValue, out_cderr=R_NilValue, out_grad=R_NilValue, out_gerr=R_NilValue, out_ll=R_NilValue;
+  SEXP out_variance=R_NilValue;
+  SEXP projection_basis=R_NilValue, projection_rows=R_NilValue;
+  SEXP projection_constant=R_NilValue, projection_result=R_NilValue;
+  SEXP projection_names=R_NilValue;
+  NPRegressionFitProjection fit_projection = {0};
+  NPConditionalPlotCapture plot_capture = {0};
+  SEXP capture_weights=R_NilValue, capture_directions=R_NilValue, capture_adjoints=R_NilValue;
+  SEXP capture_count=R_NilValue, capture_coordinate=R_NilValue, capture_order=R_NilValue;
+  SEXP capture_donor=R_NilValue, capture_response=R_NilValue, capture_logscale=R_NilValue;
+  NPRegressionFitProjection *fit_projection_ptr = NULL;
+  int projection_protected = 0;
+  SEXP empty_flags=R_NilValue, empty_base=R_NilValue;
+  NPRegressionLPEmptyRows external_rows = {NULL, 0, NULL, NULL, NULL};
+  const int allow_empty = asLogical(allow_external);
+  if(TYPEOF(allow_external) != LGLSXP || XLENGTH(allow_external) != 1 ||
+     allow_empty == NA_LOGICAL)
+    error("C_np_density_conditional: invalid external-row permission");
   int en = asInteger(enrow);
   int xd = asInteger(xndim);
   int ncon_x = 0;
@@ -6799,7 +10418,33 @@ SEXP C_np_density_conditional(SEXP tyuno,
   double * cxkerub_p = NULL;
   double * cykerlb_p = NULL;
   double * cykerub_p = NULL;
+  np_continuous_kernel_descriptor x_descriptor;
+  np_continuous_kernel_descriptor y_descriptor;
+  NPContinuousKernelRoute beta_x_route;
+  NPContinuousKernelDerivativeDiagnostics beta_x_diagnostics;
+  NPContinuousKernelRoute beta_y_route;
+  NPContinuousKernelDerivativeDiagnostics beta_y_diagnostics;
+  const NPContinuousKernelRoute *active_x_route = NULL;
+  NPContinuousKernelDerivativeDiagnostics *active_x_diagnostics = NULL;
+  const NPContinuousKernelRoute *active_y_route = NULL;
+  NPContinuousKernelDerivativeDiagnostics *active_y_diagnostics = NULL;
+  int has_kernel_descriptors = 0;
+  int categorical_compress = 0;
   R_xlen_t gsize;
+  int gnn_lp_fit_tree = 0;
+  NPConditionalLPFirstSERequest first_se_request = {0, NULL, NULL};
+  const NPConditionalLPFirstSERequest *first_se_request_ptr = NULL;
+  int first_se_protected = 0;
+  const int *cat_se_mask = NULL;
+
+  if ((TYPEOF(se_request) != LGLSXP && TYPEOF(se_request) != INTSXP) ||
+      XLENGTH(se_request) != 1 ||
+      (asInteger(se_request) != 0 && asInteger(se_request) != 1))
+    error("C_np_density_conditional: invalid SE request");
+  const int do_merr = asInteger(se_request);
+  if (!do_merr && (first_se != R_NilValue || cat_se_request != R_NilValue ||
+                  export_variance))
+    error("C_np_density_conditional: derivative-SE request requires SEs");
 
   if (en < 0) en = 0;
   if (xd < 0) xd = 0;
@@ -6839,9 +10484,67 @@ SEXP C_np_density_conditional(SEXP tyuno,
   ncon_y = (int)INTEGER(myopti_i)[CD_CNCONI];
   resolve_bounds_or_default(ckerlbx_r, ckerubx_r, ncon_x, &cxkerlb_p, &cxkerub_p);
   resolve_bounds_or_default(ckerlby_r, ckeruby_r, ncon_y, &cykerlb_p, &cykerub_p);
+  if(XLENGTH(myopti_i) > CD_CYORDERI) {
+    x_descriptor = np_continuous_kernel_descriptor_or_error(
+      INTEGER(myopti_i)[CD_CXFAMILYI],
+      INTEGER(myopti_i)[CD_CXKRNEVI],
+      INTEGER(myopti_i)[CD_CXORDERI],
+      "C_np_density_conditional x kernel");
+    y_descriptor = np_continuous_kernel_descriptor_or_error(
+      INTEGER(myopti_i)[CD_CYFAMILYI],
+      INTEGER(myopti_i)[CD_CYKRNEVI],
+      INTEGER(myopti_i)[CD_CYORDERI],
+      "C_np_density_conditional y kernel");
+    has_kernel_descriptors = 1;
+  }
+  if(XLENGTH(myopti_i) > CD_CATCOMPI)
+    categorical_compress = INTEGER(myopti_i)[CD_CATCOMPI];
+  if(XLENGTH(myopti_i) > CD_GNNLPFIT_TREEI)
+    gnn_lp_fit_tree = INTEGER(myopti_i)[CD_GNNLPFIT_TREEI];
+  if(gnn_lp_fit_tree != 0 && gnn_lp_fit_tree != 1)
+    error("C_np_density_conditional: invalid GNN LP fitting-tree request");
+  if(categorical_compress != 0 && categorical_compress != 1)
+    error("C_np_density_conditional: categorical compression must be TRUE or FALSE");
 
-  int_ll_extern = asInteger(regtype_i);
-  if ((int_ll_extern == LL_LP) && (ncon_x > 0)) {
+  if(has_kernel_descriptors &&
+     x_descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    if(ncon_x <= 0)
+      error("C_np_density_conditional: explanatory beta route requires continuous X variables");
+    beta_x_route.segment_count = 1;
+    beta_x_route.segment[0].descriptor = x_descriptor;
+    beta_x_route.segment[0].coordinate_offset = 0;
+    beta_x_route.segment[0].coordinate_count = ncon_x;
+    beta_x_route.segment[0].lower = cxkerlb_p;
+    beta_x_route.segment[0].upper = cxkerub_p;
+    beta_x_diagnostics.bad_coordinate = -1;
+    beta_x_diagnostics.bad_observation = -1;
+    beta_x_diagnostics.undefined_count = 0;
+    beta_x_diagnostics.beta_status = NP_BETA_OK;
+    active_x_route = &beta_x_route;
+    active_x_diagnostics = &beta_x_diagnostics;
+  }
+  if(has_kernel_descriptors &&
+     y_descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    if(ncon_y <= 0)
+      error("C_np_density_conditional: dependent beta route requires continuous Y variables");
+    beta_y_route.segment_count = 1;
+    beta_y_route.segment[0].descriptor = y_descriptor;
+    beta_y_route.segment[0].coordinate_offset = 0;
+    beta_y_route.segment[0].coordinate_count = ncon_y;
+    beta_y_route.segment[0].lower = cykerlb_p;
+    beta_y_route.segment[0].upper = cykerub_p;
+    beta_y_diagnostics.bad_coordinate = -1;
+    beta_y_diagnostics.bad_observation = -1;
+    beta_y_diagnostics.undefined_count = 0;
+    beta_y_diagnostics.beta_status = NP_BETA_OK;
+    active_y_route = &beta_y_route;
+    active_y_diagnostics = &beta_y_diagnostics;
+  }
+
+  np_lp_engine_extern = np_regression_engine_or_error(
+    asInteger(regtype_i), "C_np_conditional_density_bw");
+  vector_glp_gradient_order_extern = NULL;
+  if ((np_lp_engine_extern == NP_LP_ENGINE_GENERAL) && (ncon_x > 0)) {
     if ((int)XLENGTH(glp_degree_i) != ncon_x)
       error("C_np_density_conditional: length(glp_degree) must equal number of continuous x variables");
     vector_glp_degree_extern = INTEGER(glp_degree_i);
@@ -6853,44 +10556,510 @@ SEXP C_np_density_conditional(SEXP tyuno,
     int_glp_basis_extern = 1;
   }
 
+  if(gnn_lp_fit_tree &&
+     (INTEGER(myopti_i)[CD_DENI] != BW_GEN_NN ||
+      INTEGER(myopti_i)[CD_TREEI] != NP_TREE_TRUE ||
+      np_lp_engine_extern != NP_LP_ENGINE_GENERAL || ncon_x <= 0 ||
+      active_x_route != NULL || active_y_route != NULL ||
+      (INTEGER(myopti_i)[CD_CXKRNEVI] != CK_EPAN2 &&
+       INTEGER(myopti_i)[CD_CXKRNEVI] != CK_UNIF) ||
+      (ncon_y > 0 && INTEGER(myopti_i)[CD_CYKRNEVI] != CK_EPAN2 &&
+       INTEGER(myopti_i)[CD_CYKRNEVI] != CK_UNIF) ||
+      np_has_finite_cker_bounds(cxkerlb_p, cxkerub_p, ncon_x) ||
+      np_has_finite_cker_bounds(cykerlb_p, cykerub_p, ncon_y)))
+    error("C_np_density_conditional: incoherent GNN LP fitting-tree request");
+
+  if(first_se != R_NilValue) {
+    SEXP names = getAttrib(first_se, R_NamesSymbol);
+    SEXP order, mask;
+    int selected = 0;
+    if(TYPEOF(first_se) != VECSXP || XLENGTH(first_se) != 2 ||
+       TYPEOF(names) != STRSXP || XLENGTH(names) != 2 ||
+       strcmp(CHAR(STRING_ELT(names, 0)), "order") != 0 ||
+       strcmp(CHAR(STRING_ELT(names, 1)), "se") != 0)
+      error("C_np_density_conditional: invalid first-SE request");
+    order = VECTOR_ELT(first_se, 0);
+    mask = VECTOR_ELT(first_se, 1);
+    if(np_lp_engine_extern != NP_LP_ENGINE_GENERAL || ncon_x <= 0 ||
+       INTEGER(myopti_i)[CD_GRAD] != 0 ||
+       TYPEOF(order) != INTSXP || TYPEOF(mask) != INTSXP ||
+       XLENGTH(order) != ncon_x || XLENGTH(mask) != ncon_x)
+      error("C_np_density_conditional: incoherent first-SE request");
+    for(int coordinate = 0; coordinate < ncon_x; ++coordinate) {
+      const int demand = INTEGER(mask)[coordinate];
+      const int requested_order = INTEGER(order)[coordinate];
+      if(requested_order < 1 || (demand != 0 && demand != 1) ||
+         (demand && (requested_order != 1 ||
+                     INTEGER(glp_degree_i)[coordinate] < 1)))
+        error("C_np_density_conditional: invalid first-SE direction");
+      selected += demand;
+    }
+    if(selected == 0)
+      error("C_np_density_conditional: empty first-SE request");
+    PROTECT(order);
+    PROTECT(mask);
+    first_se_protected = 2;
+    first_se_request.ncon = ncon_x;
+    first_se_request.order = INTEGER(order);
+    first_se_request.se = INTEGER(mask);
+    first_se_request_ptr = &first_se_request;
+  }
+
+  if(cat_se_request != R_NilValue) {
+    const int ncat = INTEGER(myopti_i)[CD_UNUNOI] +
+      INTEGER(myopti_i)[CD_UNORDI];
+    int selected = 0;
+    if(ncat <= 0 || INTEGER(myopti_i)[CD_GRAD] != 1 ||
+       TYPEOF(cat_se_request) != INTSXP ||
+       XLENGTH(cat_se_request) != ncat)
+      error("C_np_density_conditional: invalid categorical-SE request");
+    for(int coordinate = 0; coordinate < ncat; ++coordinate) {
+      const int demand = INTEGER(cat_se_request)[coordinate];
+      if(demand != 0 && demand != 1)
+        error("C_np_density_conditional: invalid categorical-SE direction");
+      selected += demand;
+    }
+    if(selected == 0)
+      error("C_np_density_conditional: empty categorical-SE request");
+    cat_se_mask = INTEGER(cat_se_request);
+  }
+
+  if(allow_empty) {
+    if(INTEGER(myopti_i)[CD_TISEI])
+      error("C_np_density_conditional: external-row permission requires external evaluation");
+    PROTECT(empty_flags = allocVector(INTSXP, en));
+    PROTECT(empty_base = allocVector(INTSXP, en));
+    memset(INTEGER(empty_flags), 0, (size_t)en*sizeof(int));
+    memset(INTEGER(empty_base), 0, (size_t)en*sizeof(int));
+    external_rows.flags = INTEGER(empty_flags);
+    external_rows.base_flags = INTEGER(empty_base);
+  }
+
   PROTECT(out_cond = allocVector(REALSXP, en));
-  PROTECT(out_cderr = allocVector(REALSXP, en));
+  PROTECT(out_cderr = do_merr ? allocVector(REALSXP, en) : R_NilValue);
   PROTECT(out_grad = allocVector(REALSXP, gsize));
-  PROTECT(out_gerr = allocVector(REALSXP, gsize));
+  PROTECT(out_gerr = do_merr ? allocVector(REALSXP, gsize) : R_NilValue);
   PROTECT(out_ll = allocVector(REALSXP, 1));
+  if(export_variance) {
+    if(np_lp_engine_extern != NP_LP_ENGINE_GENERAL || ncon_x <= 0 ||
+       en > INT_MAX / 4)
+      error("C_np_density_conditional: invalid variance export request");
+    PROTECT(out_variance = allocMatrix(REALSXP, en, 4));
+    memset(REAL(out_variance), 0, (size_t)en * 4 * sizeof(double));
+  }
+
+  if(projection_request != R_NilValue) {
+    const int width = INTEGER(projection_request)[0];
+    const int ntrain = INTEGER(myopti_i)[CD_TNOBSI];
+    if(width < 1 || ntrain < 1 || en < 1 || ncon_x < 1 ||
+       np_lp_engine_extern != NP_LP_ENGINE_GENERAL ||
+       (double)width*((double)ntrain + en) > 8*1024*1024)
+      error("invalid or oversized conditional plot projection request");
+    if(XLENGTH(glp_degree_i)!=ncon_x || XLENGTH(glp_basis_i)!=1)
+      error("invalid conditional plot projection degree shape");
+    np_plot_validate_basis_request(ncon_x,INTEGER(glp_degree_i),
+      INTEGER(glp_basis_i)[0],width);
+    const int slots=ncon_x+1;
+    /* Integer metadata and pointer scratch are conservatively charged as doubles. */
+    const double capture_cells=64 + 2.0*ntrain*en +
+      2.0*en*slots*width + ntrain + (double)width*(width+2) + width+2 +
+      2.0*en*slots + 2.0*en + ntrain;
+    if(en > INT_MAX/slots || !R_FINITE(capture_cells) ||
+       capture_cells + ((double)ntrain+en)*width > 8*1024*1024)
+      error("conditional plot capture exceeds its total native budget");
+#ifdef MPI2
+    if(!np_mpi_local_regression_active() && iNum_Processors > 1)
+      error("conditional plot projection requires an explicit local regression scope");
+#endif
+    PROTECT(projection_basis = allocMatrix(REALSXP, ntrain, width));
+    PROTECT(projection_rows = allocMatrix(REALSXP, en, width));
+    PROTECT(projection_constant = allocVector(INTSXP, en));
+    projection_protected += 3;
+    for(int row = 0; row < en; ++row) INTEGER(projection_constant)[row] = -1;
+    fit_projection = (NPRegressionFitProjection){
+      .ntrain = ntrain, .neval = en, .width = width,
+      .basis = REAL(projection_basis), .projection = REAL(projection_rows)};
+    fit_projection_ptr = &fit_projection;
+    PROTECT(capture_weights=allocMatrix(REALSXP,ntrain,en)); ++projection_protected;
+    PROTECT(capture_directions=allocMatrix(REALSXP,width,en*slots)); ++projection_protected;
+    PROTECT(capture_adjoints=allocMatrix(REALSXP,width,en*slots)); ++projection_protected;
+    PROTECT(capture_count=allocVector(INTSXP,en)); ++projection_protected;
+    PROTECT(capture_coordinate=allocMatrix(INTSXP,slots,en)); ++projection_protected;
+    PROTECT(capture_order=allocMatrix(INTSXP,slots,en)); ++projection_protected;
+    PROTECT(capture_donor=allocVector(INTSXP,ntrain)); ++projection_protected;
+    PROTECT(capture_response=allocMatrix(REALSXP,ntrain,en)); ++projection_protected;
+    PROTECT(capture_logscale=allocVector(REALSXP,en)); ++projection_protected;
+    for(R_xlen_t k=0;k<XLENGTH(capture_weights);++k) REAL(capture_weights)[k]=NA_REAL;
+    for(R_xlen_t k=0;k<XLENGTH(capture_directions);++k) {
+      REAL(capture_directions)[k]=NA_REAL; REAL(capture_adjoints)[k]=NA_REAL;
+    }
+    memset(INTEGER(capture_count),0,(size_t)en*sizeof(int));
+    for(R_xlen_t k=0;k<XLENGTH(capture_coordinate);++k) {
+      INTEGER(capture_coordinate)[k]=-1; INTEGER(capture_order)[k]=-1;
+    }
+    plot_capture=(NPConditionalPlotCapture){.n=ntrain,.m=en,.width=width,.slots=slots,.row=-1,
+      .weights=REAL(capture_weights),.directions=REAL(capture_directions),
+      .responses=REAL(capture_response),.response_logscale=REAL(capture_logscale),
+      .adjoints=REAL(capture_adjoints),.captured=INTEGER(capture_count),
+      .coordinate=INTEGER(capture_coordinate),.order=INTEGER(capture_order),
+      .donor_order=INTEGER(capture_donor),
+      .scratch_weights=(double *)R_alloc((size_t)ntrain,sizeof(double)),
+      .scratch_moments=(double *)R_alloc((size_t)width*(width+2),sizeof(double)),
+      .scratch_columns=(double **)R_alloc((size_t)width+2,sizeof(double *))};
+    np_conditional_plot_capture_swap(&plot_capture);
+  }
 
   np_density_conditional(REAL(tyuno_r), REAL(tyord_r), REAL(tycon_r),
-                         REAL(txuno_r), REAL(txord_r), REAL(txcon_r),
-                         REAL(eyuno_r), REAL(eyord_r), REAL(eycon_r),
-                         REAL(exuno_r), REAL(exord_r), REAL(excon_r),
-                         REAL(rbw_r),
-                         REAL(ymcv_r), REAL(ypadnum_r), REAL(xmcv_r), REAL(xpadnum_r),
-                         REAL(nconfac_r), REAL(ncatfac_r), REAL(mysd_r),
-                         INTEGER(myopti_i),
-                         REAL(out_cond), REAL(out_cderr), REAL(out_grad), REAL(out_gerr), REAL(out_ll),
-                         cxkerlb_p, cxkerub_p, cykerlb_p, cykerub_p);
+                           REAL(txuno_r), REAL(txord_r), REAL(txcon_r),
+                           REAL(eyuno_r), REAL(eyord_r), REAL(eycon_r),
+                           REAL(exuno_r), REAL(exord_r), REAL(excon_r),
+                           REAL(rbw_r),
+                           REAL(ymcv_r), REAL(ypadnum_r), REAL(xmcv_r), REAL(xpadnum_r),
+                           REAL(nconfac_r), REAL(ncatfac_r), REAL(mysd_r),
+                           INTEGER(myopti_i),
+                           REAL(out_cond), do_merr ? REAL(out_cderr) : NULL,
+                           REAL(out_grad), do_merr ? REAL(out_gerr) : NULL, REAL(out_ll),
+                           cxkerlb_p, cxkerub_p, cykerlb_p, cykerub_p,
+                           active_x_route, active_x_diagnostics,
+                           active_y_route, active_y_diagnostics,
+                           categorical_compress, first_se_request_ptr,
+                           cat_se_mask,
+                           export_variance ? REAL(out_variance) : NULL,
+                           allow_empty ? &external_rows : NULL,
+                           gnn_lp_fit_tree, fit_projection_ptr,
+                           fit_projection_ptr != NULL ? INTEGER(projection_constant) : NULL,
+                           fit_projection_ptr != NULL ? &plot_capture : NULL);
 
-  PROTECT(out = allocVector(VECSXP, 5));
+  PROTECT(out = allocVector(VECSXP, export_variance ? 6 : 5));
   SET_VECTOR_ELT(out, 0, out_cond);
   SET_VECTOR_ELT(out, 1, out_cderr);
   SET_VECTOR_ELT(out, 2, out_grad);
   SET_VECTOR_ELT(out, 3, out_gerr);
   SET_VECTOR_ELT(out, 4, out_ll);
+  if(export_variance) SET_VECTOR_ELT(out, 5, out_variance);
 
-  PROTECT(out_names = allocVector(STRSXP, 5));
+  PROTECT(out_names = allocVector(STRSXP, export_variance ? 6 : 5));
   SET_STRING_ELT(out_names, 0, mkChar("condens"));
   SET_STRING_ELT(out_names, 1, mkChar("conderr"));
   SET_STRING_ELT(out_names, 2, mkChar("congrad"));
   SET_STRING_ELT(out_names, 3, mkChar("congerr"));
   SET_STRING_ELT(out_names, 4, mkChar("log_likelihood"));
+  if(export_variance)
+    SET_STRING_ELT(out_names, 5, mkChar("variance_metadata"));
   setAttrib(out, R_NamesSymbol, out_names);
+  if(fit_projection_ptr != NULL) {
+    if(fit_projection.emitted != en)
+      error("conditional plot projection returned incomplete rows");
+    PROTECT(projection_result = allocVector(VECSXP, 12));
+    PROTECT(projection_names = allocVector(STRSXP, 12));
+    projection_protected += 2;
+    SET_VECTOR_ELT(projection_result, 0, projection_basis);
+    SET_VECTOR_ELT(projection_result, 1, projection_rows);
+    SET_VECTOR_ELT(projection_result, 2, projection_constant);
+    SET_STRING_ELT(projection_names, 0, mkChar("basis"));
+    SET_STRING_ELT(projection_names, 1, mkChar("projection"));
+    SET_STRING_ELT(projection_names, 2, mkChar("constant"));
+    setAttrib(projection_result, R_NamesSymbol, projection_names);
+        SET_VECTOR_ELT(projection_result,3,capture_weights);
+    SET_VECTOR_ELT(projection_result,4,capture_directions);
+    SET_VECTOR_ELT(projection_result,5,capture_adjoints);
+    SET_VECTOR_ELT(projection_result,6,capture_count);
+    SET_VECTOR_ELT(projection_result,7,capture_coordinate);
+    SET_VECTOR_ELT(projection_result,8,capture_order);
+    SET_VECTOR_ELT(projection_result,9,capture_donor);
+    SET_VECTOR_ELT(projection_result,10,capture_response);
+    SET_VECTOR_ELT(projection_result,11,capture_logscale);
+    SET_STRING_ELT(projection_names,3,mkChar("weights"));
+    SET_STRING_ELT(projection_names,4,mkChar("directions"));
+    SET_STRING_ELT(projection_names,5,mkChar("adjoints"));
+    SET_STRING_ELT(projection_names,6,mkChar("captured"));
+    SET_STRING_ELT(projection_names,7,mkChar("coordinate"));
+    SET_STRING_ELT(projection_names,8,mkChar("order"));
+    SET_STRING_ELT(projection_names,9,mkChar("donor.order"));
+    SET_STRING_ELT(projection_names,10,mkChar("responses"));
+    SET_STRING_ELT(projection_names,11,mkChar("response.logscale"));
+    setAttrib(out, install(".np.conditional.projection"), projection_result);
+  }
   vector_glp_degree_extern = NULL;
+  vector_glp_gradient_order_extern = NULL;
   int_glp_bernstein_extern = 0;
   int_glp_basis_extern = 1;
-  int_ll_extern = LL_LC;
+  np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
 
-  UNPROTECT(36);
+  if(allow_empty) {
+    int any_empty = 0, any_base = 0;
+    for(int row = 0; row < en; ++row) {
+      any_empty |= external_rows.flags[row];
+      any_base |= external_rows.base_flags[row];
+    }
+    if(any_empty) setAttrib(out, install(".np.empty.rows"), empty_flags);
+    if(any_base) setAttrib(out, install(".np.empty.base.rows"), empty_base);
+  }
+  UNPROTECT(36 + first_se_protected + export_variance + 2*allow_empty + projection_protected);
   return out;
+}
+
+SEXP C_np_density_conditional(SEXP tyuno,
+                              SEXP tyord,
+                              SEXP tycon,
+                              SEXP txuno,
+                              SEXP txord,
+                              SEXP txcon,
+                              SEXP eyuno,
+                              SEXP eyord,
+                              SEXP eycon,
+                              SEXP exuno,
+                              SEXP exord,
+                              SEXP excon,
+                              SEXP rbw,
+                              SEXP ymcv,
+                              SEXP ypadnum,
+                              SEXP xmcv,
+                              SEXP xpadnum,
+                              SEXP nconfac,
+                              SEXP ncatfac,
+                              SEXP mysd,
+                              SEXP myopti,
+                              SEXP enrow,
+                              SEXP xndim,
+                              SEXP ckerlbx,
+                              SEXP ckerubx,
+                              SEXP ckerlby,
+                              SEXP ckeruby,
+                              SEXP regtype,
+                              SEXP glp_degree,
+                              SEXP glp_bernstein,
+                              SEXP glp_basis,
+                              SEXP first_se,
+                              SEXP cat_se_request,
+                              SEXP se_request,
+                              SEXP allow_external)
+{
+  return np_density_conditional_call(
+    tyuno, tyord, tycon, txuno, txord, txcon, eyuno, eyord, eycon,
+    exuno, exord, excon, rbw, ymcv, ypadnum, xmcv, xpadnum,
+    nconfac, ncatfac, mysd, myopti, enrow, xndim,
+    ckerlbx, ckerubx, ckerlby, ckeruby, regtype, glp_degree,
+    glp_bernstein, glp_basis, first_se, cat_se_request, se_request, allow_external, 0, R_NilValue);
+}
+
+SEXP C_np_density_conditional_variance(SEXP tyuno,
+                              SEXP tyord,
+                              SEXP tycon,
+                              SEXP txuno,
+                              SEXP txord,
+                              SEXP txcon,
+                              SEXP eyuno,
+                              SEXP eyord,
+                              SEXP eycon,
+                              SEXP exuno,
+                              SEXP exord,
+                              SEXP excon,
+                              SEXP rbw,
+                              SEXP ymcv,
+                              SEXP ypadnum,
+                              SEXP xmcv,
+                              SEXP xpadnum,
+                              SEXP nconfac,
+                              SEXP ncatfac,
+                              SEXP mysd,
+                              SEXP myopti,
+                              SEXP enrow,
+                              SEXP xndim,
+                              SEXP ckerlbx,
+                              SEXP ckerubx,
+                              SEXP ckerlby,
+                              SEXP ckeruby,
+                              SEXP regtype,
+                              SEXP glp_degree,
+                              SEXP glp_bernstein,
+                              SEXP glp_basis,
+                              SEXP first_se,
+                              SEXP cat_se_request,
+                              SEXP se_request,
+                              SEXP allow_external)
+{
+  return np_density_conditional_call(
+    tyuno, tyord, tycon, txuno, txord, txcon, eyuno, eyord, eycon,
+    exuno, exord, excon, rbw, ymcv, ypadnum, xmcv, xpadnum,
+    nconfac, ncatfac, mysd, myopti, enrow, xndim,
+    ckerlbx, ckerubx, ckerlby, ckeruby, regtype, glp_degree,
+    glp_bernstein, glp_basis, first_se, cat_se_request, se_request, allow_external, 1, R_NilValue);
+}
+
+typedef struct {
+  SEXP args[36];
+  NPConditionalPlotCapture *previous;
+  int previous_engine, previous_bernstein, previous_basis;
+  int *previous_degree, *previous_gradient_order;
+} NPConditionalProjectionCall;
+static SEXP np_conditional_projection_body(void *data)
+{
+  NPConditionalProjectionCall *call=(NPConditionalProjectionCall *)data;
+  return np_density_conditional_call(
+    call->args[0], call->args[1], call->args[2], call->args[3], call->args[4], call->args[5], call->args[6], call->args[7], call->args[8], call->args[9], call->args[10], call->args[11], call->args[12], call->args[13], call->args[14], call->args[15], call->args[16], call->args[17], call->args[18], call->args[19], call->args[20], call->args[21], call->args[22], call->args[23], call->args[24], call->args[25], call->args[26], call->args[27], call->args[28], call->args[29], call->args[30], call->args[31], call->args[32], call->args[33], call->args[34], INTEGER(call->args[35])[1], call->args[35]);
+}
+static void np_conditional_projection_cleanup(void *data, Rboolean jump)
+{
+  NPConditionalProjectionCall *call=(NPConditionalProjectionCall *)data;
+  (void)jump;
+  np_conditional_plot_capture_swap(call->previous);
+  /* Only the opt-in plot request owns this scope. Restore even when validation
+   * fails after the conditional wrapper installs temporary GLP pointers. */
+  np_lp_engine_extern = call->previous_engine;
+  vector_glp_degree_extern = call->previous_degree;
+  vector_glp_gradient_order_extern = call->previous_gradient_order;
+  int_glp_bernstein_extern = call->previous_bernstein;
+  int_glp_basis_extern = call->previous_basis;
+}
+SEXP C_np_density_conditional_projection(SEXP tyuno,
+                              SEXP tyord,
+                              SEXP tycon,
+                              SEXP txuno,
+                              SEXP txord,
+                              SEXP txcon,
+                              SEXP eyuno,
+                              SEXP eyord,
+                              SEXP eycon,
+                              SEXP exuno,
+                              SEXP exord,
+                              SEXP excon,
+                              SEXP rbw,
+                              SEXP ymcv,
+                              SEXP ypadnum,
+                              SEXP xmcv,
+                              SEXP xpadnum,
+                              SEXP nconfac,
+                              SEXP ncatfac,
+                              SEXP mysd,
+                              SEXP myopti,
+                              SEXP enrow,
+                              SEXP xndim,
+                              SEXP ckerlbx,
+                              SEXP ckerubx,
+                              SEXP ckerlby,
+                              SEXP ckeruby,
+                              SEXP regtype,
+                              SEXP glp_degree,
+                              SEXP glp_bernstein,
+                              SEXP glp_basis,
+                              SEXP first_se,
+                              SEXP cat_se_request,
+                              SEXP se_request,
+                              SEXP allow_external,
+                              SEXP projection_request)
+{
+  if(TYPEOF(projection_request) != INTSXP || XLENGTH(projection_request) != 2 ||
+     INTEGER(projection_request)[0] == NA_INTEGER ||
+     (INTEGER(projection_request)[1] != 0 && INTEGER(projection_request)[1] != 1))
+    error("invalid conditional plot projection request");
+  NPConditionalProjectionCall call={.args={tyuno, tyord, tycon, txuno, txord, txcon, eyuno, eyord, eycon, exuno, exord, excon, rbw, ymcv, ypadnum, xmcv, xpadnum, nconfac, ncatfac, mysd, myopti, enrow, xndim, ckerlbx, ckerubx, ckerlby, ckeruby, regtype, glp_degree, glp_bernstein, glp_basis, first_se, cat_se_request, se_request, allow_external, projection_request},
+    .previous=np_conditional_plot_capture_swap(NULL),
+    .previous_engine=np_lp_engine_extern,
+    .previous_degree=vector_glp_degree_extern,
+    .previous_gradient_order=vector_glp_gradient_order_extern,
+    .previous_bernstein=int_glp_bernstein_extern,
+    .previous_basis=int_glp_basis_extern};
+  return R_UnwindProtect(np_conditional_projection_body,&call,
+    np_conditional_projection_cleanup,&call,NULL);
+}
+
+#include "conditional_literal/entry_np_regression_lp_apply_conditional_impl.inc"
+#line 11819 "np.c"
+SEXP C_np_regression_lp_apply_conditional(SEXP txuno,
+                                          SEXP txord,
+                                          SEXP txcon,
+                                          SEXP exuno,
+                                          SEXP exord,
+                                          SEXP excon,
+                                          SEXP rhs,
+                                          SEXP rbw,
+                                          SEXP bwtype,
+                                          SEXP kernel_x,
+                                          SEXP kernel_xu,
+                                          SEXP kernel_xo,
+                                          SEXP use_tree,
+                                          SEXP glp_degree,
+                                          SEXP glp_gradient_order,
+                                          SEXP glp_bernstein,
+                                          SEXP glp_basis,
+                                          SEXP continuous_kernel_family,
+                                          SEXP continuous_kernel_order,
+                                          SEXP ckerlb,
+                                          SEXP ckerub,
+                                          SEXP categorical_compress,
+                                          SEXP return_hat,
+                                          SEXP declared_support)
+{
+  return np_regression_lp_apply_conditional_impl(
+    txuno, txord, txcon, exuno, exord, excon, rhs, rbw, bwtype,
+    kernel_x, kernel_xu, kernel_xo, use_tree, glp_degree,
+    glp_gradient_order, glp_bernstein, glp_basis,
+    continuous_kernel_family, continuous_kernel_order, ckerlb, ckerub,
+    categorical_compress, return_hat, R_NilValue, R_NilValue,
+    R_NilValue, R_NilValue, R_NilValue, R_NilValue,
+    R_NilValue, R_NilValue, R_NilValue, declared_support);
+}
+
+#include "conditional_literal/entry_C_np_regression_lp_apply_conditional_ctx.inc"
+#line 11891 "np.c"
+
+SEXP C_np_regression_lp_sigtest_conditional_ctx(
+  SEXP txuno,
+  SEXP txord,
+  SEXP txcon,
+  SEXP exuno,
+  SEXP exord,
+  SEXP excon,
+  SEXP donor_index,
+  SEXP rbw,
+  SEXP bwtype,
+  SEXP kernel_x,
+  SEXP kernel_xu,
+  SEXP kernel_xo,
+  SEXP use_tree,
+  SEXP glp_degree,
+  SEXP glp_gradient_order,
+  SEXP glp_bernstein,
+  SEXP glp_basis,
+  SEXP continuous_kernel_family,
+  SEXP continuous_kernel_order,
+  SEXP ckerlb,
+  SEXP ckerub,
+  SEXP categorical_compress,
+  SEXP return_hat,
+  SEXP train_is_eval,
+  SEXP leave_one_out,
+  SEXP sigtest_mode,
+  SEXP sigtest_coordinate,
+  SEXP sigtest_response_ready,
+  SEXP sigtest_pivotal,
+  SEXP sigtest_null_mean,
+  SEXP sigtest_residual_pool,
+  SEXP declared_support)
+{
+  return np_regression_lp_apply_conditional_impl(
+    txuno, txord, txcon, exuno, exord, excon, donor_index, rbw, bwtype,
+    kernel_x, kernel_xu, kernel_xo, use_tree, glp_degree,
+    glp_gradient_order, glp_bernstein, glp_basis,
+    continuous_kernel_family, continuous_kernel_order, ckerlb, ckerub,
+    categorical_compress, return_hat, train_is_eval, leave_one_out,
+    sigtest_mode, sigtest_coordinate, sigtest_response_ready,
+    sigtest_pivotal, sigtest_null_mean,
+    sigtest_residual_pool, R_NilValue, declared_support);
+}
+
+static void np_density_bw_integer_contract_or_error(SEXP myopti,
+                                                     const char *where)
+{
+  if(XLENGTH(myopti) <= BW_NCONI)
+    error("%s: integer option contract is incomplete", where);
+  if(INTEGER(myopti)[BW_CKRNEVI] != NP_CKERNEL_COORDINATE_CODE)
+    return;
+  if(XLENGTH(myopti) <= BW_CKORDERI)
+    error("%s: continuous-kernel descriptor is missing", where);
+  if(XLENGTH(myopti) <= BW_CATCOMPI)
+    error("%s: categorical-compression state is missing", where);
 }
 
 static SEXP C_np_density_bw_common(SEXP myuno,
@@ -6905,14 +11074,15 @@ static SEXP C_np_density_bw_common(SEXP myuno,
                                    SEXP penalty_mult,
                                    SEXP ckerlb,
                                    SEXP ckerub,
-                                   const int eval_only)
+                                   const int eval_only,
+                                   SEXP declared_support)
 {
   SEXP myuno_r=R_NilValue, myord_r=R_NilValue, mycon_r=R_NilValue, mysd_r=R_NilValue;
   SEXP myopti_i=R_NilValue, myoptd_r=R_NilValue, bw_r=R_NilValue, ckerlb_r=R_NilValue, ckerub_r=R_NilValue;
   SEXP out=R_NilValue, out_names=R_NilValue;
   SEXP out_bw=R_NilValue, out_fval=R_NilValue, out_fval_hist=R_NilValue, out_eval_hist=R_NilValue;
   SEXP out_invalid_hist=R_NilValue, out_timing=R_NilValue, out_fast=R_NilValue, out_guarded=R_NilValue, out_nn_cache=R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int ncon = 0;
@@ -6933,6 +11103,15 @@ static SEXP C_np_density_bw_common(SEXP myuno,
 
   if (XLENGTH(myoptd_r) <= BW_SFLOORD)
     error("C_np_density_bw: myoptd is missing scale.factor.lower.bound");
+  np_density_bw_integer_contract_or_error(myopti_i, "C_np_density_bw");
+
+  const int support_dimensions[4] = {
+    0, 0, INTEGER(myopti_i)[BW_NUNOI], INTEGER(myopti_i)[BW_NORDI]
+  };
+  const SEXP support_data[4] = {R_NilValue, R_NilValue, myuno_r, myord_r};
+  const NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[BW_NOBSI],
+    support_dimensions, support_data);
 
   ncon = (int)INTEGER(myopti_i)[BW_NCONI];
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
@@ -6952,7 +11131,7 @@ static SEXP C_np_density_bw_common(SEXP myuno,
                 REAL(mysd_r), INTEGER(myopti_i), REAL(myoptd_r), REAL(out_bw), REAL(out_fval),
                 REAL(out_fval_hist), REAL(out_eval_hist), REAL(out_invalid_hist), REAL(out_timing),
                 REAL(out_fast), REAL(out_guarded),
-                &pmode, &pmult, ckerlb_p, ckerub_p, eval_only);
+                &pmode, &pmult, ckerlb_p, ckerub_p, eval_only, &support);
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
   PROTECT(out = allocVector(VECSXP, 9));
@@ -6993,12 +11172,13 @@ SEXP C_np_density_bw(SEXP myuno,
                      SEXP penalty_mode,
                      SEXP penalty_mult,
                      SEXP ckerlb,
-                     SEXP ckerub)
+                     SEXP ckerub,
+                     SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
   return C_np_density_bw_common(myuno, myord, mycon, mysd, myopti, myoptd,
                                 bw, hist_len, penalty_mode, penalty_mult,
-                                ckerlb, ckerub, 0);
+                                ckerlb, ckerub, 0, declared_support);
 }
 
 SEXP C_np_density_bw_eval(SEXP myuno,
@@ -7012,143 +11192,12 @@ SEXP C_np_density_bw_eval(SEXP myuno,
                           SEXP penalty_mode,
                           SEXP penalty_mult,
                           SEXP ckerlb,
-                          SEXP ckerub)
+                          SEXP ckerub,
+                          SEXP declared_support)
 {
   return C_np_density_bw_common(myuno, myord, mycon, mysd, myopti, myoptd,
                                 bw, hist_len, penalty_mode, penalty_mult,
-                                ckerlb, ckerub, 1);
-}
-
-static int np_density_nomad_native_eval_once(double *myuno,
-                                             double *myord,
-                                             double *mycon,
-                                             double *mysd,
-                                             int *myopti,
-                                             double *myoptd,
-                                             const double *bw_in,
-                                             int penalty_mode,
-                                             double penalty_mult,
-                                             double *ckerlb,
-                                             double *ckerub,
-                                             double out[5])
-{
-  int i;
-  const int num_var = myopti[BW_NCONI] + myopti[BW_NUNOI] + myopti[BW_NORDI];
-  double *bw = NULL;
-  double fval[2] = {R_NaN, R_NaN};
-  double fval_history[1] = {R_NaN};
-  double eval_history[1] = {R_NaN};
-  double invalid_history[1] = {R_NaN};
-  double timing[1] = {R_NaN};
-  double fast[1] = {R_NaN};
-  double guarded[1] = {R_NaN};
-  int pmode = penalty_mode;
-  double pmult = penalty_mult;
-
-  if (num_var <= 0 || bw_in == NULL || out == NULL)
-    return 1;
-
-  bw = NP_NOMAD_CALLBACK_CALLOC(num_var, double);
-  if (bw == NULL)
-    return 1;
-  for (i = 0; i < num_var; i++)
-    bw[i] = bw_in[i];
-
-  np_density_bw(myuno,
-                myord,
-                mycon,
-                mysd,
-                myopti,
-                myoptd,
-                bw,
-                fval,
-                fval_history,
-                eval_history,
-                invalid_history,
-                timing,
-                fast,
-                guarded,
-                &pmode,
-                &pmult,
-                ckerlb,
-                ckerub,
-                1);
-
-  out[0] = -fval[0];
-  out[1] = fval[0];
-  out[2] = eval_history[0];
-  out[3] = fast[0];
-  out[4] = guarded[0];
-
-  NP_NOMAD_CALLBACK_FREE(bw);
-  return 0;
-}
-
-SEXP C_np_density_nomad_native_fixed_eval(SEXP myuno,
-                                          SEXP myord,
-                                          SEXP mycon,
-                                          SEXP mysd,
-                                          SEXP myopti,
-                                          SEXP myoptd,
-                                          SEXP bw,
-                                          SEXP penalty_mode,
-                                          SEXP penalty_mult,
-                                          SEXP ckerlb,
-                                          SEXP ckerub)
-{
-  SEXP myuno_r = R_NilValue, myord_r = R_NilValue, mycon_r = R_NilValue;
-  SEXP mysd_r = R_NilValue, myopti_i = R_NilValue, myoptd_r = R_NilValue;
-  SEXP bw_r = R_NilValue, ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
-  SEXP out = R_NilValue, names = R_NilValue;
-  double eval_out[5];
-  int status;
-
-  PROTECT(myuno_r = coerceVector(myuno, REALSXP));
-  PROTECT(myord_r = coerceVector(myord, REALSXP));
-  PROTECT(mycon_r = coerceVector(mycon, REALSXP));
-  PROTECT(mysd_r = coerceVector(mysd, REALSXP));
-  PROTECT(myopti_i = coerceVector(myopti, INTSXP));
-  PROTECT(myoptd_r = coerceVector(myoptd, REALSXP));
-  PROTECT(bw_r = coerceVector(bw, REALSXP));
-  PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
-  PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
-
-  if (XLENGTH(myoptd_r) <= BW_SFLOORD) {
-    UNPROTECT(9);
-    error("native npudens NOMAD evaluator received incomplete myoptd");
-  }
-
-  status = np_density_nomad_native_eval_once(REAL(myuno_r),
-                                             REAL(myord_r),
-                                             REAL(mycon_r),
-                                             REAL(mysd_r),
-                                             INTEGER(myopti_i),
-                                             REAL(myoptd_r),
-                                             REAL(bw_r),
-                                             asInteger(penalty_mode),
-                                             asReal(penalty_mult),
-                                             REAL(ckerlb_r),
-                                             REAL(ckerub_r),
-                                             eval_out);
-
-  PROTECT(out = allocVector(VECSXP, 6));
-  PROTECT(names = allocVector(STRSXP, 6));
-  SET_VECTOR_ELT(out, 0, ScalarInteger(status));
-  SET_VECTOR_ELT(out, 1, ScalarReal(eval_out[0]));
-  SET_VECTOR_ELT(out, 2, ScalarReal(eval_out[1]));
-  SET_VECTOR_ELT(out, 3, ScalarReal(eval_out[2]));
-  SET_VECTOR_ELT(out, 4, ScalarReal(eval_out[3]));
-  SET_VECTOR_ELT(out, 5, ScalarReal(eval_out[4]));
-  SET_STRING_ELT(names, 0, mkChar("status"));
-  SET_STRING_ELT(names, 1, mkChar("objective"));
-  SET_STRING_ELT(names, 2, mkChar("fval"));
-  SET_STRING_ELT(names, 3, mkChar("num.feval"));
-  SET_STRING_ELT(names, 4, mkChar("num.feval.fast"));
-  SET_STRING_ELT(names, 5, mkChar("num.feval.guarded"));
-  setAttrib(out, R_NamesSymbol, names);
-
-  UNPROTECT(11);
-  return out;
+                                ckerlb, ckerub, 1, declared_support);
 }
 
 typedef struct {
@@ -7174,26 +11223,23 @@ typedef struct {
   double best_objective;
   double best_eval[5];
   double *best_point;
+  double *raw_point;
+  double *eval_bw;
+  NPDensityPreparedCtx prepared;
 } np_udens_native_search_context;
 
 static int np_udens_native_decode_eval_bw(const np_udens_native_search_context *context,
                                           const double *raw_point,
                                           double *eval_bw)
 {
-  int j, ncon, ncat, scaling;
+  int j, ncon, ncat, scaling, bandwidth;
   double nconfac, ncatfac;
-  const double bandwidth_scale_categorical = 1.0e4;
 
   if (context == NULL || raw_point == NULL || eval_bw == NULL ||
       context->myopti == NULL || context->myoptd == NULL)
     return 1;
 
-  if (context->myopti[BW_DENI] != BW_FIXED) {
-    for (j = 0; j < context->n; j++)
-      eval_bw[j] = raw_point[j];
-    return 0;
-  }
-
+  bandwidth = context->myopti[BW_DENI];
   ncon = context->myopti[BW_NCONI];
   ncat = context->myopti[BW_NUNOI] + context->myopti[BW_NORDI];
   if (ncon < 0 || ncat < 0 || ncon + ncat != context->n)
@@ -7204,25 +11250,24 @@ static int np_udens_native_decode_eval_bw(const np_udens_native_search_context *
   ncatfac = context->myoptd[BW_NCATFD];
 
   for (j = 0; j < ncon; j++) {
-    if (scaling) {
-      eval_bw[j] = raw_point[j];
+    if (bandwidth == BW_FIXED) {
+      if (scaling) {
+        eval_bw[j] = raw_point[j];
+      } else {
+        if (context->mysd == NULL)
+          return 1;
+        eval_bw[j] = raw_point[j] * context->mysd[j] * nconfac;
+      }
     } else {
-      if (context->mysd == NULL)
-        return 1;
-      eval_bw[j] = raw_point[j] * context->mysd[j] * nconfac;
+      eval_bw[j] = raw_point[j];
     }
   }
 
   for (j = 0; j < ncat; j++) {
     const int k = ncon + j;
-    const double ext_bw = raw_point[k] / bandwidth_scale_categorical;
-    if (scaling) {
-      if (ncatfac == 0.0)
-        return 1;
-      eval_bw[k] = ext_bw / ncatfac;
-    } else {
-      eval_bw[k] = ext_bw;
-    }
+    if(np_nomad_decode_categorical_bandwidth(
+         raw_point[k], scaling, ncatfac, &eval_bw[k]) != 0)
+      return 1;
   }
 
   return 0;
@@ -7236,25 +11281,19 @@ static int np_udens_native_search_callback(int n,
 {
   np_udens_native_search_context *context =
     (np_udens_native_search_context *) user_data;
-  double *raw_point = NULL;
-  double *eval_bw = NULL;
+  double *raw_point;
+  double *eval_bw;
   double eval_out[5];
   int j;
   int status;
 
   if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 ||
-      n != context->n)
+      n != context->n || context->raw_point == NULL ||
+      context->eval_bw == NULL)
     return 1;
 
-  raw_point = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  eval_bw = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  if (raw_point == NULL || eval_bw == NULL) {
-    if (raw_point != NULL)
-      NP_NOMAD_CALLBACK_FREE(raw_point);
-    if (eval_bw != NULL)
-      NP_NOMAD_CALLBACK_FREE(eval_bw);
-    return 1;
-  }
+  raw_point = context->raw_point;
+  eval_bw = context->eval_bw;
 
   for (j = 0; j < context->n; j++) {
     raw_point[j] = (context->bbin[j] == 1) ? nearbyint(x[j]) : x[j];
@@ -7267,27 +11306,16 @@ static int np_udens_native_search_callback(int n,
   status = np_udens_native_decode_eval_bw(context, raw_point, eval_bw);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
     return 1;
   }
 
-  status = np_density_nomad_native_eval_once(context->myuno,
-                                             context->myord,
-                                             context->mycon,
-                                             context->mysd,
-                                             context->myopti,
-                                             context->myoptd,
-                                             eval_bw,
-                                             context->penalty_mode,
-                                             context->penalty_mult,
-                                             context->ckerlb,
-                                             context->ckerub,
-                                             eval_out);
+  status = np_density_prepared_context_eval(&context->prepared,
+                                            eval_bw,
+                                            context->penalty_mode,
+                                            context->penalty_mult,
+                                            eval_out);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
     return 1;
   }
 
@@ -7306,8 +11334,6 @@ static int np_udens_native_search_callback(int n,
   }
 
   bb_outputs[0] = eval_out[0];
-  NP_NOMAD_CALLBACK_FREE(raw_point);
-  NP_NOMAD_CALLBACK_FREE(eval_bw);
   return 0;
 }
 
@@ -7329,7 +11355,8 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
                                       SEXP penalty_mode,
                                       SEXP penalty_mult,
                                       SEXP ckerlb,
-                                      SEXP ckerub)
+                                      SEXP ckerub,
+                                      SEXP declared_support)
 {
   SEXP myuno_r = R_NilValue, myord_r = R_NilValue, mycon_r = R_NilValue;
   SEXP mysd_r = R_NilValue, myopti_i = R_NilValue, myoptd_r = R_NilValue;
@@ -7337,7 +11364,6 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
   crs_nomad_option *native_options = NULL;
@@ -7346,6 +11372,8 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   np_udens_native_search_context context;
   double *solution = NULL;
   double *best_point = NULL;
+  double *raw_start = NULL;
+  double *eval_start = NULL;
   int n, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
   PROTECT(myuno_r = coerceVector(myuno, REALSXP));
@@ -7362,78 +11390,53 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   PROTECT(option_values_s = coerceVector(option_values, STRSXP));
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
+
+  np_density_bw_integer_contract_or_error(
+    myopti_i, "native npudens NOMAD search");
+
+  const int support_dimensions[4] = {
+    0, 0, INTEGER(myopti_i)[BW_NUNOI], INTEGER(myopti_i)[BW_NORDI]
+  };
+  const SEXP support_data[4] = {R_NilValue, R_NilValue, myuno_r, myord_r};
+  const NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[BW_NOBSI],
+    support_dimensions, support_data);
 
   n = (int) XLENGTH(x0_r);
   if (n <= 0 ||
       XLENGTH(bbin_i) != n ||
       XLENGTH(lower_r) != n ||
       XLENGTH(upper_r) != n) {
-    UNPROTECT(14);
+    UNPROTECT(15);
     error("native npudens NOMAD search received inconsistent problem dimensions");
   }
   if (XLENGTH(myoptd_r) <= BW_SFLOORD) {
-    UNPROTECT(14);
+    UNPROTECT(15);
     error("native npudens NOMAD search received incomplete myoptd");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(14);
+    UNPROTECT(15);
     error("native npudens NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(14);
+    UNPROTECT(15);
     error("native npudens NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(14);
+    UNPROTECT(15);
     error("native npudens NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
 
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(14);
-    error("failed to resolve crs final native NOMAD callable");
-  }
-
-  solution = R_Calloc(n, double);
-  best_point = R_Calloc(n, double);
-  if (solution == NULL || best_point == NULL) {
-    if (solution != NULL) R_Free(solution);
-    if (best_point != NULL) R_Free(best_point);
-    UNPROTECT(14);
-    error("failed to allocate native npudens NOMAD buffers");
-  }
-  if (n_options > 0) {
-    native_options = R_Calloc(n_options, crs_nomad_option);
-    if (native_options == NULL) {
-      R_Free(solution);
-      R_Free(best_point);
-      UNPROTECT(14);
-      error("failed to allocate native npudens NOMAD option buffers");
-    }
-    for (i = 0; i < n_options; i++) {
-      native_options[i].name = CHAR(STRING_ELT(option_names_s, i));
-      native_options[i].value = CHAR(STRING_ELT(option_values_s, i));
-    }
-  }
-  for (i = 0; i < n; i++) {
-    solution[i] = R_NaN;
-    best_point[i] = R_NaN;
-  }
-
-  memset(&problem, 0, sizeof(problem));
-  memset(&result, 0, sizeof(result));
   memset(&context, 0, sizeof(context));
   for (i = 0; i < 5; i++)
     context.best_eval[i] = R_NaN;
-
   context.n = n;
   context.bbin = INTEGER(bbin_i);
   context.lower = REAL(lower_r);
@@ -7448,6 +11451,72 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   context.penalty_mult = asReal(penalty_mult);
   context.ckerlb = REAL(ckerlb_r);
   context.ckerub = REAL(ckerub_r);
+
+  raw_start = (double *)R_alloc((size_t)n, sizeof(double));
+  eval_start = (double *)R_alloc((size_t)n, sizeof(double));
+  for (i = 0; i < n; i++) {
+    raw_start[i] = context.bbin[i] == 1 ? nearbyint(REAL(x0_r)[i]) :
+      REAL(x0_r)[i];
+    if (R_FINITE(context.lower[i]) && raw_start[i] < context.lower[i])
+      raw_start[i] = context.lower[i];
+    if (R_FINITE(context.upper[i]) && raw_start[i] > context.upper[i])
+      raw_start[i] = context.upper[i];
+  }
+  if (np_udens_native_decode_eval_bw(&context, raw_start, eval_start) != 0 ||
+      np_density_prepared_context_prepare(
+        &context.prepared, context.myuno, context.myord, context.mycon,
+        context.mysd, context.myopti, context.myoptd, eval_start,
+        context.penalty_mode, context.penalty_mult,
+        context.ckerlb, context.ckerub, &support) != 0) {
+    np_density_prepared_context_destroy(&context.prepared);
+    UNPROTECT(15);
+    error("native npudens NOMAD search failed to prepare objective state");
+  }
+
+  context.raw_point = R_Calloc(n, double);
+  context.eval_bw = R_Calloc(n, double);
+  if (context.raw_point == NULL || context.eval_bw == NULL) {
+    if (context.raw_point != NULL) R_Free(context.raw_point);
+    if (context.eval_bw != NULL) R_Free(context.eval_bw);
+    np_density_prepared_context_destroy(&context.prepared);
+    UNPROTECT(15);
+    error("failed to allocate native npudens callback scratch");
+  }
+
+  solution = R_Calloc(n, double);
+  best_point = R_Calloc(n, double);
+  if (solution == NULL || best_point == NULL) {
+    if (solution != NULL) R_Free(solution);
+    if (best_point != NULL) R_Free(best_point);
+    R_Free(context.raw_point);
+    R_Free(context.eval_bw);
+    np_density_prepared_context_destroy(&context.prepared);
+    UNPROTECT(15);
+    error("failed to allocate native npudens NOMAD buffers");
+  }
+  if (n_options > 0) {
+    native_options = R_Calloc(n_options, crs_nomad_option);
+    if (native_options == NULL) {
+      R_Free(solution);
+      R_Free(best_point);
+      R_Free(context.raw_point);
+      R_Free(context.eval_bw);
+      np_density_prepared_context_destroy(&context.prepared);
+      UNPROTECT(15);
+      error("failed to allocate native npudens NOMAD option buffers");
+    }
+    for (i = 0; i < n_options; i++) {
+      native_options[i].name = CHAR(STRING_ELT(option_names_s, i));
+      native_options[i].value = CHAR(STRING_ELT(option_values_s, i));
+    }
+  }
+  for (i = 0; i < n; i++) {
+    solution[i] = R_NaN;
+    best_point[i] = R_NaN;
+  }
+
+  memset(&problem, 0, sizeof(problem));
+  memset(&result, 0, sizeof(result));
   context.best_point = best_point;
 
   problem.api_version = CRS_NOMAD_API_VERSION;
@@ -7476,13 +11545,24 @@ SEXP C_np_density_nomad_native_search(SEXP myuno,
   result.outputs_len = 1;
 
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem,
-                 np_udens_native_search_callback,
-                 &context,
-                 &result);
-  nomad_c_callback_active = 0;
+  status = np_nomad_solve_with_progress(&problem,
+                                        np_udens_native_search_callback,
+                                        &context,
+                                        NULL,
+                                        &result, callback_error);
   bwm_objective_cache_callback_option_end();
+  R_Free(context.raw_point);
+  R_Free(context.eval_bw);
+  context.raw_point = NULL;
+  context.eval_bw = NULL;
+  np_density_prepared_context_destroy(&context.prepared);
+  if (np_nomad_error_pending(callback_error)) {
+    R_Free(solution);
+    R_Free(best_point);
+    if (native_options != NULL) R_Free(native_options);
+    np_nomad_error_raise(callback_error);
+  }
+  UNPROTECT(1);
 
   PROTECT(out = allocVector(VECSXP, 23));
   PROTECT(names = allocVector(STRSXP, 23));
@@ -7566,7 +11646,8 @@ static SEXP C_np_distribution_bw_common(SEXP myuno,
                           SEXP penalty_mult,
                           SEXP ckerlb,
                           SEXP ckerub,
-                          const int eval_only)
+                                        const int eval_only,
+                                        SEXP declared_support)
 {
   SEXP myuno_r=R_NilValue, myord_r=R_NilValue, mycon_r=R_NilValue;
   SEXP myeuno_r=R_NilValue, myeord_r=R_NilValue, myecon_r=R_NilValue, mysd_r=R_NilValue;
@@ -7574,7 +11655,7 @@ static SEXP C_np_distribution_bw_common(SEXP myuno,
   SEXP out=R_NilValue, out_names=R_NilValue;
   SEXP out_bw=R_NilValue, out_fval=R_NilValue, out_fval_hist=R_NilValue, out_eval_hist=R_NilValue;
   SEXP out_invalid_hist=R_NilValue, out_timing=R_NilValue, out_fast=R_NilValue, out_nn_cache=R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int ncon = 0;
@@ -7596,6 +11677,22 @@ static SEXP C_np_distribution_bw_common(SEXP myuno,
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
 
+  if (XLENGTH(myopti_i) <= DBW_NCONI)
+    error("C_np_distribution_bw: integer option contract is incomplete");
+  if (XLENGTH(myopti_i) <= DBW_CKORDERI &&
+      INTEGER(myopti_i)[DBW_CKRNEVI] == NP_CKERNEL_COORDINATE_CODE)
+    error("C_np_distribution_bw: continuous-kernel descriptor is missing");
+  if (INTEGER(myopti_i)[DBW_CKRNEVI] == NP_CKERNEL_COORDINATE_CODE &&
+      XLENGTH(myopti_i) <= DBW_CATCOMPI)
+    error("C_np_distribution_bw: categorical-compression state is missing");
+
+  const int support_dimensions[4] = {
+    0, 0, INTEGER(myopti_i)[DBW_NUNOI], INTEGER(myopti_i)[DBW_NORDI]};
+  const SEXP support_data[4] = {R_NilValue, R_NilValue, myuno_r, myord_r};
+  const NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[DBW_NOBSI],
+    support_dimensions, support_data);
+
   ncon = (int)INTEGER(myopti_i)[DBW_NCONI];
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
 
@@ -7614,7 +11711,7 @@ static SEXP C_np_distribution_bw_common(SEXP myuno,
                      INTEGER(myopti_i), REAL(myoptd_r), REAL(out_bw), REAL(out_fval),
                      REAL(out_fval_hist), REAL(out_eval_hist), REAL(out_invalid_hist), REAL(out_timing),
                      REAL(out_fast),
-                     &pmode, &pmult, ckerlb_p, ckerub_p, eval_only);
+                     &pmode, &pmult, ckerlb_p, ckerub_p, eval_only, &support);
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
   PROTECT(out = allocVector(VECSXP, 8));
@@ -7656,12 +11753,14 @@ SEXP C_np_distribution_bw(SEXP myuno,
                           SEXP penalty_mode,
                           SEXP penalty_mult,
                           SEXP ckerlb,
-                          SEXP ckerub)
+                          SEXP ckerub,
+                          SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
   return C_np_distribution_bw_common(myuno, myord, mycon, myeuno, myeord, myecon,
                                      mysd, myopti, myoptd, bw, hist_len,
-                                     penalty_mode, penalty_mult, ckerlb, ckerub, 0);
+                                     penalty_mode, penalty_mult, ckerlb, ckerub, 0,
+                                     declared_support);
 }
 
 SEXP C_np_distribution_bw_eval(SEXP myuno,
@@ -7678,80 +11777,13 @@ SEXP C_np_distribution_bw_eval(SEXP myuno,
                                SEXP penalty_mode,
                                SEXP penalty_mult,
                                SEXP ckerlb,
-                               SEXP ckerub)
+                               SEXP ckerub,
+                               SEXP declared_support)
 {
   return C_np_distribution_bw_common(myuno, myord, mycon, myeuno, myeord, myecon,
                                      mysd, myopti, myoptd, bw, hist_len,
-                                     penalty_mode, penalty_mult, ckerlb, ckerub, 1);
-}
-
-static int np_distribution_nomad_native_eval_once(double *myuno,
-                                                  double *myord,
-                                                  double *mycon,
-                                                  double *myeuno,
-                                                  double *myeord,
-                                                  double *myecon,
-                                                  double *mysd,
-                                                  int *myopti,
-                                                  double *myoptd,
-                                                  const double *bw_in,
-                                                  int penalty_mode,
-                                                  double penalty_mult,
-                                                  double *ckerlb,
-                                                  double *ckerub,
-                                                  double out[5])
-{
-  int i;
-  const int num_var = myopti[DBW_NCONI] + myopti[DBW_NUNOI] + myopti[DBW_NORDI];
-  double *bw = NULL;
-  double fval[3] = {R_NaN, R_NaN, R_NaN};
-  double fval_history[1] = {R_NaN};
-  double eval_history[1] = {R_NaN};
-  double invalid_history[1] = {R_NaN};
-  double timing[1] = {R_NaN};
-  double fast[1] = {R_NaN};
-  int pmode = penalty_mode;
-  double pmult = penalty_mult;
-
-  if (num_var <= 0 || bw_in == NULL || out == NULL)
-    return 1;
-
-  bw = NP_NOMAD_CALLBACK_CALLOC(num_var, double);
-  if (bw == NULL)
-    return 1;
-  for (i = 0; i < num_var; i++)
-    bw[i] = bw_in[i];
-
-  np_distribution_bw(myuno,
-                     myord,
-                     mycon,
-                     myeuno,
-                     myeord,
-                     myecon,
-                     mysd,
-                     myopti,
-                     myoptd,
-                     bw,
-                     fval,
-                     fval_history,
-                     eval_history,
-                     invalid_history,
-                     timing,
-                     fast,
-                     &pmode,
-                     &pmult,
-                     ckerlb,
-                     ckerub,
-                     1);
-
-  out[0] = fval[0];
-  out[1] = fval[0];
-  out[2] = eval_history[0];
-  out[3] = fast[0];
-  out[4] = invalid_history[0];
-
-  NP_NOMAD_CALLBACK_FREE(bw);
-  return 0;
+                                     penalty_mode, penalty_mult, ckerlb, ckerub, 1,
+                                     declared_support);
 }
 
 typedef struct {
@@ -7780,6 +11812,9 @@ typedef struct {
   double best_objective;
   double best_eval[5];
   double *best_point;
+  double *raw_point;
+  double *eval_bw;
+  NPDistributionPreparedCtx prepared;
 } np_udist_native_search_context;
 
 static int np_udist_native_decode_eval_bw(const np_udist_native_search_context *context,
@@ -7788,7 +11823,6 @@ static int np_udist_native_decode_eval_bw(const np_udist_native_search_context *
 {
   int j, ncon, ncat, scaling, bandwidth;
   double nconfac, ncatfac;
-  const double bandwidth_scale_categorical = 1.0e4;
 
   if (context == NULL || raw_point == NULL || eval_bw == NULL ||
       context->myopti == NULL || context->myoptd == NULL)
@@ -7820,14 +11854,9 @@ static int np_udist_native_decode_eval_bw(const np_udist_native_search_context *
 
   for (j = 0; j < ncat; j++) {
     const int k = ncon + j;
-    const double ext_bw = raw_point[k] / bandwidth_scale_categorical;
-    if (scaling) {
-      if (ncatfac == 0.0)
-        return 1;
-      eval_bw[k] = ext_bw / ncatfac;
-    } else {
-      eval_bw[k] = ext_bw;
-    }
+    if(np_nomad_decode_categorical_bandwidth(
+         raw_point[k], scaling, ncatfac, &eval_bw[k]) != 0)
+      return 1;
   }
 
   return 0;
@@ -7841,25 +11870,19 @@ static int np_udist_native_search_callback(int n,
 {
   np_udist_native_search_context *context =
     (np_udist_native_search_context *) user_data;
-  double *raw_point = NULL;
-  double *eval_bw = NULL;
+  double *raw_point;
+  double *eval_bw;
   double eval_out[5];
   int j;
   int status;
 
   if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 ||
-      n != context->n)
+      n != context->n || context->raw_point == NULL ||
+      context->eval_bw == NULL)
     return 1;
 
-  raw_point = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  eval_bw = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  if (raw_point == NULL || eval_bw == NULL) {
-    if (raw_point != NULL)
-      NP_NOMAD_CALLBACK_FREE(raw_point);
-    if (eval_bw != NULL)
-      NP_NOMAD_CALLBACK_FREE(eval_bw);
-    return 1;
-  }
+  raw_point = context->raw_point;
+  eval_bw = context->eval_bw;
 
   for (j = 0; j < context->n; j++) {
     raw_point[j] = (context->bbin[j] == 1) ? nearbyint(x[j]) : x[j];
@@ -7879,30 +11902,16 @@ static int np_udist_native_search_callback(int n,
   status = np_udist_native_decode_eval_bw(context, raw_point, eval_bw);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
     return 1;
   }
 
-  status = np_distribution_nomad_native_eval_once(context->myuno,
-                                                  context->myord,
-                                                  context->mycon,
-                                                  context->myeuno,
-                                                  context->myeord,
-                                                  context->myecon,
-                                                  context->mysd,
-                                                  context->myopti,
-                                                  context->myoptd,
-                                                  eval_bw,
-                                                  context->penalty_mode,
-                                                  context->penalty_mult,
-                                                  context->ckerlb,
-                                                  context->ckerub,
-                                                  eval_out);
+  status = np_distribution_prepared_context_eval(&context->prepared,
+                                                 eval_bw,
+                                                 context->penalty_mode,
+                                                 context->penalty_mult,
+                                                 eval_out);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
     return 1;
   }
 
@@ -7921,8 +11930,6 @@ static int np_udist_native_search_callback(int n,
   }
 
   bb_outputs[0] = eval_out[0];
-  NP_NOMAD_CALLBACK_FREE(raw_point);
-  NP_NOMAD_CALLBACK_FREE(eval_bw);
   return 0;
 }
 
@@ -7947,7 +11954,8 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
                                            SEXP penalty_mode,
                                            SEXP penalty_mult,
                                            SEXP ckerlb,
-                                           SEXP ckerub)
+                                           SEXP ckerub,
+                                           SEXP declared_support)
 {
   SEXP myuno_r = R_NilValue, myord_r = R_NilValue, mycon_r = R_NilValue;
   SEXP myeuno_r = R_NilValue, myeord_r = R_NilValue, myecon_r = R_NilValue;
@@ -7956,7 +11964,6 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   SEXP upper_r = R_NilValue, option_names_s = R_NilValue, option_values_s = R_NilValue;
   SEXP ckerlb_r = R_NilValue, ckerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
   crs_nomad_option *native_options = NULL;
@@ -7965,6 +11972,8 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   np_udist_native_search_context context;
   double *solution = NULL;
   double *best_point = NULL;
+  double *raw_start = NULL;
+  double *eval_start = NULL;
   const char *result_message = NULL;
   int n, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
@@ -7985,52 +11994,54 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   PROTECT(option_values_s = coerceVector(option_values, STRSXP));
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
+
+  if(XLENGTH(myopti_i) <= DBW_NCONI)
+    error("native npudist NOMAD search received incomplete myopti");
+  const int support_dimensions[4] = {
+    0, 0, INTEGER(myopti_i)[DBW_NUNOI], INTEGER(myopti_i)[DBW_NORDI]};
+  const SEXP support_data[4] = {R_NilValue, R_NilValue, myuno_r, myord_r};
+  const NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[DBW_NOBSI],
+    support_dimensions, support_data);
 
   n = (int) XLENGTH(x0_r);
   if (n <= 0 ||
       XLENGTH(bbin_i) != n ||
       XLENGTH(lower_r) != n ||
       XLENGTH(upper_r) != n) {
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("native npudist NOMAD search received inconsistent problem dimensions");
   }
   if (XLENGTH(myoptd_r) <= DBW_SFLOORD) {
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("native npudist NOMAD search received incomplete myoptd");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("native npudist NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("native npudist NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("native npudist NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
-
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn)
-    R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(17);
-    error("failed to resolve crs final native NOMAD callable");
-  }
 
   solution = R_Calloc(n, double);
   best_point = R_Calloc(n, double);
   if (solution == NULL || best_point == NULL) {
     if (solution != NULL) R_Free(solution);
     if (best_point != NULL) R_Free(best_point);
-    UNPROTECT(17);
+    UNPROTECT(18);
     error("failed to allocate native npudist NOMAD buffers");
   }
   if (n_options > 0) {
@@ -8038,7 +12049,7 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
     if (native_options == NULL) {
       R_Free(solution);
       R_Free(best_point);
-      UNPROTECT(17);
+      UNPROTECT(18);
       error("failed to allocate native npudist NOMAD option buffers");
     }
     for (i = 0; i < n_options; i++) {
@@ -8076,6 +12087,47 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   context.ckerub = REAL(ckerub_r);
   context.best_point = best_point;
 
+  raw_start = (double *)R_alloc((size_t)n, sizeof(double));
+  eval_start = (double *)R_alloc((size_t)n, sizeof(double));
+  for (i = 0; i < n; i++) {
+    raw_start[i] = context.bbin[i] == 1 ? nearbyint(REAL(x0_r)[i]) :
+      REAL(x0_r)[i];
+    if (R_FINITE(context.lower[i]) && raw_start[i] < context.lower[i])
+      raw_start[i] = context.lower[i];
+    if (R_FINITE(context.upper[i]) && raw_start[i] > context.upper[i])
+      raw_start[i] = context.upper[i];
+  }
+  if (np_udist_native_decode_eval_bw(&context, raw_start, eval_start) != 0 ||
+      np_distribution_prepared_context_prepare(
+        &context.prepared,
+        context.myuno, context.myord, context.mycon,
+        context.myeuno, context.myeord, context.myecon, context.mysd,
+        context.myopti, context.myoptd, eval_start,
+        context.penalty_mode, context.penalty_mult,
+        context.ckerlb, context.ckerub, &support) != 0) {
+    np_distribution_prepared_context_destroy(&context.prepared);
+    R_Free(solution);
+    R_Free(best_point);
+    if (native_options != NULL)
+      R_Free(native_options);
+    UNPROTECT(18);
+    error("native npudist NOMAD search failed to prepare objective state");
+  }
+
+  context.raw_point = R_Calloc(n, double);
+  context.eval_bw = R_Calloc(n, double);
+  if (context.raw_point == NULL || context.eval_bw == NULL) {
+    if (context.raw_point != NULL) R_Free(context.raw_point);
+    if (context.eval_bw != NULL) R_Free(context.eval_bw);
+    np_distribution_prepared_context_destroy(&context.prepared);
+    R_Free(solution);
+    R_Free(best_point);
+    if (native_options != NULL)
+      R_Free(native_options);
+    UNPROTECT(18);
+    error("failed to allocate native npudist callback scratch");
+  }
+
   problem.api_version = CRS_NOMAD_API_VERSION;
   problem.struct_size = sizeof(problem);
   problem.n = n;
@@ -8102,13 +12154,24 @@ SEXP C_np_distribution_nomad_native_search(SEXP myuno,
   result.outputs_len = 1;
 
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem,
-                 np_udist_native_search_callback,
-                 &context,
-                 &result);
-  nomad_c_callback_active = 0;
+  status = np_nomad_solve_with_progress(&problem,
+                                        np_udist_native_search_callback,
+                                        &context,
+                                        NULL,
+                                        &result, callback_error);
   bwm_objective_cache_callback_option_end();
+  R_Free(context.raw_point);
+  R_Free(context.eval_bw);
+  context.raw_point = NULL;
+  context.eval_bw = NULL;
+  np_distribution_prepared_context_destroy(&context.prepared);
+  if (np_nomad_error_pending(callback_error)) {
+    R_Free(solution);
+    R_Free(best_point);
+    if (native_options != NULL) R_Free(native_options);
+    np_nomad_error_raise(callback_error);
+  }
+  UNPROTECT(1);
 
   PROTECT(out = allocVector(VECSXP, 23));
   PROTECT(names = allocVector(STRSXP, 23));
@@ -8199,8 +12262,10 @@ static SEXP C_np_density_conditional_bw_common(SEXP c_uno,
                                                SEXP cxkerub,
                                                SEXP cykerlb,
                                                SEXP cykerub,
-                                               const int eval_only)
+                                               const int eval_only,
+                                               SEXP declared_support)
 {
+  np_conditional_gnn_notice_reset();
   SEXP c_uno_r=R_NilValue, c_ord_r=R_NilValue, c_con_r=R_NilValue, u_uno_r=R_NilValue, u_ord_r=R_NilValue, u_con_r=R_NilValue;
   SEXP mysd_r=R_NilValue, myopti_i=R_NilValue, myoptd_r=R_NilValue, bw_r=R_NilValue;
   SEXP degree_i=R_NilValue;
@@ -8208,12 +12273,13 @@ static SEXP C_np_density_conditional_bw_common(SEXP c_uno,
   SEXP out=R_NilValue, out_names=R_NilValue;
   SEXP out_bw=R_NilValue, out_fval=R_NilValue, out_fval_hist=R_NilValue, out_eval_hist=R_NilValue;
   SEXP out_invalid_hist=R_NilValue, out_timing=R_NilValue, out_fast=R_NilValue, out_guarded=R_NilValue, out_nn_cache=R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int bern = asInteger(glp_bernstein);
   int basis = asInteger(glp_basis);
-  int ll_mode = asInteger(regtype);
+  int ll_mode = np_regression_engine_or_error(
+    asInteger(regtype), "C_np_density_conditional_bw");
   int ncon_x = 0;
   int ncon_y = 0;
   double * cxkerlb_p = NULL;
@@ -8239,13 +12305,21 @@ static SEXP C_np_density_conditional_bw_common(SEXP c_uno,
   PROTECT(cykerlb_r = coerceVector(cykerlb, REALSXP));
   PROTECT(cykerub_r = coerceVector(cykerub, REALSXP));
 
-  if (XLENGTH(myopti_i) <= CBW_CVLS_QUAD_POINTSI)
-    error("C_np_density_conditional_bw: myopti is missing cvls.quadrature.points");
+  if (XLENGTH(myopti_i) <= CBW_CATCOMPI)
+    error("C_np_density_conditional_bw: myopti is missing canonical search controls");
   if (XLENGTH(myoptd_r) <= CBW_QUAD_EXTD)
     error("C_np_density_conditional_bw: myoptd is missing cvls.quadrature.extend.factor");
 
-  ncon_x = (int)INTEGER(myopti_i)[CDBW_UNCONI];
-  ncon_y = (int)INTEGER(myopti_i)[CDBW_CNCONI];
+  const int support_dimensions[4] = {
+    INTEGER(myopti_i)[CBW_CNUNOI], INTEGER(myopti_i)[CBW_CNORDI],
+    INTEGER(myopti_i)[CBW_UNUNOI], INTEGER(myopti_i)[CBW_UNORDI]};
+  const SEXP support_data[4] = {c_uno_r, c_ord_r, u_uno_r, u_ord_r};
+  const NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[CBW_NOBSI],
+    support_dimensions, support_data);
+
+  ncon_x = (int)INTEGER(myopti_i)[CBW_UNCONI];
+  ncon_y = (int)INTEGER(myopti_i)[CBW_CNCONI];
   resolve_bounds_or_default(cxkerlb_r, cxkerub_r, ncon_x, &cxkerlb_p, &cxkerub_p);
   resolve_bounds_or_default(cykerlb_r, cykerub_r, ncon_y, &cykerlb_p, &cykerub_p);
 
@@ -8267,7 +12341,7 @@ static SEXP C_np_density_conditional_bw_common(SEXP c_uno,
                             REAL(out_fast), REAL(out_guarded), &pmode, &pmult,
                             INTEGER(degree_i), &bern, &basis, &ll_mode,
                             cxkerlb_p, cxkerub_p, cykerlb_p, cykerub_p,
-                            eval_only);
+                            eval_only, &support);
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
   PROTECT(out = allocVector(VECSXP, 9));
@@ -8293,6 +12367,7 @@ static SEXP C_np_density_conditional_bw_common(SEXP c_uno,
   SET_STRING_ELT(out_names, 8, mkChar("nn.cache"));
   setAttrib(out, R_NamesSymbol, out_names);
 
+  np_conditional_gnn_notice_emit();
   UNPROTECT(26);
   return out;
 }
@@ -8321,6 +12396,7 @@ static SEXP C_np_distribution_conditional_bw_common(SEXP c_uno,
                                                     SEXP cxkerub,
                                                     SEXP cykerlb,
                                                     SEXP cykerub,
+                                                    SEXP declared_support,
                                                     const int eval_only)
 {
   SEXP c_uno_r=R_NilValue, c_ord_r=R_NilValue, c_con_r=R_NilValue, u_uno_r=R_NilValue, u_ord_r=R_NilValue, u_con_r=R_NilValue;
@@ -8329,12 +12405,13 @@ static SEXP C_np_distribution_conditional_bw_common(SEXP c_uno,
   SEXP out=R_NilValue, out_names=R_NilValue;
   SEXP out_bw=R_NilValue, out_fval=R_NilValue, out_fval_hist=R_NilValue, out_eval_hist=R_NilValue;
   SEXP out_invalid_hist=R_NilValue, out_timing=R_NilValue, out_fast=R_NilValue, out_nn_cache=R_NilValue;
-  int hlen = asInteger(hist_len);
+  int hlen = np_bw_history_length(hist_len, eval_only);
   int pmode = asInteger(penalty_mode);
   double pmult = asReal(penalty_mult);
   int bern = asInteger(glp_bernstein);
   int basis = asInteger(glp_basis);
-  int ll_mode = asInteger(regtype);
+  int ll_mode = np_regression_engine_or_error(
+    asInteger(regtype), "C_np_distribution_conditional_bw");
   int ncon_x = 0;
   int ncon_y = 0;
   double * cxkerlb_p = NULL;
@@ -8363,8 +12440,19 @@ static SEXP C_np_distribution_conditional_bw_common(SEXP c_uno,
   PROTECT(cykerlb_r = coerceVector(cykerlb, REALSXP));
   PROTECT(cykerub_r = coerceVector(cykerub, REALSXP));
 
-  ncon_x = (int)INTEGER(myopti_i)[CBW_UNCONI];
-  ncon_y = (int)INTEGER(myopti_i)[CBW_CNCONI];
+  if (XLENGTH(myopti_i) <= CDBW_CATCOMPI)
+    error("C_np_distribution_conditional_bw: myopti is incomplete");
+
+  int support_dimensions[4] = {INTEGER(myopti_i)[CDBW_CNUNOI],
+    INTEGER(myopti_i)[CDBW_CNORDI], INTEGER(myopti_i)[CDBW_UNUNOI],
+    INTEGER(myopti_i)[CDBW_UNORDI]};
+  SEXP support_data[4] = {c_uno_r, c_ord_r, u_uno_r, u_ord_r};
+  NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[CDBW_NOBSI],
+    support_dimensions, support_data);
+
+  ncon_x = (int)INTEGER(myopti_i)[CDBW_UNCONI];
+  ncon_y = (int)INTEGER(myopti_i)[CDBW_CNCONI];
   resolve_bounds_or_default(cxkerlb_r, cxkerub_r, ncon_x, &cxkerlb_p, &cxkerub_p);
   resolve_bounds_or_default(cykerlb_r, cykerub_r, ncon_y, &cykerlb_p, &cykerub_p);
 
@@ -8386,7 +12474,7 @@ static SEXP C_np_distribution_conditional_bw_common(SEXP c_uno,
                                  REAL(out_fast), &pmode, &pmult,
                                  INTEGER(degree_i), &bern, &basis, &ll_mode,
                                  cxkerlb_p, cxkerub_p, cykerlb_p, cykerub_p,
-                                 eval_only);
+                                 eval_only, &support);
   bwm_nn_cache_write_stats(REAL(out_nn_cache));
 
   PROTECT(out = allocVector(VECSXP, 8));
@@ -8437,7 +12525,8 @@ SEXP C_np_distribution_conditional_bw(SEXP c_uno,
                                       SEXP cxkerlb,
                                       SEXP cxkerub,
                                       SEXP cykerlb,
-                                      SEXP cykerub)
+                                      SEXP cykerub,
+                                          SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
 
@@ -8445,7 +12534,7 @@ SEXP C_np_distribution_conditional_bw(SEXP c_uno,
                                                  cg_uno, cg_ord, cg_con, mysd, myopti, myoptd,
                                                  bw, hist_len, penalty_mode, penalty_mult,
                                                  glp_degree, glp_bernstein, glp_basis, regtype,
-                                                 cxkerlb, cxkerub, cykerlb, cykerub, 0);
+                                                 cxkerlb, cxkerub, cykerlb, cykerub, declared_support, 0);
 }
 
 SEXP C_np_distribution_conditional_bw_eval(SEXP c_uno,
@@ -8471,13 +12560,14 @@ SEXP C_np_distribution_conditional_bw_eval(SEXP c_uno,
                                            SEXP cxkerlb,
                                            SEXP cxkerub,
                                            SEXP cykerlb,
-                                           SEXP cykerub)
+                                           SEXP cykerub,
+                                          SEXP declared_support)
 {
   return C_np_distribution_conditional_bw_common(c_uno, c_ord, c_con, u_uno, u_ord, u_con,
                                                  cg_uno, cg_ord, cg_con, mysd, myopti, myoptd,
                                                  bw, hist_len, penalty_mode, penalty_mult,
                                                  glp_degree, glp_bernstein, glp_basis, regtype,
-                                                 cxkerlb, cxkerub, cykerlb, cykerub, 1);
+                                                 cxkerlb, cxkerub, cykerlb, cykerub, declared_support, 1);
 }
 
 SEXP C_np_density_conditional_bw(SEXP c_uno,
@@ -8500,7 +12590,8 @@ SEXP C_np_density_conditional_bw(SEXP c_uno,
                                  SEXP cxkerlb,
                                  SEXP cxkerub,
                                  SEXP cykerlb,
-                                 SEXP cykerub)
+                                 SEXP cykerub,
+                                 SEXP declared_support)
 {
   np_reset_c_rng_for_bandwidth_search();
 
@@ -8508,7 +12599,8 @@ SEXP C_np_density_conditional_bw(SEXP c_uno,
                                             mysd, myopti, myoptd, bw, hist_len,
                                             penalty_mode, penalty_mult,
                                             glp_degree, glp_bernstein, glp_basis, regtype,
-                                            cxkerlb, cxkerub, cykerlb, cykerub, 0);
+                                            cxkerlb, cxkerub, cykerlb, cykerub, 0,
+                                            declared_support);
 }
 
 SEXP C_np_density_conditional_bw_eval(SEXP c_uno,
@@ -8531,551 +12623,20 @@ SEXP C_np_density_conditional_bw_eval(SEXP c_uno,
                                       SEXP cxkerlb,
                                       SEXP cxkerub,
                                       SEXP cykerlb,
-                                      SEXP cykerub)
+                                      SEXP cykerub,
+                                      SEXP declared_support)
 {
   return C_np_density_conditional_bw_common(c_uno, c_ord, c_con, u_uno, u_ord, u_con,
                                             mysd, myopti, myoptd, bw, hist_len,
                                             penalty_mode, penalty_mult,
                                             glp_degree, glp_bernstein, glp_basis, regtype,
-                                            cxkerlb, cxkerub, cykerlb, cykerub, 1);
-}
-
-SEXP C_np_shadow_cv_xweights_conditional(SEXP tyuno,
-                                         SEXP tyord,
-                                         SEXP tycon,
-                                         SEXP txuno,
-                                         SEXP txord,
-                                         SEXP txcon,
-                                         SEXP rbw,
-                                         SEXP bwtype,
-                                         SEXP kernel_x,
-                                         SEXP kernel_xu,
-                                         SEXP kernel_xo,
-                                         SEXP use_tree,
-                                         SEXP regtype,
-                                         SEXP glp_degree,
-                                         SEXP glp_bernstein,
-                                         SEXP glp_basis,
-                                         SEXP row_index)
-{
-  /*
-   * Registered test/proof helper only.
-   *
-   * npRmpi keeps this proof helper row-streamed.  Public estimator, plot,
-   * bootstrap, and CV routes must not call this helper as a production
-   * evaluator; production routes use their ordinary MPI/local streaming
-   * helpers directly.
-   */
-  SEXP tycon_r = R_NilValue;
-  SEXP txuno_r = R_NilValue, txord_r = R_NilValue, txcon_r = R_NilValue;
-  SEXP rbw_r = R_NilValue, degree_i = R_NilValue;
-  SEXP out = R_NilValue, out_names = R_NilValue, out_streamed = R_NilValue;
-  int nrow_yuno = 0, ncol_yuno = 0, nrow_yord = 0, ncol_yord = 0, nrow_ycon = 0, ncol_ycon = 0;
-  int nrow_xuno = 0, ncol_xuno = 0, nrow_xord = 0, ncol_xord = 0, nrow_xcon = 0, ncol_xcon = 0;
-  int num_obs = 0;
-  int tree_flag = asLogical(use_tree);
-  int int_large_sf_save = int_LARGE_SF;
-  double nconfac_save = nconfac_extern;
-  double ncatfac_save = ncatfac_extern;
-  double *vector_continuous_stddev_save = vector_continuous_stddev_extern;
-  double *shadow_continuous_stddev = NULL;
-  double *streamed_row = NULL;
-  int row_idx = asInteger(row_index) - 1;
-  int i;
-
-  tycon_r = PROTECT(coerceVector(tycon, REALSXP));
-  txuno_r = PROTECT(coerceVector(txuno, REALSXP));
-  txord_r = PROTECT(coerceVector(txord, REALSXP));
-  txcon_r = PROTECT(coerceVector(txcon, REALSXP));
-  rbw_r = PROTECT(coerceVector(rbw, REALSXP));
-  degree_i = PROTECT(coerceVector(glp_degree, INTSXP));
-
-  np_shadow_matrix_dims(tyuno, &nrow_yuno, &ncol_yuno);
-  np_shadow_matrix_dims(tyord, &nrow_yord, &ncol_yord);
-  np_shadow_matrix_dims(tycon, &nrow_ycon, &ncol_ycon);
-  np_shadow_matrix_dims(txuno, &nrow_xuno, &ncol_xuno);
-  np_shadow_matrix_dims(txord, &nrow_xord, &ncol_xord);
-  np_shadow_matrix_dims(txcon, &nrow_xcon, &ncol_xcon);
-
-  num_obs = MAX(MAX(nrow_yuno, nrow_yord), MAX(MAX(nrow_ycon, nrow_xuno), MAX(nrow_xord, nrow_xcon)));
-  if(num_obs <= 0)
-    error("C_np_shadow_cv_xweights_conditional: zero-row inputs are not supported");
-  if((nrow_yuno > 0 && nrow_yuno != num_obs) || (nrow_yord > 0 && nrow_yord != num_obs) ||
-     (nrow_ycon > 0 && nrow_ycon != num_obs) || (nrow_xuno > 0 && nrow_xuno != num_obs) ||
-     (nrow_xord > 0 && nrow_xord != num_obs) || (nrow_xcon > 0 && nrow_xcon != num_obs))
-    error("C_np_shadow_cv_xweights_conditional: all inputs must share the same row count");
-  if((row_idx < 0) || (row_idx >= num_obs))
-    error("C_np_shadow_cv_xweights_conditional: row_index out of range");
-  if((asInteger(bwtype) != BW_FIXED) &&
-     (asInteger(bwtype) != BW_GEN_NN))
-    error("C_np_shadow_cv_xweights_conditional: fixed/generalized-nn bandwidths only");
-
-  np_shadow_state_active = 1;
-  num_obs_train_extern = num_obs_eval_extern = num_obs;
-  num_var_unordered_extern = ncol_yuno;
-  num_var_ordered_extern = ncol_yord;
-  num_var_continuous_extern = ncol_ycon;
-  num_reg_unordered_extern = ncol_xuno;
-  num_reg_ordered_extern = ncol_xord;
-  num_reg_continuous_extern = ncol_xcon;
-  int_LARGE_SF = 1;
-  nconfac_extern = 1.0;
-  ncatfac_extern = 1.0;
-
-  KERNEL_den_extern = CK_GAUSS2;
-  KERNEL_den_unordered_extern = UKERNEL_UAA;
-  KERNEL_den_ordered_extern = 0;
-  KERNEL_reg_extern = asInteger(kernel_x);
-  KERNEL_reg_unordered_extern = asInteger(kernel_xu);
-  KERNEL_reg_ordered_extern = asInteger(kernel_xo);
-  BANDWIDTH_den_extern = asInteger(bwtype);
-
-  matrix_X_unordered_train_extern = alloc_matd(num_obs, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs, num_reg_continuous_extern);
-  np_shadow_fill_matrix(matrix_X_unordered_train_extern, REAL(txuno_r), num_obs, num_reg_unordered_extern);
-  np_shadow_fill_matrix(matrix_X_ordered_train_extern, REAL(txord_r), num_obs, num_reg_ordered_extern);
-  np_shadow_fill_matrix(matrix_X_continuous_train_extern, REAL(txcon_r), num_obs, num_reg_continuous_extern);
-
-  if((num_reg_continuous_extern + num_var_continuous_extern) > 0){
-    shadow_continuous_stddev =
-      (double *)malloc((size_t)(num_reg_continuous_extern + num_var_continuous_extern) * sizeof(double));
-    if(shadow_continuous_stddev == NULL)
-      error("C_np_shadow_cv_xweights_conditional: stddev allocation failed");
-    for(i = 0; i < num_reg_continuous_extern; i++)
-      shadow_continuous_stddev[i] =
-        standerrd(num_obs, matrix_X_continuous_train_extern[i]);
-    for(i = 0; i < num_var_continuous_extern; i++)
-      shadow_continuous_stddev[num_reg_continuous_extern + i] =
-        standerrd(num_obs, REAL(tycon_r) + i*num_obs);
-    vector_continuous_stddev_extern = shadow_continuous_stddev;
-  } else {
-    vector_continuous_stddev_extern = NULL;
-  }
-
-  if(tree_flag){
-    int_TREE_X = (num_reg_continuous_extern > 0) ? NP_TREE_TRUE : NP_TREE_FALSE;
-    int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-    if(int_TREE_X == NP_TREE_TRUE){
-      ipt_extern_X = (int *)malloc((size_t)num_obs*sizeof(int));
-      ipt_lookup_extern_X = (int *)malloc((size_t)num_obs*sizeof(int));
-      if((ipt_extern_X == NULL) || (ipt_lookup_extern_X == NULL))
-        error("C_np_shadow_cv_xweights_conditional: x-tree allocation failed");
-      for(i = 0; i < num_obs; i++) ipt_extern_X[i] = i;
-      build_kdtree(matrix_X_continuous_train_extern, num_obs, num_reg_continuous_extern,
-                   4*num_reg_continuous_extern, ipt_extern_X, &kdt_extern_X);
-      for(i = 0; i < num_obs; i++) ipt_lookup_extern_X[ipt_extern_X[i]] = i;
-      for(int j = 0; j < num_reg_unordered_extern; j++)
-        for(i = 0; i < num_obs; i++)
-          matrix_X_unordered_train_extern[j][i] = REAL(txuno_r)[(size_t)j * (size_t)num_obs + (size_t)ipt_extern_X[i]];
-      for(int j = 0; j < num_reg_ordered_extern; j++)
-        for(i = 0; i < num_obs; i++)
-          matrix_X_ordered_train_extern[j][i] = REAL(txord_r)[(size_t)j * (size_t)num_obs + (size_t)ipt_extern_X[i]];
-      for(int j = 0; j < num_reg_continuous_extern; j++)
-        for(i = 0; i < num_obs; i++)
-          matrix_X_continuous_train_extern[j][i] = REAL(txcon_r)[(size_t)j * (size_t)num_obs + (size_t)ipt_extern_X[i]];
-    } else {
-      ipt_extern_X = NULL;
-      ipt_lookup_extern_X = NULL;
-      kdt_extern_X = NULL;
-    }
-  } else {
-    int_TREE_X = int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-    ipt_extern_X = ipt_extern_Y = ipt_extern_XY = NULL;
-    ipt_lookup_extern_X = ipt_lookup_extern_Y = ipt_lookup_extern_XY = NULL;
-    kdt_extern_X = kdt_extern_Y = kdt_extern_XY = NULL;
-  }
-
-  num_categories_extern_X = alloc_vecu(num_reg_unordered_extern + num_reg_ordered_extern);
-  matrix_categorical_vals_extern_X = alloc_matd(num_obs, num_reg_unordered_extern + num_reg_ordered_extern);
-  determine_categorical_vals(num_obs,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             NULL,
-                             NULL,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern_X,
-                             matrix_categorical_vals_extern_X);
-
-  int_ll_extern = asInteger(regtype);
-  if((int_ll_extern == LL_LP) && (num_reg_continuous_extern > 0)){
-    if((int)XLENGTH(degree_i) != num_reg_continuous_extern)
-      error("C_np_shadow_cv_xweights_conditional: glp_degree length mismatch");
-    vector_glp_degree_extern = INTEGER(degree_i);
-    int_glp_bernstein_extern = asInteger(glp_bernstein);
-    int_glp_basis_extern = asInteger(glp_basis);
-  } else {
-    vector_glp_degree_extern = NULL;
-    int_glp_bernstein_extern = 0;
-    int_glp_basis_extern = 1;
-  }
-
-  streamed_row = (double *)malloc((size_t)num_obs*sizeof(double));
-  if(streamed_row == NULL)
-    error("C_np_shadow_cv_xweights_conditional: weight allocation failed");
-
-  if(np_shadow_proof_conditional_x_weight_row_stream(REAL(rbw_r), row_idx, streamed_row) != 0)
-    error("C_np_shadow_cv_xweights_conditional: streamed row helper failed");
-
-  out_streamed = PROTECT(allocVector(REALSXP, num_obs));
-  for(i = 0; i < num_obs; i++)
-    REAL(out_streamed)[i] = streamed_row[i];
-  out = PROTECT(allocVector(VECSXP, 1));
-  SET_VECTOR_ELT(out, 0, out_streamed);
-  out_names = PROTECT(allocVector(STRSXP, 1));
-  SET_STRING_ELT(out_names, 0, mkChar("streamed"));
-  setAttrib(out, R_NamesSymbol, out_names);
-
-  if(kdt_extern_X != NULL) free_kdtree(&kdt_extern_X);
-  safe_free(ipt_extern_X); safe_free(ipt_lookup_extern_X);
-  if(matrix_X_unordered_train_extern != NULL) free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  if(matrix_X_ordered_train_extern != NULL) free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  if(matrix_X_continuous_train_extern != NULL) free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  if(num_categories_extern_X != NULL) safe_free(num_categories_extern_X);
-  if(matrix_categorical_vals_extern_X != NULL) free_mat(matrix_categorical_vals_extern_X, num_reg_unordered_extern + num_reg_ordered_extern);
-  safe_free(streamed_row);
-  safe_free(shadow_continuous_stddev);
-  matrix_X_unordered_train_extern = matrix_X_ordered_train_extern = matrix_X_continuous_train_extern = NULL;
-  num_categories_extern_X = NULL;
-  matrix_categorical_vals_extern_X = NULL;
-  ipt_extern_X = NULL;
-  ipt_lookup_extern_X = NULL;
-  int_ll_extern = LL_LC;
-  vector_glp_degree_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
-  int_TREE_X = int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-  int_LARGE_SF = int_large_sf_save;
-  nconfac_extern = nconfac_save;
-  ncatfac_extern = ncatfac_save;
-  vector_continuous_stddev_extern = vector_continuous_stddev_save;
-  np_glp_cv_clear_extern();
-  np_shadow_state_active = 0;
-
-  UNPROTECT(9);
-  return out;
-}
-
-SEXP C_np_regression_lp_apply_conditional(SEXP txuno,
-                                          SEXP txord,
-                                          SEXP txcon,
-                                          SEXP exuno,
-                                          SEXP exord,
-                                          SEXP excon,
-                                          SEXP rhs,
-                                          SEXP rbw,
-                                          SEXP bwtype,
-                                          SEXP kernel_x,
-                                          SEXP kernel_xu,
-                                          SEXP kernel_xo,
-                                          SEXP use_tree,
-                                          SEXP glp_degree,
-                                          SEXP glp_gradient_order,
-                                          SEXP glp_bernstein,
-                                          SEXP glp_basis)
-{
-  SEXP txuno_r = R_NilValue, txord_r = R_NilValue, txcon_r = R_NilValue;
-  SEXP exuno_r = R_NilValue, exord_r = R_NilValue, excon_r = R_NilValue;
-  SEXP rhs_r = R_NilValue, rbw_r = R_NilValue, degree_i = R_NilValue, grad_i = R_NilValue, out = R_NilValue;
-  int nrow_txuno = 0, ncol_txuno = 0, nrow_txord = 0, ncol_txord = 0, nrow_txcon = 0, ncol_txcon = 0;
-  int nrow_exuno = 0, ncol_exuno = 0, nrow_exord = 0, ncol_exord = 0, nrow_excon = 0, ncol_excon = 0;
-  int nrow_rhs = 0, ncol_rhs = 0;
-  int num_obs_train = 0, num_obs_eval = 0;
-  int tree_flag = asLogical(use_tree);
-  int int_large_sf_save = int_LARGE_SF;
-  double nconfac_save = nconfac_extern;
-  double ncatfac_save = ncatfac_extern;
-  double *vector_continuous_stddev_save = vector_continuous_stddev_extern;
-  double *shadow_continuous_stddev = NULL;
-  double **rhs_cols = NULL;
-  double *rhs_sorted = NULL;
-  int helper_status = 1;
-  int i;
-
-  txuno_r = PROTECT(coerceVector(txuno, REALSXP));
-  txord_r = PROTECT(coerceVector(txord, REALSXP));
-  txcon_r = PROTECT(coerceVector(txcon, REALSXP));
-  exuno_r = PROTECT(coerceVector(exuno, REALSXP));
-  exord_r = PROTECT(coerceVector(exord, REALSXP));
-  excon_r = PROTECT(coerceVector(excon, REALSXP));
-  rhs_r = PROTECT(coerceVector(rhs, REALSXP));
-  rbw_r = PROTECT(coerceVector(rbw, REALSXP));
-  degree_i = PROTECT(coerceVector(glp_degree, INTSXP));
-  grad_i = PROTECT(coerceVector(glp_gradient_order, INTSXP));
-
-  np_shadow_matrix_dims(txuno, &nrow_txuno, &ncol_txuno);
-  np_shadow_matrix_dims(txord, &nrow_txord, &ncol_txord);
-  np_shadow_matrix_dims(txcon, &nrow_txcon, &ncol_txcon);
-  np_shadow_matrix_dims(exuno, &nrow_exuno, &ncol_exuno);
-  np_shadow_matrix_dims(exord, &nrow_exord, &ncol_exord);
-  np_shadow_matrix_dims(excon, &nrow_excon, &ncol_excon);
-  np_shadow_matrix_dims(rhs, &nrow_rhs, &ncol_rhs);
-
-  num_obs_train = MAX(nrow_txuno, MAX(nrow_txord, nrow_txcon));
-  num_obs_eval = MAX(nrow_exuno, MAX(nrow_exord, nrow_excon));
-  if((num_obs_train <= 0) || (num_obs_eval <= 0))
-    error("C_np_regression_lp_apply_conditional: zero-row inputs are not supported");
-  if((nrow_txuno > 0 && nrow_txuno != num_obs_train) ||
-     (nrow_txord > 0 && nrow_txord != num_obs_train) ||
-     (nrow_txcon > 0 && nrow_txcon != num_obs_train))
-    error("C_np_regression_lp_apply_conditional: training inputs must share the same row count");
-  if((nrow_exuno > 0 && nrow_exuno != num_obs_eval) ||
-     (nrow_exord > 0 && nrow_exord != num_obs_eval) ||
-     (nrow_excon > 0 && nrow_excon != num_obs_eval))
-    error("C_np_regression_lp_apply_conditional: evaluation inputs must share the same row count");
-  if((nrow_rhs <= 0) || (ncol_rhs <= 0))
-    error("C_np_regression_lp_apply_conditional: rhs must be a non-empty numeric matrix");
-  if(nrow_rhs != num_obs_train)
-    error("C_np_regression_lp_apply_conditional: rhs row count must match training row count");
-  if((asInteger(bwtype) != BW_FIXED) &&
-     (asInteger(bwtype) != BW_GEN_NN))
-    error("C_np_regression_lp_apply_conditional: fixed/generalized-nn bandwidths only");
-
-  np_shadow_state_active = 1;
-  num_obs_train_extern = num_obs_train;
-  num_obs_eval_extern = num_obs_eval;
-  num_var_unordered_extern = 0;
-  num_var_ordered_extern = 0;
-  num_var_continuous_extern = 0;
-  num_reg_unordered_extern = ncol_txuno;
-  num_reg_ordered_extern = ncol_txord;
-  num_reg_continuous_extern = ncol_txcon;
-  int_LARGE_SF = 1;
-  nconfac_extern = 1.0;
-  ncatfac_extern = 1.0;
-
-  KERNEL_den_extern = CK_GAUSS2;
-  KERNEL_den_unordered_extern = UKERNEL_UAA;
-  KERNEL_den_ordered_extern = 0;
-  KERNEL_reg_extern = asInteger(kernel_x);
-  KERNEL_reg_unordered_extern = asInteger(kernel_xu);
-  KERNEL_reg_ordered_extern = asInteger(kernel_xo);
-  BANDWIDTH_den_extern = asInteger(bwtype);
-
-  matrix_X_unordered_train_extern = alloc_matd(num_obs_train, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs_train, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs_train, num_reg_continuous_extern);
-  matrix_X_unordered_eval_extern = alloc_matd(num_obs_eval, num_reg_unordered_extern);
-  matrix_X_ordered_eval_extern = alloc_matd(num_obs_eval, num_reg_ordered_extern);
-  matrix_X_continuous_eval_extern = alloc_matd(num_obs_eval, num_reg_continuous_extern);
-  np_shadow_fill_matrix(matrix_X_unordered_train_extern, REAL(txuno_r), num_obs_train, num_reg_unordered_extern);
-  np_shadow_fill_matrix(matrix_X_ordered_train_extern, REAL(txord_r), num_obs_train, num_reg_ordered_extern);
-  np_shadow_fill_matrix(matrix_X_continuous_train_extern, REAL(txcon_r), num_obs_train, num_reg_continuous_extern);
-  np_shadow_fill_matrix(matrix_X_unordered_eval_extern, REAL(exuno_r), num_obs_eval, num_reg_unordered_extern);
-  np_shadow_fill_matrix(matrix_X_ordered_eval_extern, REAL(exord_r), num_obs_eval, num_reg_ordered_extern);
-  np_shadow_fill_matrix(matrix_X_continuous_eval_extern, REAL(excon_r), num_obs_eval, num_reg_continuous_extern);
-
-  if(num_reg_continuous_extern > 0){
-    shadow_continuous_stddev =
-      (double *)malloc((size_t)num_reg_continuous_extern*sizeof(double));
-    if(shadow_continuous_stddev == NULL)
-      error("C_np_regression_lp_apply_conditional: stddev allocation failed");
-    for(i = 0; i < num_reg_continuous_extern; i++)
-      shadow_continuous_stddev[i] =
-        standerrd(num_obs_train, matrix_X_continuous_train_extern[i]);
-    vector_continuous_stddev_extern = shadow_continuous_stddev;
-  } else {
-    vector_continuous_stddev_extern = NULL;
-  }
-
-  if(tree_flag){
-    int_TREE_X = (num_reg_continuous_extern > 0) ? NP_TREE_TRUE : NP_TREE_FALSE;
-    int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-    if(int_TREE_X == NP_TREE_TRUE){
-      ipt_extern_X = (int *)malloc((size_t)num_obs_train*sizeof(int));
-      ipt_lookup_extern_X = (int *)malloc((size_t)num_obs_train*sizeof(int));
-      if((ipt_extern_X == NULL) || (ipt_lookup_extern_X == NULL))
-        error("C_np_regression_lp_apply_conditional: x-tree allocation failed");
-      for(i = 0; i < num_obs_train; i++) ipt_extern_X[i] = i;
-      build_kdtree(matrix_X_continuous_train_extern, num_obs_train, num_reg_continuous_extern,
-                   4*num_reg_continuous_extern, ipt_extern_X, &kdt_extern_X);
-      for(i = 0; i < num_obs_train; i++) ipt_lookup_extern_X[ipt_extern_X[i]] = i;
-      for(int j = 0; j < num_reg_unordered_extern; j++)
-        for(i = 0; i < num_obs_train; i++)
-          matrix_X_unordered_train_extern[j][i] = REAL(txuno_r)[(size_t)j * (size_t)num_obs_train + (size_t)ipt_extern_X[i]];
-      for(int j = 0; j < num_reg_ordered_extern; j++)
-        for(i = 0; i < num_obs_train; i++)
-          matrix_X_ordered_train_extern[j][i] = REAL(txord_r)[(size_t)j * (size_t)num_obs_train + (size_t)ipt_extern_X[i]];
-      for(int j = 0; j < num_reg_continuous_extern; j++)
-        for(i = 0; i < num_obs_train; i++)
-          matrix_X_continuous_train_extern[j][i] = REAL(txcon_r)[(size_t)j * (size_t)num_obs_train + (size_t)ipt_extern_X[i]];
-    } else {
-      ipt_extern_X = NULL;
-      ipt_lookup_extern_X = NULL;
-      kdt_extern_X = NULL;
-    }
-  } else {
-    int_TREE_X = int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-    ipt_extern_X = ipt_extern_Y = ipt_extern_XY = NULL;
-    ipt_lookup_extern_X = ipt_lookup_extern_Y = ipt_lookup_extern_XY = NULL;
-    kdt_extern_X = kdt_extern_Y = kdt_extern_XY = NULL;
-  }
-
-  num_categories_extern_X = alloc_vecu(num_reg_unordered_extern + num_reg_ordered_extern);
-  matrix_categorical_vals_extern_X = alloc_matd(num_obs_train, num_reg_unordered_extern + num_reg_ordered_extern);
-  determine_categorical_vals(num_obs_train,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             NULL,
-                             NULL,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern_X,
-                             matrix_categorical_vals_extern_X);
-
-  int_ll_extern = LL_LP;
-  if((int)XLENGTH(degree_i) != num_reg_continuous_extern)
-    error("C_np_regression_lp_apply_conditional: glp_degree length mismatch");
-  if((XLENGTH(grad_i) != 0) && ((int)XLENGTH(grad_i) != num_reg_continuous_extern))
-    error("C_np_regression_lp_apply_conditional: glp_gradient_order length mismatch");
-  vector_glp_degree_extern = INTEGER(degree_i);
-  vector_glp_gradient_order_extern = (XLENGTH(grad_i) > 0) ? INTEGER(grad_i) : NULL;
-  int_glp_bernstein_extern = asInteger(glp_bernstein);
-  int_glp_basis_extern = asInteger(glp_basis);
-
-  rhs_cols = (double **)malloc((size_t)ncol_rhs*sizeof(double *));
-  if(rhs_cols == NULL)
-    error("C_np_regression_lp_apply_conditional: rhs column allocation failed");
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    rhs_sorted = (double *)malloc((size_t)num_obs_train*(size_t)ncol_rhs*sizeof(double));
-    if(rhs_sorted == NULL)
-      error("C_np_regression_lp_apply_conditional: rhs reorder allocation failed");
-    for(int j = 0; j < ncol_rhs; j++){
-      double *rhs_col = rhs_sorted + (size_t)j*(size_t)num_obs_train;
-      for(i = 0; i < num_obs_train; i++)
-        rhs_col[i] = REAL(rhs_r)[(size_t)ipt_extern_X[i] + (size_t)j*(size_t)num_obs_train];
-      rhs_cols[j] = rhs_col;
-    }
-  } else {
-    for(i = 0; i < ncol_rhs; i++)
-      rhs_cols[i] = REAL(rhs_r) + ((size_t)i * (size_t)nrow_rhs);
-  }
-
-  out = PROTECT(allocMatrix(REALSXP, num_obs_eval, ncol_rhs));
-  helper_status = np_regression_lp_apply_matrix(REAL(rbw_r), rhs_cols, ncol_rhs, REAL(out));
-
-  if(kdt_extern_X != NULL) free_kdtree(&kdt_extern_X);
-  safe_free(ipt_extern_X); safe_free(ipt_lookup_extern_X);
-  if(matrix_X_unordered_train_extern != NULL) free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  if(matrix_X_ordered_train_extern != NULL) free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  if(matrix_X_continuous_train_extern != NULL) free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  if(matrix_X_unordered_eval_extern != NULL) free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
-  if(matrix_X_ordered_eval_extern != NULL) free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
-  if(matrix_X_continuous_eval_extern != NULL) free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
-  if(num_categories_extern_X != NULL) safe_free(num_categories_extern_X);
-  if(matrix_categorical_vals_extern_X != NULL) free_mat(matrix_categorical_vals_extern_X, num_reg_unordered_extern + num_reg_ordered_extern);
-  safe_free(shadow_continuous_stddev);
-  safe_free(rhs_sorted);
-  safe_free(rhs_cols);
-  matrix_X_unordered_train_extern = matrix_X_ordered_train_extern = matrix_X_continuous_train_extern = NULL;
-  matrix_X_unordered_eval_extern = matrix_X_ordered_eval_extern = matrix_X_continuous_eval_extern = NULL;
-  num_categories_extern_X = NULL;
-  matrix_categorical_vals_extern_X = NULL;
-  ipt_extern_X = NULL;
-  ipt_lookup_extern_X = NULL;
-  int_ll_extern = LL_LC;
-  vector_glp_degree_extern = NULL;
-  vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
-  int_TREE_X = int_TREE_Y = int_TREE_XY = NP_TREE_FALSE;
-  vector_continuous_stddev_extern = vector_continuous_stddev_save;
-  int_LARGE_SF = int_large_sf_save;
-  nconfac_extern = nconfac_save;
-  ncatfac_extern = ncatfac_save;
-  np_glp_cv_clear_extern();
-  np_shadow_state_active = 0;
-
-  if(helper_status != 0)
-    error("C_np_regression_lp_apply_conditional: lp apply helper failed");
-
-  UNPROTECT(11);
-  return out;
-}
-
-static int np_distribution_conditional_nomad_native_eval_once(double *c_uno,
-                                                              double *c_ord,
-                                                              double *c_con,
-                                                              double *u_uno,
-                                                              double *u_ord,
-                                                              double *u_con,
-                                                              double *cg_uno,
-                                                              double *cg_ord,
-                                                              double *cg_con,
-                                                              double *mysd,
-                                                              int *myopti,
-                                                              double *myoptd,
-                                                              const double *bw_in,
-                                                              int penalty_mode,
-                                                              double penalty_mult,
-                                                              int *degree,
-                                                              int bernstein,
-                                                              int basis,
-                                                              int regtype,
-                                                              double *cxkerlb,
-                                                              double *cxkerub,
-                                                              double *cykerlb,
-                                                              double *cykerub,
-                                                              double out[5])
-{
-  int i;
-  const int num_var = myopti[CDBW_UNCONI] + myopti[CDBW_CNCONI] +
-    myopti[CDBW_CNUNOI] + myopti[CDBW_CNORDI] +
-    myopti[CDBW_UNUNOI] + myopti[CDBW_UNORDI];
-  double *bw = NULL;
-  double fval[3] = {R_NaN, R_NaN, R_NaN};
-  double fval_history[1] = {R_NaN};
-  double eval_history[1] = {R_NaN};
-  double invalid_history[1] = {R_NaN};
-  double timing[1] = {R_NaN};
-  double fast[1] = {R_NaN};
-  int pmode = penalty_mode;
-  double pmult = penalty_mult;
-  int bern = bernstein;
-  int basis_local = basis;
-  int regtype_local = regtype;
-  if (num_var <= 0 || bw_in == NULL || out == NULL)
-    return 1;
-
-  bw = NP_NOMAD_CALLBACK_CALLOC(num_var, double);
-  if (bw == NULL)
-    return 1;
-  for (i = 0; i < num_var; i++)
-    bw[i] = bw_in[i];
-
-#ifdef MPI2
-  np_mpi_local_regression_enter_internal();
-#endif
-
-  np_distribution_conditional_bw(c_uno, c_ord, c_con,
-                                 u_uno, u_ord, u_con,
-                                 cg_uno, cg_ord, cg_con,
-                                 mysd, myopti, myoptd, bw, fval,
-                                 fval_history, eval_history, invalid_history, timing,
-                                 fast, &pmode, &pmult, degree, &bern, &basis_local,
-                                 &regtype_local, cxkerlb, cxkerub, cykerlb, cykerub, 1);
-
-#ifdef MPI2
-  np_mpi_local_regression_leave_internal();
-#endif
-
-  out[0] = fval[0];
-  out[1] = fval[0];
-  out[2] = eval_history[0];
-  out[3] = (R_FINITE(fast[0]) && fast[0] > 0.0) ? 1.0 : 0.0;
-  out[4] = invalid_history[0];
-
-  NP_NOMAD_CALLBACK_FREE(bw);
-  return 0;
+                                            cxkerlb, cxkerub, cykerlb, cykerub, 1,
+                                            declared_support);
 }
 
 typedef struct {
+  np_conditional_nomad_stop_context stop;
+  NPConditionalDistributionPreparedCtx prepared;
   int n;
   int nbw;
   int ndegree;
@@ -9115,6 +12676,9 @@ typedef struct {
   double *best_point;
   int *best_degree;
   int *first_degree;
+  double *raw_point;
+  double *eval_bw;
+  int *degree_work;
   int progress_last_signal_eval;
   clock_t progress_last_signal_clock;
   time_t progress_last_signal_wall;
@@ -9126,7 +12690,6 @@ static int np_cdist_native_decode_eval_bw(const np_cdist_native_search_context *
 {
   int j, yncon, xncon, yncat, xncat, ncont, ncat, scaling, bandwidth;
   double nconfac, ncatfac;
-  const double bandwidth_scale_categorical = 1.0e4;
 
   if (context == NULL || raw_point == NULL || eval_bw == NULL ||
       context->myopti == NULL || context->myoptd == NULL)
@@ -9182,14 +12745,9 @@ static int np_cdist_native_decode_eval_bw(const np_cdist_native_search_context *
   for (j = 0; j < ncat; j++) {
     const int raw_idx = ncont + j;
     const int eval_idx = ncont + j;
-    const double ext_bw = raw_point[raw_idx] / bandwidth_scale_categorical;
-    if (scaling) {
-      if (ncatfac == 0.0)
-        return 1;
-      eval_bw[eval_idx] = ext_bw / ncatfac;
-    } else {
-      eval_bw[eval_idx] = ext_bw;
-    }
+    if(np_nomad_decode_categorical_bandwidth(
+         raw_point[raw_idx], scaling, ncatfac, &eval_bw[eval_idx]) != 0)
+      return 1;
   }
 
   return 0;
@@ -9202,26 +12760,22 @@ static int np_cdist_native_search_callback(int n,
                                            void *user_data)
 {
   np_cdist_native_search_context *context = (np_cdist_native_search_context *) user_data;
-  double *raw_point = NULL;
-  double *eval_bw = NULL;
-  int *degree_work = NULL;
+  double *raw_point;
+  double *eval_bw;
+  int *degree_work;
   double eval_out[5];
   int j, status;
 
-  if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 || n != context->n)
+  if (context == NULL || x == NULL || bb_outputs == NULL || m != 1 ||
+      n != context->n || context->raw_point == NULL ||
+      context->eval_bw == NULL ||
+      (context->ndegree > 0 && context->degree_work == NULL))
     return 1;
 
-  raw_point = NP_NOMAD_CALLBACK_CALLOC(context->n, double);
-  eval_bw = NP_NOMAD_CALLBACK_CALLOC(context->nbw, double);
-  if (context->ndegree > 0)
-    degree_work = NP_NOMAD_CALLBACK_CALLOC(context->ndegree, int);
-  if (raw_point == NULL || eval_bw == NULL ||
-      (context->ndegree > 0 && degree_work == NULL)) {
-    if (raw_point != NULL) NP_NOMAD_CALLBACK_FREE(raw_point);
-    if (eval_bw != NULL) NP_NOMAD_CALLBACK_FREE(eval_bw);
-    if (degree_work != NULL) NP_NOMAD_CALLBACK_FREE(degree_work);
-    return 1;
-  }
+  raw_point = context->raw_point;
+  eval_bw = context->eval_bw;
+  degree_work = context->ndegree > 0 ?
+    context->degree_work : context->degree;
 
   for (j = 0; j < context->n; j++) {
     raw_point[j] = (context->bbin[j] == 1) ? nearbyint(x[j]) : x[j];
@@ -9234,9 +12788,6 @@ static int np_cdist_native_search_callback(int n,
   status = np_cdist_native_decode_eval_bw(context, raw_point, eval_bw);
   if (status != 0) {
     context->callback_failures++;
-    NP_NOMAD_CALLBACK_FREE(raw_point);
-    NP_NOMAD_CALLBACK_FREE(eval_bw);
-    if (degree_work != NULL) NP_NOMAD_CALLBACK_FREE(degree_work);
     return 1;
   }
 
@@ -9247,7 +12798,19 @@ static int np_cdist_native_search_callback(int n,
     degree_work = context->degree;
   }
 
-  if (context->regtype == LL_LP &&
+  {
+    const int active_regtype =
+      (context->ndegree > 0) ?
+      np_canonical_lp_engine_for_degree(degree_work, context->ndegree) :
+      context->regtype;
+
+  if (active_regtype < 0) {
+    eval_out[0] = DBL_MAX;
+    eval_out[1] = DBL_MAX;
+    eval_out[2] = 1.0;
+    eval_out[3] = 0.0;
+    eval_out[4] = 1.0;
+  } else if (active_regtype == NP_LP_ENGINE_GENERAL &&
       !np_glp_cv_degree_admissible_extern(context->myopti[CDBW_NOBSI],
                                           context->ndegree,
                                           degree_work,
@@ -9258,23 +12821,15 @@ static int np_cdist_native_search_callback(int n,
     eval_out[3] = 0.0;
     eval_out[4] = 1.0;
   } else {
-    status = np_distribution_conditional_nomad_native_eval_once(
-      context->c_uno, context->c_ord, context->c_con,
-      context->u_uno, context->u_ord, context->u_con,
-      context->cg_uno, context->cg_ord, context->cg_con,
-      context->mysd, context->myopti, context->myoptd, eval_bw,
-      context->penalty_mode, context->penalty_mult, degree_work,
-      context->bernstein, context->basis, context->regtype,
-      context->cxkerlb, context->cxkerub, context->cykerlb, context->cykerub,
-      eval_out);
-
+    status = np_conditional_distribution_prepared_context_eval(
+      &context->prepared, eval_bw, degree_work, 1, eval_out);
     if (status != 0) {
       context->callback_failures++;
-      NP_NOMAD_CALLBACK_FREE(raw_point);
-      NP_NOMAD_CALLBACK_FREE(eval_bw);
-      if (context->ndegree > 0 && degree_work != NULL) NP_NOMAD_CALLBACK_FREE(degree_work);
+      if (status == NP_CONDITIONAL_NATIVE_STOP)
+        np_conditional_nomad_stop(&context->stop);
       return 1;
     }
+  }
   }
 
   context->callback_calls++;
@@ -9303,10 +12858,6 @@ static int np_cdist_native_search_callback(int n,
     }
   }
   bb_outputs[0] = eval_out[0];
-  NP_NOMAD_CALLBACK_FREE(raw_point);
-  NP_NOMAD_CALLBACK_FREE(eval_bw);
-  if (context->ndegree > 0 && degree_work != NULL)
-    NP_NOMAD_CALLBACK_FREE(degree_work);
   return 0;
 }
 
@@ -9340,7 +12891,8 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
                                                        SEXP cxkerlb,
                                                        SEXP cxkerub,
                                                        SEXP cykerlb,
-                                                       SEXP cykerub)
+                                                       SEXP cykerub,
+                                                       SEXP declared_support)
 {
   SEXP c_uno_r = R_NilValue, c_ord_r = R_NilValue, c_con_r = R_NilValue;
   SEXP u_uno_r = R_NilValue, u_ord_r = R_NilValue, u_con_r = R_NilValue;
@@ -9351,14 +12903,16 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   SEXP cxkerlb_r = R_NilValue, cxkerub_r = R_NilValue, cykerlb_r = R_NilValue, cykerub_r = R_NilValue;
   SEXP out = R_NilValue, names = R_NilValue, sol = R_NilValue, best = R_NilValue;
   SEXP best_degree = R_NilValue, first_degree = R_NilValue;
-  crs_nomad_solve_fn solve;
   crs_nomad_problem problem;
   crs_nomad_result result;
+  np_nomad_progress_spec progress_spec;
   crs_nomad_option *native_options = NULL;
   int bb_output_type[1] = {CRS_NOMAD_OUTPUT_OBJ};
   double crs_outputs[1];
   np_cdist_native_search_context context;
   double *solution = NULL, *best_point = NULL;
+  double *raw_start = NULL, *eval_start = NULL;
+  int *degree_start = NULL;
   int *best_degree_i = NULL, *first_degree_i = NULL;
   int n, nbw, ndegree, i, status, budget, seed, inner_count, n_options, objective_cache_enabled;
 
@@ -9385,14 +12939,20 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   PROTECT(cxkerub_r = coerceVector(cxkerub, REALSXP));
   PROTECT(cykerlb_r = coerceVector(cykerlb, REALSXP));
   PROTECT(cykerub_r = coerceVector(cykerub, REALSXP));
+  /* Root errors before acquiring any native invocation resources. */
+  SEXP callback_error = PROTECT(np_nomad_callback_error_state());
 
+  if (XLENGTH(myopti_i) <= CDBW_CATCOMPI) {
+    UNPROTECT(24);
+    error("native npcdist NOMAD search received incomplete myopti");
+  }
   n = (int) XLENGTH(x0_r);
   if (n <= 0 || XLENGTH(bbin_i) != n || XLENGTH(lower_r) != n || XLENGTH(upper_r) != n) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received inconsistent problem dimensions");
   }
   if (XLENGTH(myoptd_r) <= CDBW_SFLOORD) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received incomplete myoptd");
   }
   nbw = INTEGER(myopti_i)[CDBW_UNCONI] + INTEGER(myopti_i)[CDBW_CNCONI] +
@@ -9400,85 +12960,46 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
     INTEGER(myopti_i)[CDBW_UNUNOI] + INTEGER(myopti_i)[CDBW_UNORDI];
   ndegree = n - nbw;
   if (nbw <= 0 || ndegree < 0) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received inconsistent bandwidth/degree dimensions");
   }
   if (ndegree > 0 && XLENGTH(degree_i) != ndegree) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received inconsistent degree dimensions");
   }
   budget = asInteger(max_eval);
   seed = asInteger(random_seed);
   inner_count = asInteger(inner_start_count);
   if (budget < 0 || seed < 0 || inner_count < 0) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received invalid budget or seed");
   }
   if (XLENGTH(option_names_s) != XLENGTH(option_values_s)) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received inconsistent option name/value lengths");
   }
   if (XLENGTH(option_names_s) > INT_MAX) {
-    UNPROTECT(23);
+    UNPROTECT(24);
     error("native npcdist NOMAD search received too many options");
   }
   n_options = (int) XLENGTH(option_names_s);
   objective_cache_enabled = bwm_objective_cache_read_user_enabled();
 
-  np_load_crs_namespace();
-
-  solve = (crs_nomad_solve_fn) R_GetCCallable("crs", "crs_nomad_solve");
-  if (solve == NULL) {
-    UNPROTECT(23);
-    error("failed to resolve crs final native NOMAD callable");
-  }
-
-  solution = R_Calloc(n, double);
-  best_point = R_Calloc(n, double);
-  if (ndegree > 0) {
-    best_degree_i = R_Calloc(ndegree, int);
-    first_degree_i = R_Calloc(ndegree, int);
-  }
-  if (solution == NULL || best_point == NULL ||
-      (ndegree > 0 && (best_degree_i == NULL || first_degree_i == NULL))) {
-    if (solution != NULL) R_Free(solution);
-    if (best_point != NULL) R_Free(best_point);
-    if (best_degree_i != NULL) R_Free(best_degree_i);
-    if (first_degree_i != NULL) R_Free(first_degree_i);
-    UNPROTECT(23);
-    error("failed to allocate native npcdist NOMAD buffers");
-  }
-  if (n_options > 0) {
-    native_options = R_Calloc(n_options, crs_nomad_option);
-    if (native_options == NULL) {
-      R_Free(solution);
-      R_Free(best_point);
-      if (best_degree_i != NULL) R_Free(best_degree_i);
-      if (first_degree_i != NULL) R_Free(first_degree_i);
-      UNPROTECT(23);
-      error("failed to allocate native npcdist NOMAD option buffers");
-    }
-    for (i = 0; i < n_options; i++) {
-      native_options[i].name = CHAR(STRING_ELT(option_names_s, i));
-      native_options[i].value = CHAR(STRING_ELT(option_values_s, i));
-    }
-  }
-  for (i = 0; i < n; i++) {
-    solution[i] = R_NaN;
-    best_point[i] = R_NaN;
-  }
-  for (i = 0; i < ndegree; i++) {
-    best_degree_i[i] = NA_INTEGER;
-    first_degree_i[i] = NA_INTEGER;
-  }
+  int support_dimensions[4] = {INTEGER(myopti_i)[CDBW_CNUNOI],
+    INTEGER(myopti_i)[CDBW_CNORDI], INTEGER(myopti_i)[CDBW_UNUNOI],
+    INTEGER(myopti_i)[CDBW_UNORDI]};
+  SEXP support_data[4] = {c_uno_r, c_ord_r, u_uno_r, u_ord_r};
+  NPCategoricalSupport support = np_categorical_support_parse(
+    declared_support, INTEGER(myopti_i)[CDBW_NOBSI],
+    support_dimensions, support_data);
 
   memset(&problem, 0, sizeof(problem));
   memset(&result, 0, sizeof(result));
   memset(&context, 0, sizeof(context));
-  for (i = 0; i < 5; i++)
+  for (i = 0; i < 5; i++) {
     context.best_eval[i] = R_NaN;
-  for (i = 0; i < 5; i++)
     context.first_eval[i] = R_NaN;
+  }
 
   context.n = n;
   context.nbw = nbw;
@@ -9503,11 +13024,121 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   context.degree = INTEGER(degree_i);
   context.bernstein = asInteger(glp_bernstein);
   context.basis = asInteger(glp_basis);
-  context.regtype = asInteger(regtype);
+  context.regtype = np_regression_engine_or_error(
+    asInteger(regtype), "C_np_conditional_nomad_native");
   context.cxkerlb = REAL(cxkerlb_r);
   context.cxkerub = REAL(cxkerub_r);
   context.cykerlb = REAL(cykerlb_r);
   context.cykerub = REAL(cykerub_r);
+
+  raw_start = (double *)R_alloc((size_t)n, sizeof(double));
+  eval_start = (double *)R_alloc((size_t)nbw, sizeof(double));
+  for (i = 0; i < n; i++) {
+    raw_start[i] = context.bbin[i] == 1 ? nearbyint(REAL(x0_r)[i]) :
+      REAL(x0_r)[i];
+    if (R_FINITE(context.lower[i]) && raw_start[i] < context.lower[i])
+      raw_start[i] = context.lower[i];
+    if (R_FINITE(context.upper[i]) && raw_start[i] > context.upper[i])
+      raw_start[i] = context.upper[i];
+  }
+  if (np_cdist_native_decode_eval_bw(&context, raw_start, eval_start) != 0) {
+    UNPROTECT(24);
+    error("native npcdist NOMAD search failed to decode initial state");
+  }
+  if (ndegree > 0) {
+    degree_start = (int *)R_alloc((size_t)ndegree, sizeof(int));
+    for (i = 0; i < ndegree; i++)
+      degree_start[i] = (int)nearbyint(raw_start[nbw + i]);
+  } else {
+    degree_start = context.degree;
+  }
+
+  {
+    double fval_prepare[2] = {R_NaN, R_NaN};
+    double history_prepare[1] = {R_NaN};
+    double eval_prepare[1] = {R_NaN};
+    double invalid_prepare[1] = {R_NaN};
+    double timing_prepare[1] = {R_NaN};
+    double fast_prepare[1] = {R_NaN};
+    int penalty_mode_prepare = context.penalty_mode;
+    double penalty_mult_prepare = context.penalty_mult;
+    int bernstein_prepare = context.bernstein;
+    int basis_prepare = context.basis;
+    int regtype_prepare = context.regtype;
+
+    np_distribution_conditional_bw_mode(
+      context.c_uno, context.c_ord, context.c_con,
+      context.u_uno, context.u_ord, context.u_con,
+      context.cg_uno, context.cg_ord, context.cg_con, context.mysd,
+      context.myopti, context.myoptd, eval_start, fval_prepare,
+      history_prepare, eval_prepare, invalid_prepare, timing_prepare,
+      fast_prepare, &penalty_mode_prepare, &penalty_mult_prepare,
+      degree_start, &bernstein_prepare, &basis_prepare, &regtype_prepare,
+      context.cxkerlb, context.cxkerub, context.cykerlb, context.cykerub,
+      1, &context.prepared, 1, ndegree > 0, &support);
+  }
+
+  context.raw_point = R_Calloc(n, double);
+  context.eval_bw = R_Calloc(nbw, double);
+  if (ndegree > 0)
+    context.degree_work = R_Calloc(ndegree, int);
+  if (context.raw_point == NULL || context.eval_bw == NULL ||
+      (ndegree > 0 && context.degree_work == NULL)) {
+    if (context.raw_point != NULL) R_Free(context.raw_point);
+    if (context.eval_bw != NULL) R_Free(context.eval_bw);
+    if (context.degree_work != NULL) R_Free(context.degree_work);
+    np_conditional_distribution_prepared_context_destroy(&context.prepared);
+    UNPROTECT(24);
+    error("failed to allocate native npcdist callback scratch");
+  }
+
+  solution = R_Calloc(n, double);
+  best_point = R_Calloc(n, double);
+  if (ndegree > 0) {
+    best_degree_i = R_Calloc(ndegree, int);
+    first_degree_i = R_Calloc(ndegree, int);
+  }
+  if (solution == NULL || best_point == NULL ||
+      (ndegree > 0 && (best_degree_i == NULL || first_degree_i == NULL))) {
+    if (solution != NULL) R_Free(solution);
+    if (best_point != NULL) R_Free(best_point);
+    if (best_degree_i != NULL) R_Free(best_degree_i);
+    if (first_degree_i != NULL) R_Free(first_degree_i);
+    R_Free(context.raw_point);
+    R_Free(context.eval_bw);
+    if (context.degree_work != NULL) R_Free(context.degree_work);
+    np_conditional_distribution_prepared_context_destroy(&context.prepared);
+    UNPROTECT(24);
+    error("failed to allocate native npcdist NOMAD buffers");
+  }
+  if (n_options > 0) {
+    native_options = R_Calloc(n_options, crs_nomad_option);
+    if (native_options == NULL) {
+      R_Free(solution);
+      R_Free(best_point);
+      if (best_degree_i != NULL) R_Free(best_degree_i);
+      if (first_degree_i != NULL) R_Free(first_degree_i);
+      R_Free(context.raw_point);
+      R_Free(context.eval_bw);
+      if (context.degree_work != NULL) R_Free(context.degree_work);
+      np_conditional_distribution_prepared_context_destroy(&context.prepared);
+      UNPROTECT(24);
+      error("failed to allocate native npcdist NOMAD option buffers");
+    }
+    for (i = 0; i < n_options; i++) {
+      native_options[i].name = CHAR(STRING_ELT(option_names_s, i));
+      native_options[i].value = CHAR(STRING_ELT(option_values_s, i));
+    }
+  }
+  for (i = 0; i < n; i++) {
+    solution[i] = R_NaN;
+    best_point[i] = R_NaN;
+  }
+  for (i = 0; i < ndegree; i++) {
+    best_degree_i[i] = NA_INTEGER;
+    first_degree_i[i] = NA_INTEGER;
+  }
+
   context.best_point = best_point;
   context.best_degree = best_degree_i;
   context.first_degree = first_degree_i;
@@ -9537,13 +13168,43 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   result.outputs = crs_outputs;
   result.outputs_len = 1;
 
+  memset(&progress_spec, 0, sizeof(progress_spec));
+  progress_spec.degree_offset = context.nbw;
+  progress_spec.ndegree = context.ndegree;
+  progress_spec.best_degree = context.best_degree;
+  progress_spec.best_objective = &context.best_objective;
+  progress_spec.accepted_evaluations = &context.callback_calls;
+
   nomad_degree_progress_active = (context.ndegree > 0);
   bwm_objective_cache_callback_option_begin(objective_cache_enabled);
-  nomad_c_callback_active = 1;
-  status = solve(&problem, np_cdist_native_search_callback, &context, &result);
-  nomad_c_callback_active = 0;
+  status = np_conditional_nomad_solve(&problem,
+                                        np_cdist_native_search_callback,
+                                        &context,
+                                        &progress_spec,
+                                        &result, &context.stop, callback_error);
   bwm_objective_cache_callback_option_end();
   nomad_degree_progress_active = 0;
+  R_Free(context.raw_point);
+  R_Free(context.eval_bw);
+  if (context.degree_work != NULL)
+    R_Free(context.degree_work);
+  context.raw_point = NULL;
+  context.eval_bw = NULL;
+  context.degree_work = NULL;
+  np_conditional_distribution_prepared_context_destroy(&context.prepared);
+  if (np_nomad_error_pending(callback_error) || context.stop.terminal) {
+    R_Free(solution);
+    R_Free(best_point);
+    if (best_degree_i != NULL) R_Free(best_degree_i);
+    if (first_degree_i != NULL) R_Free(first_degree_i);
+    if (native_options != NULL) R_Free(native_options);
+    if (np_nomad_error_pending(callback_error))
+      np_nomad_error_raise(callback_error);
+    UNPROTECT(1);
+    UNPROTECT(23);
+    np_conditional_nomad_raise(&context.stop);
+  }
+  UNPROTECT(1);
   if (context.ndegree > 0 && context.callback_calls > 0)
     np_progress_nomad_degree_step(context.callback_calls,
                                   context.best_degree,
@@ -9638,42 +13299,355 @@ SEXP C_np_distribution_conditional_nomad_native_search(SEXP c_uno,
   return out;
 }
 
-SEXP C_np_kernelsum(SEXP tuno,
-                    SEXP tord,
-                    SEXP tcon,
-                    SEXP ty,
-                    SEXP weights,
-                    SEXP euno,
-                    SEXP eord,
-                    SEXP econ,
-                    SEXP bw,
-                    SEXP mcv,
-                    SEXP padnum,
-                    SEXP op,
-                    SEXP myopti,
-                    SEXP kpow,
-                    SEXP ksum_len,
-                    SEXP pksum_len,
-                    SEXP kw_len,
-                    SEXP ckerlb,
-                    SEXP ckerub)
+static np_continuous_kernel_descriptor
+np_continuous_kernel_descriptor_or_error(int family,
+                                         int code,
+                                         int order,
+                                         const char *where)
+{
+  np_continuous_kernel_descriptor descriptor;
+  np_continuous_kernel_descriptor_status status;
+
+  status = np_continuous_kernel_descriptor_init(
+    family, code, order,
+    &descriptor);
+  if(status != NP_CKERNEL_DESCRIPTOR_OK)
+    error("%s: %s", where,
+          np_continuous_kernel_descriptor_status_message(status));
+
+  return descriptor;
+}
+
+static np_continuous_kernel_descriptor
+np_bandwidth_kernel_descriptor_or_error(int family,
+                                        int code,
+                                        int order,
+                                        int ncon,
+                                        int nuno,
+                                        int nord,
+                                        NPBetaBandwidthCategoricalPolicy
+                                          categorical_policy,
+                                        const double *lower,
+                                        const double *upper,
+                                        const char *where)
+{
+  np_continuous_kernel_descriptor descriptor =
+    np_continuous_kernel_descriptor_or_error(family, code, order, where);
+
+  if(descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    int dimension;
+
+    if(categorical_policy != NP_BETA_BW_CONTINUOUS_ONLY &&
+       categorical_policy != NP_BETA_BW_ALLOW_CATEGORICAL)
+      error("%s: beta bandwidth selection has invalid categorical policy",
+            where);
+    if(ncon <= 0 ||
+       (categorical_policy == NP_BETA_BW_CONTINUOUS_ONLY &&
+        (nuno != 0 || nord != 0)))
+      error("%s: beta bandwidth selection requires continuous variables only",
+            where);
+    if(lower == NULL || upper == NULL)
+      error("%s: beta bandwidth selection requires finite fixed bounds", where);
+    for(dimension = 0; dimension < ncon; ++dimension) {
+      if(!R_FINITE(lower[dimension]) || !R_FINITE(upper[dimension]) ||
+         !(upper[dimension] > lower[dimension]))
+        error("%s: beta bandwidth selection requires valid finite bounds", where);
+    }
+  }
+
+  return descriptor;
+}
+
+static np_continuous_kernel_descriptor
+np_kernelsum_descriptor_or_error(SEXP options, const char *where)
+{
+  if(XLENGTH(options) <= KWS_CKORDERI)
+    error("%s: continuous-kernel descriptor is missing", where);
+
+  return np_continuous_kernel_descriptor_or_error(
+    INTEGER(options)[KWS_CKFAMILYI],
+    INTEGER(options)[KWS_CKRNEVI],
+    INTEGER(options)[KWS_CKORDERI],
+    where);
+}
+
+static int np_real_buffer_has_matrix(SEXP value, int nrow, int ncol)
+{
+  size_t required;
+
+  return nrow >= 0 && ncol >= 0 &&
+    np_size_mul_checked((size_t)nrow, (size_t)ncol, &required) &&
+    required <= (size_t)R_XLEN_T_MAX &&
+    XLENGTH(value) >= (R_xlen_t)required;
+}
+
+typedef struct {
+  double **train_unordered;
+  double **train_ordered;
+  double **evaluation_unordered;
+  double **evaluation_ordered;
+  double **category_values;
+  int *kernel_unordered;
+  int *kernel_ordered;
+  int *num_categories;
+} NPBetaCategoricalIngress;
+
+static void np_beta_categorical_ingress_prepare_or_error(
+  NPBetaCategoricalIngress *ingress,
+  SEXP train_unordered,
+  SEXP train_ordered,
+  SEXP evaluation_unordered,
+  SEXP evaluation_ordered,
+  SEXP category_values,
+  SEXP category_padding,
+  SEXP options,
+  int num_train,
+  int num_eval,
+  int num_unordered,
+  int num_ordered,
+  int train_is_eval,
+  const char *where)
+{
+  int num_categorical;
+  int coordinate;
+
+  if(ingress == NULL || where == NULL || num_train <= 0 || num_eval <= 0 ||
+     num_unordered < 0 || num_ordered < 0 ||
+     num_unordered > INT_MAX - num_ordered ||
+     (train_is_eval != 0 && train_is_eval != 1))
+    error("%s: invalid categorical ingress layout", where);
+  num_categorical = num_unordered + num_ordered;
+  memset(ingress, 0, sizeof(*ingress));
+  if(num_categorical == 0)
+    return;
+  if(XLENGTH(options) <= KWS_MLEVI ||
+     !np_real_buffer_has_matrix(train_unordered, num_train, num_unordered) ||
+     !np_real_buffer_has_matrix(train_ordered, num_train, num_ordered) ||
+     (!train_is_eval &&
+      (!np_real_buffer_has_matrix(
+         evaluation_unordered, num_eval, num_unordered) ||
+       !np_real_buffer_has_matrix(
+         evaluation_ordered, num_eval, num_ordered))))
+    error("%s: categorical data buffer is too short", where);
+
+  {
+    const int max_levels = INTEGER(options)[KWS_MLEVI];
+    const double pad_value =
+      XLENGTH(category_padding) > 0 ? REAL(category_padding)[0] : NA_REAL;
+
+    if(max_levels <= 0 || XLENGTH(category_padding) < 1 ||
+       !R_FINITE(pad_value) ||
+       !np_real_buffer_has_matrix(
+         category_values, max_levels, num_categorical))
+      error("%s: invalid categorical support metadata", where);
+    ingress->category_values = (double **)R_alloc(
+      (size_t)num_categorical, sizeof(double *));
+    ingress->num_categories = (int *)R_alloc(
+      (size_t)num_categorical, sizeof(int));
+    for(coordinate = 0; coordinate < num_categorical; ++coordinate) {
+      int level_count = 0;
+
+      ingress->category_values[coordinate] = REAL(category_values) +
+        (size_t)coordinate * (size_t)max_levels;
+      while(level_count < max_levels &&
+            ingress->category_values[coordinate][level_count] != pad_value)
+        ++level_count;
+      if(level_count <= 0)
+        error("%s: categorical support is empty", where);
+      ingress->num_categories[coordinate] = level_count;
+    }
+  }
+
+  if(num_unordered > 0) {
+    ingress->train_unordered = (double **)R_alloc(
+      (size_t)num_unordered, sizeof(double *));
+    ingress->evaluation_unordered = (double **)R_alloc(
+      (size_t)num_unordered, sizeof(double *));
+    ingress->kernel_unordered = (int *)R_alloc(
+      (size_t)num_unordered, sizeof(int));
+    for(coordinate = 0; coordinate < num_unordered; ++coordinate) {
+      ingress->train_unordered[coordinate] = REAL(train_unordered) +
+        (size_t)coordinate * (size_t)num_train;
+      ingress->evaluation_unordered[coordinate] = train_is_eval ?
+        ingress->train_unordered[coordinate] : REAL(evaluation_unordered) +
+          (size_t)coordinate * (size_t)num_eval;
+      ingress->kernel_unordered[coordinate] =
+        INTEGER(options)[KWS_UKRNEVI];
+    }
+  }
+  if(num_ordered > 0) {
+    ingress->train_ordered = (double **)R_alloc(
+      (size_t)num_ordered, sizeof(double *));
+    ingress->evaluation_ordered = (double **)R_alloc(
+      (size_t)num_ordered, sizeof(double *));
+    ingress->kernel_ordered = (int *)R_alloc(
+      (size_t)num_ordered, sizeof(int));
+    for(coordinate = 0; coordinate < num_ordered; ++coordinate) {
+      ingress->train_ordered[coordinate] = REAL(train_ordered) +
+        (size_t)coordinate * (size_t)num_train;
+      ingress->evaluation_ordered[coordinate] = train_is_eval ?
+        ingress->train_ordered[coordinate] : REAL(evaluation_ordered) +
+          (size_t)coordinate * (size_t)num_eval;
+      ingress->kernel_ordered[coordinate] =
+        INTEGER(options)[KWS_OKRNEVI];
+    }
+  }
+}
+
+static int np_kernelsum_fold_prepare(
+  NPNNKernelFold *fold, int mode, int nt, int ne, int nc,
+  int nu, int no, double **train, double **evaluation, const int *map,
+  double *scale_factor, double *lambda, int select_rows, int suppress_parallel)
+{
+  const int columns = mode == BW_ADAP_NN ? nt : ne;
+  NPNNGeometryContext geometry = {.mode = NP_NN_QUERY_TRAINING_MAP,
+                                 .eval_to_train = map};
+  NPNNGeometryStatus status = NP_NN_GEOMETRY_OK;
+  double *fold_scale_factor = scale_factor;
+  fold->num_train = nt; fold->num_eval = ne; fold->num_continuous = nc;
+  fold->train = train; fold->eval_to_train = map;
+  fold->primary = (double **)R_alloc((size_t)nc, sizeof(double *));
+  for(int d = 0; d < nc; ++d)
+    fold->primary[d] = (double *)R_alloc((size_t)columns, sizeof(double));
+  if(mode == BW_GEN_NN) {
+    /* Resolve extended counts against the deleted sample, exactly as an
+       external evaluation on a literal n-1-observation fit does. */
+    fold_scale_factor = (double *)R_alloc((size_t)(nc + nu + no), sizeof(double));
+    fold->scale = (double *)R_alloc((size_t)nc, sizeof(double));
+    for(int d = 0; d < nc + nu + no; ++d) fold_scale_factor[d] = scale_factor[d];
+    for(int d = 0; d < nc; ++d) {
+      int lookup;
+      if(np_nn_lookup_from_scale(nt - 1, 1, scale_factor[d],
+           &lookup, &fold->scale[d], NULL) != 0)
+        return KWSNP_ERR_BADINVOC;
+      fold_scale_factor[d] = (double)lookup;
+    }
+  }
+  if(mode == BW_ADAP_NN) {
+    fold->successor = (double **)R_alloc((size_t)nc, sizeof(double *));
+    if(select_rows)
+      fold->selected = (double **)R_alloc((size_t)nc, sizeof(double *));
+    fold->scale = (double *)R_alloc((size_t)nc, sizeof(double));
+    for(int d = 0; d < nc; ++d) {
+      fold->successor[d] = (double *)R_alloc((size_t)nt, sizeof(double));
+      if(select_rows)
+        fold->selected[d] = (double *)R_alloc((size_t)nt, sizeof(double));
+    }
+    geometry.mode = NP_NN_QUERY_ADAPTIVE_FOLD_PREPARE;
+    geometry.eval_to_train = NULL;
+    geometry.adaptive_successor = fold->successor;
+    geometry.adaptive_fold_scale = fold->scale;
+  }
+  /* This ingress owns raw NN counts and physical categorical weights, not
+     scaled bandwidths. Do not consult another call's scaling globals. */
+  if(np_kernel_bandwidth_continuous_nn_ctx(mode, nt,
+       mode == BW_ADAP_NN ? nt : ne, nc, suppress_parallel, fold_scale_factor,
+       train, mode == BW_ADAP_NN ? train : evaluation, fold->primary,
+       &geometry, &status) != 0)
+    return KWSNP_ERR_BADINVOC;
+  for(int d = 0; d < nu + no; ++d)
+    lambda[d] = fold_scale_factor[nc + d];
+  if(mode == BW_GEN_NN)
+    for(int d = 0; d < nc; ++d)
+      for(int i = 0; i < ne; ++i) fold->primary[d][i] *= fold->scale[d];
+  if(select_rows && mode == BW_ADAP_NN && np_nn_adaptive_fold_select_row(
+       nt, nc, train, fold->primary, fold->successor, fold->scale, map[0],
+       fold->selected) != NP_NN_GEOMETRY_OK)
+    return KWSNP_ERR_BADINVOC;
+  return 0;
+}
+
+#include "conditional_literal/entry_C_np_kernelsum.inc"
+#line 14934 "np.c"
+
+SEXP C_np_regression_k1_geometry_validate(SEXP train,
+                                          SEXP evaluation,
+                                          SEXP train_is_eval)
+{
+  SEXP train_r = R_NilValue, evaluation_r = R_NilValue;
+  NPNNGeometryContext geometry_context = {
+    .mode = NP_NN_QUERY_EXTERNAL,
+    .eval_to_train = NULL,
+    .adaptive_successor = NULL
+  };
+  NPNNGeometryStatus status;
+  double *distance;
+  R_xlen_t ntrain_xlen, neval_xlen;
+  int ntrain, neval;
+  int identity = asLogical(train_is_eval);
+
+  if(identity == NA_LOGICAL)
+    error("regression k=1 geometry validation requires a logical query mode");
+
+  PROTECT(train_r = coerceVector(train, REALSXP));
+  PROTECT(evaluation_r = coerceVector(evaluation, REALSXP));
+  ntrain_xlen = XLENGTH(train_r);
+  neval_xlen = XLENGTH(evaluation_r);
+  if(ntrain_xlen <= 0 || neval_xlen <= 0 ||
+     ntrain_xlen > INT_MAX || neval_xlen > INT_MAX ||
+     (identity && ntrain_xlen != neval_xlen)) {
+    UNPROTECT(2);
+    error("invalid regression k=1 geometry dimensions");
+  }
+  ntrain = (int)ntrain_xlen;
+  neval = (int)neval_xlen;
+  distance = (double *)R_alloc((size_t)neval, sizeof(double));
+  geometry_context.mode = identity ?
+    NP_NN_QUERY_TRAINING_IDENTITY : NP_NN_QUERY_EXTERNAL;
+  status = compute_nn_distance_train_eval_ctx(
+    ntrain, neval, 1,
+    REAL(train_r), REAL(evaluation_r), 1,
+    &geometry_context, distance);
+  if(status == NP_NN_GEOMETRY_ZERO_RADIUS) {
+    const double k = 1.0;
+    const NPNNZeroRadiusInfo info = np_nn_zero_radius_info_flat(
+      BW_GEN_NN, ntrain, neval, 1, REAL(train_r), REAL(evaluation_r),
+      &k, &geometry_context, 0);
+    UNPROTECT(2);
+    np_nn_zero_radius_error(&info);
+  }
+  UNPROTECT(2);
+
+  if(status != NP_NN_GEOMETRY_OK)
+    error("generalized nearest-neighbor k=1 geometry failed with status %d",
+          (int)status);
+  return ScalarLogical(1);
+}
+
+SEXP C_np_kernelsum_power12(SEXP tuno,
+                            SEXP tord,
+                            SEXP tcon,
+                            SEXP ty,
+                            SEXP weights,
+                            SEXP euno,
+                            SEXP eord,
+                            SEXP econ,
+                            SEXP bw,
+                            SEXP mcv,
+                            SEXP padnum,
+                            SEXP op,
+                            SEXP myopti,
+                            SEXP kpow,
+                            SEXP ksum_len,
+                            SEXP pksum_len,
+                            SEXP kw_len,
+                            SEXP ckerlb,
+                            SEXP ckerub)
 {
   SEXP tuno_r=R_NilValue, tord_r=R_NilValue, tcon_r=R_NilValue, ty_r=R_NilValue, weights_r=R_NilValue;
   SEXP euno_r=R_NilValue, eord_r=R_NilValue, econ_r=R_NilValue, bw_r=R_NilValue, mcv_r=R_NilValue;
   SEXP padnum_r=R_NilValue, op_i=R_NilValue, myopti_i=R_NilValue, kpow_r=R_NilValue, ckerlb_r=R_NilValue, ckerub_r=R_NilValue;
-  SEXP out=R_NilValue, out_names=R_NilValue, out_ksum=R_NilValue, out_pksum=R_NilValue, out_kw=R_NilValue, out_pkw=R_NilValue;
+  SEXP out=R_NilValue, out_names=R_NilValue, out_ksum=R_NilValue, out_ksum_power2=R_NilValue;
   int n_ksum = asInteger(ksum_len);
   int n_pksum = asInteger(pksum_len);
   int n_kw = asInteger(kw_len);
-  int ncon = 0, nuno = 0, nord = 0, p_operator = 0, do_score = 0, do_ocg = 0, return_kernel_weights = 0, p_nvar = 0;
-  R_xlen_t n_pkw = 0;
-  int * myopti_p = NULL;
+  int ncon = 0, nuno = 0, nord = 0, ncat = 0, i = 0;
   double * ckerlb_p = NULL;
   double * ckerub_p = NULL;
+  np_continuous_kernel_descriptor descriptor;
 
-  if(n_ksum < 0) n_ksum = 0;
-  if(n_pksum < 0) n_pksum = 0;
-  if(n_kw < 0) n_kw = 0;
+  if(n_ksum < 0)
+    n_ksum = 0;
 
   PROTECT(tuno_r = coerceVector(tuno, REALSXP));
   PROTECT(tord_r = coerceVector(tord, REALSXP));
@@ -9692,55 +13666,224 @@ SEXP C_np_kernelsum(SEXP tuno,
   PROTECT(ckerlb_r = coerceVector(ckerlb, REALSXP));
   PROTECT(ckerub_r = coerceVector(ckerub, REALSXP));
 
+  if(XLENGTH(myopti_i) < KWS_OPTIONS_COUNT)
+    error("C_np_kernelsum_power12: invalid internal option vector");
+  descriptor = np_kernelsum_descriptor_or_error(myopti_i,
+                                                "C_np_kernelsum_power12");
+  if(XLENGTH(kpow_r) != 1 || REAL(kpow_r)[0] != 1.0)
+    error("C_np_kernelsum_power12: internal route requires kernel.pow = 1");
+
   ncon = (int)INTEGER(myopti_i)[KWS_NCONI];
   nuno = (int)INTEGER(myopti_i)[KWS_NUNOI];
   nord = (int)INTEGER(myopti_i)[KWS_NORDI];
-  p_operator = (int)INTEGER(myopti_i)[KWS_POPI];
-  do_score = (int)INTEGER(myopti_i)[KWS_PSCOREI];
-  do_ocg = (int)INTEGER(myopti_i)[KWS_POCGI];
-  return_kernel_weights = (int)INTEGER(myopti_i)[KWS_RKWI];
-  p_nvar = ((p_operator != OP_NOOP) ? ncon : 0) + ((do_score || do_ocg) ? (nuno + nord) : 0);
-  n_pkw = (return_kernel_weights && (p_nvar > 0)) ? ((R_xlen_t)n_kw * (R_xlen_t)p_nvar) : 0;
-  myopti_p = INTEGER(myopti_i);
-  if(XLENGTH(myopti_i) <= KWS_SPARI){
-    int i;
-    int * myopti_tmp = (int *)R_alloc((size_t)(KWS_SPARI + 1), sizeof(int));
-    for(i = 0; i <= KWS_SPARI; i++)
-      myopti_tmp[i] = 0;
-    for(i = 0; i < XLENGTH(myopti_i); i++)
-      myopti_tmp[i] = myopti_p[i];
-    myopti_p = myopti_tmp;
-  }
+  if(ncon < 0 || nuno < 0 || nord < 0 ||
+     nuno > INT_MAX - nord || ncon > INT_MAX - (nuno + nord))
+    error("C_np_kernelsum_power12: invalid kernel-sum dimensions");
+  ncat = nuno + nord;
+  if(n_pksum != 0 || n_kw != 0 ||
+     INTEGER(myopti_i)[KWS_YNCOLI] > 1 ||
+     INTEGER(myopti_i)[KWS_WNCOLI] != 0 ||
+     INTEGER(myopti_i)[KWS_RKWI] != 0 ||
+     INTEGER(myopti_i)[KWS_POPI] != OP_NOOP ||
+     INTEGER(myopti_i)[KWS_PSCOREI] != 0 ||
+     INTEGER(myopti_i)[KWS_POCGI] != 0)
+    error("C_np_kernelsum_power12: unsupported internal kernel-sum configuration");
+  if(XLENGTH(op_i) != (R_xlen_t)(ncon + nuno + nord))
+    error("C_np_kernelsum_power12: invalid operator vector length");
+  for(i = 0; i < ncon + nuno + nord; i++)
+    if(INTEGER(op_i)[i] != OP_NORMAL)
+      error("C_np_kernelsum_power12: only ordinary kernel operators are supported");
+
   resolve_bounds_or_default(ckerlb_r, ckerub_r, ncon, &ckerlb_p, &ckerub_p);
 
   PROTECT(out_ksum = allocVector(REALSXP, n_ksum));
-  PROTECT(out_pksum = allocVector(REALSXP, n_pksum));
-  PROTECT(out_kw = allocVector(REALSXP, n_kw));
-  PROTECT(out_pkw = allocVector(REALSXP, n_pkw));
+  PROTECT(out_ksum_power2 = allocVector(REALSXP, n_ksum));
 
-  np_kernelsum(REAL(tuno_r), REAL(tord_r), REAL(tcon_r),
-               REAL(ty_r), REAL(weights_r),
-               REAL(euno_r), REAL(eord_r), REAL(econ_r),
-               REAL(bw_r),
-               REAL(mcv_r), REAL(padnum_r),
-               INTEGER(op_i), myopti_p, REAL(kpow_r),
-               REAL(out_ksum), REAL(out_pksum), REAL(out_kw), REAL(out_pkw),
-               ckerlb_p, ckerub_p);
+  if(descriptor.family == NP_CKERNEL_FAMILY_BETA) {
+    const int num_train = INTEGER(myopti_i)[KWS_TNOBSI];
+    const int num_eval = INTEGER(myopti_i)[KWS_ENOBSI];
+    const int train_is_eval = INTEGER(myopti_i)[KWS_TISEI];
+    const int leave_one_out = INTEGER(myopti_i)[KWS_LOOI];
+    const int suppress_parallel = INTEGER(myopti_i)[KWS_SPARI];
+    const int ncol_Y = INTEGER(myopti_i)[KWS_YNCOLI];
+    const int bandwidth_code = INTEGER(myopti_i)[KWS_BWI];
+    const int categorical_compress = ncat > 0 &&
+      XLENGTH(myopti_i) > KWS_CCOMPRESSI ?
+      INTEGER(myopti_i)[KWS_CCOMPRESSI] : 0;
+    const R_xlen_t expected_sum =
+      (R_xlen_t)num_eval * (R_xlen_t)(ncol_Y > 0 ? ncol_Y : 1);
+    double **train_columns;
+    double **evaluation_columns;
+    double **response_columns = NULL;
+    double **bandwidth_eval_columns = NULL;
+    double **bandwidth_train_columns = NULL;
+    double *bandwidth_eval_storage = NULL;
+    double *bandwidth_train_storage = NULL;
+    size_t eval_bandwidth_count = 0U;
+    size_t train_bandwidth_count = 0U;
+    NPContinuousKernelRoute route;
+    NPContinuousKernelDerivativeDiagnostics diagnostics = {
+      -1, -1, 0, NP_BETA_OK
+    };
+    NPBetaCategoricalIngress categorical_ingress;
+    int status;
 
-  PROTECT(out = allocVector(VECSXP, 4));
+    if(ncon <= 0 ||
+       num_train <= 0 || num_eval <= 0 ||
+       (suppress_parallel != 0 && suppress_parallel != 1) ||
+       (train_is_eval != 0 && train_is_eval != 1) ||
+       (leave_one_out != 0 && leave_one_out != 1) ||
+       (train_is_eval && num_train != num_eval) ||
+       (leave_one_out && !train_is_eval) ||
+       ncol_Y < 0 ||
+       (bandwidth_code != BW_FIXED && bandwidth_code != BW_GEN_NN &&
+        bandwidth_code != BW_ADAP_NN) ||
+       n_ksum != expected_sum ||
+       XLENGTH(tcon_r) < (R_xlen_t)num_train * (R_xlen_t)ncon ||
+       (!train_is_eval &&
+        XLENGTH(econ_r) < (R_xlen_t)num_eval * (R_xlen_t)ncon) ||
+       !np_real_buffer_has_matrix(tuno_r, num_train, nuno) ||
+       !np_real_buffer_has_matrix(tord_r, num_train, nord) ||
+       (!train_is_eval &&
+        (!np_real_buffer_has_matrix(euno_r, num_eval, nuno) ||
+         !np_real_buffer_has_matrix(eord_r, num_eval, nord))) ||
+       XLENGTH(bw_r) < ncon + ncat || XLENGTH(ckerlb_r) < ncon ||
+       XLENGTH(ckerub_r) < ncon ||
+       (ncol_Y > 0 &&
+        XLENGTH(ty_r) < (R_xlen_t)num_train * (R_xlen_t)ncol_Y))
+      error("C_np_kernelsum_power12: invalid beta dual-power layout");
+    if(ncat > 0 && XLENGTH(myopti_i) <= KWS_CCOMPRESSI)
+      error("C_np_kernelsum_power12: categorical-compression state is missing");
+    if(categorical_compress != 0 && categorical_compress != 1)
+      error("C_np_kernelsum_power12: invalid categorical-compression option");
+    for(i = 0; i < ncon; ++i)
+      if(!R_FINITE(ckerlb_p[i]) || !R_FINITE(ckerub_p[i]) ||
+         !(ckerub_p[i] > ckerlb_p[i]))
+        error("C_np_kernelsum_power12: invalid beta support bounds");
+
+    train_columns = (double **)R_alloc((size_t)ncon, sizeof(double *));
+    evaluation_columns = (double **)R_alloc((size_t)ncon, sizeof(double *));
+    for(i = 0; i < ncon; ++i) {
+      train_columns[i] = REAL(tcon_r) + (size_t)i * (size_t)num_train;
+      evaluation_columns[i] = train_is_eval ? train_columns[i] :
+        REAL(econ_r) + (size_t)i * (size_t)num_eval;
+    }
+    if(ncol_Y > 0) {
+      response_columns = (double **)R_alloc(
+        (size_t)ncol_Y, sizeof(double *));
+      for(i = 0; i < ncol_Y; ++i)
+        response_columns[i] = REAL(ty_r) +
+          (size_t)i * (size_t)num_train;
+    }
+    np_beta_categorical_ingress_prepare_or_error(
+      &categorical_ingress, tuno_r, tord_r, euno_r, eord_r,
+      mcv_r, padnum_r, myopti_i, num_train, num_eval,
+      nuno, nord, train_is_eval, "C_np_kernelsum_power12");
+
+    if(bandwidth_code != BW_FIXED) {
+      const np_beta_bandwidth_mode bandwidth_mode =
+        bandwidth_code == BW_GEN_NN ? NP_BETA_BANDWIDTH_GENERALIZED_NN :
+        NP_BETA_BANDWIDTH_ADAPTIVE_NN;
+      const int need_eval = bandwidth_code == BW_GEN_NN;
+      const int need_train = bandwidth_code == BW_ADAP_NN;
+      np_beta_bandwidth_prepare_status bandwidth_status;
+
+      if((need_eval &&
+          (!np_size_mul_checked((size_t)ncon, (size_t)num_eval,
+                                &eval_bandwidth_count) ||
+           eval_bandwidth_count > SIZE_MAX / sizeof(double))) ||
+         (need_train &&
+          (!np_size_mul_checked((size_t)ncon, (size_t)num_train,
+                                &train_bandwidth_count) ||
+           train_bandwidth_count > SIZE_MAX / sizeof(double))))
+        error("C_np_kernelsum_power12: beta bandwidth layout overflow");
+      bandwidth_eval_storage = need_eval ?
+        (double *)R_alloc(eval_bandwidth_count, sizeof(double)) : NULL;
+      bandwidth_train_storage = need_train ?
+        (double *)R_alloc(train_bandwidth_count, sizeof(double)) : NULL;
+      bandwidth_status = np_beta_bandwidth_prepare(
+        bandwidth_mode, REAL(tcon_r), train_is_eval ? NULL : REAL(econ_r),
+        REAL(bw_r), num_train, num_eval, ncon, train_is_eval,
+        need_eval, need_train, suppress_parallel,
+        bandwidth_eval_storage, bandwidth_train_storage);
+      if(bandwidth_status == NP_BETA_BANDWIDTH_PREPARE_ERR_ZERO_RADIUS) {
+        const NPNNZeroRadiusInfo info = np_nn_zero_radius_info_flat(
+          bandwidth_code, num_train, num_eval, ncon,
+          REAL(tcon_r), train_is_eval ? NULL : REAL(econ_r), REAL(bw_r), NULL, 0);
+        np_nn_zero_radius_error(&info);
+      }
+      if(bandwidth_status != NP_BETA_BANDWIDTH_PREPARE_OK)
+        error("C_np_kernelsum_power12: %s",
+              np_beta_bandwidth_prepare_status_message(bandwidth_status));
+      if(need_eval) {
+        bandwidth_eval_columns = (double **)R_alloc(
+          (size_t)ncon, sizeof(double *));
+        for(i = 0; i < ncon; ++i)
+          bandwidth_eval_columns[i] = bandwidth_eval_storage +
+            (size_t)i * (size_t)num_eval;
+      }
+      if(need_train) {
+        bandwidth_train_columns = (double **)R_alloc(
+          (size_t)ncon, sizeof(double *));
+        for(i = 0; i < ncon; ++i)
+          bandwidth_train_columns[i] = bandwidth_train_storage +
+            (size_t)i * (size_t)num_train;
+      }
+    }
+
+    route.segment_count = 1;
+    route.segment[0].descriptor = descriptor;
+    route.segment[0].coordinate_offset = 0;
+    route.segment[0].coordinate_count = ncon;
+    route.segment[0].lower = ckerlb_p;
+    route.segment[0].upper = ckerub_p;
+    status = kernel_weighted_sum_np_route_power12(
+      NULL, categorical_ingress.kernel_unordered,
+      categorical_ingress.kernel_ordered,
+      bandwidth_code, num_train, num_eval,
+      nuno, nord, ncon, leave_one_out, 0, 0, 0,
+      INTEGER(op_i), ncol_Y, 0,
+      categorical_ingress.train_unordered,
+      categorical_ingress.train_ordered, train_columns,
+      categorical_ingress.evaluation_unordered,
+      categorical_ingress.evaluation_ordered, evaluation_columns,
+      response_columns, NULL,
+      bandwidth_code == BW_FIXED ? REAL(bw_r) : NULL,
+      bandwidth_code != BW_FIXED,
+      bandwidth_train_columns, bandwidth_eval_columns,
+      ncat > 0 ? REAL(bw_r) + ncon : NULL,
+      categorical_ingress.num_categories,
+      categorical_ingress.category_values, categorical_compress,
+      REAL(out_ksum), REAL(out_ksum_power2), &route, &diagnostics, NULL);
+    if(status != 0 && diagnostics.beta_status != NP_BETA_OK)
+      error("C_np_kernelsum_power12: beta row failed in continuous dimension %d: %s",
+            diagnostics.bad_coordinate + 1,
+            np_beta_status_message(diagnostics.beta_status));
+    if(status != 0)
+      error("C_np_kernelsum_power12: canonical beta dual-power row failed with code %d",
+            status);
+  } else {
+    np_kernelsum_power12(REAL(tuno_r), REAL(tord_r), REAL(tcon_r),
+                         REAL(ty_r), REAL(weights_r),
+                         REAL(euno_r), REAL(eord_r), REAL(econ_r),
+                         REAL(bw_r),
+                         REAL(mcv_r), REAL(padnum_r),
+                         INTEGER(op_i), INTEGER(myopti_i), REAL(kpow_r),
+                         REAL(out_ksum), REAL(out_ksum_power2),
+                         NULL, NULL, NULL,
+                         ckerlb_p, ckerub_p);
+  }
+
+  PROTECT(out = allocVector(VECSXP, 2));
   SET_VECTOR_ELT(out, 0, out_ksum);
-  SET_VECTOR_ELT(out, 1, out_pksum);
-  SET_VECTOR_ELT(out, 2, out_kw);
-  SET_VECTOR_ELT(out, 3, out_pkw);
+  SET_VECTOR_ELT(out, 1, out_ksum_power2);
 
-  PROTECT(out_names = allocVector(STRSXP, 4));
+  PROTECT(out_names = allocVector(STRSXP, 2));
   SET_STRING_ELT(out_names, 0, mkChar("ksum"));
-  SET_STRING_ELT(out_names, 1, mkChar("p.ksum"));
-  SET_STRING_ELT(out_names, 2, mkChar("kernel.weights"));
-  SET_STRING_ELT(out_names, 3, mkChar("p.kernel.weights"));
+  SET_STRING_ELT(out_names, 1, mkChar("ksum.power2"));
   setAttrib(out, R_NamesSymbol, out_names);
 
-  UNPROTECT(22);
+  UNPROTECT(20);
   return out;
 }
 
@@ -9845,24 +13988,257 @@ SEXP C_np_mpi_init(void)
   return ans;
 }
 
+static void np_density_prepared_context_destroy(NPDensityPreparedCtx *context)
+{
+  if (context == NULL || !context->active)
+    return;
 
-void np_density_bw(double * myuno, double * myord, double * mycon, 
-                   double * mysd, int * myopti, double * myoptd, double * myans, double * fval,
-                   double * objective_function_values, double * objective_function_evals,
-                   double * objective_function_invalid, double * timing,
-                   double * objective_function_fast,
-                   double * objective_function_guarded,
-                   int * penalty_mode, double * penalty_mult,
-                   double * ckerlb, double * ckerub,
-                   const int eval_only){
+  bwm_clear_floor_context();
+  bwm_nn_cache_free();
+  bwm_objective_cache_free();
+  bwm_search_context_release();
+
+  if (context->matrix_x_unordered != NULL)
+    free_mat(context->matrix_x_unordered, context->num_unordered);
+  if (context->matrix_x_ordered != NULL)
+    free_mat(context->matrix_x_ordered, context->num_ordered);
+  if (context->matrix_x_continuous != NULL)
+    free_mat(context->matrix_x_continuous, context->num_continuous);
+  safe_free(context->extendednn_upper);
+  if (context->powell_directions != NULL)
+    free_mat(context->powell_directions, context->num_var + 1);
+  safe_free(context->scale_factor);
+  safe_free(context->scale_factor_startbest);
+  safe_free(context->powell_step);
+  safe_free(context->num_categories);
+  if (context->matrix_categorical_vals != NULL)
+    free_mat(context->matrix_categorical_vals,
+             context->num_unordered + context->num_ordered);
+  safe_free(context->continuous_stddev);
+  safe_free(context->tree_permutation);
+  if (context->tree != NULL)
+    free_kdtree(&context->tree);
+
+  matrix_X_unordered_train_extern = NULL;
+  matrix_X_ordered_train_extern = NULL;
+  matrix_X_continuous_train_extern = NULL;
+  num_categories_extern = NULL;
+  matrix_categorical_vals_extern = NULL;
+  vector_continuous_stddev_extern = NULL;
+  vector_extendednn_upper_extern = NULL;
+  int_extendednn_upper_num_extern = 0;
+  kdt_extern_X = NULL;
+  int_TREE_X = NP_TREE_FALSE;
+  int_TREE_PROFILE_X = NP_TREE_FALSE;
+  int_cker_bound_extern = 0;
+  vector_ckerlb_extern = NULL;
+  vector_ckerub_extern = NULL;
+  np_density_bw_categorical_compress_extern = 0;
+  np_reset_y_side_extern();
+  np_clear_estimator_extern_aliases();
+  memset(context, 0, sizeof(*context));
+}
+
+static void np_distribution_prepared_context_destroy(
+  NPDistributionPreparedCtx *context)
+{
+  if (context == NULL || !context->active)
+    return;
+
+  bwm_clear_floor_context();
+  bwm_nn_cache_free();
+  bwm_objective_cache_free();
+  bwm_search_context_release();
+
+  if (context->matrix_x_unordered_train != NULL)
+    free_mat(context->matrix_x_unordered_train, context->num_unordered);
+  if (context->matrix_x_ordered_train != NULL)
+    free_mat(context->matrix_x_ordered_train, context->num_ordered);
+  if (context->matrix_x_continuous_train != NULL)
+    free_mat(context->matrix_x_continuous_train, context->num_continuous);
+  if (!context->cdfontrain) {
+    if (context->matrix_x_unordered_eval != NULL)
+      free_mat(context->matrix_x_unordered_eval, context->num_unordered);
+    if (context->matrix_x_ordered_eval != NULL)
+      free_mat(context->matrix_x_ordered_eval, context->num_ordered);
+    if (context->matrix_x_continuous_eval != NULL)
+      free_mat(context->matrix_x_continuous_eval, context->num_continuous);
+  }
+  safe_free(context->extendednn_upper);
+  if (context->powell_directions != NULL)
+    free_mat(context->powell_directions, context->num_var + 1);
+  safe_free(context->scale_factor);
+  safe_free(context->scale_factor_multistart);
+  safe_free(context->scale_factor_startbest);
+  safe_free(context->powell_step);
+  safe_free(context->num_categories);
+  if (context->matrix_categorical_vals != NULL)
+    free_mat(context->matrix_categorical_vals,
+             context->num_unordered + context->num_ordered);
+  safe_free(context->continuous_stddev);
+  safe_free(context->tree_permutation_train);
+  if (!context->cdfontrain)
+    safe_free(context->tree_permutation_eval);
+  if (context->tree != NULL)
+    free_kdtree(&context->tree);
+
+  matrix_X_unordered_train_extern = NULL;
+  matrix_X_ordered_train_extern = NULL;
+  matrix_X_continuous_train_extern = NULL;
+  matrix_X_unordered_eval_extern = NULL;
+  matrix_X_ordered_eval_extern = NULL;
+  matrix_X_continuous_eval_extern = NULL;
+  num_categories_extern = NULL;
+  matrix_categorical_vals_extern = NULL;
+  vector_continuous_stddev_extern = NULL;
+  vector_extendednn_upper_extern = NULL;
+  int_extendednn_upper_num_extern = 0;
+  kdt_extern_X = NULL;
+  int_TREE_X = NP_TREE_FALSE;
+  int_TREE_PROFILE_X = NP_TREE_FALSE;
+  int_cker_bound_extern = 0;
+  vector_ckerlb_extern = NULL;
+  vector_ckerub_extern = NULL;
+  np_distribution_bw_categorical_compress_extern = 0;
+  np_reset_y_side_extern();
+  np_clear_estimator_extern_aliases();
+  memset(context, 0, sizeof(*context));
+}
+
+static void np_density_refresh_penalty(double *vector_scale_factor,
+                                       int num_var,
+                                       int penalty_mode,
+                                       double penalty_mult)
+{
+  int i;
+
+  bwm_penalty_mode = 0;
+  bwm_penalty_value = DBL_MAX;
+  if (penalty_mode != 1)
+    return;
+
+  {
+    double pmult = penalty_mult;
+    double baseline;
+    if (pmult < 1.0) pmult = 1.0;
+    baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
+    bwm_eval_count += 1.0;
+    if (!R_FINITE(baseline) || baseline == DBL_MAX)
+      bwm_invalid_count += 1.0;
+    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
+      double *tmp = bwm_alloc_transform_tmp(num_var + 1);
+      if (tmp != NULL &&
+          np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_var) == 0) {
+        for (i = 1; i <= num_reg_continuous_extern; i++)
+          tmp[i] *= 2.0;
+        for (i = 0; i < num_reg_unordered_extern; i++) {
+          int idx = num_reg_continuous_extern + 1 + i;
+          double maxbw = max_unordered_bw(num_categories_extern[i],
+                                          KERNEL_den_unordered_extern);
+          tmp[idx] = 0.5 * maxbw;
+        }
+        for (i = 0; i < num_reg_ordered_extern; i++) {
+          int idx = num_reg_continuous_extern +
+            num_reg_unordered_extern + 1 + i;
+          tmp[idx] = 0.5;
+        }
+        baseline = bwmfunc_raw_activity(tmp);
+        bwm_eval_count += 1.0;
+        if (!R_FINITE(baseline) || baseline == DBL_MAX)
+          bwm_invalid_count += 1.0;
+      }
+      safe_free(tmp);
+    }
+    if (!R_FINITE(baseline) || baseline == DBL_MAX)
+      bwm_penalty_value = pmult * 1.0e6;
+    else
+      bwm_penalty_value = baseline + (fabs(baseline) + 1.0) * pmult;
+    if (R_FINITE(bwm_penalty_value))
+      bwm_penalty_mode = 1;
+  }
+}
+
+static void np_distribution_refresh_penalty(double *vector_scale_factor,
+                                            int num_var,
+                                            int penalty_mode,
+                                            double penalty_mult)
+{
+  int i;
+
+  bwm_penalty_mode = 0;
+  bwm_penalty_value = DBL_MAX;
+  if (penalty_mode != 1)
+    return;
+
+  {
+    double pmult = penalty_mult;
+    double baseline;
+    if (pmult < 1.0) pmult = 1.0;
+    baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
+    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
+      double *tmp = bwm_alloc_transform_tmp(num_var + 1);
+      if (tmp != NULL &&
+          np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_var) == 0) {
+        for (i = 1; i <= num_reg_continuous_extern; i++)
+          tmp[i] *= 2.0;
+        for (i = 0; i < num_reg_unordered_extern; i++) {
+          int idx = num_reg_continuous_extern + 1 + i;
+          double maxbw = max_unordered_bw(num_categories_extern[i],
+                                          KERNEL_den_unordered_extern);
+          tmp[idx] = 0.5 * maxbw;
+        }
+        for (i = 0; i < num_reg_ordered_extern; i++) {
+          int idx = num_reg_continuous_extern +
+            num_reg_unordered_extern + 1 + i;
+          tmp[idx] = 0.5;
+        }
+        baseline = bwmfunc_raw_activity(tmp);
+      }
+      safe_free(tmp);
+    }
+    if (!R_FINITE(baseline) || baseline == DBL_MAX)
+      bwm_penalty_value = pmult * 1.0e6;
+    else
+      bwm_penalty_value = baseline + (fabs(baseline) + 1.0) * pmult;
+    if (R_FINITE(bwm_penalty_value))
+      bwm_penalty_mode = 1;
+  }
+}
+
+
+static void np_density_bw_internal(double * myuno, double * myord, double * mycon,
+                                   double * mysd, int * myopti, double * myoptd,
+                                   double * myans, double * fval,
+                                   double * objective_function_values,
+                                   double * objective_function_evals,
+                                   double * objective_function_invalid,
+                                   double * timing,
+                                   double * objective_function_fast,
+                                   double * objective_function_guarded,
+                                   int * penalty_mode, double * penalty_mult,
+                                   double * ckerlb, double * ckerub,
+                                   const int eval_only,
+                                   NPDensityPreparedCtx *retained_context,
+                                   const int prepare_only,
+                                   const NPCategoricalSupport *support){
+  NPDensityPreparedCtx local_context = {0};
+  NPDensityPreparedCtx *prepared_context =
+    retained_context != NULL ? retained_context : &local_context;
+  if (retained_context != NULL && retained_context->active)
+    error("C_np_density_bw: prepared context is already active");
+  np_validate_nonfixed_support_input("C_np_density_bw", myopti[BW_DENI],
+    myopti[BW_NOBSI], myopti[BW_NCONI], mycon, 0, NULL);
+  memset(prepared_context, 0, sizeof(*prepared_context));
   int_nn_k_min_extern = 1;
   /* Likelihood bandwidth selection for density estimation */
 
-  double **matrix_y;
+  double **matrix_y = NULL;
 
   double *vector_continuous_stddev = NULL;
-  double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
-  double *vector_scale_factor_startbest;
+  double *vsfh = NULL;
+  double *vector_scale_factor = NULL;
+  double *vector_scale_factor_multistart = NULL;
+  double *vector_scale_factor_startbest = NULL;
 
   double fret, fret_best, fret_start_best, fret_initial;
   double ftol, tol;
@@ -9871,10 +14247,10 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   double small, lbc_dir, c_dir;
   double initc_dir;
   double lbd_dir, hbd_dir, d_dir, initd_dir;
-  double lbc_init, hbc_init, c_init; 
+  double lbc_init, hbc_init, c_init;
   double lbd_init, hbd_init, d_init;
   int dfc_dir;
-  
+
   int i,j;
   double fast_eval_total = 0.0;
   double guarded_eval_total = 0.0;
@@ -9882,13 +14258,15 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   int iMultistart, iMs_counter, iNum_Multistart, iImproved;
   int enforce_fixed_feasibility;
   int have_start_best, have_multistart_best;
+  int nn_retry_attempted = 0;
+  int nn_retry_history_index = 0;
+  int nn_retry_improved = 0;
   int itmax, iter;
   int int_use_starting_values;
   int scale_cat;
   const char *bw_error_msg = NULL;
 
   int * ipt = NULL;  // point permutation, see tree.c
-  int old_bw;
 
 
   num_reg_unordered_extern = myopti[BW_NUNOI];
@@ -9902,6 +14280,11 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   int_cker_bound_extern = np_has_finite_cker_bounds(ckerlb, ckerub, num_reg_continuous_extern);
 
   num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
+  prepared_context->active = 1;
+  prepared_context->num_var = num_var;
+  prepared_context->num_unordered = num_reg_unordered_extern;
+  prepared_context->num_ordered = num_reg_ordered_extern;
+  prepared_context->num_continuous = num_reg_continuous_extern;
 
   num_obs_train_extern = myopti[BW_NOBSI];
   iMultistart = myopti[BW_IMULTII];
@@ -9912,18 +14295,40 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   KERNEL_den_extern = myopti[BW_CKRNEVI];
   KERNEL_den_unordered_extern = myopti[BW_UKRNEVI];
   KERNEL_den_ordered_extern = myopti[BW_OKRNEVI];
+  np_beta_bw_order_extern = 2;
+  np_density_bw_categorical_compress_extern = 0;
+  if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    np_beta_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+      myopti[BW_CKFAMILYI], KERNEL_den_extern, myopti[BW_CKORDERI],
+      num_reg_continuous_extern, num_reg_unordered_extern,
+      num_reg_ordered_extern, NP_BETA_BW_ALLOW_CATEGORICAL,
+      ckerlb, ckerub,
+      "C_np_density_bw").order;
+    np_density_bw_categorical_compress_extern = myopti[BW_CATCOMPI];
+    if(np_density_bw_categorical_compress_extern != 0 &&
+       np_density_bw_categorical_compress_extern != 1)
+      error("C_np_density_bw: categorical compression must be TRUE or FALSE");
+  }
 
   int_use_starting_values= myopti[BW_USTARTI];
   int_LARGE_SF=myopti[BW_LSFI];
   BANDWIDTH_den_extern=myopti[BW_DENI];
-  enforce_fixed_feasibility = ((BANDWIDTH_den_extern == BW_FIXED) && (!eval_only));
+  enforce_fixed_feasibility =
+    (((BANDWIDTH_den_extern == BW_FIXED) ||
+      (BANDWIDTH_den_extern == BW_GEN_NN) ||
+      (BANDWIDTH_den_extern == BW_ADAP_NN)) && (!eval_only));
   int_RESTART_FROM_MIN = myopti[BW_REMINI];
   int_MINIMIZE_IO = myopti[BW_MINIOI];
 
   itmax=myopti[BW_ITMAXI];
-  old_bw=myopti[BW_OLDBW];
+  if (myopti[BW_RESERVED_LEGACYI] != 0)
+    error("C_np_density_bw: reserved legacy selector must be zero");
   int_TREE_X = myopti[BW_DOTREEI];
   int_TREE_PROFILE_X = myopti[BW_DOTREEI];
+  if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    int_TREE_X = 0;
+    int_TREE_PROFILE_X = 0;
+  }
   scale_cat = myopti[BW_SCATI];
   bwm_use_transform = myopti[BW_TBNDI];
   if (BANDWIDTH_den_extern != BW_FIXED)
@@ -9973,12 +14378,24 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
 
 
   num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
-  matrix_y = alloc_matd(num_var + 1, num_var +1);
   vector_scale_factor = alloc_vecd(num_var + 1);
-  vector_scale_factor_startbest = alloc_vecd(num_var + 1);
-  vsfh = alloc_vecd(num_var + 1);
+  if (!eval_only) {
+    matrix_y = alloc_matd(num_var + 1, num_var + 1);
+    vector_scale_factor_startbest = alloc_vecd(num_var + 1);
+    vsfh = alloc_vecd(num_var + 1);
+  }
 
-  matrix_categorical_vals_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
+  matrix_categorical_vals_extern = alloc_matd(support->max_levels, num_reg_unordered_extern + num_reg_ordered_extern);
+
+  prepared_context->matrix_x_unordered = matrix_X_unordered_train_extern;
+  prepared_context->matrix_x_ordered = matrix_X_ordered_train_extern;
+  prepared_context->matrix_x_continuous = matrix_X_continuous_train_extern;
+  prepared_context->num_categories = num_categories_extern;
+  prepared_context->powell_directions = matrix_y;
+  prepared_context->scale_factor = vector_scale_factor;
+  prepared_context->scale_factor_startbest = vector_scale_factor_startbest;
+  prepared_context->powell_step = vsfh;
+  prepared_context->matrix_categorical_vals = matrix_categorical_vals_extern;
 
   
   if (int_use_starting_values)
@@ -10001,6 +14418,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
       matrix_X_continuous_train_extern[j][i]=mycon[j*num_obs_train_extern+i];
 
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->tree_permutation = ipt;
   if(!(ipt != NULL)){
     bw_error_msg = "!(ipt != NULL)";
     goto cleanup_np_density_bw;
@@ -10016,6 +14434,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   if(int_TREE_X == NP_TREE_TRUE){
     build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
                  4*num_reg_continuous_extern, ipt, &kdt_extern_X);
+    prepared_context->tree = kdt_extern_X;
   
 
     //put training data into tree-order using the index array
@@ -10036,20 +14455,20 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   }
 
 
-  determine_categorical_vals(
-                             num_obs_train_extern,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
+  /* Retain legacy verbose/debug diagnostics without paying for an observed
+   * support scan on the ordinary preparation path. Declared values own the
+   * computation independently of those observational diagnostics. */
+  if(int_VERBOSE == 1 || int_DEBUG == 1)
+    determine_categorical_vals(num_obs_train_extern, 0, 0,
+      num_reg_unordered_extern, num_reg_ordered_extern,
+      matrix_Y_unordered_train_extern, matrix_Y_ordered_train_extern,
+      matrix_X_unordered_train_extern, matrix_X_ordered_train_extern,
+      num_categories_extern, matrix_categorical_vals_extern);
+  np_categorical_support_copy(support, num_categories_extern,
+                              matrix_categorical_vals_extern);
 
   vector_continuous_stddev = alloc_vecd(num_reg_continuous_extern);
+  prepared_context->continuous_stddev = vector_continuous_stddev;
 
   for (j = 0; j < num_reg_continuous_extern; j++)
     vector_continuous_stddev[j] = mysd[j];
@@ -10073,6 +14492,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
       myans);
   int_extendednn_upper_num_extern =
     (vector_extendednn_upper_extern != NULL) ? num_reg_continuous_extern : 0;
+  prepared_context->extendednn_upper = vector_extendednn_upper_extern;
 
   /* Initialize scale factors and Hessian for NR modules */
 
@@ -10101,47 +14521,49 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
                                     matrix_X_continuous_train_extern,
                                     matrix_Y_continuous_train_extern);
 
-  initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
-                                    0,                /* Not Random (0) Random (1) */
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    0, 
-                                    0,
-                                    0,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    0, 
-                                    KERNEL_den_unordered_extern,                                    
-                                    0,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),             /* Init for continuous vars */
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev,
-                                    vsfh,
-                                    lbc_init, hbc_init, c_init, 
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
+  if (!eval_only) {
+    initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
+                                      0,                /* Not Random (0) Random (1) */
+                                      int_RANDOM_SEED,
+                                      int_LARGE_SF,
+                                      num_obs_train_extern,
+                                      0,
+                                      0,
+                                      0,
+                                      num_reg_continuous_extern,
+                                      num_reg_unordered_extern,
+                                      num_reg_ordered_extern,
+                                      0,
+                                      KERNEL_den_unordered_extern,
+                                      0,
+                                      scale_cat,
+                                      pow((double)4.0/(double)3.0,0.2),
+                                      nconfac_extern, ncatfac_extern,
+                                      num_categories_extern,
+                                      vector_continuous_stddev,
+                                      vsfh,
+                                      lbc_init, hbc_init, c_init,
+                                      lbd_init, hbd_init, d_init,
+                                      matrix_X_continuous_train_extern,
+                                      matrix_Y_continuous_train_extern);
 
-  initialize_nr_directions(BANDWIDTH_den_extern,
-                           num_obs_train_extern,
-                           num_reg_continuous_extern,
-                           num_reg_unordered_extern,
-                           num_reg_ordered_extern,
-                           0,
-                           0,
-                           0,
-                           vsfh,
-                           num_categories_extern,
-                           matrix_y,
-                           0, int_RANDOM_SEED, 
-                           lbc_dir, dfc_dir, c_dir,initc_dir,
-                           lbd_dir, hbd_dir, d_dir, initd_dir,
-                           matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
+    initialize_nr_directions(BANDWIDTH_den_extern,
+                             num_obs_train_extern,
+                             num_reg_continuous_extern,
+                             num_reg_unordered_extern,
+                             num_reg_ordered_extern,
+                             0,
+                             0,
+                             0,
+                             vsfh,
+                             num_categories_extern,
+                             matrix_y,
+                             0, int_RANDOM_SEED,
+                             lbc_dir, dfc_dir, c_dir, initc_dir,
+                             lbd_dir, hbd_dir, d_dir, initd_dir,
+                             matrix_X_continuous_train_extern,
+                             matrix_Y_continuous_train_extern);
+  }
 
   /* When multistarting, set counter */
 
@@ -10151,48 +14573,36 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   /* Conduct direction set search */
 
   /* assign the function to be optimized */
-  if(old_bw){
-    switch(myopti[BW_MI]){
-    case BWM_CVML : bwmfunc = cv_func_density_categorical_ml; break;
-    case BWM_CVLS : bwmfunc = cv_func_density_categorical_ls; break;
-      //case BWM_CVML_NP : bwmfunc = cv_func_np_density_categorical_ml; break;
-    default : REprintf("np.c: invalid bandwidth selection method.");
-      bw_error_msg = "np.c: invalid bandwidth selection method.";
-      goto cleanup_np_density_bw;
-    }
-  } else {
-    switch(myopti[BW_MI]){
-    case BWM_CVML : bwmfunc = np_cv_func_density_categorical_ml; break;
-    case BWM_CVLS : bwmfunc = np_cv_func_density_categorical_ls; break;
-    default : REprintf("np.c: invalid bandwidth selection method.");
-      bw_error_msg = "np.c: invalid bandwidth selection method.";
-      goto cleanup_np_density_bw;
-    }
-
+  switch(myopti[BW_MI]){
+  case BWM_CVML : bwmfunc = np_cv_func_density_categorical_ml; break;
+  case BWM_CVLS : bwmfunc = np_cv_func_density_categorical_ls; break;
+  default : REprintf("np.c: invalid bandwidth selection method.");
+    bw_error_msg = "np.c: invalid bandwidth selection method.";
+    goto cleanup_np_density_bw;
   }
 
+  bwm_search_context_configure_uniform(
+    num_reg_continuous_extern,
+    num_reg_unordered_extern,
+    num_reg_ordered_extern,
+    0,
+    KERNEL_den_unordered_extern,
+    num_categories_extern);
   if (bwm_use_transform &&
       bwm_to_unconstrained(vector_scale_factor, num_var) != 0) {
     bw_error_msg = "C_np_density_bw: transform buffer allocation failed";
     goto cleanup_np_density_bw;
   }
 
-  spinner(0);
 
   np_bwm_clear_deferred_error();
   bwmfunc_raw = bwmfunc;
-  bwm_num_reg_continuous = num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_reg_ordered_extern;
-  bwm_kernel_unordered = KERNEL_den_unordered_extern;
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
-  bwm_num_categories = num_categories_extern;
   bwm_set_floor_context(
-    enforce_fixed_feasibility,
+    enforce_fixed_feasibility && (BANDWIDTH_den_extern == BW_FIXED),
     num_var,
     bwm_use_transform,
     KERNEL_den_extern,
+    KERNEL_den_unordered_extern,
     KERNEL_den_unordered_extern,
     BANDWIDTH_den_extern,
     BANDWIDTH_den_extern,
@@ -10206,46 +14616,11 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
     num_reg_ordered_extern,
     num_categories_extern,
     bwm_scale_factor_lower_bound);
+  if (prepare_only)
+    return;
   bwm_reset_counters();
-  bwm_penalty_mode = 0;
-  bwm_penalty_value = DBL_MAX;
-  if (penalty_mode[0] == 1) {
-    double pmult = penalty_mult[0];
-    double baseline;
-    if (pmult < 1.0) pmult = 1.0;
-    baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
-    bwm_eval_count += 1.0;
-    if (!R_FINITE(baseline) || baseline == DBL_MAX)
-      bwm_invalid_count += 1.0;
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      double *tmp = bwm_alloc_transform_tmp(num_var + 1);
-      if (tmp != NULL && np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_var) == 0) {
-        for (i = 1; i <= num_reg_continuous_extern; i++)
-          tmp[i] *= 2.0;
-        for (i = 0; i < num_reg_unordered_extern; i++) {
-          int idx = num_reg_continuous_extern + 1 + i;
-          double maxbw = max_unordered_bw(num_categories_extern[i], KERNEL_den_unordered_extern);
-          tmp[idx] = 0.5*maxbw;
-        }
-        for (i = 0; i < num_reg_ordered_extern; i++) {
-          int idx = num_reg_continuous_extern + num_reg_unordered_extern + 1 + i;
-          tmp[idx] = 0.5;
-        }
-        baseline = bwmfunc_raw(tmp);
-        bwm_eval_count += 1.0;
-        if (!R_FINITE(baseline) || baseline == DBL_MAX)
-          bwm_invalid_count += 1.0;
-      }
-      safe_free(tmp);
-    }
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      bwm_penalty_value = pmult * 1.0e6;
-    } else {
-      bwm_penalty_value = baseline + (fabs(baseline) + 1.0) * pmult;
-    }
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
-  }
+  np_density_refresh_penalty(vector_scale_factor, num_var,
+                             penalty_mode[0], penalty_mult[0]);
 
   fret_initial = fret_best = bwmfunc_wrapper(vector_scale_factor);
   iImproved = 0;
@@ -10257,6 +14632,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
         num_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_den_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -10276,6 +14652,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   }
 
   fret = fret_initial;
+density_powell_attempt:
   if(!eval_only){
     powell(0,
            0,
@@ -10336,6 +14713,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
         bwm_use_transform,
         KERNEL_den_extern,
         KERNEL_den_unordered_extern,
+        KERNEL_den_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
         0,
@@ -10367,14 +14745,25 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   *timing = timing_extern;
 
   /* When multistarting save initial minimum of objective function and scale factors */
-  objective_function_values[0]=-fret;
-  objective_function_evals[0]=bwm_eval_count;
-  objective_function_invalid[0]=bwm_invalid_count;
-  bwm_snapshot_fast_counters();
-  fast_eval_total += bwm_fast_eval_count;
-  guarded_eval_total += bwm_guarded_eval_count;
+  if (!nn_retry_attempted) {
+    objective_function_values[0]=-fret;
+    objective_function_evals[0]=bwm_eval_count;
+    objective_function_invalid[0]=bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    guarded_eval_total += bwm_guarded_eval_count;
+  } else {
+    objective_function_values[nn_retry_history_index]=-fret;
+    objective_function_evals[nn_retry_history_index] += bwm_eval_count;
+    objective_function_invalid[nn_retry_history_index] += bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    guarded_eval_total += bwm_guarded_eval_count;
+    iImproved = nn_retry_improved;
+  }
 
-  if((!eval_only) && (iMultistart == IMULTI_TRUE)){
+  if((!eval_only) && (!nn_retry_attempted) &&
+     (iMultistart == IMULTI_TRUE)){
     if (enforce_fixed_feasibility) {
       if (have_start_best) {
         have_multistart_best = 1;
@@ -10509,6 +14898,7 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
               bwm_use_transform,
               KERNEL_den_extern,
               KERNEL_den_unordered_extern,
+              KERNEL_den_unordered_extern,
               BANDWIDTH_den_extern,
               BANDWIDTH_den_extern,
               0,
@@ -10572,13 +14962,14 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   if (enforce_fixed_feasibility) {
     double final_raw;
     if (!have_start_best) {
-      bw_error_msg = "C_np_density_bw: optimizer failed to produce a feasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_density_bw: optimizer failed to produce a feasible bandwidth candidate";
       goto cleanup_np_density_bw;
     }
     if (!np_bw_candidate_is_admissible(
           num_var,
           bwm_use_transform,
           KERNEL_den_extern,
+          KERNEL_den_unordered_extern,
           KERNEL_den_unordered_extern,
           BANDWIDTH_den_extern,
           BANDWIDTH_den_extern,
@@ -10592,12 +14983,67 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
           num_reg_ordered_extern,
           num_categories_extern,
           vector_scale_factor)) {
-      bw_error_msg = "C_np_density_bw: optimizer returned an infeasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_density_bw: optimizer returned an infeasible bandwidth candidate";
       goto cleanup_np_density_bw;
     }
     final_raw = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
     if (!R_FINITE(final_raw) || final_raw == DBL_MAX) {
-      bw_error_msg = "C_np_density_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective";
+      if ((!nn_retry_attempted) &&
+          (!eval_only) &&
+          (!int_use_starting_values) &&
+          ((BANDWIDTH_den_extern == BW_GEN_NN) ||
+           (BANDWIDTH_den_extern == BW_ADAP_NN)) &&
+          (num_reg_continuous_extern > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+        const int maximum_k = num_obs_train_extern - 2;
+
+        nn_retry_history_index = (iImproved > 0) ? iImproved - 1 : 0;
+        nn_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = np_ordinary_nn_find_finite_raw_seed_domain(
+          vector_scale_factor,
+          num_reg_continuous_extern,
+          num_obs_train_extern,
+          maximum_k,
+          num_var,
+          1,
+          &finite_seed);
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_den_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   0,
+                                   0,
+                                   0,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_var);
+          nn_retry_attempted = 1;
+          goto density_powell_attempt;
+        }
+      }
+      bw_error_msg = "C_np_density_bw: optimizer returned a bandwidth candidate with invalid raw objective";
       goto cleanup_np_density_bw;
     }
     fret = final_raw;
@@ -10627,69 +15073,141 @@ void np_density_bw(double * myuno, double * myord, double * mycon,
   /* end return data */
 
 cleanup_np_density_bw:
-  /* Free data objects */
-  bwm_clear_floor_context();
-  bwm_nn_cache_free();
-  bwm_objective_cache_free();
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  safe_free(vector_extendednn_upper_extern);
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
-  free_mat(matrix_y, num_var + 1);
-  free(vector_scale_factor);
-  free(vector_scale_factor_startbest);
-  free(vsfh);
-  free(num_categories_extern);
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
-
-  free(vector_continuous_stddev);
-
-  free(ipt);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-  int_TREE_PROFILE_X = NP_TREE_FALSE;
-
-  int_cker_bound_extern = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  np_reset_y_side_extern();
-  np_clear_estimator_extern_aliases();
+  np_density_prepared_context_destroy(prepared_context);
 
   if (bw_error_msg != NULL)
-    error("%s", bw_error_msg);
+    np_bandwidth_candidate_error(bw_error_msg, myopti[BW_DENI]);
 
   return ;
   
+}
+
+static int np_density_prepared_context_prepare(
+  NPDensityPreparedCtx *context,
+  double *myuno, double *myord, double *mycon, double *mysd,
+  int *myopti, double *myoptd, const double *bw,
+  int penalty_mode, double penalty_mult,
+  double *ckerlb, double *ckerub, const NPCategoricalSupport *support)
+{
+  double fval[2] = {R_NaN, R_NaN};
+  double objective[1] = {R_NaN};
+  double evaluations[1] = {R_NaN};
+  double invalid[1] = {R_NaN};
+  double timing[1] = {R_NaN};
+  double fast[1] = {R_NaN};
+  double guarded[1] = {R_NaN};
+  int pmode = penalty_mode;
+  double pmult = penalty_mult;
+
+  if (context == NULL || bw == NULL)
+    return 1;
+
+  np_density_bw_internal(myuno, myord, mycon, mysd, myopti, myoptd,
+                         (double *)bw, fval, objective, evaluations, invalid,
+                         timing, fast, guarded, &pmode, &pmult,
+                         ckerlb, ckerub, 1, context, 1, support);
+  return context->active ? 0 : 1;
+}
+
+static int np_density_prepared_context_eval(
+  NPDensityPreparedCtx *context, const double *bw,
+  int penalty_mode, double penalty_mult, double out[5])
+{
+  double *vector_scale_factor;
+  double fret;
+  int i;
+
+  if (context == NULL || !context->active || bw == NULL || out == NULL ||
+      context->scale_factor == NULL || context->num_var <= 0)
+    return 1;
+
+  vector_scale_factor = context->scale_factor;
+  for (i = 0; i < context->num_var; i++)
+    vector_scale_factor[i + 1] = bw[i];
+
+  if (context->extendednn_upper != NULL) {
+    const double base_k = (double)(num_obs_train_extern - 1);
+    for (i = 0; i < context->num_continuous; i++) {
+      context->extendednn_upper[i] =
+        np_extendednn_eval_upper(bw[i], base_k);
+    }
+  }
+
+  if (bwm_use_transform &&
+      bwm_to_unconstrained(vector_scale_factor, context->num_var) != 0)
+    return 1;
+
+  np_bwm_clear_deferred_error();
+  bwm_reset_counters();
+  np_density_refresh_penalty(vector_scale_factor, context->num_var,
+                             penalty_mode, penalty_mult);
+
+  fret = bwmfunc_wrapper(vector_scale_factor);
+  bwm_snapshot_fast_counters();
+  out[0] = fret;
+  out[1] = -fret;
+  out[2] = bwm_eval_count;
+  out[3] = bwm_fast_eval_count;
+  out[4] = bwm_guarded_eval_count;
+  return 0;
+}
+
+void np_density_bw(double * myuno, double * myord, double * mycon,
+                   double * mysd, int * myopti, double * myoptd,
+                   double * myans, double * fval,
+                   double * objective_function_values,
+                   double * objective_function_evals,
+                   double * objective_function_invalid, double * timing,
+                   double * objective_function_fast,
+                   double * objective_function_guarded,
+                   int * penalty_mode, double * penalty_mult,
+                   double * ckerlb, double * ckerub,
+                   const int eval_only, const NPCategoricalSupport *support)
+{
+  np_density_bw_internal(myuno, myord, mycon, mysd, myopti, myoptd,
+                         myans, fval, objective_function_values,
+                         objective_function_evals, objective_function_invalid,
+                         timing, objective_function_fast,
+                         objective_function_guarded, penalty_mode, penalty_mult,
+                         ckerlb, ckerub, eval_only, NULL, 0, support);
 }
 
  
 // For distributions the bandwidth selection involves evaluating the CDF at a number of points.
 // We allow one to specify those points, passed in by mye{uno,ord,con}.
 
-void np_distribution_bw(double * myuno, double * myord, double * mycon, 
-                        double * myeuno, double * myeord, double * myecon, double * mysd,
-                        int * myopti, double * myoptd, double * myans, double * fval,
-                        double * objective_function_values, double * objective_function_evals,
-                        double * objective_function_invalid, double * timing,
-                        double * objective_function_fast,
-                        int * penalty_mode, double * penalty_mult,
-                        double * ckerlb, double * ckerub,
-                        const int eval_only){
+static void np_distribution_bw_internal(
+  double *myuno, double *myord, double *mycon,
+  double *myeuno, double *myeord, double *myecon, double *mysd,
+  int *myopti, double *myoptd, double *myans, double *fval,
+  double *objective_function_values, double *objective_function_evals,
+  double *objective_function_invalid, double *timing,
+  double *objective_function_fast,
+  int *penalty_mode, double *penalty_mult,
+  double *ckerlb, double *ckerub,
+  const int eval_only,
+  NPDistributionPreparedCtx *retained_context,
+  const int prepare_only,
+  const NPCategoricalSupport *support)
+{
+  NPDistributionPreparedCtx local_context = {0};
+  NPDistributionPreparedCtx *prepared_context =
+    retained_context != NULL ? retained_context : &local_context;
+  if (retained_context != NULL && retained_context->active)
+    error("C_np_distribution_bw: prepared context is already active");
+  np_validate_nonfixed_support_input("C_np_distribution_bw", myopti[DBW_DENI],
+    myopti[DBW_NOBSI], myopti[DBW_NCONI], mycon, 0, NULL);
+  memset(prepared_context, 0, sizeof(*prepared_context));
   int_nn_k_min_extern = 1;
   /* Likelihood bandwidth selection for density estimation */
 
-  double **matrix_y;
+  double **matrix_y = NULL;
 
   double *vector_continuous_stddev = NULL;
-  double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
-  double *vector_scale_factor_startbest;
+  double *vsfh = NULL;
+  double *vector_scale_factor = NULL;
+  double *vector_scale_factor_multistart = NULL;
+  double *vector_scale_factor_startbest = NULL;
 
   double fret, fret_best, fret_start_best, fret_initial;
   double fast_eval_total = 0.0;
@@ -10708,6 +15226,9 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   int iMultistart, iMs_counter, iNum_Multistart, iImproved;
   int enforce_fixed_feasibility;
   int have_start_best, have_multistart_best;
+  int nn_retry_attempted = 0;
+  int nn_retry_history_index = 0;
+  int nn_retry_improved = 0;
   int itmax, iter;
   int int_use_starting_values, cdfontrain;
 
@@ -10729,6 +15250,12 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   int_cker_bound_extern = np_has_finite_cker_bounds(ckerlb, ckerub, num_reg_continuous_extern);
 
   num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
+  prepared_context->active = 1;
+  prepared_context->num_var = num_var;
+  prepared_context->num_unordered = num_reg_unordered_extern;
+  prepared_context->num_ordered = num_reg_ordered_extern;
+  prepared_context->num_continuous = num_reg_continuous_extern;
+  prepared_context->cdfontrain = cdfontrain;
 
   num_obs_train_extern = myopti[DBW_NOBSI];
   
@@ -10742,11 +15269,28 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   KERNEL_den_extern = myopti[DBW_CKRNEVI];
   KERNEL_den_unordered_extern = myopti[DBW_UKRNEVI];
   KERNEL_den_ordered_extern = myopti[DBW_OKRNEVI];
+  np_beta_bw_order_extern = 2;
+  np_distribution_bw_categorical_compress_extern = 0;
+  if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    np_beta_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+      myopti[DBW_CKFAMILYI], KERNEL_den_extern, myopti[DBW_CKORDERI],
+      num_reg_continuous_extern, num_reg_unordered_extern,
+      num_reg_ordered_extern, NP_BETA_BW_ALLOW_CATEGORICAL,
+      ckerlb, ckerub,
+      "C_np_distribution_bw").order;
+    np_distribution_bw_categorical_compress_extern = myopti[DBW_CATCOMPI];
+    if(np_distribution_bw_categorical_compress_extern != 0 &&
+       np_distribution_bw_categorical_compress_extern != 1)
+      error("C_np_distribution_bw: categorical compression must be TRUE or FALSE");
+  }
 
   int_use_starting_values= myopti[DBW_USTARTI];
   int_LARGE_SF=myopti[DBW_LSFI];
   BANDWIDTH_den_extern=myopti[DBW_DENI];
-  enforce_fixed_feasibility = ((BANDWIDTH_den_extern == BW_FIXED) && (!eval_only));
+  enforce_fixed_feasibility =
+    (((BANDWIDTH_den_extern == BW_FIXED) ||
+      (BANDWIDTH_den_extern == BW_GEN_NN) ||
+      (BANDWIDTH_den_extern == BW_ADAP_NN)) && (!eval_only));
   int_RESTART_FROM_MIN = myopti[DBW_REMINI];
   int_MINIMIZE_IO = myopti[DBW_MINIOI];
 
@@ -10754,6 +15298,10 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
 
   int_TREE_X = myopti[DBW_DOTREEI];
   int_TREE_PROFILE_X = myopti[DBW_DOTREEI];
+  if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    int_TREE_X = 0;
+    int_TREE_PROFILE_X = 0;
+  }
   scale_cat = myopti[DBW_SCATI];
   bwm_use_transform = myopti[DBW_TBNDI];
   if (BANDWIDTH_den_extern != BW_FIXED)
@@ -10813,13 +15361,27 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     matrix_X_continuous_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_continuous_extern);
   }
 
+  prepared_context->matrix_x_unordered_train = matrix_X_unordered_train_extern;
+  prepared_context->matrix_x_ordered_train = matrix_X_ordered_train_extern;
+  prepared_context->matrix_x_continuous_train = matrix_X_continuous_train_extern;
+  prepared_context->matrix_x_unordered_eval = matrix_X_unordered_eval_extern;
+  prepared_context->matrix_x_ordered_eval = matrix_X_ordered_eval_extern;
+  prepared_context->matrix_x_continuous_eval = matrix_X_continuous_eval_extern;
+
   num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
-  matrix_y = alloc_matd(num_var + 1, num_var +1);
+  matrix_y = prepare_only ? NULL : alloc_matd(num_var + 1, num_var + 1);
   vector_scale_factor = alloc_vecd(num_var + 1);
-  vector_scale_factor_startbest = alloc_vecd(num_var + 1);
-  vsfh = alloc_vecd(num_var + 1);
+  vector_scale_factor_startbest = prepare_only ? NULL : alloc_vecd(num_var + 1);
+  vsfh = prepare_only ? NULL : alloc_vecd(num_var + 1);
   // nb check vals
-  matrix_categorical_vals_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
+  matrix_categorical_vals_extern = alloc_matd(support->max_levels, num_reg_unordered_extern + num_reg_ordered_extern);
+
+  prepared_context->num_categories = num_categories_extern;
+  prepared_context->powell_directions = matrix_y;
+  prepared_context->scale_factor = vector_scale_factor;
+  prepared_context->scale_factor_startbest = vector_scale_factor_startbest;
+  prepared_context->powell_step = vsfh;
+  prepared_context->matrix_categorical_vals = matrix_categorical_vals_extern;
 
   if(num_reg_unordered_extern > 0){
     bw_error_msg = "np.c: distribution bw selection only works on ordered and continuous data.";
@@ -10862,6 +15424,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   }
 
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->tree_permutation_train = ipt;
   if(!(ipt != NULL)){
     bw_error_msg = "!(ipt != NULL)";
     goto cleanup_np_distribution_bw;
@@ -10873,6 +15436,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
 
   if(!cdfontrain) {
     ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
+    prepared_context->tree_permutation_eval = ipe;
     if(!(ipe != NULL)){
       bw_error_msg = "!(ipe != NULL)";
       goto cleanup_np_distribution_bw;
@@ -10883,6 +15447,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     }
   } else {
     ipe = ipt;
+    prepared_context->tree_permutation_eval = ipe;
   }
 
   // attempt tree build, if enabled 
@@ -10892,6 +15457,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     if((BANDWIDTH_den_extern != BW_ADAP_NN) || ((BANDWIDTH_den_extern == BW_ADAP_NN) && cdfontrain)){
       build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
                    4*num_reg_continuous_extern, ipt, &kdt_extern_X);
+      prepared_context->tree = kdt_extern_X;
 
       //put training data into tree-order using the index array
 
@@ -10910,6 +15476,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     } else {
       build_kdtree(matrix_X_continuous_eval_extern, num_obs_eval_extern, num_reg_continuous_extern, 
                    4*num_reg_continuous_extern, ipe, &kdt_extern_X);      
+      prepared_context->tree = kdt_extern_X;
 
       for( j=0;j<num_reg_unordered_extern;j++)
         for( i=0;i<num_obs_eval_extern;i++ )
@@ -10927,20 +15494,17 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
 
   }
 
-  determine_categorical_vals(
-                             num_obs_train_extern,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
+  if(int_VERBOSE == 1 || int_DEBUG == 1)
+    determine_categorical_vals(num_obs_train_extern, 0, 0,
+      num_reg_unordered_extern, num_reg_ordered_extern,
+      matrix_Y_unordered_train_extern, matrix_Y_ordered_train_extern,
+      matrix_X_unordered_train_extern, matrix_X_ordered_train_extern,
+      num_categories_extern, matrix_categorical_vals_extern);
+  np_categorical_support_copy(support, num_categories_extern,
+                              matrix_categorical_vals_extern);
 
   vector_continuous_stddev = alloc_vecd(num_reg_continuous_extern);
+  prepared_context->continuous_stddev = vector_continuous_stddev;
 
   for (j = 0; j < num_reg_continuous_extern; j++)
     vector_continuous_stddev[j] = mysd[j];
@@ -10964,6 +15528,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
       myans);
   int_extendednn_upper_num_extern =
     (vector_extendednn_upper_extern != NULL) ? num_reg_continuous_extern : 0;
+  prepared_context->extendednn_upper = vector_extendednn_upper_extern;
 
   /* Initialize scale factors and Directions for NR modules */
 
@@ -10992,47 +15557,49 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
                                     matrix_X_continuous_eval_extern,
                                     matrix_Y_continuous_train_extern);
 
-  initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
-                                    0,                /* Not Random (0) Random (1) */
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    0,
-                                    0,
-                                    0,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    0,
-                                    KERNEL_den_unordered_extern,
-                                    0,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),             /* Init for continuous vars */
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev,
-                                    vsfh,
-                                    lbc_init, hbc_init, c_init, 
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_eval_extern,
-                                    matrix_Y_continuous_train_extern);
+  if (!prepare_only) {
+    initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
+                                      0,                /* Not Random (0) Random (1) */
+                                      int_RANDOM_SEED,
+                                      int_LARGE_SF,
+                                      num_obs_train_extern,
+                                      0,
+                                      0,
+                                      0,
+                                      num_reg_continuous_extern,
+                                      num_reg_unordered_extern,
+                                      num_reg_ordered_extern,
+                                      0,
+                                      KERNEL_den_unordered_extern,
+                                      0,
+                                      scale_cat,
+                                      pow((double)4.0/(double)3.0,0.2),
+                                      nconfac_extern, ncatfac_extern,
+                                      num_categories_extern,
+                                      vector_continuous_stddev,
+                                      vsfh,
+                                      lbc_init, hbc_init, c_init,
+                                      lbd_init, hbd_init, d_init,
+                                      matrix_X_continuous_eval_extern,
+                                      matrix_Y_continuous_train_extern);
 
-  initialize_nr_directions(BANDWIDTH_den_extern,
-                           num_obs_train_extern,
-                           num_reg_continuous_extern,
-                           num_reg_unordered_extern,
-                           num_reg_ordered_extern,
-                           0,
-                           0,
-                           0,
-                           vsfh,
-                           num_categories_extern,
-                           matrix_y,
-                           0, int_RANDOM_SEED, 
-                           lbc_dir, dfc_dir, c_dir, initc_dir,
-                           lbd_dir, hbd_dir, d_dir, initd_dir,
-                           matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
+    initialize_nr_directions(BANDWIDTH_den_extern,
+                             num_obs_train_extern,
+                             num_reg_continuous_extern,
+                             num_reg_unordered_extern,
+                             num_reg_ordered_extern,
+                             0,
+                             0,
+                             0,
+                             vsfh,
+                             num_categories_extern,
+                             matrix_y,
+                             0, int_RANDOM_SEED,
+                             lbc_dir, dfc_dir, c_dir, initc_dir,
+                             lbd_dir, hbd_dir, d_dir, initd_dir,
+                             matrix_X_continuous_train_extern,
+                             matrix_Y_continuous_train_extern);
+  }
 
 
   /* When multistarting, set counter */
@@ -11050,28 +15617,28 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     goto cleanup_np_distribution_bw;
   }
 
+  bwm_search_context_configure_uniform(
+    num_reg_continuous_extern,
+    num_reg_unordered_extern,
+    num_reg_ordered_extern,
+    0,
+    KERNEL_den_unordered_extern,
+    num_categories_extern);
   if (bwm_use_transform &&
       bwm_to_unconstrained(vector_scale_factor, num_var) != 0) {
     bw_error_msg = "C_np_distribution_bw: transform buffer allocation failed";
     goto cleanup_np_distribution_bw;
   }
 
-  spinner(0);
 
   np_bwm_clear_deferred_error();
   bwmfunc_raw = bwmfunc;
-  bwm_num_reg_continuous = num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_reg_ordered_extern;
-  bwm_kernel_unordered = KERNEL_den_unordered_extern;
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
-  bwm_num_categories = num_categories_extern;
   bwm_set_floor_context(
-    enforce_fixed_feasibility,
+    enforce_fixed_feasibility && (BANDWIDTH_den_extern == BW_FIXED),
     num_var,
     bwm_use_transform,
     KERNEL_den_extern,
+    KERNEL_den_unordered_extern,
     KERNEL_den_unordered_extern,
     BANDWIDTH_den_extern,
     BANDWIDTH_den_extern,
@@ -11085,40 +15652,11 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     num_reg_ordered_extern,
     num_categories_extern,
     bwm_scale_factor_lower_bound);
+  if (prepare_only)
+    return;
   bwm_reset_counters();
-  bwm_penalty_mode = 0;
-  bwm_penalty_value = DBL_MAX;
-  if (penalty_mode[0] == 1) {
-    double pmult = penalty_mult[0];
-    double baseline;
-    if (pmult < 1.0) pmult = 1.0;
-    baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      double *tmp = bwm_alloc_transform_tmp(num_var + 1);
-      if (tmp != NULL && np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_var) == 0) {
-        for (i = 1; i <= num_reg_continuous_extern; i++)
-          tmp[i] *= 2.0;
-        for (i = 0; i < num_reg_unordered_extern; i++) {
-          int idx = num_reg_continuous_extern + 1 + i;
-          double maxbw = max_unordered_bw(num_categories_extern[i], KERNEL_den_unordered_extern);
-          tmp[idx] = 0.5*maxbw;
-        }
-        for (i = 0; i < num_reg_ordered_extern; i++) {
-          int idx = num_reg_continuous_extern + num_reg_unordered_extern + 1 + i;
-          tmp[idx] = 0.5;
-        }
-        baseline = bwmfunc_raw(tmp);
-      }
-      safe_free(tmp);
-    }
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      bwm_penalty_value = pmult * 1.0e6;
-    } else {
-      bwm_penalty_value = baseline + (fabs(baseline) + 1.0) * pmult;
-    }
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
-  }
+  np_distribution_refresh_penalty(vector_scale_factor, num_var,
+                                  penalty_mode[0], penalty_mult[0]);
   fret_initial = fret_best = bwmfunc_wrapper(vector_scale_factor);
   iImproved = 0;
   have_start_best = 0;
@@ -11129,6 +15667,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
         num_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_den_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -11148,6 +15687,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   }
 
   fret = fret_initial;
+distribution_powell_attempt:
   if(!eval_only){
     powell(0,
            0,
@@ -11177,7 +15717,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
                                vsfh,
                                num_categories_extern,
                                matrix_y,
-                               0, int_RANDOM_SEED,  
+                               0, int_RANDOM_SEED,
                                lbc_dir, dfc_dir, c_dir, initc_dir,
                                lbd_dir, hbd_dir, d_dir, initd_dir,
                                matrix_X_continuous_train_extern,
@@ -11206,6 +15746,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
         num_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_den_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -11237,14 +15778,24 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   iImproved = (enforce_fixed_feasibility && have_start_best) ? (fret_start_best < fret_initial) : (fret < fret_best);
   *timing = timing_extern;
 
-  objective_function_values[0]=fret;
-  objective_function_evals[0]=bwm_eval_count;
-  objective_function_invalid[0]=bwm_invalid_count;
-  bwm_snapshot_fast_counters();
-  fast_eval_total += bwm_fast_eval_count;
+  if (!nn_retry_attempted) {
+    objective_function_values[0]=fret;
+    objective_function_evals[0]=bwm_eval_count;
+    objective_function_invalid[0]=bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+  } else {
+    objective_function_values[nn_retry_history_index]=fret;
+    objective_function_evals[nn_retry_history_index] += bwm_eval_count;
+    objective_function_invalid[nn_retry_history_index] += bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    iImproved = nn_retry_improved;
+  }
   /* When multistarting save initial minimum of objective function and scale factors */
 
-  if((!eval_only) && (iMultistart == IMULTI_TRUE)){
+  if((!eval_only) && (!nn_retry_attempted) &&
+     (iMultistart == IMULTI_TRUE)){
     if (enforce_fixed_feasibility) {
       if (have_start_best) {
         have_multistart_best = 1;
@@ -11257,6 +15808,8 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
       fret_best = fret;
     }
     vector_scale_factor_multistart = alloc_vecd(num_var + 1);
+    prepared_context->scale_factor_multistart =
+      vector_scale_factor_multistart;
     for(i = 1; i <= num_var; i++)
       vector_scale_factor_multistart[i] = (double) vector_scale_factor[i];
     np_progress_bandwidth_multistart_step(1, iNum_Multistart);
@@ -11375,6 +15928,7 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
               bwm_use_transform,
               KERNEL_den_extern,
               KERNEL_den_unordered_extern,
+              KERNEL_den_unordered_extern,
               BANDWIDTH_den_extern,
               BANDWIDTH_den_extern,
               0,
@@ -11431,19 +15985,21 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
     }
 
     free(vector_scale_factor_multistart);
+    prepared_context->scale_factor_multistart = NULL;
 
   }
 
   if (enforce_fixed_feasibility) {
     double final_raw;
     if (!have_start_best) {
-      bw_error_msg = "C_np_distribution_bw: optimizer failed to produce a feasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_distribution_bw: optimizer failed to produce a feasible bandwidth candidate";
       goto cleanup_np_distribution_bw;
     }
     if (!np_bw_candidate_is_admissible(
           num_var,
           bwm_use_transform,
           KERNEL_den_extern,
+          KERNEL_den_unordered_extern,
           KERNEL_den_unordered_extern,
           BANDWIDTH_den_extern,
           BANDWIDTH_den_extern,
@@ -11457,12 +16013,67 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
           num_reg_ordered_extern,
           num_categories_extern,
           vector_scale_factor)) {
-      bw_error_msg = "C_np_distribution_bw: optimizer returned an infeasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_distribution_bw: optimizer returned an infeasible bandwidth candidate";
       goto cleanup_np_distribution_bw;
     }
     final_raw = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
     if (!R_FINITE(final_raw) || final_raw == DBL_MAX) {
-      bw_error_msg = "C_np_distribution_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective";
+      if ((!nn_retry_attempted) &&
+          (!eval_only) &&
+          (!int_use_starting_values) &&
+          ((BANDWIDTH_den_extern == BW_GEN_NN) ||
+           (BANDWIDTH_den_extern == BW_ADAP_NN)) &&
+          (num_reg_continuous_extern > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+        const int maximum_k = num_obs_train_extern - 2;
+
+        nn_retry_history_index = (iImproved > 0) ? iImproved - 1 : 0;
+        nn_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = np_ordinary_nn_find_finite_raw_seed_domain(
+          vector_scale_factor,
+          num_reg_continuous_extern,
+          num_obs_train_extern,
+          maximum_k,
+          num_var,
+          1,
+          &finite_seed);
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_den_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   0,
+                                   0,
+                                   0,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_var);
+          nn_retry_attempted = 1;
+          goto distribution_powell_attempt;
+        }
+      }
+      bw_error_msg = "C_np_distribution_bw: optimizer returned a bandwidth candidate with invalid raw objective";
       goto cleanup_np_distribution_bw;
     }
     fret = final_raw;
@@ -11492,59 +16103,110 @@ void np_distribution_bw(double * myuno, double * myord, double * mycon,
   /* end return data */
 
 cleanup_np_distribution_bw:
-  /* Free data objects */
-  safe_free(vector_extendednn_upper_extern);
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
-  bwm_clear_floor_context();
-  bwm_nn_cache_free();
-  bwm_objective_cache_free();
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-
-  if(!cdfontrain){
-    free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
-    free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
-    free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
-  }
-
-  free_mat(matrix_y, num_var + 1);
-  free(vector_scale_factor);
-  free(vector_scale_factor_startbest);
-  free(vsfh);
-  free(num_categories_extern);
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
-
-  free(vector_continuous_stddev);
-
-  free(ipt);
-  if(!cdfontrain)
-    free(ipe);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-  int_TREE_PROFILE_X = NP_TREE_FALSE;
-
-  int_cker_bound_extern = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  np_reset_y_side_extern();
-  np_clear_estimator_extern_aliases();
+  np_distribution_prepared_context_destroy(prepared_context);
 
   if (bw_error_msg != NULL)
-    error("%s", bw_error_msg);
+    np_bandwidth_candidate_error(bw_error_msg, myopti[DBW_DENI]);
 
   return ;
   
 }
 
+static int np_distribution_prepared_context_prepare(
+  NPDistributionPreparedCtx *context,
+  double *myuno, double *myord, double *mycon,
+  double *myeuno, double *myeord, double *myecon, double *mysd,
+  int *myopti, double *myoptd, const double *bw,
+  int penalty_mode, double penalty_mult,
+  double *ckerlb, double *ckerub, const NPCategoricalSupport *support)
+{
+  double fval[3] = {R_NaN, R_NaN, R_NaN};
+  double objective[1] = {R_NaN};
+  double evaluations[1] = {R_NaN};
+  double invalid[1] = {R_NaN};
+  double timing[1] = {R_NaN};
+  double fast[1] = {R_NaN};
+  int pmode = penalty_mode;
+  double pmult = penalty_mult;
 
-void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con, 
+  if (context == NULL || bw == NULL)
+    return 1;
+
+  np_distribution_bw_internal(
+    myuno, myord, mycon, myeuno, myeord, myecon, mysd,
+    myopti, myoptd, (double *)bw, fval,
+    objective, evaluations, invalid, timing, fast,
+    &pmode, &pmult, ckerlb, ckerub,
+    1, context, 1, support);
+  return context->active ? 0 : 1;
+}
+
+static int np_distribution_prepared_context_eval(
+  NPDistributionPreparedCtx *context, const double *bw,
+  int penalty_mode, double penalty_mult, double out[5])
+{
+  double *vector_scale_factor;
+  double fret;
+  int i;
+
+  if (context == NULL || !context->active || bw == NULL || out == NULL ||
+      context->scale_factor == NULL || context->num_var <= 0)
+    return 1;
+
+  vector_scale_factor = context->scale_factor;
+  for (i = 0; i < context->num_var; i++)
+    vector_scale_factor[i + 1] = bw[i];
+
+  if (context->extendednn_upper != NULL) {
+    const double base_k = (double)(num_obs_train_extern - 1);
+    for (i = 0; i < context->num_continuous; i++) {
+      context->extendednn_upper[i] =
+        np_extendednn_eval_upper(bw[i], base_k);
+    }
+  }
+
+  if (bwm_use_transform &&
+      bwm_to_unconstrained(vector_scale_factor, context->num_var) != 0)
+    return 1;
+
+  np_bwm_clear_deferred_error();
+  bwm_reset_counters();
+  np_distribution_refresh_penalty(vector_scale_factor, context->num_var,
+                                  penalty_mode, penalty_mult);
+
+  fret = bwmfunc_wrapper(vector_scale_factor);
+  bwm_snapshot_fast_counters();
+  out[0] = fret;
+  out[1] = fret;
+  out[2] = bwm_eval_count;
+  out[3] = bwm_fast_eval_count;
+  out[4] = bwm_invalid_count;
+  return 0;
+}
+
+void np_distribution_bw(double *myuno, double *myord, double *mycon,
+                        double *myeuno, double *myeord, double *myecon,
+                        double *mysd, int *myopti, double *myoptd,
+                        double *myans, double *fval,
+                        double *objective_function_values,
+                        double *objective_function_evals,
+                        double *objective_function_invalid, double *timing,
+                        double *objective_function_fast,
+                        int *penalty_mode, double *penalty_mult,
+                        double *ckerlb, double *ckerub,
+                        const int eval_only, const NPCategoricalSupport *support)
+{
+  np_distribution_bw_internal(
+    myuno, myord, mycon, myeuno, myeord, myecon, mysd,
+    myopti, myoptd, myans, fval,
+    objective_function_values, objective_function_evals,
+    objective_function_invalid, timing, objective_function_fast,
+    penalty_mode, penalty_mult, ckerlb, ckerub,
+    eval_only, NULL, 0, support);
+}
+
+
+static void np_density_conditional_bw_owned(double * c_uno, double * c_ord, double * c_con,
                                double * u_uno, double * u_ord, double * u_con,
                                double * mysd,
                                int * myopti, double * myoptd, double * myans, double * fval,
@@ -11559,7 +16221,8 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                int * regtype,
                                double * cxkerlb, double * cxkerub,
                                double * cykerlb, double * cykerub,
-                               const int eval_only){
+                               const int eval_only, const NPCategoricalSupport *support){
+  np_conditional_failure_reset();
   int_nn_k_min_extern = 1;
 /* Likelihood bandwidth selection for density estimation */
 
@@ -11568,7 +16231,6 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   double *vector_continuous_stddev = NULL;
   double *vsfh, *vector_scale_factor, *vector_scale_factor_multistart;
   double *vector_scale_factor_startbest;
-  double *cxylb = NULL, *cxyub = NULL;
 
   double fret, fret_best, fret_start_best, fret_initial;
   double ftol, tol;
@@ -11582,581 +16244,79 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   double scale_factor_lower_bound;
   int dfc_dir;
   
-  int i,j;
-  int need_y_side = 0;
+  int i;
   double fast_eval_total = 0.0;
   double guarded_eval_total = 0.0;
-  int num_var;
-  int iMultistart, iMs_counter, iNum_Multistart, num_all_var, num_var_var, iImproved;
+  int iMultistart, iMs_counter, iNum_Multistart, num_all_var, iImproved;
   int enforce_fixed_feasibility;
   int have_start_best, have_multistart_best;
+  int nn_retry_attempted = 0;
+  int nn_retry_history_index = 0;
+  int nn_retry_improved = 0;
   int itmax, iter;
-  int int_use_starting_values, ibwmfunc, old_cdens, scale_cat;
+  int ibwmfunc, scale_cat;
   const char *bw_error_msg = NULL;
 
-  int num_all_cvar, num_all_uvar, num_all_ovar;
-
-  int * ipt_X = NULL, * ipt_XY = NULL, * ipt_Y = NULL; 
-  int * ipt_lookup_XY = NULL, * ipt_lookup_Y = NULL, * ipt_lookup_X = NULL;
-
-  /* Ensure optional Y-only categorical arrays are reset each call */
-  num_categories_extern_Y = NULL;
-  matrix_categorical_vals_extern_Y = NULL;
-  np_bounded_cvls_conditional_quad_context_clear_extern();
-  bwm_clear_floor_context();
-
-  num_var_unordered_extern = myopti[CBW_CNUNOI];
-  num_var_ordered_extern = myopti[CBW_CNORDI];
-  num_var_continuous_extern = myopti[CBW_CNCONI];
-
-  num_reg_unordered_extern = myopti[CBW_UNUNOI];
-  num_reg_ordered_extern = myopti[CBW_UNORDI];
-  num_reg_continuous_extern = myopti[CBW_UNCONI];
-
-  num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
-  num_var_var = num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern;
-  num_all_var = num_var+num_var_var;
-
-  num_obs_train_extern = myopti[CBW_NOBSI];
   iMultistart = myopti[CBW_IMULTII];
   iNum_Multistart = myopti[CBW_NMULTII];
   if (!eval_only && iNum_Multistart < 1)
     error("C_np_density_conditional_bw: nmulti must be a positive integer");
 
-  KERNEL_reg_extern = myopti[CBW_CXKRNEVI];
-  KERNEL_den_extern = myopti[CBW_CYKRNEVI];
+  np_validate_nonfixed_support_input("C_np_density_conditional_bw", myopti[CBW_DENI],
+    myopti[CBW_NOBSI], myopti[CBW_UNCONI], u_con, myopti[CBW_CNCONI], c_con);
 
-  KERNEL_reg_unordered_extern = myopti[CBW_UXKRNEVI];
-  KERNEL_den_unordered_extern = myopti[CBW_UYKRNEVI];
+  if (!np_conditional_density_prepared_context_prepare_internal(
+        c_uno, c_ord, c_con, u_uno, u_ord, u_con,
+        mysd, myopti, myoptd, myans,
+        penalty_mode, penalty_mult,
+        glp_degree, glp_bernstein, glp_basis, regtype,
+        cxkerlb, cxkerub, cykerlb, cykerub,
+        1, eval_only, NULL, support))
+    error("C_np_density_conditional_bw: failed to prepare objective state");
 
-  KERNEL_reg_ordered_extern = myopti[CBW_OXKRNEVI];
-  KERNEL_den_ordered_extern = myopti[CBW_OYKRNEVI];
+  num_all_var = np_conditional_density_prepared_context.num_all_var;
 
-  vector_cxkerlb_extern = cxkerlb;
-  vector_cxkerub_extern = cxkerub;
-  int_cxker_bound_extern = np_has_finite_cker_bounds(cxkerlb, cxkerub, num_reg_continuous_extern);
+  matrix_y = np_conditional_density_prepared_context.powell_directions;
+  vector_scale_factor = np_conditional_density_prepared_context.vector_scale_factor;
+  vector_scale_factor_startbest =
+    np_conditional_density_prepared_context.scale_factor_startbest;
+  vsfh = np_conditional_density_prepared_context.powell_step;
+  vector_continuous_stddev = vector_continuous_stddev_extern;
 
-  vector_cykerlb_extern = cykerlb;
-  vector_cykerub_extern = cykerub;
-  int_cyker_bound_extern = np_has_finite_cker_bounds(cykerlb, cykerub, num_var_continuous_extern);
-
-  if((num_reg_continuous_extern + num_var_continuous_extern) > 0){
-    cxylb = alloc_vecd(num_reg_continuous_extern + num_var_continuous_extern);
-    cxyub = alloc_vecd(num_reg_continuous_extern + num_var_continuous_extern);
-    for(i = 0; i < num_reg_continuous_extern; i++){
-      cxylb[i] = (cxkerlb != NULL) ? cxkerlb[i] : DBL_MAX;
-      cxyub[i] = (cxkerub != NULL) ? cxkerub[i] : DBL_MAX;
-    }
-    for(i = 0; i < num_var_continuous_extern; i++){
-      cxylb[num_reg_continuous_extern + i] = (cykerlb != NULL) ? cykerlb[i] : DBL_MAX;
-      cxyub[num_reg_continuous_extern + i] = (cykerub != NULL) ? cykerub[i] : DBL_MAX;
-    }
-    vector_cxykerlb_extern = cxylb;
-    vector_cxykerub_extern = cxyub;
-    int_cxyker_bound_extern = np_has_finite_cker_bounds(cxylb, cxyub, num_reg_continuous_extern + num_var_continuous_extern);
-  } else {
-    vector_cxykerlb_extern = NULL;
-    vector_cxykerub_extern = NULL;
-    int_cxyker_bound_extern = 0;
-  }
-
-  int_use_starting_values= myopti[CBW_USTARTI];
-  int_LARGE_SF=myopti[CBW_LSFI];
-  BANDWIDTH_den_extern=myopti[CBW_DENI];
-  enforce_fixed_feasibility = ((BANDWIDTH_den_extern == BW_FIXED) && (!eval_only));
+  int_LARGE_SF = myopti[CBW_LSFI];
+  BANDWIDTH_den_extern = myopti[CBW_DENI];
+  enforce_fixed_feasibility =
+    (((BANDWIDTH_den_extern == BW_FIXED) ||
+      (BANDWIDTH_den_extern == BW_GEN_NN) ||
+      (BANDWIDTH_den_extern == BW_ADAP_NN)) && (!eval_only));
   int_RESTART_FROM_MIN = myopti[CBW_REMINI];
   int_MINIMIZE_IO = myopti[CBW_MINIOI];
-
-  itmax=myopti[CBW_ITMAXI];
-  int_WEIGHTS = 0;
-  old_cdens = myopti[CBW_OLDI];
-  int_TREE_XY = int_TREE_Y = int_TREE_X = myopti[CBW_TREEI];
-  int_TREE_PROFILE_X = myopti[CBW_TREEI];
+  itmax = myopti[CBW_ITMAXI];
   scale_cat = myopti[CBW_SCATI];
-  bwm_use_transform = 0;
-  
   ibwmfunc = myopti[CBW_MI];
-  int_ll_extern = ((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) ? *regtype : LL_LC;
-  vector_glp_degree_extern = (((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) && (int_ll_extern == LL_LP)) ? glp_degree : NULL;
-  vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = (((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) && (int_ll_extern == LL_LP)) ? *glp_bernstein : 0;
-  int_glp_basis_extern = (((ibwmfunc == CBWM_CVML) || (ibwmfunc == CBWM_CVLS)) && (int_ll_extern == LL_LP)) ? *glp_basis : 1;
-  int_bounded_cvls_quadrature_grid_extern = myopti[CBW_CVLS_QUAD_GRIDI];
-  if ((int_bounded_cvls_quadrature_grid_extern < 0) ||
-      (int_bounded_cvls_quadrature_grid_extern > 2))
-    error("C_np_density_conditional_bw: cvls.quadrature.grid is invalid");
-  int_bounded_cvls_quadrature_points_extern = myopti[CBW_CVLS_QUAD_POINTSI];
-  if (int_bounded_cvls_quadrature_points_extern < 2)
-    int_bounded_cvls_quadrature_points_extern = 0;
-  need_y_side = (ibwmfunc == CBWM_CVLS) || ((ibwmfunc == CBWM_CVML) && (int_ll_extern == LL_LP));
-  bwm_use_transform = myopti[CBW_TBNDI];
-  if (BANDWIDTH_den_extern != BW_FIXED)
-    bwm_use_transform = 0;
-  if (bwm_use_transform) {
-    int n = num_var_continuous_extern + num_reg_continuous_extern +
-      num_var_unordered_extern + num_reg_unordered_extern +
-      num_var_ordered_extern + num_reg_ordered_extern;
-    bwm_reserve_transform_buf(n + 1);
-  }
-  bwm_nn_cache_configure_for_powell(BANDWIDTH_den_extern,
-                                    eval_only,
-                                    0,
-                                    num_var_continuous_extern + num_reg_continuous_extern,
-                                    num_var_unordered_extern + num_reg_unordered_extern,
-                                    num_var_ordered_extern + num_reg_ordered_extern);
 
-  ftol=myoptd[CBW_FTOLD];
-  tol=myoptd[CBW_TOLD];
-  small=myoptd[CBW_SMALLD];
-  dbl_memfac_ccdf_extern = myoptd[CBW_MEMFACD];
+  ftol = myoptd[CBW_FTOLD];
+  tol = myoptd[CBW_TOLD];
+  small = myoptd[CBW_SMALLD];
   scale_factor_lower_bound = myoptd[CBW_SFLOORD];
   if (!R_FINITE(scale_factor_lower_bound) || scale_factor_lower_bound < 0.0)
     scale_factor_lower_bound = 0.1;
-  double_bounded_cvls_quadrature_extend_factor_extern = myoptd[CBW_QUAD_EXTD];
-  if (!R_FINITE(double_bounded_cvls_quadrature_extend_factor_extern) ||
-      double_bounded_cvls_quadrature_extend_factor_extern <= 0.0)
-    error("C_np_density_conditional_bw: cvls.quadrature.extend.factor must be positive and finite");
-  double_bounded_cvls_quadrature_ratios_extern[0] = myoptd[CBW_QUAD_RATIO_UNIFORMD];
-  double_bounded_cvls_quadrature_ratios_extern[1] = myoptd[CBW_QUAD_RATIO_SAMPLED];
-  double_bounded_cvls_quadrature_ratios_extern[2] = myoptd[CBW_QUAD_RATIO_GLD];
-  if (!R_FINITE(double_bounded_cvls_quadrature_ratios_extern[0]) ||
-      !R_FINITE(double_bounded_cvls_quadrature_ratios_extern[1]) ||
-      !R_FINITE(double_bounded_cvls_quadrature_ratios_extern[2]) ||
-      (double_bounded_cvls_quadrature_ratios_extern[0] < 0.0) ||
-      (double_bounded_cvls_quadrature_ratios_extern[1] < 0.0) ||
-      (double_bounded_cvls_quadrature_ratios_extern[2] < 0.0) ||
-      (fabs(double_bounded_cvls_quadrature_ratios_extern[0] +
-            double_bounded_cvls_quadrature_ratios_extern[1] +
-            double_bounded_cvls_quadrature_ratios_extern[2] - 1.0) > 1.0e-8))
-    error("C_np_density_conditional_bw: cvls.quadrature.ratios must be non-negative and sum to one");
-
   dfc_dir = myopti[CBW_DFC_DIRI];
   lbc_dir = myoptd[CBW_LBC_DIRD];
   c_dir = myoptd[CBW_C_DIRD];
-  initc_dir = myoptd[CBW_INITC_DIRD]; 
-
-  lbd_dir = myoptd[CBW_LBD_DIRD]; 
-  hbd_dir = myoptd[CBW_HBD_DIRD]; 
-  d_dir = myoptd[CBW_D_DIRD]; 
-  initd_dir = myoptd[CBW_INITD_DIRD]; 
-
-  lbc_init = myoptd[CBW_LBC_INITD]; 
-  hbc_init = myoptd[CBW_HBC_INITD]; 
-  c_init = myoptd[CBW_C_INITD]; 
-
-  lbd_init = myoptd[CBW_LBD_INITD]; 
-  hbd_init = myoptd[CBW_HBD_INITD]; 
-  d_init = myoptd[CBW_D_INITD]; 
-
+  initc_dir = myoptd[CBW_INITC_DIRD];
+  lbd_dir = myoptd[CBW_LBD_DIRD];
+  hbd_dir = myoptd[CBW_HBD_DIRD];
+  d_dir = myoptd[CBW_D_DIRD];
+  initd_dir = myoptd[CBW_INITD_DIRD];
+  lbc_init = myoptd[CBW_LBC_INITD];
+  hbc_init = myoptd[CBW_HBC_INITD];
+  c_init = myoptd[CBW_C_INITD];
+  lbd_init = myoptd[CBW_LBD_INITD];
+  hbd_init = myoptd[CBW_HBD_INITD];
+  d_init = myoptd[CBW_D_INITD];
   nconfac_extern = myoptd[CBW_NCONFD];
   ncatfac_extern = myoptd[CBW_NCATFD];
-
-/* Allocate memory for objects */
-
-  //if((BANDWIDTH_den_extern != BW_FIXED) && (ibwmfunc == CBWM_CVLS))
-  //old_cdens = 1;
-
-  matrix_Y_unordered_train_extern = alloc_matd(num_obs_train_extern, num_var_unordered_extern);
-  matrix_Y_ordered_train_extern = alloc_matd(num_obs_train_extern, num_var_ordered_extern);
-  matrix_Y_continuous_train_extern = alloc_matd(num_obs_train_extern, num_var_continuous_extern);
-
-  matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
-	
-  num_categories_extern = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern +
-                                     num_reg_unordered_extern + num_reg_ordered_extern);
-
-  num_categories_extern_XY = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern +
-                                     num_reg_unordered_extern + num_reg_ordered_extern);
-
-  num_categories_extern_X = alloc_vecu(num_reg_unordered_extern + num_reg_ordered_extern);
-  
-  if(need_y_side){
-    num_categories_extern_Y = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern);
-  }
-
-  matrix_y = alloc_matd(num_all_var + 1, num_all_var + 1);
-  vector_scale_factor = alloc_vecd(num_all_var + 1);
-  vector_scale_factor_startbest = alloc_vecd(num_all_var + 1);
-  vsfh = alloc_vecd(num_all_var + 1);
-  
-  matrix_categorical_vals_extern = 
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern + 
-               num_reg_unordered_extern + num_reg_ordered_extern);
-
-  matrix_categorical_vals_extern_X = 
-    alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  if(need_y_side){
-    matrix_categorical_vals_extern_Y = 
-      alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern);
-  }
-
-  matrix_categorical_vals_extern_XY = 
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern + 
-               num_reg_unordered_extern + num_reg_ordered_extern);
-
-
-  /* in v_s_f order is creg, cvar, uvar, ovar, ureg, oreg  */
-
-  if (int_use_starting_values)
-    for( i=0;i<num_all_var; i++ )
-      vector_scale_factor[i+1] = myans[i];
-
-/* Parse data */
-
-  for(j=0;j<num_var_unordered_extern;j++)
-    for(i=0;i<num_obs_train_extern;i++)
-      matrix_Y_unordered_train_extern[j][i]=c_uno[j*num_obs_train_extern+i];
-
-  for(j=0;j<num_var_ordered_extern;j++)
-    for(i=0;i<num_obs_train_extern;i++)
-      matrix_Y_ordered_train_extern[j][i]=c_ord[j*num_obs_train_extern+i];
-
-  for(j=0;j<num_var_continuous_extern;j++)
-    for(i=0;i<num_obs_train_extern;i++)
-      matrix_Y_continuous_train_extern[j][i]=c_con[j*num_obs_train_extern+i];
-
-
-  for(j=0;j<num_reg_unordered_extern;j++)
-    for(i=0;i<num_obs_train_extern;i++)
-      matrix_X_unordered_train_extern[j][i]=u_uno[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_ordered_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_ordered_train_extern[j][i]=u_ord[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_continuous_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_continuous_train_extern[j][i]=u_con[j*num_obs_train_extern+i];
-
-  /* data has been parsed, make the joint xy dataset */
-
-  // the main tree is x, the alt tree is xy
-
-  num_all_cvar = num_reg_continuous_extern + num_var_continuous_extern;
-  num_all_uvar = num_reg_unordered_extern + num_var_unordered_extern;
-  num_all_ovar = num_reg_ordered_extern + num_var_ordered_extern;
-
-  // we use 3 trees for cpdf ls, and 2 for cpdf ml
-
-  ipt_X = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_X != NULL)){
-    bw_error_msg = "!(ipt_X != NULL)";
-    goto cleanup_np_density_conditional_bw;
-  }
-
-  ipt_lookup_X = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_lookup_X != NULL)){
-    bw_error_msg = "!(ipt_lookup_X != NULL)";
-    goto cleanup_np_density_conditional_bw;
-  }
-
-  for(i = 0; i < num_obs_train_extern; i++){
-    ipt_lookup_X[i] = ipt_X[i] = i;
-  }
-
-  ipt_extern_X = ipt_X;
-  ipt_lookup_extern_X = ipt_lookup_X;
-
-  if(need_y_side){
-    ipt_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
-    if(!(ipt_Y != NULL)){
-      bw_error_msg = "!(ipt_Y != NULL)";
-      goto cleanup_np_density_conditional_bw;
-    }
-
-    ipt_lookup_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
-    if(!(ipt_lookup_Y != NULL)){
-      bw_error_msg = "!(ipt_lookup_Y != NULL)";
-      goto cleanup_np_density_conditional_bw;
-    }
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt_lookup_Y[i] = ipt_Y[i] = i;
-    }
-
-  } else {
-    ipt_Y = ipt_X;
-    ipt_lookup_Y = ipt_lookup_X;
-  }
-
-  ipt_extern_Y = ipt_Y;
-  ipt_lookup_extern_Y = ipt_lookup_Y;
-
-  ipt_XY = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_XY != NULL)){
-    bw_error_msg = "!(ipt_XY != NULL)";
-    goto cleanup_np_density_conditional_bw;
-  }
-
-  ipt_lookup_XY = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt_lookup_XY != NULL)){
-    bw_error_msg = "!(ipt_lookup_XY != NULL)";
-    goto cleanup_np_density_conditional_bw;
-  }
-
-  for(i = 0; i < num_obs_train_extern; i++){
-    ipt_lookup_XY[i] = ipt_XY[i] = i;
-  }
-
-  ipt_extern_XY = ipt_XY;
-  ipt_lookup_extern_XY = ipt_lookup_XY;
-
-  int_TREE_XY = int_TREE_XY && (((num_all_cvar) != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
-
-  int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
-
-  int_TREE_Y = int_TREE_Y && need_y_side && ((num_var_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
-
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
-                 4*num_reg_continuous_extern, ipt_X, &kdt_extern_X);
-  
-
-    //put training data into tree-order using the index array
-
-    for( j=0;j<num_reg_unordered_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_unordered_train_extern[j][i]=u_uno[j*num_obs_train_extern+ipt_X[i]];
-    
-    
-    for( j=0;j<num_reg_ordered_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_ordered_train_extern[j][i]=u_ord[j*num_obs_train_extern+ipt_X[i]];
-
-    for( j=0;j<num_reg_continuous_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_continuous_train_extern[j][i]=u_con[j*num_obs_train_extern+ipt_X[i]];
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt_lookup_X[ipt_X[i]] = i;
-    }
-  }
-
-  if(int_TREE_Y == NP_TREE_TRUE){
-    build_kdtree(matrix_Y_continuous_train_extern, num_obs_train_extern, num_var_continuous_extern, 
-                 4*num_var_continuous_extern, ipt_Y, &kdt_extern_Y);
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt_lookup_Y[ipt_Y[i]] = i;
-    }
-
-  }
-
-
-  if((int_TREE_X == NP_TREE_TRUE) || (int_TREE_Y == NP_TREE_TRUE)){
-    for(j=0;j<num_var_unordered_extern;j++)
-      for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_unordered_train_extern[j][i]=c_uno[j*num_obs_train_extern+ipt_Y[i]];
-
-    for(j=0;j<num_var_ordered_extern;j++)
-      for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_ordered_train_extern[j][i]=c_ord[j*num_obs_train_extern+ipt_Y[i]];
-
-    for(j=0;j<num_var_continuous_extern;j++)
-      for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_continuous_train_extern[j][i]=c_con[j*num_obs_train_extern+ipt_Y[i]];
-
-  }
-
-
-  matrix_XY_continuous_train_extern = alloc_matd(num_obs_train_extern, num_all_cvar);
-  matrix_XY_unordered_train_extern = alloc_matd(num_obs_train_extern, num_all_uvar);
-  matrix_XY_ordered_train_extern = alloc_matd(num_obs_train_extern, num_all_ovar);
-
-
-  for(j = 0; j < num_reg_unordered_extern; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_unordered_train_extern[j][i]=u_uno[j*num_obs_train_extern+i];
-
-  for(j = num_reg_unordered_extern; j < num_all_uvar; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_unordered_train_extern[j][i]=c_uno[(j-num_reg_unordered_extern)*num_obs_train_extern+i];
-
-
-  for(j = 0; j < num_reg_ordered_extern; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_ordered_train_extern[j][i]=u_ord[j*num_obs_train_extern+i];
-
-  for(j = num_reg_ordered_extern; j < num_all_ovar; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_ordered_train_extern[j][i]=c_ord[(j-num_reg_ordered_extern)*num_obs_train_extern+i];
-
-
-  for(j = 0; j < num_reg_continuous_extern; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_continuous_train_extern[j][i]=u_con[j*num_obs_train_extern+i];
-
-  for(j = num_reg_continuous_extern; j < num_all_cvar; j++)
-    for(i = 0; i < num_obs_train_extern; i++)
-      matrix_XY_continuous_train_extern[j][i]=c_con[(j-num_reg_continuous_extern)*num_obs_train_extern+i];
-
-  if(int_TREE_XY == NP_TREE_TRUE){
-
-    build_kdtree(matrix_XY_continuous_train_extern, num_obs_train_extern, num_all_cvar, 
-                 4*num_all_cvar, ipt_XY, &kdt_extern_XY);
-
-    // put data into tree-order
-    for(j = 0; j < num_reg_unordered_extern; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i]=u_uno[j*num_obs_train_extern+ipt_XY[i]];
-
-    for(j = num_reg_unordered_extern; j < num_all_uvar; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i]=c_uno[(j-num_reg_unordered_extern)*num_obs_train_extern+ipt_XY[i]];
-
-
-    for(j = 0; j < num_reg_ordered_extern; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i]=u_ord[j*num_obs_train_extern+ipt_XY[i]];
-
-    for(j = num_reg_ordered_extern; j < num_all_ovar; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i]=c_ord[(j-num_reg_ordered_extern)*num_obs_train_extern+ipt_XY[i]];
-
-
-    for(j = 0; j < num_reg_continuous_extern; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i]=u_con[j*num_obs_train_extern+ipt_XY[i]];
-
-    for(j = num_reg_continuous_extern; j < num_all_cvar; j++)
-      for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i]=c_con[(j-num_reg_continuous_extern)*num_obs_train_extern+ipt_XY[i]];
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt_lookup_XY[ipt_XY[i]] = i;
-    }
-
-  }
-
-  determine_categorical_vals(num_obs_train_extern,
-                             num_var_unordered_extern,
-                             num_var_ordered_extern,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
-
-  np_splitxy_vsf_mcv_nc(num_var_unordered_extern, num_var_ordered_extern, num_var_continuous_extern,
-                        num_reg_unordered_extern, num_reg_ordered_extern, num_reg_continuous_extern,
-                        vector_scale_factor+1,
-                        num_categories_extern,
-                        matrix_categorical_vals_extern,
-                        NULL, NULL, NULL,
-                        num_categories_extern_X, need_y_side ? num_categories_extern_Y : NULL, num_categories_extern_XY,
-                        matrix_categorical_vals_extern_X, need_y_side ? matrix_categorical_vals_extern_Y : NULL, matrix_categorical_vals_extern_XY);
-  
-
-  vector_continuous_stddev = alloc_vecd(num_var_continuous_extern + num_reg_continuous_extern);
-
-  for(j = 0; j < (num_var_continuous_extern + num_reg_continuous_extern); j++)
-    vector_continuous_stddev[j] = mysd[j];
-
-  vector_continuous_stddev_extern = vector_continuous_stddev;
-
-  vector_extendednn_upper_extern = (!eval_only) ?
-    np_conditional_extendednn_upper_alloc(
-      BANDWIDTH_den_extern,
-      KERNEL_reg_extern,
-      KERNEL_den_extern,
-      num_obs_train_extern,
-      num_obs_train_extern,
-      num_reg_continuous_extern,
-      num_var_continuous_extern,
-      matrix_X_continuous_train_extern,
-      matrix_Y_continuous_train_extern,
-      matrix_Y_continuous_train_extern) :
-    np_continuous_extendednn_eval_upper_alloc(
-      BANDWIDTH_den_extern,
-      num_obs_train_extern,
-      num_reg_continuous_extern + num_var_continuous_extern,
-      myans);
-  int_extendednn_upper_num_extern =
-    (vector_extendednn_upper_extern != NULL) ?
-    (num_reg_continuous_extern + num_var_continuous_extern) : 0;
-
-  if((ibwmfunc == CBWM_CVLS) && (int_ll_extern == LL_LP)){
-    if(np_bounded_cvls_conditional_quad_context_prepare_extern() != 0){
-      bw_error_msg = "C_np_density_conditional_bw: failed to prepare bounded cv.ls quadrature context";
-      goto cleanup_np_density_conditional_bw;
-    }
-  }
-
-  /* Initialize scale factors and Directions for NR modules */
-
-  initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
-                                    0,                /* Not Random (0) Random (1) */
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    num_var_continuous_extern,
-                                    num_var_unordered_extern,
-                                    num_var_ordered_extern,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    KERNEL_den_unordered_extern,
-                                    KERNEL_reg_unordered_extern,
-                                    int_use_starting_values,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),             /* Init for continuous vars */
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev,
-                                    vector_scale_factor,
-                                    lbc_init, hbc_init, c_init, 
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
-
-  initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
-                                    0,                /* Not Random (0) Random (1) */
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    num_var_continuous_extern,
-                                    num_var_unordered_extern,
-                                    num_var_ordered_extern,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    KERNEL_den_unordered_extern,
-                                    KERNEL_reg_unordered_extern,
-                                    0,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),             /* Init for continuous vars */
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev,
-                                    vsfh,
-                                    lbc_init, hbc_init, c_init, 
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
-
-  initialize_nr_directions(BANDWIDTH_den_extern,
-                           num_obs_train_extern,
-                           num_reg_continuous_extern,
-                           num_reg_unordered_extern,
-                           num_reg_ordered_extern,
-                           num_var_continuous_extern,
-                           num_var_unordered_extern,
-                           num_var_ordered_extern,
-                           vsfh,
-                           num_categories_extern,
-                           matrix_y,
-                           0, int_RANDOM_SEED,  
-                           lbc_dir, dfc_dir, c_dir, initc_dir,
-                           lbd_dir, hbd_dir, d_dir, initd_dir,
-                           matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
 
   /* When multistarting, set counter */
 
@@ -12167,57 +16327,39 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
 
   /* assign the function to be optimized */
 
-  /* 7/2/2010 */  
-  if(old_cdens){
-    switch(ibwmfunc){
-    case CBWM_CVML : bwmfunc = cv_func_con_density_categorical_ml; break;
-    case CBWM_CVLS : bwmfunc = cv_func_con_density_categorical_ls; break;
-    case CBWM_NPLS : bwmfunc = np_cv_func_con_density_categorical_ls;break;
-    case CBWM_CCDF : bwmfunc = cv_func_con_distribution_categorical_ccdf; break;
-    default : REprintf("np.c: invalid bandwidth selection method.");
-      bw_error_msg = "np.c: invalid bandwidth selection method.";
-      goto cleanup_np_density_conditional_bw;
-    }
-  } else {
-    switch(ibwmfunc){
-    case CBWM_CVML : bwmfunc = np_cv_func_con_density_categorical_ml; break;
-    case CBWM_CVLS : bwmfunc = np_cv_func_con_density_categorical_ls_npksum; break;
-    default : REprintf("np.c: invalid bandwidth selection method.");
-      bw_error_msg = "np.c: invalid bandwidth selection method.";
-      goto cleanup_np_density_conditional_bw;
-    }
+  switch(ibwmfunc){
+  case CBWM_CVML : bwmfunc = np_cv_func_con_density_categorical_ml; break;
+  case CBWM_CVLS : bwmfunc = np_cv_func_con_density_categorical_ls_npksum; break;
+  default : REprintf("np.c: invalid bandwidth selection method.");
+    bw_error_msg = "np.c: invalid bandwidth selection method.";
+    goto cleanup_np_density_conditional_bw;
   }
 
+  bwm_search_context_configure_split(
+    num_var_continuous_extern + num_reg_continuous_extern,
+    num_var_unordered_extern,
+    num_reg_unordered_extern,
+    num_var_ordered_extern,
+    num_reg_ordered_extern,
+    0,
+    KERNEL_den_unordered_extern,
+    KERNEL_reg_unordered_extern,
+    num_categories_extern);
   if (bwm_use_transform &&
       bwm_to_unconstrained(vector_scale_factor, num_all_var) != 0) {
     bw_error_msg = "C_np_density_conditional_bw: transform buffer allocation failed";
     goto cleanup_np_density_conditional_bw;
   }
 
-  spinner(0);
 
   np_bwm_clear_deferred_error();
   bwmfunc_raw = bwmfunc;
-  bwm_num_reg_continuous = num_var_continuous_extern + num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_var_unordered_extern + num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_var_ordered_extern + num_reg_ordered_extern;
-  bwm_kernel_unordered = KERNEL_den_unordered_extern;
-  bwm_kernel_unordered_len = bwm_num_reg_unordered;
-  if (bwm_kernel_unordered_len > 0) {
-    bwm_kernel_unordered_vec = alloc_vecu(bwm_kernel_unordered_len);
-    for (i = 0; i < num_var_unordered_extern; i++)
-      bwm_kernel_unordered_vec[i] = KERNEL_den_unordered_extern;
-    for (i = 0; i < num_reg_unordered_extern; i++)
-      bwm_kernel_unordered_vec[num_var_unordered_extern + i] = KERNEL_reg_unordered_extern;
-  } else {
-    bwm_kernel_unordered_vec = NULL;
-  }
-  bwm_num_categories = num_categories_extern;
   bwm_set_floor_context(
-    enforce_fixed_feasibility,
+    enforce_fixed_feasibility && (BANDWIDTH_den_extern == BW_FIXED),
     num_all_var,
     bwm_use_transform,
     KERNEL_den_extern,
+    KERNEL_den_unordered_extern,
     KERNEL_reg_unordered_extern,
     BANDWIDTH_den_extern,
     BANDWIDTH_den_extern,
@@ -12232,50 +16374,15 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
     num_categories_extern,
     scale_factor_lower_bound);
   bwm_reset_counters();
-  bwm_penalty_mode = 0;
-  bwm_penalty_value = DBL_MAX;
-  if (penalty_mode[0] == 1) {
-    double pmult = penalty_mult[0];
-    double baseline;
-    if (pmult < 1.0) pmult = 1.0;
-    baseline = bwmfunc_raw_current_scale(vector_scale_factor, num_all_var);
-    /* Penalty-baseline probes are real objective evaluations and must be
-       included in the evaluation/invalid accounting. */
-    bwm_eval_count += 1.0;
-    if (!R_FINITE(baseline) || baseline == DBL_MAX)
-      bwm_invalid_count += 1.0;
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      double *tmp = bwm_alloc_transform_tmp(num_all_var + 1);
-      if (tmp != NULL && np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_all_var) == 0) {
-        for (i = 1; i <= (num_var_continuous_extern + num_reg_continuous_extern); i++)
-          tmp[i] *= 2.0;
-        for (i = 0; i < (num_var_unordered_extern + num_reg_unordered_extern); i++) {
-          int idx = num_var_continuous_extern + num_reg_continuous_extern + 1 + i;
-          double maxbw = max_unordered_bw(num_categories_extern[i], KERNEL_den_unordered_extern);
-          tmp[idx] = 0.5*maxbw;
-        }
-        for (i = 0; i < (num_var_ordered_extern + num_reg_ordered_extern); i++) {
-          int idx = num_var_continuous_extern + num_reg_continuous_extern +
-            num_var_unordered_extern + num_reg_unordered_extern + 1 + i;
-          tmp[idx] = 0.5;
-        }
-        baseline = bwmfunc_raw(tmp);
-        bwm_eval_count += 1.0;
-        if (!R_FINITE(baseline) || baseline == DBL_MAX)
-          bwm_invalid_count += 1.0;
-      }
-      safe_free(tmp);
-    }
-    if (!R_FINITE(baseline) || baseline == DBL_MAX) {
-      bwm_penalty_value = pmult * 1.0e6;
-    } else {
-      bwm_penalty_value = baseline + (fabs(baseline) + 1.0) * pmult;
-    }
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
-  }
+  np_conditional_density_refresh_penalty_canonical(
+    vector_scale_factor,
+    num_all_var,
+    penalty_mode[0],
+    penalty_mult[0],
+    1,
+    !myopti[CBW_USTARTI]);
 
-  fret_initial = fret_best = bwmfunc_wrapper(vector_scale_factor);
+  fret_initial = fret_best = np_conditional_bwmfunc_wrapper(vector_scale_factor);
   iImproved = 0;
   have_start_best = 0;
   have_multistart_best = 0;
@@ -12285,6 +16392,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
         num_all_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_reg_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -12304,8 +16412,9 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
     np_copy_scale_factor(vector_scale_factor_startbest, vector_scale_factor, num_all_var);
   }
 
+conditional_density_powell_attempt:
   if(!eval_only){
-    powell(0,
+    np_conditional_powell(0,
            0,
            vector_scale_factor,
            vector_scale_factor,
@@ -12317,7 +16426,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
            itmax,
            &iter,
            &fret,
-           bwmfunc_wrapper);
+           np_conditional_bwmfunc_wrapper);
 
     if(int_RESTART_FROM_MIN == RE_MIN_TRUE){
 
@@ -12332,12 +16441,12 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                vsfh,
                                num_categories_extern,
                                matrix_y,
-                               0, int_RANDOM_SEED,  
+                               0, int_RANDOM_SEED,
                                lbc_dir, dfc_dir, c_dir, initc_dir,
                                lbd_dir, hbd_dir, d_dir, initd_dir,
                                matrix_X_continuous_train_extern,
                                matrix_Y_continuous_train_extern);
-      powell(0,
+      np_conditional_powell(0,
              0,
              vector_scale_factor,
              vector_scale_factor,
@@ -12349,7 +16458,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
              itmax,
              &iter,
              &fret,
-             bwmfunc_wrapper);
+             np_conditional_bwmfunc_wrapper);
 
     }
   } else {
@@ -12361,6 +16470,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
         num_all_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_reg_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -12398,16 +16508,27 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   iImproved = (enforce_fixed_feasibility && have_start_best) ? (fret_start_best < fret_initial) : (fret < fret_best);
   *timing = timing_extern;
 
-  objective_function_values[0]=-fret;
-  objective_function_evals[0]=bwm_eval_count;
-  objective_function_invalid[0]=bwm_invalid_count;
-  bwm_snapshot_fast_counters();
-  fast_eval_total += bwm_fast_eval_count;
-  guarded_eval_total += bwm_guarded_eval_count;
+  if (!nn_retry_attempted) {
+    objective_function_values[0]=-fret;
+    objective_function_evals[0]=bwm_eval_count;
+    objective_function_invalid[0]=bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    guarded_eval_total += bwm_guarded_eval_count;
+  } else {
+    objective_function_values[nn_retry_history_index]=-fret;
+    objective_function_evals[nn_retry_history_index] += bwm_eval_count;
+    objective_function_invalid[nn_retry_history_index] += bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    guarded_eval_total += bwm_guarded_eval_count;
+    iImproved = nn_retry_improved;
+  }
   /* When multistarting save initial minimum of objective function and scale factors */
 
 
-  if((!eval_only) && (iMultistart == IMULTI_TRUE)){
+  if((!eval_only) && (!nn_retry_attempted) &&
+     (iMultistart == IMULTI_TRUE)){
     if (enforce_fixed_feasibility) {
       if (have_start_best) {
         have_multistart_best = 1;
@@ -12419,7 +16540,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
     } else {
       fret_best = fret;
     }
-    vector_scale_factor_multistart = alloc_vecd(num_all_var + 1);
+    vector_scale_factor_multistart = (double *)R_alloc(num_all_var + 1, sizeof(double));
     for(i = 1; i <= num_all_var; i++)
       vector_scale_factor_multistart[i] = (double) vector_scale_factor[i];
     np_progress_bandwidth_multistart_step(1, iNum_Multistart);
@@ -12482,7 +16603,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
 
       bwm_reset_counters();
       
-      powell(0,
+      np_conditional_powell(0,
              0,
              vector_scale_factor,
              vector_scale_factor,
@@ -12494,7 +16615,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
              itmax,
              &iter,
              &fret,
-             bwmfunc_wrapper);
+             np_conditional_bwmfunc_wrapper);
 
       if(int_RESTART_FROM_MIN == RE_MIN_TRUE){
 
@@ -12515,7 +16636,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                                  matrix_X_continuous_train_extern,
                                  matrix_Y_continuous_train_extern);
 
-        powell(0,
+        np_conditional_powell(0,
                0,
                vector_scale_factor,
                vector_scale_factor,
@@ -12527,7 +16648,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
                itmax,
                &iter,
                &fret,
-               bwmfunc_wrapper);
+               np_conditional_bwmfunc_wrapper);
       }
 				
       /* If this run resulted in an improved minimum save information */
@@ -12537,6 +16658,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
               num_all_var,
               bwm_use_transform,
               KERNEL_den_extern,
+              KERNEL_den_unordered_extern,
               KERNEL_reg_unordered_extern,
               BANDWIDTH_den_extern,
               BANDWIDTH_den_extern,
@@ -12593,7 +16715,7 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
       for(i = 1; i <= num_all_var; i++)
         vector_scale_factor[i] = (double) vector_scale_factor_multistart[i];
     }
-    free(vector_scale_factor_multistart);
+    /* R owns the multistart vector through normal return and unwind. */
   }
 
   if (np_bwm_get_deferred_error() != NULL) {
@@ -12604,13 +16726,14 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   if (enforce_fixed_feasibility) {
     double final_raw;
     if (!have_start_best) {
-      bw_error_msg = "C_np_density_conditional_bw: optimizer failed to produce a feasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_density_conditional_bw: optimizer failed to produce a feasible bandwidth candidate";
       goto cleanup_np_density_conditional_bw;
     }
     if (!np_bw_candidate_is_admissible_with_floor(
           num_all_var,
           bwm_use_transform,
           KERNEL_den_extern,
+          KERNEL_den_unordered_extern,
           KERNEL_reg_unordered_extern,
           BANDWIDTH_den_extern,
           BANDWIDTH_den_extern,
@@ -12625,12 +16748,74 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
           num_categories_extern,
           vector_scale_factor,
           scale_factor_lower_bound)) {
-      bw_error_msg = "C_np_density_conditional_bw: optimizer returned an infeasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_density_conditional_bw: optimizer returned an infeasible bandwidth candidate";
       goto cleanup_np_density_conditional_bw;
     }
     final_raw = bwmfunc_raw_current_scale(vector_scale_factor, num_all_var);
+    np_conditional_failure_raise();
     if (!R_FINITE(final_raw) || final_raw == DBL_MAX) {
-      bw_error_msg = "C_np_density_conditional_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective";
+      if ((!nn_retry_attempted) &&
+          (!eval_only) &&
+          (!myopti[CBW_USTARTI]) &&
+          ((BANDWIDTH_den_extern == BW_GEN_NN) ||
+           (BANDWIDTH_den_extern == BW_ADAP_NN)) &&
+          ((num_var_continuous_extern + num_reg_continuous_extern) > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+        const int deleted_fit =
+          BANDWIDTH_den_extern == BW_ADAP_NN || ibwmfunc == CBWM_CVML;
+        const int maximum_k = num_obs_train_extern - (deleted_fit ? 2 : 1);
+
+        nn_retry_history_index = (iImproved > 0) ? iImproved - 1 : 0;
+        nn_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = np_ordinary_nn_find_finite_raw_seed_domain(
+          vector_scale_factor,
+          num_var_continuous_extern + num_reg_continuous_extern,
+          num_obs_train_extern,
+          maximum_k,
+          num_all_var,
+          deleted_fit,
+          &finite_seed);
+        if (np_bwm_get_deferred_error() != NULL) {
+          bw_error_msg = np_bwm_get_deferred_error();
+          goto cleanup_np_density_conditional_bw;
+        }
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_den_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   num_var_continuous_extern,
+                                   num_var_unordered_extern,
+                                   num_var_ordered_extern,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_all_var);
+          nn_retry_attempted = 1;
+          goto conditional_density_powell_attempt;
+        }
+      }
+      bw_error_msg = "C_np_density_conditional_bw: optimizer returned a bandwidth candidate with invalid raw objective";
       goto cleanup_np_density_conditional_bw;
     }
     fret = final_raw;
@@ -12660,113 +16845,511 @@ void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
   /* end return data */
 
 cleanup_np_density_conditional_bw:
-  /* Free data objects */
+  np_conditional_density_prepared_context_clear_internal();
 
-  np_bounded_cvls_conditional_quad_context_clear_extern();
+  if (bw_error_msg != NULL) {
+    np_bwm_clear_deferred_error();
+    np_conditional_bandwidth_candidate_error(bw_error_msg, myopti[CBW_DENI]);
+  }
+
+  return ;
+}
+typedef struct {
+  double *c_uno;
+  double *c_ord;
+  double *c_con;
+  double *u_uno;
+  double *u_ord;
+  double *u_con;
+  double *mysd;
+  int *myopti;
+  double *myoptd;
+  double *myans;
+  double *fval;
+  double *objective_function_values;
+  double *objective_function_evals;
+  double *objective_function_invalid;
+  double *timing;
+  double *objective_function_fast;
+  double *objective_function_guarded;
+  int *penalty_mode;
+  double *penalty_mult;
+  int *glp_degree;
+  int *glp_bernstein;
+  int *glp_basis;
+  int *regtype;
+  double *cxkerlb;
+  double *cxkerub;
+  double *cykerlb;
+  double *cykerub;
+  int eval_only;
+  const NPCategoricalSupport *support;
+  int completed, had_active;
+} np_density_conditional_bw_call;
+static SEXP np_density_conditional_bw_call_run(void *raw){
+  np_density_conditional_bw_call *c=raw;
+  np_density_conditional_bw_owned(c->c_uno,c->c_ord,c->c_con,c->u_uno,c->u_ord,c->u_con,c->mysd,c->myopti,c->myoptd,c->myans,c->fval,c->objective_function_values,c->objective_function_evals,c->objective_function_invalid,c->timing,c->objective_function_fast,c->objective_function_guarded,c->penalty_mode,c->penalty_mult,c->glp_degree,c->glp_bernstein,c->glp_basis,c->regtype,c->cxkerlb,c->cxkerub,c->cykerlb,c->cykerub,c->eval_only,c->support);
+  c->completed=1;return R_NilValue;
+}
+static void np_density_conditional_bw_call_cleanup(void *raw){
+  np_density_conditional_bw_call *c=raw;
+  if(!c->completed && !c->had_active){
+    np_conditional_density_prepared_context_clear_internal();
+    np_conditional_failure_reset();
+  }
+}
+void np_density_conditional_bw(double * c_uno, double * c_ord, double * c_con,
+                               double * u_uno, double * u_ord, double * u_con,
+                               double * mysd,
+                               int * myopti, double * myoptd, double * myans, double * fval,
+                               double * objective_function_values, double * objective_function_evals,
+                               double * objective_function_invalid, double * timing,
+                               double * objective_function_fast,
+                               double * objective_function_guarded,
+                               int * penalty_mode, double * penalty_mult,
+                               int * glp_degree,
+                               int * glp_bernstein,
+                               int * glp_basis,
+                               int * regtype,
+                               double * cxkerlb, double * cxkerub,
+                               double * cykerlb, double * cykerub,
+                               const int eval_only, const NPCategoricalSupport *support){
+  np_density_conditional_bw_call c={.c_uno=c_uno,.c_ord=c_ord,.c_con=c_con,.u_uno=u_uno,.u_ord=u_ord,.u_con=u_con,.mysd=mysd,.myopti=myopti,.myoptd=myoptd,.myans=myans,.fval=fval,.objective_function_values=objective_function_values,.objective_function_evals=objective_function_evals,.objective_function_invalid=objective_function_invalid,.timing=timing,.objective_function_fast=objective_function_fast,.objective_function_guarded=objective_function_guarded,.penalty_mode=penalty_mode,.penalty_mult=penalty_mult,.glp_degree=glp_degree,.glp_bernstein=glp_bernstein,.glp_basis=glp_basis,.regtype=regtype,.cxkerlb=cxkerlb,.cxkerub=cxkerub,.cykerlb=cykerlb,.cykerub=cykerub,.eval_only=eval_only,.support=support,.had_active=(np_conditional_density_prepared_context.active || np_conditional_density_prepared_context.owned)};
+  R_ExecWithCleanup(np_density_conditional_bw_call_run,&c,np_density_conditional_bw_call_cleanup,&c);
+}
+
+
+static void np_conditional_distribution_prepared_context_destroy(
+  NPConditionalDistributionPreparedCtx *context)
+{
+  np_conditional_profile_index_cache_clear_extern();
+  if (context == NULL || !context->active)
+    return;
+
+  int_conditional_prepared_context_extern = 0;
+
   bwm_clear_floor_context();
   bwm_nn_cache_free();
   bwm_objective_cache_free();
-  safe_free(vector_extendednn_upper_extern);
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
+  bwm_search_context_release();
 
-  free_mat(matrix_Y_unordered_train_extern, num_var_unordered_extern);
-  free_mat(matrix_Y_ordered_train_extern, num_var_ordered_extern);
-  free_mat(matrix_Y_continuous_train_extern, num_var_continuous_extern);
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  free_mat(matrix_y, num_all_var + 1);
-  safe_free(vector_scale_factor);
-  safe_free(vector_scale_factor_startbest);
-  safe_free(vsfh);
-  safe_free(num_categories_extern);
-  safe_free(num_categories_extern_XY);
-  safe_free(num_categories_extern_X);
-  safe_free(num_categories_extern_Y);
-  safe_free(bwm_kernel_unordered_vec);
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern + num_reg_ordered_extern +
-           num_var_unordered_extern + num_var_ordered_extern);
-
-  free_mat(matrix_categorical_vals_extern_X, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  free_mat(matrix_categorical_vals_extern_XY, num_reg_unordered_extern + num_reg_ordered_extern +
-           num_var_unordered_extern + num_var_ordered_extern);
-
-  if(need_y_side)
-    free_mat(matrix_categorical_vals_extern_Y, num_var_unordered_extern + num_var_ordered_extern);
-  matrix_categorical_vals_extern_Y = NULL;
-
-  safe_free(vector_continuous_stddev);
-
-  safe_free(ipt_X);
-  safe_free(ipt_XY);
-
-  safe_free(ipt_lookup_X);
-  safe_free(ipt_lookup_XY);
-
-  if(need_y_side){
-    safe_free(ipt_Y);
-    safe_free(ipt_lookup_Y);
-  }
-  num_categories_extern_Y = NULL;
-
-  if(int_TREE_X == NP_TREE_TRUE){
+  if (kdt_extern_X != NULL)
     free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-
-  if(int_TREE_Y == NP_TREE_TRUE){
+  if (kdt_extern_Y != NULL)
     free_kdtree(&kdt_extern_Y);
-    int_TREE_Y = NP_TREE_FALSE;
-  }
-
-  free_mat(matrix_XY_continuous_train_extern, num_all_cvar);
-  free_mat(matrix_XY_unordered_train_extern, num_all_uvar);
-  free_mat(matrix_XY_ordered_train_extern, num_all_ovar);
-
-  if(int_TREE_XY == NP_TREE_TRUE){
+  if (kdt_extern_XY != NULL)
     free_kdtree(&kdt_extern_XY);
-    int_TREE_XY = NP_TREE_FALSE;
-  }
+  int_TREE_X = NP_TREE_FALSE;
+  int_TREE_Y = NP_TREE_FALSE;
+  int_TREE_XY = NP_TREE_FALSE;
   int_TREE_PROFILE_X = NP_TREE_FALSE;
 
+  free_mat(context->matrix_y_unordered_train, context->num_var_unordered);
+  free_mat(context->matrix_y_ordered_train, context->num_var_ordered);
+  free_mat(context->matrix_y_continuous_train, context->num_var_continuous);
+  if (!context->cdfontrain) {
+    free_mat(context->matrix_y_unordered_eval, context->num_var_unordered);
+    free_mat(context->matrix_y_ordered_eval, context->num_var_ordered);
+    free_mat(context->matrix_y_continuous_eval, context->num_var_continuous);
+  }
+  free_mat(context->matrix_x_unordered_train, context->num_reg_unordered);
+  free_mat(context->matrix_x_ordered_train, context->num_reg_ordered);
+  free_mat(context->matrix_x_continuous_train, context->num_reg_continuous);
+  free_mat(context->matrix_xy_unordered_train, context->num_all_uvar);
+  free_mat(context->matrix_xy_ordered_train, context->num_all_ovar);
+  free_mat(context->matrix_xy_continuous_train, context->num_all_cvar);
+  free_mat(context->matrix_y_unordered_tree, context->num_var_unordered);
+  free_mat(context->matrix_y_ordered_tree, context->num_var_ordered);
+  free_mat(context->matrix_y_continuous_tree, context->num_var_continuous);
+  free_mat(context->matrix_xy_unordered_tree, context->num_all_uvar);
+  free_mat(context->matrix_xy_ordered_tree, context->num_all_ovar);
+  free_mat(context->matrix_xy_continuous_tree, context->num_all_cvar);
+  free_mat(context->matrix_categorical_vals,
+           context->num_var_unordered + context->num_var_ordered +
+           context->num_reg_unordered + context->num_reg_ordered);
+  free_mat(context->matrix_categorical_vals_x,
+           context->num_reg_unordered + context->num_reg_ordered);
+  free_mat(context->matrix_categorical_vals_y,
+           context->num_var_unordered + context->num_var_ordered);
+  free_mat(context->matrix_categorical_vals_xy,
+           context->num_var_unordered + context->num_var_ordered +
+           context->num_reg_unordered + context->num_reg_ordered);
+  free_mat(context->powell_directions, context->num_all_var + 1);
+
+  safe_free(context->scale_factor);
+  safe_free(context->eval_bandwidth);
+  safe_free(context->eval_degree);
+  safe_free(context->glp_degree);
+  safe_free(context->scale_factor_startbest);
+  safe_free(context->powell_step);
+  safe_free(context->scale_factor_multistart);
+  safe_free(context->cxy_lower);
+  safe_free(context->cxy_upper);
+  safe_free(context->extendednn_upper);
+  safe_free(context->num_categories);
+  safe_free(context->num_categories_x);
+  safe_free(context->num_categories_y);
+  safe_free(context->num_categories_xy);
+  safe_free(context->ipt_x);
+  safe_free(context->ipt_y);
+  safe_free(context->ipt_xy);
+  safe_free(context->ipt_lookup_x);
+  safe_free(context->ipt_lookup_y);
+  safe_free(context->ipt_lookup_xy);
+
+  matrix_Y_unordered_train_extern = NULL;
+  matrix_Y_ordered_train_extern = NULL;
+  matrix_Y_continuous_train_extern = NULL;
+  matrix_Y_unordered_eval_extern = NULL;
+  matrix_Y_ordered_eval_extern = NULL;
+  matrix_Y_continuous_eval_extern = NULL;
+  matrix_X_unordered_train_extern = NULL;
+  matrix_X_ordered_train_extern = NULL;
+  matrix_X_continuous_train_extern = NULL;
+  matrix_XY_unordered_train_extern = NULL;
+  matrix_XY_ordered_train_extern = NULL;
+  matrix_XY_continuous_train_extern = NULL;
+  matrix_categorical_vals_extern = NULL;
+  matrix_categorical_vals_extern_X = NULL;
+  matrix_categorical_vals_extern_Y = NULL;
+  matrix_categorical_vals_extern_XY = NULL;
+  num_categories_extern = NULL;
+  num_categories_extern_X = NULL;
+  num_categories_extern_Y = NULL;
+  num_categories_extern_XY = NULL;
+  vector_extendednn_upper_extern = NULL;
+  int_extendednn_upper_num_extern = 0;
+  ipt_extern_X = NULL;
+  ipt_extern_Y = NULL;
+  ipt_extern_XY = NULL;
+  ipt_lookup_extern_X = NULL;
+  ipt_lookup_extern_Y = NULL;
+  ipt_lookup_extern_XY = NULL;
 
   int_WEIGHTS = 0;
-
   int_cxker_bound_extern = 0;
   int_cyker_bound_extern = 0;
   int_cxyker_bound_extern = 0;
-  int_ll_extern = LL_LC;
-  vector_glp_degree_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
+  int_cker_bound_extern = 0;
   vector_cxkerlb_extern = NULL;
   vector_cxkerub_extern = NULL;
   vector_cykerlb_extern = NULL;
   vector_cykerub_extern = NULL;
   vector_cxykerlb_extern = NULL;
   vector_cxykerub_extern = NULL;
-  int_cker_bound_extern = 0;
   vector_ckerlb_extern = NULL;
   vector_ckerub_extern = NULL;
-  safe_free(cxylb);
-  safe_free(cxyub);
+  np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
+  vector_glp_degree_extern = NULL;
+  vector_glp_gradient_order_extern = NULL;
+  int_glp_bernstein_extern = 0;
+  int_glp_basis_extern = 1;
+  np_conditional_distribution_bw_categorical_compress_extern = 0;
+  cdfontrain_extern = 0;
   np_clear_estimator_extern_aliases();
+  np_glp_cv_clear_extern();
 
-  if (bw_error_msg != NULL) {
-    np_bwm_clear_deferred_error();
-    error("%s", bw_error_msg);
-  }
-
-  return ;
+  memset(context, 0, sizeof(*context));
 }
 
-void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_con, 
+static void np_conditional_distribution_prepared_context_activate_matrix_view(
+  NPConditionalDistributionPreparedCtx *context,
+  const int lp_engine)
+{
+  const int scalar = lp_engine == NP_LP_ENGINE_SCALAR;
+
+  if (context == NULL)
+    return;
+
+  matrix_Y_unordered_train_extern =
+    (scalar && context->tree_y_ready &&
+     context->matrix_y_unordered_tree != NULL) ?
+    context->matrix_y_unordered_tree : context->matrix_y_unordered_train;
+  matrix_Y_ordered_train_extern =
+    (scalar && context->tree_y_ready &&
+     context->matrix_y_ordered_tree != NULL) ?
+    context->matrix_y_ordered_tree : context->matrix_y_ordered_train;
+  matrix_Y_continuous_train_extern =
+    (scalar && context->tree_y_ready &&
+     context->matrix_y_continuous_tree != NULL) ?
+    context->matrix_y_continuous_tree : context->matrix_y_continuous_train;
+  if (context->cdfontrain) {
+    matrix_Y_unordered_eval_extern = matrix_Y_unordered_train_extern;
+    matrix_Y_ordered_eval_extern = matrix_Y_ordered_train_extern;
+    matrix_Y_continuous_eval_extern = matrix_Y_continuous_train_extern;
+  }
+
+  matrix_XY_unordered_train_extern =
+    (scalar && context->tree_xy_ready &&
+     context->matrix_xy_unordered_tree != NULL) ?
+    context->matrix_xy_unordered_tree : context->matrix_xy_unordered_train;
+  matrix_XY_ordered_train_extern =
+    (scalar && context->tree_xy_ready &&
+     context->matrix_xy_ordered_tree != NULL) ?
+    context->matrix_xy_ordered_tree : context->matrix_xy_ordered_train;
+  matrix_XY_continuous_train_extern =
+    (scalar && context->tree_xy_ready &&
+     context->matrix_xy_continuous_tree != NULL) ?
+    context->matrix_xy_continuous_tree : context->matrix_xy_continuous_train;
+}
+
+static int np_conditional_distribution_prepared_context_refresh_degree(
+  NPConditionalDistributionPreparedCtx *context,
+  const int *degree)
+{
+  int changed = 0;
+  int i;
+  int old_basis;
+  int old_bernstein;
+  int old_engine;
+  int old_tree_x;
+  int old_tree_y;
+  int old_tree_xy;
+  int target_engine;
+
+  if (context == NULL || !context->active)
+    return 0;
+  if (context->num_reg_continuous <= 0)
+    return 1;
+  if (degree == NULL || context->glp_degree == NULL)
+    return 0;
+  if (!context->degree_search)
+    return 1;
+
+  target_engine = np_canonical_lp_engine_for_degree(
+    degree, context->num_reg_continuous);
+  if (target_engine < 0)
+    return 0;
+  for (i = 0; i < context->num_reg_continuous; i++) {
+    if (context->glp_degree[i] != degree[i]) {
+      changed = 1;
+      break;
+    }
+  }
+  if (!changed && np_lp_engine_extern == target_engine &&
+      context->degree_state_ready)
+    return 1;
+
+  if (target_engine == NP_LP_ENGINE_GENERAL &&
+      !np_glp_cv_degree_admissible_extern(
+        num_obs_train_extern,
+        context->num_reg_continuous,
+        degree,
+        context->requested_glp_basis))
+    return 0;
+
+  old_engine = np_lp_engine_extern;
+  old_bernstein = int_glp_bernstein_extern;
+  old_basis = int_glp_basis_extern;
+  old_tree_x = int_TREE_X;
+  old_tree_y = int_TREE_Y;
+  old_tree_xy = int_TREE_XY;
+  context->degree_state_ready = 0;
+  np_glp_cv_clear_extern();
+
+  if (target_engine == NP_LP_ENGINE_SCALAR) {
+    for (i = 0; i < context->num_reg_continuous; i++)
+      context->glp_degree[i] = degree[i];
+    vector_glp_degree_extern = NULL;
+    int_glp_bernstein_extern = 0;
+    int_glp_basis_extern = 1;
+    int_TREE_X = context->tree_x_ready;
+    int_TREE_Y = context->tree_y_ready;
+    int_TREE_XY = context->tree_xy_ready;
+    np_conditional_distribution_prepared_context_activate_matrix_view(
+      context, NP_LP_ENGINE_SCALAR);
+    np_lp_engine_extern = NP_LP_ENGINE_SCALAR;
+    context->degree_state_ready = 1;
+    return 1;
+  }
+
+  vector_glp_degree_extern = (int *)degree;
+  int_glp_bernstein_extern = context->requested_glp_bernstein;
+  int_glp_basis_extern = context->requested_glp_basis;
+  int_TREE_X = context->tree_x_ready;
+  int_TREE_Y = NP_TREE_FALSE;
+  int_TREE_XY = NP_TREE_FALSE;
+  np_conditional_distribution_prepared_context_activate_matrix_view(
+    context, NP_LP_ENGINE_GENERAL);
+  np_lp_engine_extern = NP_LP_ENGINE_GENERAL;
+
+  if (!np_glp_cv_prepare_extern(
+        NP_LP_ENGINE_GENERAL,
+        num_obs_train_extern,
+        context->num_reg_continuous,
+        matrix_X_continuous_train_extern)) {
+    np_glp_cv_clear_extern();
+    np_lp_engine_extern = old_engine;
+    int_glp_bernstein_extern = old_bernstein;
+    int_glp_basis_extern = old_basis;
+    int_TREE_X = old_tree_x;
+    int_TREE_Y = old_tree_y;
+    int_TREE_XY = old_tree_xy;
+    np_conditional_distribution_prepared_context_activate_matrix_view(
+      context, old_engine);
+    vector_glp_degree_extern =
+      old_engine == NP_LP_ENGINE_GENERAL ? context->glp_degree : NULL;
+    if (old_engine == NP_LP_ENGINE_GENERAL) {
+      context->degree_state_ready = np_glp_cv_prepare_extern(
+        NP_LP_ENGINE_GENERAL,
+        num_obs_train_extern,
+        context->num_reg_continuous,
+        matrix_X_continuous_train_extern) ? 1 : 0;
+    } else {
+      context->degree_state_ready = 1;
+    }
+    return 0;
+  }
+
+  for (i = 0; i < context->num_reg_continuous; i++)
+    context->glp_degree[i] = degree[i];
+  vector_glp_degree_extern = context->glp_degree;
+  context->degree_state_ready = 1;
+  return 1;
+}
+
+static void np_conditional_distribution_prepared_context_refresh_penalty(
+  NPConditionalDistributionPreparedCtx *context)
+{
+  double baseline;
+  double pmult;
+  double *tmp;
+  int i;
+
+  bwm_penalty_mode = 0;
+  bwm_penalty_value = DBL_MAX;
+  if (context == NULL || context->penalty_mode != 1)
+    return;
+
+  pmult = MAX(1.0, context->penalty_multiplier);
+  baseline = bwmfunc_raw_current_scale(context->scale_factor,
+                                       context->num_all_var);
+  if (np_conditional_failure_pending())
+    return;
+  if (!R_FINITE(baseline) || baseline == DBL_MAX) {
+    tmp = bwm_alloc_transform_tmp(context->num_all_var + 1);
+    if (tmp != NULL &&
+        np_copy_scale_factor_for_raw(tmp, context->scale_factor,
+                                     context->num_all_var) == 0) {
+      for (i = 1; i <= context->num_var_continuous +
+                        context->num_reg_continuous; i++)
+        tmp[i] *= 2.0;
+      bwm_set_categorical_midpoints(tmp);
+      baseline = bwmfunc_raw_activity(tmp);
+    }
+    safe_free(tmp);
+  }
+  if (np_conditional_failure_pending())
+    return;
+  bwm_penalty_value = (!R_FINITE(baseline) || baseline == DBL_MAX) ?
+    pmult * 1.0e6 : baseline + (fabs(baseline) + 1.0) * pmult;
+  if (R_FINITE(bwm_penalty_value))
+    bwm_penalty_mode = 1;
+}
+
+static int np_conditional_distribution_prepared_context_eval(
+  NPConditionalDistributionPreparedCtx *context,
+  const double *bandwidth,
+  const int *degree,
+  const int defer_failure,
+  double out[5])
+{
+  np_conditional_failure_reset();
+  double eval_before;
+  double fast_before;
+  double fast_after;
+  double invalid_before;
+  double value;
+  int i;
+
+  if (context == NULL || !context->active || bandwidth == NULL ||
+      out == NULL || context->scale_factor == NULL ||
+      context->eval_bandwidth == NULL || context->num_all_var <= 0)
+    return 1;
+  if (context->degree_key_len > 0 &&
+      (degree == NULL || context->eval_degree == NULL))
+    return 1;
+
+  for (i = 0; i < context->num_all_var; i++)
+    context->eval_bandwidth[i] = bandwidth[i];
+  for (i = 0; i < context->degree_key_len; i++)
+    context->eval_degree[i] = degree[i];
+
+  if (!np_conditional_distribution_prepared_context_refresh_degree(
+        context,
+        context->degree_key_len > 0 ? context->eval_degree :
+          context->glp_degree)) {
+    value = (bwm_penalty_mode == 1 && R_FINITE(bwm_penalty_value)) ?
+      bwm_penalty_value : DBL_MAX;
+    bwm_eval_count += 1.0;
+    bwm_invalid_count += 1.0;
+    bwm_maybe_signal_activity();
+    out[0] = value;
+    out[1] = value;
+    out[2] = 1.0;
+    out[3] = 0.0;
+    out[4] = 1.0;
+    return 0;
+  }
+
+  for (i = 0; i < context->num_all_var; i++)
+    context->scale_factor[i + 1] = context->eval_bandwidth[i];
+  for (i = 0; i < context->degree_key_len; i++)
+    context->scale_factor[context->num_all_var + i + 1] =
+      (double)context->eval_degree[i];
+
+  if (context->extendednn_upper != NULL) {
+    const double base_k = (double)(num_obs_train_extern - 1);
+    for (i = 0; i < context->num_var_continuous +
+                    context->num_reg_continuous; i++) {
+      context->extendednn_upper[i] =
+        np_extendednn_eval_upper(bandwidth[i], base_k);
+    }
+  }
+
+  if (bwm_use_transform &&
+      bwm_to_unconstrained(context->scale_factor,
+                           context->num_all_var) != 0)
+    return 1;
+
+  if (context->penalty_mode == 1) {
+    bwm_penalty_mode = 0;
+    bwm_penalty_value = DBL_MAX;
+  }
+  eval_before = bwm_eval_count;
+  invalid_before = bwm_invalid_count;
+  fast_before = np_fastcv_alllarge_hits_get() +
+    bwm_nn_cache_hits_window + bwm_objective_cache_hits_window;
+  value = bwmfunc_wrapper(context->scale_factor);
+  if (np_conditional_failure_pending()) {
+    if (defer_failure)
+      return NP_CONDITIONAL_NATIVE_STOP;
+    np_conditional_failure_raise();
+  }
+  fast_after = np_fastcv_alllarge_hits_get() +
+    bwm_nn_cache_hits_window + bwm_objective_cache_hits_window;
+
+  if ((!R_FINITE(value) || value == DBL_MAX) &&
+      context->penalty_mode == 1) {
+    np_conditional_distribution_prepared_context_refresh_penalty(context);
+    if (np_conditional_failure_pending()) {
+      if (defer_failure)
+        return NP_CONDITIONAL_NATIVE_STOP;
+      np_conditional_failure_raise();
+    }
+    value = (bwm_penalty_mode == 1 && R_FINITE(bwm_penalty_value)) ?
+      bwm_penalty_value : DBL_MAX;
+  }
+
+  out[0] = value;
+  out[1] = value;
+  out[2] = MAX(0.0, bwm_eval_count - eval_before);
+  out[3] = MAX(0.0, fast_after - fast_before);
+  out[4] = MAX(0.0, bwm_invalid_count - invalid_before);
+  return 0;
+}
+
+static void np_distribution_conditional_bw_mode_owned(double * c_uno, double * c_ord, double * c_con,
                                     double * u_uno, double * u_ord, double * u_con,
                                     double * cg_uno, double * cg_ord, double * cg_con, double * mysd,
                                     int * myopti, double * myoptd, double * myans, double * fval,
@@ -12780,7 +17363,12 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                     int * regtype,
                                     double * cxkerlb, double * cxkerub,
                                     double * cykerlb, double * cykerub,
-                                    const int eval_only){
+                                    const int eval_only,
+                                    NPConditionalDistributionPreparedCtx *retained_context,
+                                    const int prepare_only,
+                                    const int degree_search,
+                                    const NPCategoricalSupport *support, NPConditionalDistributionPreparedCtx *unwind_context){
+  np_conditional_failure_reset();
   int_nn_k_min_extern = 1;
 /* Likelihood bandwidth selection for density estimation */
 
@@ -12805,9 +17393,13 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   int i,j;
   double fast_eval_total = 0.0;
   int num_var;
+  int degree_key_len;
   int iMultistart, iMs_counter, iNum_Multistart, num_all_var, num_var_var, iImproved;
   int enforce_fixed_feasibility;
   int have_start_best, have_multistart_best;
+  int nn_retry_attempted = 0;
+  int nn_retry_history_index = 0;
+  int nn_retry_improved = 0;
   int itmax, iter;
   int int_use_starting_values, ibwmfunc;
   int cdfontrain;
@@ -12819,6 +17411,18 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   int * ipt_X = NULL, * ipt_XY = NULL, * ipt_Y = NULL; 
   int * ipt_lookup_XY = NULL, * ipt_lookup_Y = NULL, * ipt_lookup_X = NULL;
   int num_obs_alt;
+  NPConditionalDistributionPreparedCtx *prepared_context =
+    (retained_context != NULL) ? retained_context : unwind_context;
+
+  if (prepare_only && retained_context == NULL)
+    error("C_np_distribution_conditional_bw: prepare-only mode requires retained ownership");
+  if (degree_search != 0 && degree_search != 1)
+    error("C_np_distribution_conditional_bw: degree_search must be zero or one");
+  if (prepared_context->active)
+    error("C_np_distribution_conditional_bw: prepared context is already active");
+  np_validate_nonfixed_support_input("C_np_distribution_conditional_bw", myopti[CDBW_DENI],
+    myopti[CDBW_NOBSI], myopti[CDBW_UNCONI], u_con, myopti[CDBW_CNCONI], c_con);
+  memset(prepared_context, 0, sizeof(*prepared_context));
 
   cdfontrain_extern = cdfontrain =  myopti[CDBW_CDFONTRAIN];
 
@@ -12852,6 +17456,10 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   KERNEL_reg_ordered_extern = myopti[CDBW_OXKRNEVI];
   KERNEL_den_ordered_extern = myopti[CDBW_OYKRNEVI];
 
+  np_beta_cx_bw_order_extern = 2;
+  np_beta_cy_bw_order_extern = 2;
+  np_conditional_distribution_bw_categorical_compress_extern = 0;
+
   vector_cxkerlb_extern = cxkerlb;
   vector_cxkerub_extern = cxkerub;
   int_cxker_bound_extern = np_has_finite_cker_bounds(cxkerlb, cxkerub, num_reg_continuous_extern);
@@ -12860,9 +17468,58 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   vector_cykerub_extern = cykerub;
   int_cyker_bound_extern = np_has_finite_cker_bounds(cykerlb, cykerub, num_var_continuous_extern);
 
+  if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE ||
+     KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE) {
+    const int num_unordered = num_reg_unordered_extern +
+      num_var_unordered_extern;
+    const int num_ordered = num_reg_ordered_extern +
+      num_var_ordered_extern;
+
+    np_conditional_distribution_bw_categorical_compress_extern =
+      myopti[CDBW_CATCOMPI];
+    if(np_conditional_distribution_bw_categorical_compress_extern != 0 &&
+       np_conditional_distribution_bw_categorical_compress_extern != 1)
+      error("C_np_distribution_conditional_bw: categorical compression must be TRUE or FALSE");
+
+    if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE)
+      np_beta_cx_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+        myopti[CDBW_CXFAMILYI], KERNEL_reg_extern,
+        myopti[CDBW_CXORDERI], num_reg_continuous_extern,
+        num_unordered, num_ordered, NP_BETA_BW_ALLOW_CATEGORICAL,
+        cxkerlb, cxkerub,
+        "C_np_distribution_conditional_bw (X)").order;
+    else
+      np_beta_cx_bw_order_extern = myopti[CDBW_CXORDERI];
+    if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)
+      np_beta_cy_bw_order_extern = np_bandwidth_kernel_descriptor_or_error(
+        myopti[CDBW_CYFAMILYI], KERNEL_den_extern,
+        myopti[CDBW_CYORDERI], num_var_continuous_extern,
+        num_unordered, num_ordered, NP_BETA_BW_ALLOW_CATEGORICAL,
+        cykerlb, cykerub,
+        "C_np_distribution_conditional_bw (Y)").order;
+    else
+      np_beta_cy_bw_order_extern = myopti[CDBW_CYORDERI];
+  }
+
+  prepared_context->active = 1;
+  int_conditional_prepared_context_extern = 1;
+  prepared_context->cdfontrain = cdfontrain;
+  prepared_context->num_all_var = num_all_var;
+  prepared_context->num_var_unordered = num_var_unordered_extern;
+  prepared_context->num_var_ordered = num_var_ordered_extern;
+  prepared_context->num_var_continuous = num_var_continuous_extern;
+  prepared_context->num_reg_unordered = num_reg_unordered_extern;
+  prepared_context->num_reg_ordered = num_reg_ordered_extern;
+  prepared_context->num_reg_continuous = num_reg_continuous_extern;
+  prepared_context->degree_search = degree_search;
+  prepared_context->penalty_mode = penalty_mode[0];
+  prepared_context->penalty_multiplier = penalty_mult[0];
+
   if((num_reg_continuous_extern + num_var_continuous_extern) > 0){
     cxylb = alloc_vecd(num_reg_continuous_extern + num_var_continuous_extern);
     cxyub = alloc_vecd(num_reg_continuous_extern + num_var_continuous_extern);
+    prepared_context->cxy_lower = cxylb;
+    prepared_context->cxy_upper = cxyub;
     for(i = 0; i < num_reg_continuous_extern; i++){
       cxylb[i] = (cxkerlb != NULL) ? cxkerlb[i] : DBL_MAX;
       cxyub[i] = (cxkerub != NULL) ? cxkerub[i] : DBL_MAX;
@@ -12883,21 +17540,63 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   int_use_starting_values= myopti[CDBW_USTARTI];
   int_LARGE_SF=myopti[CDBW_LSFI];
   BANDWIDTH_den_extern=myopti[CDBW_DENI];
-  enforce_fixed_feasibility = ((BANDWIDTH_den_extern == BW_FIXED) && (!eval_only));
+  enforce_fixed_feasibility =
+    (((BANDWIDTH_den_extern == BW_FIXED) ||
+      ((!degree_search) &&
+       ((BANDWIDTH_den_extern == BW_GEN_NN) ||
+        (BANDWIDTH_den_extern == BW_ADAP_NN)))) && (!eval_only));
   int_RESTART_FROM_MIN = myopti[CDBW_REMINI];
   int_MINIMIZE_IO = myopti[CDBW_MINIOI];
 
   itmax=myopti[CDBW_ITMAXI];
   ibwmfunc = myopti[CDBW_MI];
-  int_ll_extern = (ibwmfunc == CDBWM_CVLS) ? *regtype : LL_LC;
-  vector_glp_degree_extern = ((ibwmfunc == CDBWM_CVLS) && (int_ll_extern == LL_LP)) ? glp_degree : NULL;
+  np_lp_engine_extern = np_regression_engine_or_error(
+    (ibwmfunc == CDBWM_CVLS) ? *regtype : NP_LP_ENGINE_SCALAR,
+    "np_conditional_distribution_bw_legacy");
+  if (degree_search) {
+    np_lp_engine_extern = np_canonical_lp_engine_for_degree(
+      glp_degree, num_reg_continuous_extern);
+    if (np_lp_engine_extern < 0) {
+      bw_error_msg = "C_np_distribution_conditional_bw: invalid local-polynomial degree state";
+      goto cleanup_np_distribution_conditional_bw;
+    }
+  }
+  degree_key_len = degree_search ? num_reg_continuous_extern : 0;
+  prepared_context->degree_key_len = degree_key_len;
+  prepared_context->requested_glp_bernstein =
+    (ibwmfunc == CDBWM_CVLS) ? *glp_bernstein : 0;
+  prepared_context->requested_glp_basis =
+    (ibwmfunc == CDBWM_CVLS) ? *glp_basis : 1;
+  if (num_reg_continuous_extern > 0) {
+    prepared_context->glp_degree = alloc_vecu(num_reg_continuous_extern);
+    if (prepared_context->glp_degree == NULL) {
+      bw_error_msg = "C_np_distribution_conditional_bw: failed to allocate degree state";
+      goto cleanup_np_distribution_conditional_bw;
+    }
+    for (i = 0; i < num_reg_continuous_extern; i++)
+      prepared_context->glp_degree[i] = glp_degree[i];
+  }
+  vector_glp_degree_extern =
+    ((ibwmfunc == CDBWM_CVLS) &&
+     (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) ?
+    prepared_context->glp_degree : NULL;
   vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = ((ibwmfunc == CDBWM_CVLS) && (int_ll_extern == LL_LP)) ? *glp_bernstein : 0;
-  int_glp_basis_extern = ((ibwmfunc == CDBWM_CVLS) && (int_ll_extern == LL_LP)) ? *glp_basis : 1;
+  int_glp_bernstein_extern =
+    ((ibwmfunc == CDBWM_CVLS) &&
+     (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) ?
+    prepared_context->requested_glp_bernstein : 0;
+  int_glp_basis_extern =
+    ((ibwmfunc == CDBWM_CVLS) &&
+     (np_lp_engine_extern == NP_LP_ENGINE_GENERAL)) ?
+    prepared_context->requested_glp_basis : 1;
 
   int_TREE_XY = int_TREE_Y = int_TREE_X = myopti[CDBW_TREEI];
   int_TREE_PROFILE_X = myopti[CDBW_TREEI];
-  if(int_ll_extern == LL_LP){
+  if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE ||
+     KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)
+    int_TREE_XY = int_TREE_Y = int_TREE_X = int_TREE_PROFILE_X =
+      NP_TREE_FALSE;
+  if(np_lp_engine_extern == NP_LP_ENGINE_GENERAL && !degree_search){
     int_TREE_Y = NP_TREE_FALSE;
     int_TREE_XY = NP_TREE_FALSE;
   }
@@ -12912,12 +17611,23 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
       num_var_ordered_extern + num_reg_ordered_extern;
     bwm_reserve_transform_buf(n + 1);
   }
-  bwm_nn_cache_configure_for_powell(BANDWIDTH_den_extern,
-                                    eval_only,
-                                    0,
-                                    num_var_continuous_extern + num_reg_continuous_extern,
-                                    num_var_unordered_extern + num_reg_unordered_extern,
-                                    num_var_ordered_extern + num_reg_ordered_extern);
+  if (prepare_only) {
+    bwm_nn_cache_configure_for_degree_search(
+      BANDWIDTH_den_extern,
+      0,
+      degree_key_len,
+      num_var_continuous_extern + num_reg_continuous_extern,
+      num_var_unordered_extern + num_reg_unordered_extern,
+      num_var_ordered_extern + num_reg_ordered_extern);
+  } else {
+    bwm_nn_cache_configure_for_powell(
+      BANDWIDTH_den_extern,
+      eval_only,
+      0,
+      num_var_continuous_extern + num_reg_continuous_extern,
+      num_var_unordered_extern + num_reg_unordered_extern,
+      num_var_ordered_extern + num_reg_ordered_extern);
+  }
 
   ftol=myoptd[CDBW_FTOLD];
   tol=myoptd[CDBW_TOLD];
@@ -12951,10 +17661,16 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   matrix_Y_unordered_train_extern = alloc_matd(num_obs_train_extern, num_var_unordered_extern);
   matrix_Y_ordered_train_extern = alloc_matd(num_obs_train_extern, num_var_ordered_extern);
   matrix_Y_continuous_train_extern = alloc_matd(num_obs_train_extern, num_var_continuous_extern);
+  prepared_context->matrix_y_unordered_train = matrix_Y_unordered_train_extern;
+  prepared_context->matrix_y_ordered_train = matrix_Y_ordered_train_extern;
+  prepared_context->matrix_y_continuous_train = matrix_Y_continuous_train_extern;
 
   matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
   matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
   matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
+  prepared_context->matrix_x_unordered_train = matrix_X_unordered_train_extern;
+  prepared_context->matrix_x_ordered_train = matrix_X_ordered_train_extern;
+  prepared_context->matrix_x_continuous_train = matrix_X_continuous_train_extern;
 
   if(cdfontrain){
     matrix_Y_unordered_eval_extern = matrix_Y_unordered_train_extern;
@@ -12965,6 +17681,9 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
     matrix_Y_ordered_eval_extern = alloc_matd(num_obs_eval_extern, num_var_ordered_extern);
     matrix_Y_continuous_eval_extern = alloc_matd(num_obs_eval_extern, num_var_continuous_extern);
   }
+  prepared_context->matrix_y_unordered_eval = matrix_Y_unordered_eval_extern;
+  prepared_context->matrix_y_ordered_eval = matrix_Y_ordered_eval_extern;
+  prepared_context->matrix_y_continuous_eval = matrix_Y_continuous_eval_extern;
 
   num_categories_extern = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern +
                                      num_reg_unordered_extern + num_reg_ordered_extern);
@@ -12974,25 +17693,55 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
   num_categories_extern_XY = alloc_vecu(num_var_unordered_extern + num_var_ordered_extern +
                                         num_reg_unordered_extern + num_reg_ordered_extern);
+  prepared_context->num_categories = num_categories_extern;
+  prepared_context->num_categories_x = num_categories_extern_X;
+  prepared_context->num_categories_y = num_categories_extern_Y;
+  prepared_context->num_categories_xy = num_categories_extern_XY;
   
-  matrix_y = alloc_matd(num_all_var + 1, num_all_var + 1);
-  vector_scale_factor = alloc_vecd(num_all_var + 1);
-  vector_scale_factor_startbest = alloc_vecd(num_all_var + 1);
-  vsfh = alloc_vecd(num_all_var + 1);
+  matrix_y = prepare_only ? NULL :
+    alloc_matd(num_all_var + 1, num_all_var + 1);
+  vector_scale_factor = alloc_vecd(num_all_var + degree_key_len + 1);
+  vector_scale_factor_startbest = prepare_only ? NULL :
+    alloc_vecd(num_all_var + 1);
+  vsfh = prepare_only ? NULL : alloc_vecd(num_all_var + 1);
+  prepared_context->powell_directions = matrix_y;
+  prepared_context->scale_factor = vector_scale_factor;
+  prepared_context->scale_factor_startbest = vector_scale_factor_startbest;
+  prepared_context->powell_step = vsfh;
+  prepared_context->eval_bandwidth = prepare_only ?
+    alloc_vecd(num_all_var) : NULL;
+  prepared_context->eval_degree =
+    (prepare_only && degree_key_len > 0) ?
+    alloc_vecu(degree_key_len) : NULL;
+
+  if (vector_scale_factor == NULL ||
+      (prepare_only && prepared_context->eval_bandwidth == NULL) ||
+      (prepare_only && degree_key_len > 0 &&
+       prepared_context->eval_degree == NULL) ||
+      (!prepare_only && (matrix_y == NULL ||
+                         vector_scale_factor_startbest == NULL ||
+                         vsfh == NULL))) {
+    bw_error_msg = "C_np_distribution_conditional_bw: failed to allocate objective state";
+    goto cleanup_np_distribution_conditional_bw;
+  }
   
   matrix_categorical_vals_extern = 
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern + 
+    alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern +
                num_reg_unordered_extern + num_reg_ordered_extern);
 
   matrix_categorical_vals_extern_X = 
-    alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
+    alloc_matd(support->max_levels, num_reg_unordered_extern + num_reg_ordered_extern);
 
   matrix_categorical_vals_extern_Y = 
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern);
+    alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern);
 
   matrix_categorical_vals_extern_XY = 
-    alloc_matd(num_obs_train_extern, num_var_unordered_extern + num_var_ordered_extern + 
+    alloc_matd(support->max_levels, num_var_unordered_extern + num_var_ordered_extern +
                num_reg_unordered_extern + num_reg_ordered_extern);
+  prepared_context->matrix_categorical_vals = matrix_categorical_vals_extern;
+  prepared_context->matrix_categorical_vals_x = matrix_categorical_vals_extern_X;
+  prepared_context->matrix_categorical_vals_y = matrix_categorical_vals_extern_Y;
+  prepared_context->matrix_categorical_vals_xy = matrix_categorical_vals_extern_XY;
 
   /* in v_s_f order is creg, cvar, uvar, ovar, ureg, oreg  */
 
@@ -13046,15 +17795,21 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   num_all_uvar = num_reg_unordered_extern + num_var_unordered_extern;
   num_all_ovar = num_reg_ordered_extern + num_var_ordered_extern;
 
+  prepared_context->num_all_cvar = num_all_cvar;
+  prepared_context->num_all_uvar = num_all_uvar;
+  prepared_context->num_all_ovar = num_all_ovar;
+
   // we need 3 trees to accelerate cg_concdf :)
 
   ipt_X = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->ipt_x = ipt_X;
   if(!(ipt_X != NULL)){
     bw_error_msg = "!(ipt_X != NULL)";
     goto cleanup_np_distribution_conditional_bw;
   }
 
   ipt_lookup_X = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->ipt_lookup_x = ipt_lookup_X;
   if(!(ipt_lookup_X != NULL)){
     bw_error_msg = "!(ipt_lookup_X != NULL)";
     goto cleanup_np_distribution_conditional_bw;
@@ -13069,12 +17824,14 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
 
   ipt_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->ipt_y = ipt_Y;
   if(!(ipt_Y != NULL)){
     bw_error_msg = "!(ipt_Y != NULL)";
     goto cleanup_np_distribution_conditional_bw;
   }
 
   ipt_lookup_Y = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->ipt_lookup_y = ipt_lookup_Y;
   if(!(ipt_lookup_Y != NULL)){
     bw_error_msg = "!(ipt_lookup_Y != NULL)";
     goto cleanup_np_distribution_conditional_bw;
@@ -13088,14 +17845,17 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   ipt_lookup_extern_Y = ipt_lookup_Y;
 
   num_obs_alt = (BANDWIDTH_den_extern != BW_ADAP_NN) ? num_obs_train_extern : 0;
+  prepared_context->num_obs_alt = num_obs_alt;
 
   ipt_XY = (int *)malloc(num_obs_alt*sizeof(int));
+  prepared_context->ipt_xy = ipt_XY;
   if(!(ipt_XY != NULL)){
     bw_error_msg = "!(ipt_XY != NULL)";
     goto cleanup_np_distribution_conditional_bw;
   }
 
   ipt_lookup_XY = (int *)malloc(num_obs_alt*sizeof(int));
+  prepared_context->ipt_lookup_xy = ipt_lookup_XY;
   if(!(ipt_lookup_XY != NULL)){
     bw_error_msg = "!(ipt_lookup_XY != NULL)";
     goto cleanup_np_distribution_conditional_bw;
@@ -13113,6 +17873,10 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
 
   int_TREE_Y = int_TREE_Y && ((num_var_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE) && (BANDWIDTH_den_extern != BW_ADAP_NN);
+
+  prepared_context->tree_x_ready = int_TREE_X;
+  prepared_context->tree_y_ready = int_TREE_Y;
+  prepared_context->tree_xy_ready = int_TREE_XY;
 
   if(int_TREE_X == NP_TREE_TRUE){
     build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
@@ -13139,6 +17903,34 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   }
 
   if(int_TREE_Y == NP_TREE_TRUE){
+    double **matrix_y_unordered_tree_view = matrix_Y_unordered_train_extern;
+    double **matrix_y_ordered_tree_view = matrix_Y_ordered_train_extern;
+    double **matrix_y_continuous_tree_view = matrix_Y_continuous_train_extern;
+
+    if (degree_search) {
+      prepared_context->matrix_y_unordered_tree =
+        alloc_matd(num_obs_train_extern, num_var_unordered_extern);
+      prepared_context->matrix_y_ordered_tree =
+        alloc_matd(num_obs_train_extern, num_var_ordered_extern);
+      prepared_context->matrix_y_continuous_tree =
+        alloc_matd(num_obs_train_extern, num_var_continuous_extern);
+      if ((num_var_unordered_extern > 0 &&
+           prepared_context->matrix_y_unordered_tree == NULL) ||
+          (num_var_ordered_extern > 0 &&
+           prepared_context->matrix_y_ordered_tree == NULL) ||
+          (num_var_continuous_extern > 0 &&
+           prepared_context->matrix_y_continuous_tree == NULL)) {
+        bw_error_msg = "C_np_distribution_conditional_bw: failed to allocate Y tree view";
+        goto cleanup_np_distribution_conditional_bw;
+      }
+      matrix_y_unordered_tree_view =
+        prepared_context->matrix_y_unordered_tree;
+      matrix_y_ordered_tree_view =
+        prepared_context->matrix_y_ordered_tree;
+      matrix_y_continuous_tree_view =
+        prepared_context->matrix_y_continuous_tree;
+    }
+
     build_kdtree(matrix_Y_continuous_train_extern, num_obs_train_extern, num_var_continuous_extern, 
                  4*num_var_continuous_extern, ipt_Y, &kdt_extern_Y);
   
@@ -13146,15 +17938,15 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
     for(j=0;j<num_var_unordered_extern;j++)
       for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_unordered_train_extern[j][i]=c_uno[j*num_obs_train_extern+ipt_Y[i]];
+        matrix_y_unordered_tree_view[j][i]=c_uno[j*num_obs_train_extern+ipt_Y[i]];
 
     for(j=0;j<num_var_ordered_extern;j++)
       for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_ordered_train_extern[j][i]=c_ord[j*num_obs_train_extern+ipt_Y[i]];
+        matrix_y_ordered_tree_view[j][i]=c_ord[j*num_obs_train_extern+ipt_Y[i]];
 
     for(j=0;j<num_var_continuous_extern;j++)
       for(i=0;i<num_obs_train_extern;i++)
-        matrix_Y_continuous_train_extern[j][i]=c_con[j*num_obs_train_extern+ipt_Y[i]];
+        matrix_y_continuous_tree_view[j][i]=c_con[j*num_obs_train_extern+ipt_Y[i]];
 
     for(i = 0; i < num_obs_train_extern; i++){
       ipt_lookup_Y[ipt_Y[i]] = i;
@@ -13165,8 +17957,65 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   matrix_XY_continuous_train_extern = alloc_matd(num_obs_alt, num_all_cvar);
   matrix_XY_unordered_train_extern = alloc_matd(num_obs_alt, num_all_uvar);
   matrix_XY_ordered_train_extern = alloc_matd(num_obs_alt, num_all_ovar);
+  prepared_context->matrix_xy_continuous_train = matrix_XY_continuous_train_extern;
+  prepared_context->matrix_xy_unordered_train = matrix_XY_unordered_train_extern;
+  prepared_context->matrix_xy_ordered_train = matrix_XY_ordered_train_extern;
+
+  if (degree_search && num_obs_alt > 0) {
+    for(j = 0; j < num_reg_unordered_extern; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_unordered_train_extern[j][i] =
+          u_uno[j*num_obs_train_extern+i];
+    for(j = num_reg_unordered_extern; j < num_all_uvar; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_unordered_train_extern[j][i] =
+          c_uno[(j-num_reg_unordered_extern)*num_obs_train_extern+i];
+    for(j = 0; j < num_reg_ordered_extern; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_ordered_train_extern[j][i] =
+          u_ord[j*num_obs_train_extern+i];
+    for(j = num_reg_ordered_extern; j < num_all_ovar; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_ordered_train_extern[j][i] =
+          c_ord[(j-num_reg_ordered_extern)*num_obs_train_extern+i];
+    for(j = 0; j < num_reg_continuous_extern; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_continuous_train_extern[j][i] =
+          u_con[j*num_obs_train_extern+i];
+    for(j = num_reg_continuous_extern; j < num_all_cvar; j++)
+      for(i = 0; i < num_obs_train_extern; i++)
+        matrix_XY_continuous_train_extern[j][i] =
+          c_con[(j-num_reg_continuous_extern)*num_obs_train_extern+i];
+  }
 
   if(int_TREE_XY == NP_TREE_TRUE){
+    double **matrix_xy_unordered_tree_view = matrix_XY_unordered_train_extern;
+    double **matrix_xy_ordered_tree_view = matrix_XY_ordered_train_extern;
+    double **matrix_xy_continuous_tree_view = matrix_XY_continuous_train_extern;
+
+    if (degree_search) {
+      prepared_context->matrix_xy_unordered_tree =
+        alloc_matd(num_obs_alt, num_all_uvar);
+      prepared_context->matrix_xy_ordered_tree =
+        alloc_matd(num_obs_alt, num_all_ovar);
+      prepared_context->matrix_xy_continuous_tree =
+        alloc_matd(num_obs_alt, num_all_cvar);
+      if ((num_all_uvar > 0 &&
+           prepared_context->matrix_xy_unordered_tree == NULL) ||
+          (num_all_ovar > 0 &&
+           prepared_context->matrix_xy_ordered_tree == NULL) ||
+          (num_all_cvar > 0 &&
+           prepared_context->matrix_xy_continuous_tree == NULL)) {
+        bw_error_msg = "C_np_distribution_conditional_bw: failed to allocate XY tree view";
+        goto cleanup_np_distribution_conditional_bw;
+      }
+      matrix_xy_unordered_tree_view =
+        prepared_context->matrix_xy_unordered_tree;
+      matrix_xy_ordered_tree_view =
+        prepared_context->matrix_xy_ordered_tree;
+      matrix_xy_continuous_tree_view =
+        prepared_context->matrix_xy_continuous_tree;
+    }
 
     for(j = 0; j < num_reg_unordered_extern; j++)
       for(i = 0; i < num_obs_train_extern; i++)
@@ -13202,29 +18051,29 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
     // put data into xy-tree order
     for(j = 0; j < num_reg_unordered_extern; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i]=u_uno[j*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_unordered_tree_view[j][i]=u_uno[j*num_obs_train_extern+ipt_XY[i]];
 
     for(j = num_reg_unordered_extern; j < num_all_uvar; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_unordered_train_extern[j][i]=c_uno[(j-num_reg_unordered_extern)*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_unordered_tree_view[j][i]=c_uno[(j-num_reg_unordered_extern)*num_obs_train_extern+ipt_XY[i]];
 
 
     for(j = 0; j < num_reg_ordered_extern; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i]=u_ord[j*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_ordered_tree_view[j][i]=u_ord[j*num_obs_train_extern+ipt_XY[i]];
 
     for(j = num_reg_ordered_extern; j < num_all_ovar; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_ordered_train_extern[j][i]=c_ord[(j-num_reg_ordered_extern)*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_ordered_tree_view[j][i]=c_ord[(j-num_reg_ordered_extern)*num_obs_train_extern+ipt_XY[i]];
 
 
     for(j = 0; j < num_reg_continuous_extern; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i]=u_con[j*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_continuous_tree_view[j][i]=u_con[j*num_obs_train_extern+ipt_XY[i]];
 
     for(j = num_reg_continuous_extern; j < num_all_cvar; j++)
       for(i = 0; i < num_obs_train_extern; i++)
-        matrix_XY_continuous_train_extern[j][i]=c_con[(j-num_reg_continuous_extern)*num_obs_train_extern+ipt_XY[i]];
+        matrix_xy_continuous_tree_view[j][i]=c_con[(j-num_reg_continuous_extern)*num_obs_train_extern+ipt_XY[i]];
 
     for(i = 0; i < num_obs_train_extern; i++){
       ipt_lookup_XY[ipt_XY[i]] = i;
@@ -13232,18 +18081,21 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
     
   }
 
-  determine_categorical_vals(
-                             num_obs_train_extern,
-                             num_var_unordered_extern,
-                             num_var_ordered_extern,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
+  if(int_VERBOSE == 1 || int_DEBUG == 1)
+    determine_categorical_vals(
+                               num_obs_train_extern,
+                               num_var_unordered_extern,
+                               num_var_ordered_extern,
+                               num_reg_unordered_extern,
+                               num_reg_ordered_extern,
+                               matrix_Y_unordered_train_extern,
+                               matrix_Y_ordered_train_extern,
+                               matrix_X_unordered_train_extern,
+                               matrix_X_ordered_train_extern,
+                               num_categories_extern,
+                               matrix_categorical_vals_extern);
+  np_categorical_support_copy(support, num_categories_extern,
+                              matrix_categorical_vals_extern);
 
   np_splitxy_vsf_mcv_nc(num_var_unordered_extern, num_var_ordered_extern, num_var_continuous_extern,
                         num_reg_unordered_extern, num_reg_ordered_extern, num_reg_continuous_extern,
@@ -13274,9 +18126,30 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
       num_obs_train_extern,
       num_reg_continuous_extern + num_var_continuous_extern,
       myans);
+  prepared_context->extendednn_upper = vector_extendednn_upper_extern;
   int_extendednn_upper_num_extern =
     (vector_extendednn_upper_extern != NULL) ?
     (num_reg_continuous_extern + num_var_continuous_extern) : 0;
+
+  if (degree_search) {
+    if (!np_conditional_distribution_prepared_context_refresh_degree(
+          prepared_context, glp_degree)) {
+      bw_error_msg = "C_np_distribution_conditional_bw: failed to prepare LP degree state";
+      goto cleanup_np_distribution_conditional_bw;
+    }
+  } else if (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) {
+    if (!np_glp_cv_prepare_extern(
+          NP_LP_ENGINE_GENERAL,
+          num_obs_train_extern,
+          num_reg_continuous_extern,
+          matrix_X_continuous_train_extern)) {
+      bw_error_msg = "C_np_distribution_conditional_bw: failed to prepare LP CV basis cache";
+      goto cleanup_np_distribution_conditional_bw;
+    }
+    prepared_context->degree_state_ready = 1;
+  } else {
+    prepared_context->degree_state_ready = 1;
+  }
 
   /* Initialize scale factors and Directions for NR modules */
 
@@ -13305,7 +18178,12 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                     matrix_X_continuous_train_extern,
                                     matrix_Y_continuous_train_extern);
 
-  initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
+  for (i = 0; i < degree_key_len; i++)
+    vector_scale_factor[num_all_var + i + 1] =
+      (double)prepared_context->glp_degree[i];
+
+  if (!prepare_only) {
+    initialize_nr_vector_scale_factor(BANDWIDTH_den_extern,
                                     0,                /* Not Random (0) Random (1) */
                                     int_RANDOM_SEED,
                                     int_LARGE_SF,
@@ -13328,9 +18206,9 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                     lbc_init, hbc_init, c_init, 
                                     lbd_init, hbd_init, d_init,
                                     matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
+                                      matrix_Y_continuous_train_extern);
 
-  initialize_nr_directions(BANDWIDTH_den_extern,
+    initialize_nr_directions(BANDWIDTH_den_extern,
                            num_obs_train_extern,
                            num_reg_continuous_extern,
                            num_reg_unordered_extern,
@@ -13345,7 +18223,8 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                            lbc_dir, dfc_dir, c_dir, initc_dir,
                            lbd_dir, hbd_dir, d_dir, initd_dir,
                            matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
+                             matrix_Y_continuous_train_extern);
+  }
 
 
   /* When multistarting, set counter */
@@ -13366,35 +18245,30 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
     goto cleanup_np_distribution_conditional_bw;
   }
 
+  bwm_search_context_configure_split(
+    num_var_continuous_extern + num_reg_continuous_extern,
+    num_var_unordered_extern,
+    num_reg_unordered_extern,
+    num_var_ordered_extern,
+    num_reg_ordered_extern,
+    degree_key_len,
+    KERNEL_den_unordered_extern,
+    KERNEL_reg_unordered_extern,
+    num_categories_extern);
   if (bwm_use_transform &&
       bwm_to_unconstrained(vector_scale_factor, num_all_var) != 0) {
     bw_error_msg = "C_np_distribution_conditional_bw: transform buffer allocation failed";
     goto cleanup_np_distribution_conditional_bw;
   }
 
-  spinner(0);
 
   bwmfunc_raw = bwmfunc;
-  bwm_num_reg_continuous = num_var_continuous_extern + num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_var_unordered_extern + num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_var_ordered_extern + num_reg_ordered_extern;
-  bwm_kernel_unordered = KERNEL_den_unordered_extern;
-  bwm_kernel_unordered_len = bwm_num_reg_unordered;
-  if (bwm_kernel_unordered_len > 0) {
-    bwm_kernel_unordered_vec = alloc_vecu(bwm_kernel_unordered_len);
-    for (i = 0; i < num_var_unordered_extern; i++)
-      bwm_kernel_unordered_vec[i] = KERNEL_den_unordered_extern;
-    for (i = 0; i < num_reg_unordered_extern; i++)
-      bwm_kernel_unordered_vec[num_var_unordered_extern + i] = KERNEL_reg_unordered_extern;
-  } else {
-    bwm_kernel_unordered_vec = NULL;
-  }
-  bwm_num_categories = num_categories_extern;
   bwm_set_floor_context(
-    enforce_fixed_feasibility,
+    enforce_fixed_feasibility && (BANDWIDTH_den_extern == BW_FIXED),
     num_all_var,
     bwm_use_transform,
     KERNEL_den_extern,
+    KERNEL_den_unordered_extern,
     KERNEL_reg_unordered_extern,
     BANDWIDTH_den_extern,
     BANDWIDTH_den_extern,
@@ -13421,17 +18295,8 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
       if (tmp != NULL && np_copy_scale_factor_for_raw(tmp, vector_scale_factor, num_all_var) == 0) {
         for (i = 1; i <= (num_var_continuous_extern + num_reg_continuous_extern); i++)
           tmp[i] *= 2.0;
-        for (i = 0; i < (num_var_unordered_extern + num_reg_unordered_extern); i++) {
-          int idx = num_var_continuous_extern + num_reg_continuous_extern + 1 + i;
-          double maxbw = max_unordered_bw(num_categories_extern[i], KERNEL_den_unordered_extern);
-          tmp[idx] = 0.5*maxbw;
-        }
-        for (i = 0; i < (num_var_ordered_extern + num_reg_ordered_extern); i++) {
-          int idx = num_var_continuous_extern + num_reg_continuous_extern +
-            num_var_unordered_extern + num_reg_unordered_extern + 1 + i;
-          tmp[idx] = 0.5;
-        }
-        baseline = bwmfunc_raw(tmp);
+        bwm_set_categorical_midpoints(tmp);
+        baseline = bwmfunc_raw_activity(tmp);
       }
       safe_free(tmp);
     }
@@ -13444,7 +18309,10 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
       bwm_penalty_mode = 1;
   }
 
-  fret_initial = fret_best = bwmfunc_wrapper(vector_scale_factor);
+  if (prepare_only)
+    return;
+
+  fret_initial = fret_best = np_conditional_bwmfunc_wrapper(vector_scale_factor);
   iImproved = 0;
   have_start_best = 0;
   have_multistart_best = 0;
@@ -13454,6 +18322,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
         num_all_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_reg_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -13472,8 +18341,9 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
     np_copy_scale_factor(vector_scale_factor_startbest, vector_scale_factor, num_all_var);
   }
 
+conditional_distribution_powell_attempt:
   if(!eval_only){
-    powell(0,
+    np_conditional_powell(0,
            0,
            vector_scale_factor,
            vector_scale_factor,
@@ -13485,7 +18355,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
            itmax,
            &iter,
            &fret,
-           bwmfunc_wrapper);
+           np_conditional_bwmfunc_wrapper);
 
     if(int_RESTART_FROM_MIN == RE_MIN_TRUE){
       initialize_nr_directions(BANDWIDTH_den_extern,
@@ -13505,7 +18375,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                matrix_X_continuous_train_extern,
                                matrix_Y_continuous_train_extern);
 
-      powell(0,
+      np_conditional_powell(0,
              0,
              vector_scale_factor,
              vector_scale_factor,
@@ -13517,7 +18387,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
              itmax,
              &iter,
              &fret,
-             bwmfunc_wrapper);
+             np_conditional_bwmfunc_wrapper);
 
     }
   } else {
@@ -13529,6 +18399,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
         num_all_var,
         bwm_use_transform,
         KERNEL_den_extern,
+        KERNEL_den_unordered_extern,
         KERNEL_reg_unordered_extern,
         BANDWIDTH_den_extern,
         BANDWIDTH_den_extern,
@@ -13560,15 +18431,25 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   iImproved = (enforce_fixed_feasibility && have_start_best) ? (fret_start_best < fret_initial) : (fret < fret_best);
   *timing = timing_extern;
 
-  objective_function_values[0]=fret;
-  objective_function_evals[0]=bwm_eval_count;
-  objective_function_invalid[0]=bwm_invalid_count;
-  bwm_snapshot_fast_counters();
-  fast_eval_total += bwm_fast_eval_count;
+  if (!nn_retry_attempted) {
+    objective_function_values[0]=fret;
+    objective_function_evals[0]=bwm_eval_count;
+    objective_function_invalid[0]=bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+  } else {
+    objective_function_values[nn_retry_history_index]=fret;
+    objective_function_evals[nn_retry_history_index] += bwm_eval_count;
+    objective_function_invalid[nn_retry_history_index] += bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    iImproved = nn_retry_improved;
+  }
   /* When multistarting save initial minimum of objective function and scale factors */
 
 
-  if((!eval_only) && (iMultistart == IMULTI_TRUE)){
+  if((!eval_only) && (!nn_retry_attempted) &&
+     (iMultistart == IMULTI_TRUE)){
     if (enforce_fixed_feasibility) {
       if (have_start_best) {
         have_multistart_best = 1;
@@ -13581,6 +18462,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
       fret_best = fret;
     }
     vector_scale_factor_multistart = alloc_vecd(num_all_var + 1);
+    prepared_context->scale_factor_multistart = vector_scale_factor_multistart;
     for(i = 1; i <= num_all_var; i++)
       vector_scale_factor_multistart[i] = (double) vector_scale_factor[i];
     np_progress_bandwidth_multistart_step(1, iNum_Multistart);
@@ -13643,7 +18525,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
 
       bwm_reset_counters();
 
-      powell(0,
+      np_conditional_powell(0,
              0,
              vector_scale_factor,
              vector_scale_factor,
@@ -13655,7 +18537,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
              itmax,
              &iter,
              &fret,
-             bwmfunc_wrapper);
+             np_conditional_bwmfunc_wrapper);
 
       if(int_RESTART_FROM_MIN == RE_MIN_TRUE){
 
@@ -13677,7 +18559,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                                  matrix_Y_continuous_train_extern);
 
 
-        powell(0,
+        np_conditional_powell(0,
                0,
                vector_scale_factor,
                vector_scale_factor,
@@ -13689,7 +18571,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
                itmax,
                &iter,
                &fret,
-               bwmfunc_wrapper);
+               np_conditional_bwmfunc_wrapper);
       }
 				
       /* If this run resulted in an improved minimum save information */
@@ -13699,6 +18581,7 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
               num_all_var,
               bwm_use_transform,
               KERNEL_den_extern,
+              KERNEL_den_unordered_extern,
               KERNEL_reg_unordered_extern,
               BANDWIDTH_den_extern,
               BANDWIDTH_den_extern,
@@ -13754,18 +18637,20 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
         vector_scale_factor[i] = (double) vector_scale_factor_multistart[i];
     }
     free(vector_scale_factor_multistart);
+    prepared_context->scale_factor_multistart = NULL;
   }
 
   if (enforce_fixed_feasibility) {
     double final_raw;
     if (!have_start_best) {
-      bw_error_msg = "C_np_distribution_conditional_bw: optimizer failed to produce a feasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_distribution_conditional_bw: optimizer failed to produce a feasible bandwidth candidate";
       goto cleanup_np_distribution_conditional_bw;
     }
     if (!np_bw_candidate_is_admissible(
           num_all_var,
           bwm_use_transform,
           KERNEL_den_extern,
+          KERNEL_den_unordered_extern,
           KERNEL_reg_unordered_extern,
           BANDWIDTH_den_extern,
           BANDWIDTH_den_extern,
@@ -13779,12 +18664,79 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
           num_reg_ordered_extern,
           num_categories_extern,
           vector_scale_factor)) {
-      bw_error_msg = "C_np_distribution_conditional_bw: optimizer returned an infeasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_distribution_conditional_bw: optimizer returned an infeasible bandwidth candidate";
       goto cleanup_np_distribution_conditional_bw;
     }
     final_raw = bwmfunc_raw_current_scale(vector_scale_factor, num_all_var);
+    np_conditional_failure_raise();
     if (!R_FINITE(final_raw) || final_raw == DBL_MAX) {
-      bw_error_msg = "C_np_distribution_conditional_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective";
+      if ((!nn_retry_attempted) &&
+          (!eval_only) &&
+          (!degree_search) &&
+          (!int_use_starting_values) &&
+          ((BANDWIDTH_den_extern == BW_GEN_NN) ||
+           (BANDWIDTH_den_extern == BW_ADAP_NN)) &&
+          ((num_var_continuous_extern + num_reg_continuous_extern) > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+        const int external_gnn_fold =
+          BANDWIDTH_den_extern == BW_GEN_NN && !cdfontrain &&
+          KERNEL_reg_extern != NP_CKERNEL_COORDINATE_CODE &&
+          KERNEL_den_extern != NP_CKERNEL_COORDINATE_CODE;
+        const int maximum_k =
+          (BANDWIDTH_den_extern == BW_GEN_NN && !external_gnn_fold) ?
+          num_obs_train_extern - 1 : num_obs_train_extern - 2;
+
+        nn_retry_history_index = (iImproved > 0) ? iImproved - 1 : 0;
+        nn_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = external_gnn_fold ?
+          np_ordinary_nn_find_finite_raw_seed_domain(
+            vector_scale_factor,
+            num_var_continuous_extern + num_reg_continuous_extern,
+            num_obs_train_extern, maximum_k, num_all_var, 1,
+            &finite_seed) : np_ordinary_nn_find_finite_raw_seed(
+          vector_scale_factor,
+          num_var_continuous_extern + num_reg_continuous_extern,
+          num_obs_train_extern,
+          maximum_k,
+          num_all_var,
+          &finite_seed);
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_den_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   num_var_continuous_extern,
+                                   num_var_unordered_extern,
+                                   num_var_ordered_extern,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_all_var);
+          nn_retry_attempted = 1;
+          goto conditional_distribution_powell_attempt;
+        }
+      }
+      bw_error_msg = "C_np_distribution_conditional_bw: optimizer returned a bandwidth candidate with invalid raw objective";
       goto cleanup_np_distribution_conditional_bw;
     }
     fret = final_raw;
@@ -13813,104 +18765,201 @@ void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_c
   /* end return data */
 
 cleanup_np_distribution_conditional_bw:
-  /* Free data objects */
-  bwm_clear_floor_context();
-  bwm_nn_cache_free();
-  bwm_objective_cache_free();
-  safe_free(vector_extendednn_upper_extern);
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
-
-  free_mat(matrix_Y_unordered_train_extern, num_var_unordered_extern);
-  free_mat(matrix_Y_ordered_train_extern, num_var_ordered_extern);
-  free_mat(matrix_Y_continuous_train_extern, num_var_continuous_extern);
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-
-  if(!cdfontrain){
-    free_mat(matrix_Y_unordered_eval_extern, num_var_unordered_extern);
-    free_mat(matrix_Y_ordered_eval_extern, num_var_ordered_extern);
-    free_mat(matrix_Y_continuous_eval_extern, num_var_continuous_extern);
-  }
-
-  free_mat(matrix_y, num_all_var + 1);
-  safe_free(vector_scale_factor);
-  safe_free(vector_scale_factor_startbest);
-  safe_free(vsfh);
-  safe_free(num_categories_extern);
-  safe_free(bwm_kernel_unordered_vec);
-  bwm_kernel_unordered_vec = NULL;
-  bwm_kernel_unordered_len = 0;
-  safe_free(num_categories_extern_X);
-  safe_free(num_categories_extern_Y);
-  safe_free(num_categories_extern_XY);
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern + num_reg_ordered_extern +
-           num_var_unordered_extern + num_var_ordered_extern);
-
-  free_mat(matrix_categorical_vals_extern_X, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  free_mat(matrix_categorical_vals_extern_Y, num_var_unordered_extern + num_var_ordered_extern);
-  free_mat(matrix_categorical_vals_extern_XY, num_reg_unordered_extern + num_reg_ordered_extern +
-           num_var_unordered_extern + num_var_ordered_extern);
-
-  safe_free(ipt_X);
-  safe_free(ipt_Y);
-  safe_free(ipt_XY);
-
-  safe_free(ipt_lookup_X);
-  safe_free(ipt_lookup_Y);
-  safe_free(ipt_lookup_XY);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-
- if(int_TREE_Y == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_Y);
-    int_TREE_Y = NP_TREE_FALSE;
-  }
-
-  free_mat(matrix_XY_continuous_train_extern, num_all_cvar);
-  free_mat(matrix_XY_unordered_train_extern, num_all_uvar);
-  free_mat(matrix_XY_ordered_train_extern, num_all_ovar);
-
-  if(int_TREE_XY == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_XY);
-    int_TREE_XY = NP_TREE_FALSE;
-  }
-
-  int_TREE_PROFILE_X = NP_TREE_FALSE;
-
-  int_WEIGHTS = 0;
-
-  int_cxker_bound_extern = 0;
-  int_cyker_bound_extern = 0;
-  int_cxyker_bound_extern = 0;
-  int_ll_extern = LL_LC;
-  vector_glp_degree_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
-  vector_cxkerlb_extern = NULL;
-  vector_cxkerub_extern = NULL;
-  vector_cykerlb_extern = NULL;
-  vector_cykerub_extern = NULL;
-  vector_cxykerlb_extern = NULL;
-  vector_cxykerub_extern = NULL;
-  int_cker_bound_extern = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  safe_free(cxylb);
-  safe_free(cxyub);
-  np_clear_estimator_extern_aliases();
+  np_conditional_distribution_prepared_context_destroy(prepared_context);
 
   if (bw_error_msg != NULL)
-    error("%s", bw_error_msg);
+    np_conditional_bandwidth_candidate_error(bw_error_msg, myopti[CDBW_DENI]);
 
   return ;
+}
+typedef struct {
+  double *c_uno;
+  double *c_ord;
+  double *c_con;
+  double *u_uno;
+  double *u_ord;
+  double *u_con;
+  double *cg_uno;
+  double *cg_ord;
+  double *cg_con;
+  double *mysd;
+  int *myopti;
+  double *myoptd;
+  double *myans;
+  double *fval;
+  double *objective_function_values;
+  double *objective_function_evals;
+  double *objective_function_invalid;
+  double *timing;
+  double *objective_function_fast;
+  int *penalty_mode;
+  double *penalty_mult;
+  int *glp_degree;
+  int *glp_bernstein;
+  int *glp_basis;
+  int *regtype;
+  double *cxkerlb;
+  double *cxkerub;
+  double *cykerlb;
+  double *cykerub;
+  int eval_only;
+  NPConditionalDistributionPreparedCtx *retained_context;
+  int prepare_only;
+  int degree_search;
+  const NPCategoricalSupport *support;
+  int completed, had_active;
+  NPConditionalDistributionPreparedCtx owned;
+} np_distribution_conditional_bw_mode_call;
+static SEXP np_distribution_conditional_bw_mode_call_run(void *raw){
+  np_distribution_conditional_bw_mode_call *c=raw;
+  np_distribution_conditional_bw_mode_owned(c->c_uno,c->c_ord,c->c_con,c->u_uno,c->u_ord,c->u_con,c->cg_uno,c->cg_ord,c->cg_con,c->mysd,c->myopti,c->myoptd,c->myans,c->fval,c->objective_function_values,c->objective_function_evals,c->objective_function_invalid,c->timing,c->objective_function_fast,c->penalty_mode,c->penalty_mult,c->glp_degree,c->glp_bernstein,c->glp_basis,c->regtype,c->cxkerlb,c->cxkerub,c->cykerlb,c->cykerub,c->eval_only,c->retained_context,c->prepare_only,c->degree_search,c->support,&c->owned);
+  c->completed=1;return R_NilValue;
+}
+static void np_distribution_conditional_bw_mode_call_cleanup(void *raw){
+  np_distribution_conditional_bw_mode_call *c=raw;
+  if(!c->completed && !c->had_active){
+    np_conditional_distribution_prepared_context_destroy(c->retained_context ? c->retained_context : &c->owned);
+    np_conditional_failure_reset();
+  }
+}
+static void np_distribution_conditional_bw_mode(double * c_uno, double * c_ord, double * c_con,
+                                    double * u_uno, double * u_ord, double * u_con,
+                                    double * cg_uno, double * cg_ord, double * cg_con, double * mysd,
+                                    int * myopti, double * myoptd, double * myans, double * fval,
+                                    double * objective_function_values, double * objective_function_evals,
+                                    double * objective_function_invalid, double * timing,
+                                    double * objective_function_fast,
+                                    int * penalty_mode, double * penalty_mult,
+                                    int * glp_degree,
+                                    int * glp_bernstein,
+                                    int * glp_basis,
+                                    int * regtype,
+                                    double * cxkerlb, double * cxkerub,
+                                    double * cykerlb, double * cykerub,
+                                    const int eval_only,
+                                    NPConditionalDistributionPreparedCtx *retained_context,
+                                    const int prepare_only,
+                                    const int degree_search,
+                                    const NPCategoricalSupport *support){
+  np_distribution_conditional_bw_mode_call c={.c_uno=c_uno,.c_ord=c_ord,.c_con=c_con,.u_uno=u_uno,.u_ord=u_ord,.u_con=u_con,.cg_uno=cg_uno,.cg_ord=cg_ord,.cg_con=cg_con,.mysd=mysd,.myopti=myopti,.myoptd=myoptd,.myans=myans,.fval=fval,.objective_function_values=objective_function_values,.objective_function_evals=objective_function_evals,.objective_function_invalid=objective_function_invalid,.timing=timing,.objective_function_fast=objective_function_fast,.penalty_mode=penalty_mode,.penalty_mult=penalty_mult,.glp_degree=glp_degree,.glp_bernstein=glp_bernstein,.glp_basis=glp_basis,.regtype=regtype,.cxkerlb=cxkerlb,.cxkerub=cxkerub,.cykerlb=cykerlb,.cykerub=cykerub,.eval_only=eval_only,.retained_context=retained_context,.prepare_only=prepare_only,.degree_search=degree_search,.support=support,.had_active=(retained_context && retained_context->active)};
+  R_ExecWithCleanup(np_distribution_conditional_bw_mode_call_run,&c,np_distribution_conditional_bw_mode_call_cleanup,&c);
+}
+
+
+void np_distribution_conditional_bw(double * c_uno, double * c_ord, double * c_con,
+                                    double * u_uno, double * u_ord, double * u_con,
+                                    double * cg_uno, double * cg_ord, double * cg_con,
+                                    double * mysd,
+                                    int * myopti, double * myoptd,
+                                    double * myans, double * fval,
+                                    double * objective_function_values,
+                                    double * objective_function_evals,
+                                    double * objective_function_invalid,
+                                    double * timing,
+                                    double * objective_function_fast,
+                                    int * penalty_mode, double * penalty_mult,
+                                    int * glp_degree,
+                                    int * glp_bernstein,
+                                    int * glp_basis,
+                                    int * regtype,
+                                    double * cxkerlb, double * cxkerub,
+                                    double * cykerlb, double * cykerub,
+                                    const int eval_only,
+                                    const NPCategoricalSupport *support)
+{
+  np_distribution_conditional_bw_mode(
+    c_uno, c_ord, c_con, u_uno, u_ord, u_con,
+    cg_uno, cg_ord, cg_con, mysd,
+    myopti, myoptd, myans, fval,
+    objective_function_values, objective_function_evals,
+    objective_function_invalid, timing, objective_function_fast,
+    penalty_mode, penalty_mult,
+    glp_degree, glp_bernstein, glp_basis, regtype,
+    cxkerlb, cxkerub, cykerlb, cykerub,
+    eval_only, NULL, 0, 0, support);
+}
+
+/*
+ * Realize one immutable beta nearest-neighbor bandwidth layout for the
+ * conditional X owner.  Successive dependent-side response rows then reuse
+ * this O((n + eval) * p) layout through the common regression engine instead
+ * of rebuilding the same X bandwidths once per evaluation point.
+ */
+static int np_beta_prepared_bandwidth_view_init_or_error(
+  NPContinuousPreparedBandwidthView *view,
+  const int bandwidth_mode,
+  double **matrix_X_continuous_train,
+  double **matrix_X_continuous_eval,
+  const double *vector_scale_factor,
+  const int num_obs_train,
+  const int num_obs_eval,
+  const int num_reg_continuous)
+{
+  const int need_eval = bandwidth_mode == BW_GEN_NN;
+  const int need_train = bandwidth_mode == BW_ADAP_NN;
+  const int row_count = need_eval ? num_obs_eval : num_obs_train;
+  double **bandwidth_columns;
+  double *bandwidth_storage;
+  size_t storage_count;
+  size_t storage_bytes;
+  int coordinate;
+  np_beta_bandwidth_prepare_status status;
+
+  if(view == NULL)
+    error("np_density_conditional: missing prepared-bandwidth view");
+  memset(view, 0, sizeof(*view));
+  if(bandwidth_mode == BW_FIXED)
+    return 0;
+  if((bandwidth_mode != BW_GEN_NN && bandwidth_mode != BW_ADAP_NN) ||
+     matrix_X_continuous_train == NULL ||
+     matrix_X_continuous_eval == NULL || vector_scale_factor == NULL ||
+     num_obs_train <= 0 || num_obs_eval <= 0 ||
+     num_reg_continuous <= 0 ||
+     !np_size_mul_checked((size_t)num_reg_continuous,
+                          (size_t)row_count, &storage_count) ||
+     !np_size_array_bytes_checked(storage_count, sizeof(double),
+                                  &storage_bytes) ||
+     (size_t)num_reg_continuous > SIZE_MAX/sizeof(double *))
+    error("np_density_conditional: invalid prepared beta bandwidth layout");
+
+  bandwidth_columns = (double **)R_alloc(
+    (size_t)num_reg_continuous, sizeof(double *));
+  bandwidth_storage = (double *)R_alloc(storage_count, sizeof(double));
+  for(coordinate = 0; coordinate < num_reg_continuous; ++coordinate)
+    bandwidth_columns[coordinate] = bandwidth_storage +
+      (size_t)coordinate * (size_t)row_count;
+
+  status = np_beta_bandwidth_prepare_matrix(
+    need_eval ? NP_BETA_BANDWIDTH_GENERALIZED_NN :
+      NP_BETA_BANDWIDTH_ADAPTIVE_NN,
+    matrix_X_continuous_train, matrix_X_continuous_eval,
+    vector_scale_factor,
+    num_obs_train, num_obs_eval, num_reg_continuous,
+    matrix_X_continuous_train == matrix_X_continuous_eval,
+    need_eval, need_train, 0,
+    need_eval ? bandwidth_columns : NULL,
+    need_train ? bandwidth_columns : NULL);
+  if(status == NP_BETA_BANDWIDTH_PREPARE_ERR_ZERO_RADIUS) {
+    const NPNNZeroRadiusInfo info = np_nn_zero_radius_info(
+      bandwidth_mode, num_obs_train, num_obs_eval, num_reg_continuous,
+      matrix_X_continuous_train, matrix_X_continuous_eval,
+      (double *)vector_scale_factor, NULL, 0);
+    np_nn_zero_radius_error(&info);
+  }
+  if(status != NP_BETA_BANDWIDTH_PREPARE_OK)
+    error("np_density_conditional: %s",
+          np_beta_bandwidth_prepare_status_message(status));
+
+  view->bandwidth_mode = bandwidth_mode;
+  view->num_train = num_obs_train;
+  view->num_eval_total = num_obs_eval;
+  view->num_continuous = num_reg_continuous;
+  view->evaluation_offset = 0;
+  view->evaluation_count = 1;
+  view->bandwidth_eval = need_eval ? bandwidth_columns : NULL;
+  view->bandwidth_train = need_train ? bandwidth_columns : NULL;
+  (void)storage_bytes;
+  return 1;
 }
 
 
@@ -13927,10 +18976,25 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                             double * cg, double * cgerr,
                             double * ll,
                             double * cxkerlb, double * cxkerub,
-                            double * cykerlb, double * cykerub){
+                            double * cykerlb, double * cykerub,
+                            const NPContinuousKernelRoute *kernel_route,
+                            NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                            const NPContinuousKernelRoute *response_kernel_route,
+                            NPContinuousKernelDerivativeDiagnostics *response_kernel_route_diagnostics,
+                            int categorical_compress,
+                            const NPConditionalLPFirstSERequest *first_se_request,
+                            const int *cat_se_mask,
+                            double *variance_metadata,
+                            NPRegressionLPEmptyRows *empty_rows,
+                            int gnn_lp_fit_tree,
+                            NPRegressionFitProjection *fit_projection,
+                            int *projection_constant, NPConditionalPlotCapture *plot_capture){
   /* Likelihood bandwidth selection for density estimation */
+  int cat_se_status = 0;
+  NPRegressionFailure row_failure = {0};
 
   double *vector_scale_factor, *pdf, *pdf_stderr, log_likelihood = 0.0;
+
   double ** pdf_deriv = NULL, ** pdf_deriv_stderr = NULL;
   double *cxylb = NULL, *cxyub = NULL;
   double xpad_num, ypad_num;
@@ -13938,20 +19002,24 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
   int i,j;
   int num_var;
 
-  int num_all_var, num_var_var, train_is_eval, do_grad, num_obs_eval_alloc;
+  int num_all_var, num_var_var, train_is_eval, do_grad, do_gerr, num_obs_eval_alloc;
   int num_all_cvar, num_all_uvar, num_all_ovar, num_all_catvar;
   int xmax_lev, ymax_lev, dens_or_dist, t_num;
 
   int * ipt_XY = NULL, *ipe_XY = NULL;
   int operator;
 
-  int int_ll_eff;
+  int lp_engine_eff;
   int ycat_offset;
   int xcat_offset;
   int saved_cker_bound;
   double * saved_ckerlb = NULL;
   double * saved_ckerub = NULL;
-
+  NPNNGeometryContext full_fit_nn_geometry_context = {
+    .mode = NP_NN_QUERY_EXTERNAL,
+    .eval_to_train = NULL
+  };
+  const NPNNGeometryContext *full_fit_nn_geometry_context_ptr = NULL;
 
   num_var_unordered_extern = myopti[CD_CNUNOI];
   num_var_ordered_extern = myopti[CD_CNORDI];
@@ -14019,8 +19087,14 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
   int_LARGE_SF = myopti[CD_LSFI];
   BANDWIDTH_den_extern = myopti[CD_DENI];
+  if(BANDWIDTH_den_extern == BW_GEN_NN){
+    full_fit_nn_geometry_context.mode = train_is_eval ?
+      NP_NN_QUERY_TRAINING_IDENTITY : NP_NN_QUERY_EXTERNAL;
+    full_fit_nn_geometry_context_ptr = &full_fit_nn_geometry_context;
+  }
   int_MINIMIZE_IO = myopti[CD_MINIOI];
   do_grad = myopti[CD_GRAD];
+  do_gerr = cderr != NULL && (do_grad || first_se_request != NULL);
 
   ymax_lev = myopti[CD_YMLEVI];
   xmax_lev = myopti[CD_XMLEVI];
@@ -14040,8 +19114,23 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
   operator = (dens_or_dist == NP_DO_DENS) ? OP_NORMAL : OP_INTEGRAL;
 
+  if(response_kernel_route != NULL &&
+     (response_kernel_route_diagnostics == NULL ||
+      num_var_continuous_extern <= 0 ||
+      np_continuous_kernel_route_validate(
+        response_kernel_route, num_var_continuous_extern) !=
+        NP_CKERNEL_ROUTE_OK ||
+      !np_continuous_kernel_route_has_beta(response_kernel_route) ||
+      response_kernel_route->segment_count != 1 ||
+      response_kernel_route->segment[0].coordinate_offset != 0 ||
+      response_kernel_route->segment[0].coordinate_count !=
+        num_var_continuous_extern))
+    error("np_density_conditional: invalid canonical response-kernel route");
+
 #ifdef MPI2
-  num_obs_eval_alloc = MAX(ceil((double) num_obs_eval_extern / (double) iNum_Processors),1)*iNum_Processors;
+  num_obs_eval_alloc =
+    np_mpi_padded_count_or_error(num_obs_eval_extern,
+                                 "np_density_conditional");
 #else
   num_obs_eval_alloc = num_obs_eval_extern;
 #endif
@@ -14074,11 +19163,16 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
   /* notice use of num_obs_eval_alloc for MPI compatibility */
   pdf = alloc_vecd(num_obs_eval_alloc);
-  pdf_stderr = alloc_vecd(num_obs_eval_alloc);
+  pdf_stderr = cderr != NULL ? alloc_vecd(num_obs_eval_alloc) : NULL;
 
-  if (do_grad){
+  if (do_grad)
     pdf_deriv = alloc_matd(num_obs_eval_alloc, num_var);
+  if (do_gerr)
     pdf_deriv_stderr = alloc_matd(num_obs_eval_alloc, num_var);
+  if(first_se_request != NULL) {
+    for(j = 0; j < num_var; ++j)
+      for(i = 0; i < num_obs_eval_alloc; ++i)
+        pdf_deriv_stderr[j][i] = NA_REAL;
   }
 
   /* in v_s_f order is creg, cvar, uvar, ovar, ureg, oreg  */
@@ -14200,8 +19294,17 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
   if(int_TREE_XY == NP_TREE_TRUE){
     if((BANDWIDTH_den_extern != BW_ADAP_NN) || ((BANDWIDTH_den_extern == BW_ADAP_NN) && train_is_eval)){
-      build_kdtree(matrix_XY_continuous_train_extern, num_obs_train_extern, num_all_cvar, 
-                   4*num_all_cvar, ipt_XY, &kdt_extern_XY);
+      /* X moments require an X-dimensional tree. Keep all X/Y donor payloads
+       * in its common order below, with one owning tree pointer. */
+      const int tree_dimensions = gnn_lp_fit_tree ?
+        num_reg_continuous_extern : num_all_cvar;
+      if(gnn_lp_fit_tree) {
+        int_TREE_X = NP_TREE_TRUE;
+        int_TREE_XY = NP_TREE_FALSE;
+      }
+      build_kdtree(matrix_XY_continuous_train_extern, num_obs_train_extern,
+                   tree_dimensions, 4*tree_dimensions, ipt_XY,
+                   gnn_lp_fit_tree ? &kdt_extern_X : &kdt_extern_XY);
 
       // x
       for(j = 0; j < num_reg_unordered_extern; j++)
@@ -14261,18 +19364,21 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
     }
   }
 
-  int_ll_eff = int_ll_extern;
-  if((int_ll_eff == LL_LP) && (num_reg_continuous_extern == 0))
-    int_ll_eff = LL_LC;
+  if(empty_rows != NULL) empty_rows->row_map = ipe_XY;
 
-  if(int_ll_eff == LL_LC){
+  lp_engine_eff = np_lp_engine_extern;
+  if((lp_engine_eff == NP_LP_ENGINE_GENERAL) && (num_reg_continuous_extern == 0))
+    lp_engine_eff = NP_LP_ENGINE_SCALAR;
+
+  if(lp_engine_eff == NP_LP_ENGINE_SCALAR && kernel_route == NULL &&
+     response_kernel_route == NULL){
     int lc_owner_done = 0;
 #ifdef MPI2
-    if((int_ll_eff == LL_LC) &&
+    if((lp_engine_eff == NP_LP_ENGINE_SCALAR) &&
        (BANDWIDTH_den_extern == BW_FIXED) &&
        (iNum_Processors > 1) &&
        !np_mpi_local_regression_active()){
-      if(np_kernel_estimate_con_dens_dist_categorical_owner_blocks(KERNEL_den_extern,
+      const int lc_owner_status = np_kernel_estimate_con_dens_dist_categorical_owner_blocks(KERNEL_den_extern,
                                                                    KERNEL_den_unordered_extern,
                                                                    KERNEL_den_ordered_extern,
                                                                    KERNEL_reg_extern,
@@ -14303,7 +19409,13 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                                                                    pdf_stderr,
                                                                    pdf_deriv,
                                                                    pdf_deriv_stderr,
-                                                                   &log_likelihood) != 0)
+                                                                   &log_likelihood,
+                                                                   cat_se_mask, empty_rows);
+      if(lc_owner_status == 2) {
+        cat_se_status = 2;
+        goto cleanup_np_density_conditional;
+      }
+      if(lc_owner_status != 0)
         error("np_density_conditional: conditional LC owner-block helper failed");
       lc_owner_done = 1;
     }
@@ -14340,20 +19452,48 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                                                    pdf_stderr,
                                                    pdf_deriv,
                                                    pdf_deriv_stderr,
-                                                   &log_likelihood);
+                                                   &log_likelihood,
+                                                   NULL,
+                                                   NULL,
+                                                   0,
+                                                   full_fit_nn_geometry_context_ptr,
+                                                   cat_se_mask, 1, &cat_se_status, empty_rows);
   } else {
     int status = 0;
     int lp_eval_alloc = 1;
     double *vsf_x = NULL, *vsf_y = NULL, *ykw = NULL, *y_eval_one = NULL;
+    double *lambda_y = NULL, *lambda_x = NULL;
     double *mean_one = NULL, *stderr_one = NULL;
     double **xuno_eval_one = NULL, **xord_eval_one = NULL, **xcon_eval_one = NULL;
     double **yuno_eval_one = NULL, **yord_eval_one = NULL, **ycon_eval_one = NULL;
     double **grad_one = NULL, **graderr_one = NULL;
+    int *empty_components = NULL;
     int *kernel_cy = NULL, *kernel_uy = NULL, *kernel_oy = NULL, *operator_y = NULL;
     const char *lp_error = NULL;
+    int lp_zero_radius_side = 0; /* 1 = explanatory X, 2 = response Y */
+    double **matrix_bandwidth_y = NULL;
+    double **y_bandwidth_eval_one = NULL;
+    NPContinuousPreparedBandwidthView prepared_x_bandwidth;
+    NPContinuousPreparedBandwidthView *prepared_x_bandwidth_ptr = NULL;
+    NPBetaScaledRowContext beta_y_row_context;
+    const int beta_y_active = response_kernel_route != NULL;
+    const int ordinary_y_gnn =
+      (!beta_y_active) && (BANDWIDTH_den_extern == BW_GEN_NN) &&
+      (num_var_continuous_extern > 0);
+    const int ordinary_y_ann =
+      (!beta_y_active) && (BANDWIDTH_den_extern == BW_ADAP_NN) &&
+      (num_var_continuous_extern > 0);
+    const int ordinary_y_nn = ordinary_y_gnn || ordinary_y_ann;
+    const int beta_y_bw_rows = (BANDWIDTH_den_extern == BW_FIXED) ? 1 :
+      ((BANDWIDTH_den_extern == BW_GEN_NN) ? num_obs_eval_extern :
+       num_obs_train_extern);
     double RS = 0.0, MSE = 0.0, MAE = 0.0, MAPE = 0.0, CORR = 0.0, SIGN = 0.0;
     int num_y_vars = num_var_continuous_extern + num_var_unordered_extern + num_var_ordered_extern;
     int num_x_vars = num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern;
+    /* The X design/order is fixed across kernel-response rows. Borrow one
+     * invocation-local identity map instead of allocating one per response. */
+    NPLPDesignSupport conditional_design = {0};
+    NPANNFitBatch *ann_fit_batch = NULL;
     int lp_loop_start = 0;
     int lp_loop_stop = num_obs_eval_extern;
 #ifdef MPI2
@@ -14361,26 +19501,37 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 #endif
 
 #ifdef MPI2
-    lp_eval_alloc = MAX((int)ceil(1.0 / (double)iNum_Processors), 1) * iNum_Processors;
+    lp_eval_alloc =
+      np_mpi_padded_count_or_error(1, "np_density_conditional LP");
     lp_owner_blocks = (iNum_Processors > 1) && !np_mpi_local_regression_active();
     if(lp_owner_blocks){
-      const int lp_stride = MAX((int)ceil((double)num_obs_eval_extern / (double)iNum_Processors), 1);
+      const int lp_stride =
+        np_mpi_partition_stride_or_error(num_obs_eval_extern,
+                                         "np_density_conditional LP");
       lp_loop_start = MIN(num_obs_eval_extern, my_rank * lp_stride);
       lp_loop_stop = MIN(num_obs_eval_extern, lp_loop_start + lp_stride);
       for(i = 0; i < num_obs_eval_extern; i++){
         pdf[i] = 0.0;
-        pdf_stderr[i] = 0.0;
+        if(cderr != NULL) pdf_stderr[i] = 0.0;
       }
       if(do_grad){
         for(i = 0; i < num_x_vars; i++){
           memset(pdf_deriv[i], 0, (size_t)num_obs_eval_extern * sizeof(double));
-          memset(pdf_deriv_stderr[i], 0, (size_t)num_obs_eval_extern * sizeof(double));
+          if(do_gerr)
+            memset(pdf_deriv_stderr[i], 0, (size_t)num_obs_eval_extern * sizeof(double));
         }
       }
+      if(first_se_request != NULL)
+        for(i = 0; i < first_se_request->ncon; ++i)
+          if(first_se_request->se[i])
+            memset(pdf_deriv_stderr[i], 0,
+                   (size_t)num_obs_eval_extern * sizeof(double));
     }
 #endif
 
-    if((int_ll_eff == LL_LP) &&
+    np_beta_scaled_row_context_init(&beta_y_row_context);
+
+    if((lp_engine_eff == NP_LP_ENGINE_GENERAL) &&
        ((vector_glp_degree_extern == NULL) || (num_reg_continuous_extern <= 0)))
       error("np_density_conditional: LP conditional path requires continuous x variables and GLP degree metadata");
 
@@ -14392,7 +19543,16 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
     ykw = alloc_vecd(MAX(1, num_obs_train_extern));
     y_eval_one = alloc_vecd(1);
     mean_one = alloc_vecd(MAX(1, lp_eval_alloc));
-    stderr_one = alloc_vecd(MAX(1, lp_eval_alloc));
+    stderr_one = cderr != NULL ? alloc_vecd(MAX(1, lp_eval_alloc)) : NULL;
+    if(beta_y_active || ordinary_y_nn) {
+      lambda_y = alloc_vecd(MAX(
+        1, num_var_unordered_extern + num_var_ordered_extern));
+      matrix_bandwidth_y = alloc_tmatd(
+        beta_y_bw_rows, num_var_continuous_extern);
+    }
+    if(ordinary_y_gnn)
+      y_bandwidth_eval_one = (double **)calloc(
+        (size_t)num_var_continuous_extern, sizeof(double *));
 
     if(num_reg_unordered_extern > 0) xuno_eval_one = alloc_matd(1, num_reg_unordered_extern);
     if(num_reg_ordered_extern > 0) xord_eval_one = alloc_matd(1, num_reg_ordered_extern);
@@ -14402,27 +19562,35 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
     if(num_var_ordered_extern > 0) yord_eval_one = alloc_matd(1, num_var_ordered_extern);
     if(num_var_continuous_extern > 0) ycon_eval_one = alloc_matd(1, num_var_continuous_extern);
 
-    if(do_grad && (num_x_vars > 0)){
+    if(do_grad && (num_x_vars > 0))
       grad_one = alloc_matd(MAX(1, lp_eval_alloc), num_x_vars);
+    if(do_gerr && (num_x_vars > 0))
       graderr_one = alloc_matd(MAX(1, lp_eval_alloc), num_x_vars);
-    }
 
+    if(empty_rows != NULL && do_grad && num_x_vars > 0)
+      empty_components = (int *)calloc((size_t)num_x_vars, sizeof(int));
     kernel_cy = (int *)calloc((size_t)MAX(1, num_var_continuous_extern), sizeof(int));
     kernel_uy = (int *)calloc((size_t)MAX(1, num_var_unordered_extern), sizeof(int));
     kernel_oy = (int *)calloc((size_t)MAX(1, num_var_ordered_extern), sizeof(int));
     operator_y = (int *)calloc((size_t)MAX(1, num_y_vars), sizeof(int));
 
     if((vsf_x == NULL) || (vsf_y == NULL) || (ykw == NULL) ||
-       (y_eval_one == NULL) || (mean_one == NULL) || (stderr_one == NULL) ||
+       (y_eval_one == NULL) || (mean_one == NULL) ||
+       (cderr != NULL && stderr_one == NULL) ||
        (kernel_cy == NULL) || (kernel_uy == NULL) || (kernel_oy == NULL) ||
        (operator_y == NULL) ||
+       ((beta_y_active || ordinary_y_nn) &&
+        (lambda_y == NULL || matrix_bandwidth_y == NULL)) ||
+       (ordinary_y_gnn && y_bandwidth_eval_one == NULL) ||
        ((num_reg_unordered_extern > 0) && (xuno_eval_one == NULL)) ||
        ((num_reg_ordered_extern > 0) && (xord_eval_one == NULL)) ||
        ((num_reg_continuous_extern > 0) && (xcon_eval_one == NULL)) ||
        ((num_var_unordered_extern > 0) && (yuno_eval_one == NULL)) ||
        ((num_var_ordered_extern > 0) && (yord_eval_one == NULL)) ||
        ((num_var_continuous_extern > 0) && (ycon_eval_one == NULL)) ||
-       (do_grad && (num_x_vars > 0) && ((grad_one == NULL) || (graderr_one == NULL))))
+       (empty_rows != NULL && do_grad && num_x_vars > 0 && empty_components == NULL) ||
+       (do_grad && (num_x_vars > 0) && grad_one == NULL) ||
+       (do_gerr && (num_x_vars > 0) && graderr_one == NULL))
       error("np_density_conditional: memory allocation failed in conditional LP path");
 
     for(i = 0; i < num_var_continuous_extern; i++) kernel_cy[i] = KERNEL_den_extern;
@@ -14452,6 +19620,217 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
         vector_scale_factor[1 + num_reg_continuous_extern + num_var_continuous_extern +
                             num_var_unordered_extern + i];
 
+    if(beta_y_active) {
+      NPNNGeometryStatus beta_y_geometry_status = NP_NN_GEOMETRY_OK;
+      const NPContinuousKernelRowStatus row_status =
+        np_beta_continuous_bandwidth_prepare_canonical(
+          BANDWIDTH_den_extern,
+          num_obs_train_extern,
+          num_obs_eval_extern,
+          num_var_unordered_extern,
+          num_var_ordered_extern,
+          num_var_continuous_extern,
+          matrix_XY_continuous_train_extern + num_reg_continuous_extern,
+          matrix_XY_continuous_eval_extern + num_reg_continuous_extern,
+          vsf_y,
+          matrix_bandwidth_y,
+          NULL,
+          lambda_y,
+          NULL,
+          &beta_y_geometry_status) == 0 ?
+            np_beta_scaled_row_context_prepare_conditional_literal(
+              &beta_y_row_context,
+              response_kernel_route,
+              response_kernel_route_diagnostics,
+              BANDWIDTH_den_extern,
+              num_obs_train_extern,
+              num_obs_eval_extern,
+              num_var_continuous_extern,
+              num_var_unordered_extern,
+              num_var_ordered_extern,
+              matrix_XY_continuous_train_extern +
+                num_reg_continuous_extern,
+              matrix_XY_continuous_eval_extern +
+                num_reg_continuous_extern,
+              (num_var_unordered_extern > 0) ?
+                matrix_XY_unordered_train_extern +
+                  num_reg_unordered_extern : NULL,
+              (num_var_unordered_extern > 0) ?
+                matrix_XY_unordered_eval_extern +
+                  num_reg_unordered_extern : NULL,
+              (num_var_ordered_extern > 0) ?
+                matrix_XY_ordered_train_extern +
+                  num_reg_ordered_extern : NULL,
+              (num_var_ordered_extern > 0) ?
+                matrix_XY_ordered_eval_extern +
+                  num_reg_ordered_extern : NULL,
+              matrix_bandwidth_y,
+              matrix_bandwidth_y,
+              operator_y,
+              kernel_uy,
+              kernel_oy,
+              (num_var_unordered_extern + num_var_ordered_extern > 0) ?
+                lambda_y : NULL,
+              (num_var_unordered_extern + num_var_ordered_extern > 0) ?
+                num_categories_extern + ycat_offset : NULL,
+              (num_var_unordered_extern + num_var_ordered_extern > 0) ?
+                matrix_categorical_vals_extern + ycat_offset : NULL,
+              categorical_compress,
+              ykw) : NP_CONTINUOUS_ROW_ERR_LAYOUT;
+
+      if(row_status != NP_CONTINUOUS_ROW_OK) {
+        np_beta_scaled_row_context_clear(&beta_y_row_context);
+        if(beta_y_geometry_status == NP_NN_GEOMETRY_ZERO_RADIUS) {
+          const NPNNZeroRadiusInfo info = np_nn_zero_radius_info(
+            BANDWIDTH_den_extern, num_obs_train_extern, num_obs_eval_extern,
+            num_var_continuous_extern,
+            matrix_XY_continuous_train_extern + num_reg_continuous_extern,
+            matrix_XY_continuous_eval_extern + num_reg_continuous_extern,
+            vsf_y, NULL, num_reg_continuous_extern);
+          np_nn_zero_radius_error(&info);
+        }
+        error("np_density_conditional: canonical beta response-row preparation failed: %s",
+              np_continuous_kernel_row_status_message(row_status));
+      }
+    } else if(ordinary_y_nn) {
+      NPNNGeometryStatus nn_geometry_status = NP_NN_GEOMETRY_OK;
+
+      /* The Y-only response row uses the bandwidth helper's X slots. */
+      if(kernel_bandwidth_mean_ctx(
+           KERNEL_den_extern,
+           BANDWIDTH_den_extern,
+           num_obs_train_extern,
+           num_obs_eval_extern,
+           0, 0, 0,
+           num_var_continuous_extern,
+           num_var_unordered_extern,
+           num_var_ordered_extern,
+           0,
+           vsf_y,
+           NULL,
+           NULL,
+           matrix_XY_continuous_train_extern + num_reg_continuous_extern,
+           matrix_XY_continuous_eval_extern + num_reg_continuous_extern,
+           NULL,
+           matrix_bandwidth_y,
+           lambda_y,
+           full_fit_nn_geometry_context_ptr,
+           NULL,
+           &nn_geometry_status) != 0) {
+        if(nn_geometry_status == NP_NN_GEOMETRY_ZERO_RADIUS) {
+          const NPNNZeroRadiusInfo info = np_nn_zero_radius_info(
+            BANDWIDTH_den_extern, num_obs_train_extern, num_obs_eval_extern,
+            num_var_continuous_extern,
+            matrix_XY_continuous_train_extern + num_reg_continuous_extern,
+            matrix_XY_continuous_eval_extern + num_reg_continuous_extern,
+            vsf_y, full_fit_nn_geometry_context_ptr, num_reg_continuous_extern);
+          np_nn_zero_radius_error(&info);
+        }
+        error("np_density_conditional: invalid NN response bandwidth");
+      }
+    }
+
+    if(kernel_route != NULL &&
+       np_beta_prepared_bandwidth_view_init_or_error(
+         &prepared_x_bandwidth,
+         BANDWIDTH_den_extern,
+         matrix_XY_continuous_train_extern,
+         matrix_XY_continuous_eval_extern,
+         vsf_x,
+         num_obs_train_extern,
+         num_obs_eval_extern,
+         num_reg_continuous_extern))
+      prepared_x_bandwidth_ptr = &prepared_x_bandwidth;
+
+    if(kernel_route == NULL &&
+       (BANDWIDTH_den_extern == BW_GEN_NN ||
+        BANDWIDTH_den_extern == BW_ADAP_NN) &&
+       num_reg_continuous_extern > 0) {
+      const int radius_count = BANDWIDTH_den_extern == BW_GEN_NN ?
+        num_obs_eval_extern : num_obs_train_extern;
+      size_t count, bytes;
+      NPNNGeometryStatus geometry_status = NP_NN_GEOMETRY_OK;
+      if(!np_size_mul_checked((size_t)num_reg_continuous_extern,
+                              (size_t)radius_count, &count) ||
+         !np_size_array_bytes_checked(count, sizeof(double), &bytes))
+        error("np_density_conditional: invalid prepared NN bandwidth layout");
+      double **columns = (double **)R_alloc(
+        (size_t)num_reg_continuous_extern, sizeof(double *));
+      double *storage = (double *)R_alloc(count, sizeof(double));
+      lambda_x = (double *)R_alloc(
+        (size_t)MAX(1, num_reg_unordered_extern + num_reg_ordered_extern),
+        sizeof(double));
+      for(i = 0; i < num_reg_continuous_extern; ++i)
+        columns[i] = storage + (size_t)i*radius_count;
+      if(kernel_bandwidth_mean_ctx(
+           KERNEL_reg_extern, BANDWIDTH_den_extern,
+           num_obs_train_extern, num_obs_eval_extern, 0, 0, 0,
+           num_reg_continuous_extern, num_reg_unordered_extern,
+           num_reg_ordered_extern, 0, vsf_x, NULL, NULL,
+           matrix_XY_continuous_train_extern,
+           matrix_XY_continuous_eval_extern, NULL, columns, lambda_x,
+           full_fit_nn_geometry_context_ptr, NULL, &geometry_status) != 0) {
+        if(geometry_status == NP_NN_GEOMETRY_ZERO_RADIUS) {
+          const NPNNZeroRadiusInfo info = np_nn_zero_radius_info(
+            BANDWIDTH_den_extern, num_obs_train_extern, num_obs_eval_extern,
+            num_reg_continuous_extern, matrix_XY_continuous_train_extern,
+            matrix_XY_continuous_eval_extern, vsf_x,
+            full_fit_nn_geometry_context_ptr, 0);
+          np_nn_zero_radius_error(&info);
+        }
+        error("np_density_conditional: invalid NN explanatory bandwidth");
+      }
+      prepared_x_bandwidth = (NPContinuousPreparedBandwidthView) {
+        .bandwidth_mode = BANDWIDTH_den_extern,
+        .num_train = num_obs_train_extern,
+        .num_eval_total = num_obs_eval_extern,
+        .num_continuous = num_reg_continuous_extern,
+        .evaluation_offset = 0,
+        .evaluation_count = 1,
+        .bandwidth_eval = BANDWIDTH_den_extern == BW_GEN_NN ? columns : NULL,
+        .bandwidth_train = BANDWIDTH_den_extern == BW_ADAP_NN ? columns : NULL
+      };
+      prepared_x_bandwidth_ptr = &prepared_x_bandwidth;
+      (void)bytes;
+    }
+
+    if(BANDWIDTH_den_extern == BW_ADAP_NN &&
+       lp_engine_eff == NP_LP_ENGINE_GENERAL &&
+       int_TREE_XY == NP_TREE_TRUE && num_reg_continuous_extern > 0 &&
+       !int_cxker_bound_extern &&
+       (KERNEL_reg_extern == 4 || KERNEL_reg_extern == 8) &&
+       kernel_route == NULL) {
+      if(prepared_x_bandwidth_ptr == NULL)
+        error("adaptive LP fitting tree requires prepared donor radii");
+      ann_fit_batch = np_ann_fit_batch_create(KERNEL_reg_extern,
+        num_obs_train_extern, num_obs_eval_extern, num_reg_continuous_extern,
+        matrix_XY_continuous_train_extern, matrix_XY_continuous_eval_extern,
+        prepared_x_bandwidth.bandwidth_train);
+    }
+
+    /* Beta response scaling retains its pre-translation arithmetic.  Only a
+     * conditional-only certificate can admit the ordinary CDF translation. */
+    const int translate_cdf =
+      dens_or_dist == NP_DO_DIST && lp_engine_eff != NP_LP_ENGINE_SCALAR &&
+      kernel_route == NULL && response_kernel_route == NULL &&
+      np_conditional_cdf_translation_safe(
+        KERNEL_reg_extern, BANDWIDTH_den_extern, num_obs_train_extern,
+        num_reg_continuous_extern, num_reg_unordered_extern,
+        num_reg_ordered_extern, vsf_x, matrix_XY_continuous_train_extern);
+    NPConditionalCDFAnchor *cdf_anchor = NULL;
+    if(translate_cdf) {
+      cdf_anchor = np_conditional_cdf_anchor_prepare(
+        KERNEL_reg_extern, KERNEL_reg_unordered_extern,
+        KERNEL_reg_ordered_extern, BANDWIDTH_den_extern,
+        num_obs_train_extern, num_reg_unordered_extern,
+        num_reg_ordered_extern, num_reg_continuous_extern,
+        matrix_XY_unordered_train_extern, matrix_XY_ordered_train_extern,
+        matrix_XY_continuous_train_extern, vsf_x,
+        num_categories_extern + xcat_offset,
+        matrix_categorical_vals_extern + xcat_offset,
+        prepared_x_bandwidth_ptr, lambda_x, ann_fit_batch != NULL);
+    }
+
     saved_cker_bound = int_cker_bound_extern;
     saved_ckerlb = vector_ckerlb_extern;
     saved_ckerub = vector_ckerub_extern;
@@ -14464,7 +19843,28 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 #endif
 
     status = 0;
-    for(j = lp_loop_start; j < lp_loop_stop; j++){
+    if(translate_cdf && cdf_anchor == NULL) {
+      status = NP_REGRESSION_FIT_ERR_DEFERRED;
+      lp_error = "np_density_conditional: explanatory support preparation failed for CDF translation";
+    }
+    for(j = lp_loop_start; status == 0 && j < lp_loop_stop; j++){
+      double beta_y_log_scale = 0.0;
+      double variance_one = NA_REAL;
+      const int mapped_train_index = j;
+      const NPNNGeometryContext row_nn_geometry_context = {
+        .mode = train_is_eval ?
+          NP_NN_QUERY_TRAINING_MAP : NP_NN_QUERY_EXTERNAL,
+        .eval_to_train = train_is_eval ? &mapped_train_index : NULL
+      };
+      const NPNNGeometryContext * const row_nn_geometry_context_ptr =
+        /* Ordinary X occurrence identity does not depend on the Y kernel.
+         * Beta X retains its prepared geometry; categorical-only X has no radius. */
+        (BANDWIDTH_den_extern == BW_GEN_NN) &&
+        (!beta_y_active ||
+         (kernel_route == NULL && num_reg_continuous_extern > 0)) ?
+          &row_nn_geometry_context : NULL;
+      if(prepared_x_bandwidth_ptr != NULL)
+        prepared_x_bandwidth.evaluation_offset = j;
       for(i = 0; i < num_reg_unordered_extern; i++)
         xuno_eval_one[i][0] = matrix_XY_unordered_eval_extern[i][j];
       for(i = 0; i < num_reg_ordered_extern; i++)
@@ -14478,6 +19878,9 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
         yord_eval_one[i][0] = matrix_XY_ordered_eval_extern[num_reg_ordered_extern + i][j];
       for(i = 0; i < num_var_continuous_extern; i++)
         ycon_eval_one[i][0] = matrix_XY_continuous_eval_extern[num_reg_continuous_extern + i][j];
+      if(ordinary_y_gnn)
+        for(i = 0; i < num_var_continuous_extern; i++)
+          y_bandwidth_eval_one[i] = matrix_bandwidth_y[i] + j;
 
       int_cker_bound_extern = int_cyker_bound_extern;
       vector_ckerlb_extern = vector_cykerlb_extern;
@@ -14485,7 +19888,20 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
       lp_error = NULL;
 
-      status = kernel_weighted_sum_np(kernel_cy,
+      if(beta_y_active) {
+        const NPContinuousKernelRowStatus row_status =
+          np_beta_scaled_row_context_fill(
+            &beta_y_row_context, j, NULL, &beta_y_log_scale);
+
+        if(row_status != NP_CONTINUOUS_ROW_OK) {
+          status = 1;
+          lp_error =
+            "np_density_conditional: canonical beta response row failed";
+          break;
+        }
+        status = 0;
+      } else {
+        status = kernel_weighted_sum_np_conditional_literal(kernel_cy,
                                       kernel_uy,
                                       kernel_oy,
                                       BANDWIDTH_den_extern,
@@ -14527,10 +19943,10 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                                       NULL,
                                       NULL,
                                       vsf_y,
-                                      0,
-                                      NULL,
-                                      NULL,
-                                      NULL,
+                                      ordinary_y_nn,
+                                      ordinary_y_ann ? matrix_bandwidth_y : NULL,
+                                      ordinary_y_gnn ? y_bandwidth_eval_one : NULL,
+                                      ordinary_y_nn ? lambda_y : NULL,
                                       num_categories_extern + ycat_offset,
                                       matrix_categorical_vals_extern + ycat_offset,
                                       NULL,
@@ -14538,18 +19954,69 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                                       NULL,
                                       ykw,
                                       NULL);
-      if(status != 0){
+      }
+      if(status == KWSNP_ERR_ZERO_NN_RADIUS) {
+        lp_zero_radius_side = 2;
+        lp_error = "conditional density/distribution fit encountered a zero literal response radius after occurrence exclusion";
+      } else if(status != 0){
         lp_error = "np_density_conditional: y-kernel response construction failed in LP path";
       }
 
-      y_eval_one[0] = ykw[0];
+      if(plot_capture != NULL && status == 0) {
+        const int row=ipe_XY[j];
+        for(int ii=0;ii<plot_capture->n;++ii)
+          plot_capture->responses[(size_t)row*plot_capture->n+ipt_XY[ii]]=ykw[ii];
+        plot_capture->response_logscale[row]=beta_y_active ? beta_y_log_scale : 0.0;
+      }
 
       int_cker_bound_extern = int_cxker_bound_extern;
       vector_ckerlb_extern = vector_cxkerlb_extern;
       vector_ckerub_extern = vector_cxkerub_extern;
+      /* Extract once: the original continuous ANN row still feeds the fit. */
+      const double *ann_row = status == 0 && ann_fit_batch != NULL ?
+        np_ann_fit_batch_row(ann_fit_batch,j,lp_loop_stop,1) : NULL;
+      double response_anchor = 0.0;
+      if(status == 0 && translate_cdf) {
+        status = np_conditional_cdf_anchor_fill(cdf_anchor,
+          xuno_eval_one,xord_eval_one,xcon_eval_one,ann_row,ykw,&response_anchor);
+        if(status != 0) {
+          if(row_failure.family == NP_REGRESSION_FAILURE_NONE)
+            np_regression_failure_message(&row_failure,
+              NP_REGRESSION_FAILURE_CONDITIONAL, 1,
+              "np_density_conditional: explanatory support row failed for CDF translation");
+          status = NP_REGRESSION_FIT_ERR_DEFERRED;
+          lp_error = "np_density_conditional: explanatory support row failed for CDF translation";
+          break;
+        }
+      }
+      /* An actual contributing donor anchors constant supported responses.
+       * Inconclusive/all-large maps retain their accepted uncentered response. */
+      if(response_anchor != 0.0)
+        for(int observation = 0; observation < num_obs_train_extern; ++observation)
+          ykw[observation] -= response_anchor;
+      y_eval_one[0] = ykw[0];
 
+      NPRegressionLPEmptyRows row_empty = {NULL, 0, NULL, NULL, NULL};
+      if(empty_rows != NULL) {
+        row_empty = *empty_rows;
+        row_empty.row_map = ipe_XY + j;
+        row_empty.component_flags = empty_components;
+      }
+      NPRegressionFitProjection row_projection = {0};
+      NPRegressionFitProjection *row_projection_ptr = NULL;
       if(status == 0){
-        status = kernel_estimate_regression_categorical_tree_np(int_ll_eff,
+      if(fit_projection != NULL) {
+        row_projection = *fit_projection;
+        row_projection.donor_map = ipt_XY;
+        row_projection.eval_map = &ipe_XY[j];
+        row_projection.emitted = 0;
+        row_projection.constant = 0;
+        row_projection_ptr = &row_projection;
+        plot_capture->row=ipe_XY[j];
+        plot_capture->donor_map=ipt_XY;
+        for(int ii=0;ii<plot_capture->n;++ii) plot_capture->donor_order[ii]=ipt_XY[ii];
+      }
+      status = kernel_estimate_regression_categorical_tree_np_conditional_literal(lp_engine_eff,
                                                                  KERNEL_reg_extern,
                                                                  KERNEL_reg_unordered_extern,
                                                                  KERNEL_reg_ordered_extern,
@@ -14579,64 +20046,249 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
                                                                  &MAE,
                                                                  &MAPE,
                                                                  &CORR,
-                                                                 &SIGN);
-        if(status != 0)
+                                                                 &SIGN,
+                                                                 kernel_route,
+                                                                 kernel_route_diagnostics,
+                                                                 categorical_compress,
+                                                                 (lp_engine_eff == NP_LP_ENGINE_SCALAR) ?
+                                                                   NP_REGRESSION_STDERR_CONDITIONAL_INFLUENCE :
+                                                                   NP_REGRESSION_STDERR_LOCAL_RESIDUAL,
+                                                                 0,
+                                                                 prepared_x_bandwidth_ptr,
+                                                                 row_nn_geometry_context_ptr,
+                                                                 NULL, empty_rows != NULL ? &row_empty : NULL, first_se_request,
+                                                                 variance_metadata != NULL ? &variance_one : NULL,
+                                                                 &row_failure, &conditional_design,
+                                                                 ann_row, row_projection_ptr);
+        if(status == NP_REGRESSION_FIT_ERR_ZERO_NN_RADIUS) {
+          lp_zero_radius_side = 1;
+          lp_error = "conditional density/distribution fit encountered a zero literal explanatory radius after occurrence exclusion";
+        } else if(status != NP_REGRESSION_FIT_OK)
           lp_error = "np_density_conditional: regression LP solve failed in conditional LP path";
       }
 
       if(status != 0)
         break;
 
-      pdf[j] = mean_one[0];
-      pdf_stderr[j] = stderr_one[0];
+      if(fit_projection != NULL) {
+        if(row_projection.emitted != 1 || plot_capture->failed) {
+          np_regression_failure_message(&row_failure,
+            NP_REGRESSION_FAILURE_CONDITIONAL, 1,
+            "conditional plot projection did not return its requested row");
+          status = NP_REGRESSION_FIT_ERR_DEFERRED;
+          lp_error = "conditional plot projection did not return its requested row";
+          break;
+        }
+        projection_constant[ipe_XY[j]] = row_projection.constant;
+        ++fit_projection->emitted;
+      }
+      mean_one[0] += response_anchor;
+
+      if(empty_rows != NULL && row_empty.count > empty_rows->count)
+        empty_rows->count = row_empty.count;
+      const int base_empty = empty_rows != NULL &&
+        empty_rows->base_flags[ipe_XY[j]];
+      const int component_empty = empty_rows != NULL &&
+        empty_rows->flags[ipe_XY[j]];
+
+      if(variance_metadata != NULL) {
+        const int row = ipe_XY[j];
+        const int valid = R_FINITE(variance_one) && variance_one >= 0.0 &&
+          (R_FINITE(beta_y_log_scale) || beta_y_log_scale == -INFINITY);
+        /* Match scaled_restore: an all-zero beta response has log scale -Inf. */
+        variance_metadata[row] =
+          valid && beta_y_log_scale != -INFINITY ? variance_one : 0.0;
+        variance_metadata[row + num_obs_eval_extern] =
+          valid && R_FINITE(beta_y_log_scale) ? beta_y_log_scale : 0.0;
+        variance_metadata[row + 2*num_obs_eval_extern] = valid ? 0.0 : 1.0;
+        variance_metadata[row + 3*num_obs_eval_extern] = 1.0;
+      }
+
+      if(base_empty) {
+        pdf[j] = NA_REAL;
+        if(cderr != NULL) pdf_stderr[j] = NA_REAL;
+      } else if(beta_y_active) {
+        NPContinuousKernelRowStatus restore_status =
+          np_continuous_kernel_scaled_restore(
+            mean_one[0], beta_y_log_scale, 1, &pdf[j]);
+
+        if(restore_status == NP_CONTINUOUS_ROW_OK && cderr != NULL) {
+          if(ISNA(stderr_one[0]))
+            pdf_stderr[j] = NA_REAL;
+          else
+            restore_status = np_continuous_kernel_scaled_restore(
+              stderr_one[0], beta_y_log_scale, 1, &pdf_stderr[j]);
+        }
+        if(restore_status != NP_CONTINUOUS_ROW_OK) {
+          status = 1;
+          lp_error =
+            "np_density_conditional: canonical beta response-unit restoration failed";
+          break;
+        }
+      } else {
+        pdf[j] = mean_one[0];
+        if(cderr != NULL) pdf_stderr[j] = stderr_one[0];
+      }
 
       if(dens_or_dist == NP_DO_DENS){
-        const double val = (pdf[j] < DBL_MIN) ? DBL_MIN : pdf[j];
-        log_likelihood += log(val);
+        log_likelihood += np_fitted_log_likelihood_contribution(pdf[j]);
       }
 
       if(do_grad){
         for(i = 0; i < num_x_vars; i++){
-          pdf_deriv[i][j] = (grad_one != NULL) ? grad_one[i][0] : 0.0;
-          pdf_deriv_stderr[i][j] = (graderr_one != NULL) ? graderr_one[i][0] : 0.0;
+          const double scaled_gradient =
+            (grad_one != NULL) ? grad_one[i][0] : 0.0;
+          const double scaled_gradient_stderr =
+            (graderr_one != NULL) ? graderr_one[i][0] : 0.0;
+
+          if(base_empty || (empty_components != NULL && empty_components[i])) {
+            pdf_deriv[i][j] = NA_REAL;
+            if(do_gerr) pdf_deriv_stderr[i][j] = NA_REAL;
+          } else if(beta_y_active) {
+            NPContinuousKernelRowStatus restore_status =
+              np_continuous_kernel_scaled_derivative_restore(
+                scaled_gradient, beta_y_log_scale,
+                &pdf_deriv[i][j]);
+
+            if(restore_status == NP_CONTINUOUS_ROW_OK && do_gerr)
+              restore_status = np_continuous_kernel_scaled_derivative_restore(
+                scaled_gradient_stderr, beta_y_log_scale,
+                &pdf_deriv_stderr[i][j]);
+            if(restore_status != NP_CONTINUOUS_ROW_OK) {
+              status = 1;
+              lp_error =
+                "np_density_conditional: canonical beta gradient-unit restoration failed";
+              break;
+            }
+          } else {
+            pdf_deriv[i][j] = scaled_gradient;
+            if(do_gerr) pdf_deriv_stderr[i][j] = scaled_gradient_stderr;
+          }
         }
       }
 
+      if(first_se_request != NULL) {
+        for(i = 0; i < first_se_request->ncon; ++i) {
+          if(!first_se_request->se[i])
+            continue;
+          if(base_empty) {
+            pdf_deriv_stderr[i][j] = NA_REAL;
+          } else if(beta_y_active) {
+            const NPContinuousKernelRowStatus restore_status =
+              np_continuous_kernel_scaled_derivative_restore(
+                graderr_one[i][0], beta_y_log_scale,
+                &pdf_deriv_stderr[i][j]);
+            if(restore_status != NP_CONTINUOUS_ROW_OK) {
+              status = 1;
+              lp_error = "np_density_conditional: canonical beta first-SE restoration failed";
+              break;
+            }
+          } else {
+            pdf_deriv_stderr[i][j] = graderr_one[i][0];
+          }
+        }
+      }
+      if(status != 0)
+        break;
+
+      if(component_empty && empty_components != NULL)
+        memset(empty_components, 0, (size_t)num_x_vars*sizeof(int));
       np_progress_fit_step(j + 1);
+    }
+
+    if(status != 0 && row_failure.family == NP_REGRESSION_FAILURE_NONE) {
+      if(lp_zero_radius_side != 0) {
+        const int y_side = lp_zero_radius_side == 2;
+        const int offset = y_side ? num_reg_continuous_extern : 0;
+        const NPNNZeroRadiusInfo info = np_nn_zero_radius_info(
+          BANDWIDTH_den_extern, num_obs_train_extern, num_obs_eval_extern,
+          y_side ? num_var_continuous_extern : num_reg_continuous_extern,
+          matrix_XY_continuous_train_extern + offset,
+          matrix_XY_continuous_eval_extern + offset,
+          y_side ? vsf_y : vsf_x, full_fit_nn_geometry_context_ptr, offset);
+        np_regression_failure_zero_radius(&row_failure, &info);
+      } else {
+        np_regression_failure_message(&row_failure,
+          NP_REGRESSION_FAILURE_CONDITIONAL, status, "%s",
+          lp_error != NULL ? lp_error : "np_density_conditional: conditional LP path failed");
+      }
     }
 
 #ifdef MPI2
     if(lp_owner_blocks){
       int lp_local_fail = (status != 0);
       int lp_any_fail = 0;
+      int lp_any_zero_radius_side = 0;
       np_mpi_local_regression_leave_internal();
 
-      MPI_Allreduce(&lp_local_fail, &lp_any_fail, 1, MPI_INT, MPI_MAX, comm[1]);
-      if(lp_any_fail){
-        if(lp_local_fail)
-          error("%s", (lp_error != NULL) ? lp_error : "np_density_conditional: conditional LP owner-block path failed");
-        else
-          error("np_density_conditional: another rank failed in conditional LP owner-block path");
+      int empty_event = 0;
+      if(empty_rows != NULL) {
+        int packet[2] = {lp_local_fail, empty_rows->count > 0};
+        MPI_Allreduce(MPI_IN_PLACE, packet, 2, MPI_INT, MPI_MAX, comm[1]);
+        lp_any_fail = packet[0];
+        empty_event = packet[1];
       } else {
+      MPI_Allreduce(&lp_local_fail, &lp_any_fail, 1, MPI_INT, MPI_MAX, comm[1]);
+      }
+      MPI_Allreduce(&lp_zero_radius_side, &lp_any_zero_radius_side,
+                    1, MPI_INT, MPI_MAX, comm[1]);
+      if(lp_any_fail){
+        /* Failure-only transport: explicit fields, never struct padding. */
+        int source = lp_local_fail ? my_rank : iNum_Processors;
+        int payload[7] = {0};
+        double nn_values[2] = {0.0, 0.0};
+        MPI_Allreduce(MPI_IN_PLACE, &source, 1, MPI_INT, MPI_MIN, comm[1]);
+        if(my_rank == source) {
+          payload[0] = row_failure.family;
+          payload[1] = row_failure.code;
+          payload[2] = row_failure.nn_bandwidth_type;
+          payload[3] = row_failure.nn_coordinate;
+          payload[4] = row_failure.nn_lookup_k;
+          payload[5] = row_failure.nn_matching_donors;
+          payload[6] = row_failure.nn_excluded;
+          nn_values[0] = row_failure.nn_query_value;
+          nn_values[1] = row_failure.nn_index;
+        }
+        MPI_Bcast(payload, 7, MPI_INT, source, comm[1]);
+        MPI_Bcast(nn_values, 2, MPI_DOUBLE, source, comm[1]);
+        MPI_Bcast(row_failure.message, sizeof(row_failure.message), MPI_CHAR, source, comm[1]);
+        row_failure.family = payload[0];
+        row_failure.code = payload[1];
+        row_failure.nn_bandwidth_type = payload[2];
+        row_failure.nn_coordinate = payload[3];
+        row_failure.nn_lookup_k = payload[4];
+        row_failure.nn_matching_donors = payload[5];
+        row_failure.nn_excluded = payload[6];
+        row_failure.nn_query_value = nn_values[0];
+        row_failure.nn_index = nn_values[1];
+        row_failure.message[sizeof(row_failure.message) - 1] = '\0';
+        status = NP_REGRESSION_FIT_ERR_DEFERRED;
+      } else {
+        if(empty_event) {
+          MPI_Allreduce(MPI_IN_PLACE, empty_rows->flags, num_obs_eval_extern, MPI_INT, MPI_MAX, comm[1]);
+          MPI_Allreduce(MPI_IN_PLACE, empty_rows->base_flags, num_obs_eval_extern, MPI_INT, MPI_MAX, comm[1]);
+        }
+        if(variance_metadata != NULL)
+          MPI_Allreduce(MPI_IN_PLACE, variance_metadata,
+                        4*num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
         MPI_Allreduce(MPI_IN_PLACE, pdf, num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
-        MPI_Allreduce(MPI_IN_PLACE, pdf_stderr, num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
+        if(cderr != NULL)
+          MPI_Allreduce(MPI_IN_PLACE, pdf_stderr, num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
         if(do_grad){
           for(i = 0; i < num_x_vars; i++){
             MPI_Allreduce(MPI_IN_PLACE, pdf_deriv[i], num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
-            MPI_Allreduce(MPI_IN_PLACE, pdf_deriv_stderr[i], num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
+            if(do_gerr)
+              MPI_Allreduce(MPI_IN_PLACE, pdf_deriv_stderr[i], num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
           }
         }
+        if(first_se_request != NULL)
+          for(i = 0; i < first_se_request->ncon; ++i)
+            if(first_se_request->se[i])
+              MPI_Allreduce(MPI_IN_PLACE, pdf_deriv_stderr[i],
+                            num_obs_eval_extern, MPI_DOUBLE, MPI_SUM, comm[1]);
         MPI_Allreduce(MPI_IN_PLACE, &log_likelihood, 1, MPI_DOUBLE, MPI_SUM, comm[1]);
       }
     }
-#endif
-
-#ifdef MPI2
-    if((!lp_owner_blocks) && (status != 0))
-      error("%s", (lp_error != NULL) ? lp_error : "np_density_conditional: conditional LP path failed");
-#else
-    if(status != 0)
-      error("%s", (lp_error != NULL) ? lp_error : "np_density_conditional: conditional LP path failed");
 #endif
 
     int_cker_bound_extern = saved_cker_bound;
@@ -14645,6 +20297,7 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
     safe_free(vsf_x);
     safe_free(vsf_y);
+    safe_free(lambda_y);
     safe_free(ykw);
     safe_free(y_eval_one);
     safe_free(mean_one);
@@ -14660,11 +20313,18 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
 
     if(grad_one != NULL) free_mat(grad_one, num_x_vars);
     if(graderr_one != NULL) free_mat(graderr_one, num_x_vars);
+    safe_free(empty_components);
 
     safe_free(kernel_cy);
     safe_free(kernel_uy);
     safe_free(kernel_oy);
     safe_free(operator_y);
+    safe_free(y_bandwidth_eval_one);
+    if(matrix_bandwidth_y != NULL)
+      free_tmat(matrix_bandwidth_y);
+    np_beta_scaled_row_context_clear(&beta_y_row_context);
+    if(status != 0)
+      goto cleanup_np_density_conditional;
   }
 
 
@@ -14672,14 +20332,16 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
   for( i=0; i<num_obs_eval_extern; i++ )
     cdens[ipe_XY[i]]=pdf[i];
 
-  for( i=0; i<num_obs_eval_extern; i++ )
-    cderr[ipe_XY[i]]=pdf_stderr[i];
+  if(cderr != NULL)
+    for( i=0; i<num_obs_eval_extern; i++ )
+      cderr[ipe_XY[i]]=pdf_stderr[i];
   
-  if (do_grad) {
+  if (do_gerr) {
     for(j=0;j<num_var;j++)
       for(i=0;i<num_obs_eval_extern;i++)
         cgerr[j*num_obs_eval_extern+ipe_XY[i]]=pdf_deriv_stderr[j][i];
-
+  }
+  if (do_grad) {
     for(j=0;j<num_var;j++)
       for(i=0;i<num_obs_eval_extern;i++)
         cg[j*num_obs_eval_extern+ipe_XY[i]]=pdf_deriv[j][i];
@@ -14690,6 +20352,7 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
   *ll = log_likelihood;
   /* end return data */
 
+cleanup_np_density_conditional:
   /* Free data objects */
 
   free_mat(matrix_XY_unordered_train_extern, num_all_uvar);
@@ -14706,10 +20369,10 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
     free_mat(matrix_XY_continuous_eval_extern, num_all_cvar);
   }
 
-  if (do_grad){
+  if (do_grad)
     free_mat(pdf_deriv, num_var);
+  if (do_gerr)
     free_mat(pdf_deriv_stderr, num_var);
-  }
 
   vector_continuous_stddev_extern = NULL;
 
@@ -14750,7 +20413,34 @@ void np_density_conditional(double * tc_uno, double * tc_ord, double * tc_con,
   num_obs_train_extern = 0;
   num_obs_eval_extern = 0;
 
+  if(row_failure.family != NP_REGRESSION_FAILURE_NONE)
+    np_regression_failure_publish(&row_failure);
+
+  if(cat_se_status != 0)
+    error("np_density_conditional: categorical-SE contribution pass failed (status %d)",
+          cat_se_status);
   return;
+}
+
+static double **np_column_view_alloc_or_die(double *storage,
+                                            int row_count,
+                                            int column_count,
+                                            const char *label)
+{
+  double **columns;
+  int column;
+
+  if(column_count == 0)
+    return NULL;
+  if(storage == NULL || row_count <= 0 || column_count < 0 ||
+     (size_t)column_count > SIZE_MAX / sizeof(double *))
+    error("%s has an invalid column-view layout", label);
+  columns = (double **)malloc((size_t)column_count * sizeof(double *));
+  if(columns == NULL)
+    error("failed to allocate %s column view", label);
+  for(column = 0; column < column_count; ++column)
+    columns[column] = storage + (size_t)column * (size_t)row_count;
+  return columns;
 }
 
 
@@ -14760,16 +20450,19 @@ void np_density(double * tuno, double * tord, double * tcon,
                 double * mcv, double * padnum, 
                 double * nconfac, double * ncatfac, double * mysd,
                 int * myopti, double * mydens, double * myderr, double * ll,
-                double * ckerlb, double * ckerub){
+                double * ckerlb, double * ckerub,
+                const NPContinuousKernelRoute *kernel_route,
+                NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                int categorical_compress){
 
 
-  double small = 1.0e-16;
   double * vector_scale_factor, * pdf, * pdf_stderr, log_likelihood = 0.0;
   double pad_num;
 
-  int itmax = 10000;
   int i,j;
-  int num_var, num_obs_eval_alloc, max_lev, train_is_eval, dens_or_dist, old_dens;
+  int num_var, num_obs_eval_alloc, max_lev, train_is_eval, dens_or_dist;
+  const int canonical_beta_views = kernel_route != NULL;
+  const int compute_se = myderr != NULL;
 
   int * ipt = NULL, * ipe = NULL;
   
@@ -14806,71 +20499,117 @@ void np_density(double * tuno, double * tord, double * tcon,
   ncatfac_extern = *ncatfac;
 
   dens_or_dist = myopti[DEN_DODENI];
-  old_dens = myopti[DEN_OLDI];
+  if (myopti[DEN_RESERVED_LEGACYI] != 0)
+    error("C_np_density: reserved legacy selector must be zero");
   int_TREE_X = myopti[DEN_TREEI];
   int_TREE_PROFILE_X = myopti[DEN_TREEI];
+  if(canonical_beta_views && int_TREE_X != NP_TREE_FALSE)
+    error("canonical beta density/distribution views require non-tree data");
 
 #ifdef MPI2
-  num_obs_eval_alloc = MAX(ceil((double) num_obs_eval_extern / (double) iNum_Processors),1)*iNum_Processors;
+  num_obs_eval_alloc =
+    np_mpi_padded_count_or_error(num_obs_eval_extern, "np_density");
 #else
   num_obs_eval_alloc = num_obs_eval_extern;
 #endif
 
   /* Allocate memory for objects */
 
-  matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
+  if(canonical_beta_views) {
+    matrix_X_unordered_train_extern = np_column_view_alloc_or_die(
+      tuno, num_obs_train_extern, num_reg_unordered_extern,
+      "beta density/distribution unordered training data");
+    matrix_X_ordered_train_extern = np_column_view_alloc_or_die(
+      tord, num_obs_train_extern, num_reg_ordered_extern,
+      "beta density/distribution ordered training data");
+    matrix_X_continuous_train_extern = np_column_view_alloc_or_die(
+      tcon, num_obs_train_extern, num_reg_continuous_extern,
+      "beta density/distribution continuous training data");
+  } else {
+    matrix_X_unordered_train_extern = alloc_matd(
+      num_obs_train_extern, num_reg_unordered_extern);
+    matrix_X_ordered_train_extern = alloc_matd(
+      num_obs_train_extern, num_reg_ordered_extern);
+    matrix_X_continuous_train_extern = alloc_matd(
+      num_obs_train_extern, num_reg_continuous_extern);
+  }
 
   if(!train_is_eval){
-    matrix_X_unordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_unordered_extern);
-    matrix_X_ordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_ordered_extern);
-    matrix_X_continuous_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_continuous_extern);
+    if(canonical_beta_views) {
+      matrix_X_unordered_eval_extern = np_column_view_alloc_or_die(
+        euno, num_obs_eval_extern, num_reg_unordered_extern,
+        "beta density/distribution unordered evaluation data");
+      matrix_X_ordered_eval_extern = np_column_view_alloc_or_die(
+        eord, num_obs_eval_extern, num_reg_ordered_extern,
+        "beta density/distribution ordered evaluation data");
+      matrix_X_continuous_eval_extern = np_column_view_alloc_or_die(
+        econ, num_obs_eval_extern, num_reg_continuous_extern,
+        "beta density/distribution continuous evaluation data");
+    } else {
+      matrix_X_unordered_eval_extern = alloc_matd(
+        num_obs_eval_extern, num_reg_unordered_extern);
+      matrix_X_ordered_eval_extern = alloc_matd(
+        num_obs_eval_extern, num_reg_ordered_extern);
+      matrix_X_continuous_eval_extern = alloc_matd(
+        num_obs_eval_extern, num_reg_continuous_extern);
+    }
   } else {
     matrix_X_unordered_eval_extern = matrix_X_unordered_train_extern;
     matrix_X_ordered_eval_extern = matrix_X_ordered_train_extern;
     matrix_X_continuous_eval_extern = matrix_X_continuous_train_extern;
   }
 
-  num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
+  num_categories_extern =
+    alloc_vecu(num_reg_unordered_extern + num_reg_ordered_extern);
   vector_scale_factor = alloc_vecd(num_var + 1);
-  matrix_categorical_vals_extern = alloc_matd(max_lev, num_reg_unordered_extern + num_reg_ordered_extern);
+  matrix_categorical_vals_extern = canonical_beta_views ?
+    np_column_view_alloc_or_die(
+      mcv, max_lev, num_reg_unordered_extern + num_reg_ordered_extern,
+      "beta density/distribution category values") :
+    alloc_matd(max_lev, num_reg_unordered_extern + num_reg_ordered_extern);
 
   /* note use of num_obs_eval_alloc */
   pdf = alloc_vecd(num_obs_eval_alloc);
-  pdf_stderr = alloc_vecd(num_obs_eval_alloc);
+  pdf_stderr = compute_se ? alloc_vecd(num_obs_eval_alloc) : NULL;
   
   vector_continuous_stddev_extern = mysd;
 
   /* Parse data */
 	
-  /* train */
-
-  for( j=0;j<num_reg_unordered_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_unordered_train_extern[j][i]=tuno[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_ordered_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_ordered_train_extern[j][i]=tord[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_continuous_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_continuous_train_extern[j][i]=tcon[j*num_obs_train_extern+i];
-
-  /* eval */
-  if (!train_is_eval) {
+  if(!canonical_beta_views) {
+    /* train */
     for( j=0;j<num_reg_unordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_unordered_eval_extern[j][i]=euno[j*num_obs_eval_extern+i];
+      for( i=0;i<num_obs_train_extern;i++ )
+        matrix_X_unordered_train_extern[j][i]=
+          tuno[j*num_obs_train_extern+i];
 
     for( j=0;j<num_reg_ordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_ordered_eval_extern[j][i]=eord[j*num_obs_eval_extern+i];
+      for( i=0;i<num_obs_train_extern;i++ )
+        matrix_X_ordered_train_extern[j][i]=
+          tord[j*num_obs_train_extern+i];
 
     for( j=0;j<num_reg_continuous_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_continuous_eval_extern[j][i]=econ[j*num_obs_eval_extern+i];
+      for( i=0;i<num_obs_train_extern;i++ )
+        matrix_X_continuous_train_extern[j][i]=
+          tcon[j*num_obs_train_extern+i];
+
+    /* eval */
+    if (!train_is_eval) {
+      for( j=0;j<num_reg_unordered_extern;j++)
+        for( i=0;i<num_obs_eval_extern;i++ )
+          matrix_X_unordered_eval_extern[j][i]=
+            euno[j*num_obs_eval_extern+i];
+
+      for( j=0;j<num_reg_ordered_extern;j++)
+        for( i=0;i<num_obs_eval_extern;i++ )
+          matrix_X_ordered_eval_extern[j][i]=
+            eord[j*num_obs_eval_extern+i];
+
+      for( j=0;j<num_reg_continuous_extern;j++)
+        for( i=0;i<num_obs_eval_extern;i++ )
+          matrix_X_continuous_eval_extern[j][i]=
+            econ[j*num_obs_eval_extern+i];
+    }
   }
 
   /*  bandwidths/scale factors */
@@ -14882,32 +20621,35 @@ void np_density(double * tuno, double * tord, double * tcon,
   
   for(j=0; j < (num_reg_unordered_extern + num_reg_ordered_extern); j++){
     i = 0;
-    do { 
-      matrix_categorical_vals_extern[j][i] = mcv[j*max_lev+i];
+    do {
+      if(!canonical_beta_views)
+        matrix_categorical_vals_extern[j][i] = mcv[j*max_lev+i];
     } while(++i < max_lev && mcv[j*max_lev+i] != pad_num);
     num_categories_extern[j] = i;
   }
 
   /* data has been copied, now build tree */
 
-  ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt != NULL))
-    error("!(ipt != NULL)");
+  if(!canonical_beta_views) {
+    ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
+    if(!(ipt != NULL))
+      error("!(ipt != NULL)");
 
-  for(i = 0; i < num_obs_train_extern; i++){
-    ipt[i] = i;
-  }
-
-  if(!train_is_eval) {
-    ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
-    if(!(ipe != NULL))
-      error("!(ipe != NULL)");
-
-    for(i = 0; i < num_obs_eval_extern; i++){
-      ipe[i] = i;
+    for(i = 0; i < num_obs_train_extern; i++){
+      ipt[i] = i;
     }
-  } else {
-    ipe = ipt;
+
+    if(!train_is_eval) {
+      ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
+      if(!(ipe != NULL))
+        error("!(ipe != NULL)");
+
+      for(i = 0; i < num_obs_eval_extern; i++){
+        ipe[i] = i;
+      }
+    } else {
+      ipe = ipt;
+    }
   }
 
   int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE);
@@ -14953,107 +20695,79 @@ void np_density(double * tuno, double * tord, double * tcon,
 
   /* Conduct estimation */
   
-  if(old_dens){
-    if (dens_or_dist == NP_DO_DENS){
-      /* nb - KERNEL_(|un)ordered_den are set to zero upon declaration 
-         - they have only one kernel type each at the moment */
-      kernel_estimate_density_categorical(KERNEL_den_extern,
-                                          KERNEL_den_unordered_extern,
-                                          KERNEL_den_ordered_extern,
-                                          BANDWIDTH_den_extern,
-                                          num_obs_train_extern,
-                                          num_obs_eval_extern,
-                                          num_reg_unordered_extern,
-                                          num_reg_ordered_extern,
-                                          num_reg_continuous_extern,
-                                          /* Train */
-                                          matrix_X_unordered_train_extern,
-                                          matrix_X_ordered_train_extern,
-                                          matrix_X_continuous_train_extern,
-                                          /* Eval */
-                                          matrix_X_unordered_eval_extern,
-                                          matrix_X_ordered_eval_extern,
-                                          matrix_X_continuous_eval_extern,
-                                          &vector_scale_factor[1],
-                                          num_categories_extern,
-                                          pdf,
-                                          pdf_stderr,
-                                          &log_likelihood);
-    } else if (dens_or_dist == NP_DO_DIST) {
-      kernel_estimate_distribution_categorical(KERNEL_den_extern,
-                                               KERNEL_den_unordered_extern,
-                                               KERNEL_den_ordered_extern,
-                                               BANDWIDTH_den_extern,
-                                               num_obs_train_extern,
-                                               num_obs_eval_extern,
-                                               num_reg_unordered_extern,
-                                               num_reg_ordered_extern,
-                                               num_reg_continuous_extern,
-                                               /* Train */
-                                               matrix_X_unordered_train_extern,
-                                               matrix_X_ordered_train_extern,
-                                               matrix_X_continuous_train_extern,
-                                               /* Eval */
-                                               matrix_X_unordered_eval_extern,
-                                               matrix_X_ordered_eval_extern,
-                                               matrix_X_continuous_eval_extern,
-                                               &vector_scale_factor[1],
-                                               num_categories_extern,
-                                               matrix_categorical_vals_extern,
-                                               pdf,
-                                               pdf_stderr,
-                                               small, itmax);
-
-    }
-  } else {
+  {
     const int dop = (dens_or_dist == NP_DO_DENS) ? OP_NORMAL : OP_INTEGRAL;
+    const NPNNGeometryContext nn_geometry_context = {
+      .mode = train_is_eval ?
+        NP_NN_QUERY_TRAINING_IDENTITY : NP_NN_QUERY_EXTERNAL,
+      .eval_to_train = NULL
+    };
 
-      np_progress_fit_set_offset(0);
-      kernel_estimate_dens_dist_categorical_np(KERNEL_den_extern,
-                                               KERNEL_den_unordered_extern,
-                                               KERNEL_den_ordered_extern,
-                                               BANDWIDTH_den_extern,
-                                               num_obs_train_extern,
-                                               num_obs_eval_extern,
-                                               num_reg_unordered_extern,
-                                               num_reg_ordered_extern,
-                                               num_reg_continuous_extern,
-                                               dop,
-                                               /* Train */
-                                               matrix_X_unordered_train_extern,
-                                               matrix_X_ordered_train_extern,
-                                               matrix_X_continuous_train_extern,
-                                               /* Eval */
-                                               matrix_X_unordered_eval_extern,
-                                               matrix_X_ordered_eval_extern,
-                                               matrix_X_continuous_eval_extern,
-                                               &vector_scale_factor[1],
-                                               num_categories_extern,
-                                               matrix_categorical_vals_extern,
-                                               pdf,
-                                               pdf_stderr,
-                                               &log_likelihood);
+    np_progress_fit_set_offset(0);
+    kernel_estimate_dens_dist_categorical_np(KERNEL_den_extern,
+                                             KERNEL_den_unordered_extern,
+                                             KERNEL_den_ordered_extern,
+                                             BANDWIDTH_den_extern,
+                                             num_obs_train_extern,
+                                             num_obs_eval_extern,
+                                             num_reg_unordered_extern,
+                                             num_reg_ordered_extern,
+                                             num_reg_continuous_extern,
+                                             dop,
+                                             /* Train */
+                                             matrix_X_unordered_train_extern,
+                                             matrix_X_ordered_train_extern,
+                                             matrix_X_continuous_train_extern,
+                                             /* Eval */
+                                             matrix_X_unordered_eval_extern,
+                                             matrix_X_ordered_eval_extern,
+                                             matrix_X_continuous_eval_extern,
+                                             &vector_scale_factor[1],
+                                             num_categories_extern,
+                                             matrix_categorical_vals_extern,
+                                             pdf,
+                                             pdf_stderr,
+                                             &log_likelihood,
+                                             kernel_route,
+                                             kernel_route_diagnostics,
+                                             categorical_compress,
+                                             &nn_geometry_context);
   }
   
   
   /* write the return values */
 
   for(i=0;i<num_obs_eval_extern;i++){
-    mydens[ipe[i]] = pdf[i];
-    myderr[ipe[i]] = pdf_stderr[i];
+    const int output_index = canonical_beta_views ? i : ipe[i];
+
+    mydens[output_index] = pdf[i];
+    if(compute_se)
+      myderr[output_index] = pdf_stderr[i];
   }
   *ll = log_likelihood;
 
   /* clean up and wave goodbye */
 
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
+  if(canonical_beta_views) {
+    free(matrix_X_unordered_train_extern);
+    free(matrix_X_ordered_train_extern);
+    free(matrix_X_continuous_train_extern);
+  } else {
+    free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
+    free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
+    free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
+  }
 
   if (!train_is_eval){
-    free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
-    free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
-    free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
+    if(canonical_beta_views) {
+      free(matrix_X_unordered_eval_extern);
+      free(matrix_X_ordered_eval_extern);
+      free(matrix_X_continuous_eval_extern);
+    } else {
+      free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
+      free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
+      free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
+    }
   }
 
   vector_continuous_stddev_extern = NULL;
@@ -15063,7 +20777,11 @@ void np_density(double * tuno, double * tord, double * tcon,
   safe_free(pdf_stderr);
   safe_free(pdf);
 
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
+  if(canonical_beta_views)
+    free(matrix_categorical_vals_extern);
+  else
+    free_mat(matrix_categorical_vals_extern,
+             num_reg_unordered_extern+num_reg_ordered_extern);
 
   safe_free(ipt);
 
@@ -15104,17 +20822,35 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
                                   const double lsq_delta_start,
                                   const double lsq_delta_lower,
                                   const double lsq_delta_upper,
-                                  double * lsq_delta_out){
+                                  double * lsq_delta_out,
+                                  NPRegressionPreparedCtx *retained_context,
+                                  const int prepare_only,
+                                  const int degree_search,
+                                  const NPCategoricalSupport *support){
+  NPRegressionPreparedCtx local_context = {0};
+  NPRegressionPreparedCtx *prepared_context =
+    retained_context != NULL ? retained_context : &local_context;
+  if (prepare_only && retained_context == NULL)
+    error("C_np_regression_bw: prepare-only mode requires retained ownership");
+  if (retained_context != NULL && retained_context->active)
+    error("C_np_regression_bw: prepared context is already active");
+  if ((!R_FINITE(penalty_mult[0])) || (penalty_mult[0] < 1.0))
+    error("C_np_regression_bw: penalty.multiplier must be finite and greater than or equal to 1");
+  np_validate_nonfixed_support_input("C_np_regression_bw", myopti[RBW_REGI],
+    myopti[RBW_NOBSI], myopti[RBW_NCONI], rcon, 0, NULL);
+  memset(prepared_context, 0, sizeof(*prepared_context));
   //KDT * kdt = NULL; // tree structure
   //NL nl = { .node = NULL, .n = 0, .nalloc = 0 };// a node list structure -- used for searching - here for testing
   //double tb[4] = {0.25, 0.5, 0.3, 0.75};
   int * ipt = NULL, *ipt_lookup = NULL;  // point permutation, see tree.c
 
-  double **matrix_y;
+  double **matrix_y = NULL;
 
   double *vector_continuous_stddev = NULL;
-  double *vector_scale_factor, *vector_scale_factor_multistart, *vsfh;
-  double *vector_scale_factor_startbest;
+  double *vector_scale_factor = NULL;
+  double *vector_scale_factor_multistart = NULL;
+  double *vsfh = NULL;
+  double *vector_scale_factor_startbest = NULL;
 
   double fret, fret_best, fret_start_best, fret_initial;
   double ftol, tol, small;
@@ -15129,10 +20865,13 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
   int i,j;
   double fast_eval_total = 0.0;
-  int num_var, num_search_var;
+  int num_var, num_search_var, num_state_var;
   int iMultistart, iMs_counter, iNum_Multistart, iImproved;
   int enforce_fixed_feasibility;
   int have_start_best, have_multistart_best;
+  int adaptive_retry_attempted = 0;
+  int adaptive_retry_history_index = 0;
+  int adaptive_retry_improved = 0;
   int itmax, iter;
   int int_use_starting_values;
 
@@ -15150,6 +20889,12 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
   num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
   num_search_var = num_var + (lsq_check_mode ? 1 : 0);
+  prepared_context->active = 1;
+  prepared_context->num_var = num_var;
+  prepared_context->num_search_var = num_search_var;
+  prepared_context->num_unordered = num_reg_unordered_extern;
+  prepared_context->num_ordered = num_reg_ordered_extern;
+  prepared_context->num_continuous = num_reg_continuous_extern;
   if(lsq_check_mode && ((lsq_scale == NULL) ||
                         (!R_FINITE(lsq_tau)) ||
                         (lsq_tau <= 0.0) ||
@@ -15172,8 +20917,23 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   KERNEL_reg_unordered_extern = myopti[RBW_UKRNEVI];
   KERNEL_reg_ordered_extern = myopti[RBW_OKRNEVI];
 
-  vector_ckerlb_extern = ckerlb;
-  vector_ckerub_extern = ckerub;
+  if (retained_context != NULL && num_reg_continuous_extern > 0) {
+    prepared_context->ckerlb = alloc_vecd(num_reg_continuous_extern);
+    prepared_context->ckerub = alloc_vecd(num_reg_continuous_extern);
+    if (prepared_context->ckerlb == NULL || prepared_context->ckerub == NULL) {
+      bw_error_msg = "C_np_regression_bw: failed to allocate retained kernel bounds";
+      goto cleanup_np_regression_bw_mode;
+    }
+    for (i = 0; i < num_reg_continuous_extern; i++) {
+      prepared_context->ckerlb[i] = ckerlb[i];
+      prepared_context->ckerub[i] = ckerub[i];
+    }
+    vector_ckerlb_extern = prepared_context->ckerlb;
+    vector_ckerub_extern = prepared_context->ckerub;
+  } else {
+    vector_ckerlb_extern = ckerlb;
+    vector_ckerub_extern = ckerub;
+  }
   int_cker_bound_extern = np_has_finite_cker_bounds(ckerlb, ckerub, num_reg_continuous_extern);
 
   int_use_starting_values= myopti[RBW_USTARTI];
@@ -15189,16 +20949,56 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   int_RESTART_FROM_MIN = myopti[RBW_REMINI];
   int_MINIMIZE_IO = myopti[RBW_MINIOI];
 
-  int_ll_extern = myopti[RBW_LL];
-  vector_glp_degree_extern = glp_degree;
+  {
+    const int requested_engine = np_regression_engine_or_error(
+      myopti[RBW_LL], "C_np_regression_bw");
+    if (degree_search != 0 && degree_search != 1)
+      error("C_np_regression_bw: degree_search must be zero or one");
+    if (degree_search && lsq_check_mode)
+      error("C_np_regression_bw: degree search is unavailable for least-quantile regression");
+    prepared_context->degree_search = degree_search;
+    prepared_context->requested_bernstein = *glp_bernstein;
+    prepared_context->requested_basis = *glp_basis;
+    np_lp_engine_extern = degree_search ?
+      np_canonical_lp_engine_for_degree(glp_degree, num_reg_continuous_extern) :
+      requested_engine;
+    if (np_lp_engine_extern < 0)
+      error("C_np_regression_bw: invalid local-polynomial degree state");
+    prepared_context->degree_key_len = degree_search ?
+      num_reg_continuous_extern : 0;
+  }
+  if(KERNEL_reg_extern == NP_CKERNEL_COORDINATE_CODE &&
+     lsq_check_mode)
+    error("C_np_regression_bw: beta bandwidth selection does not support least-quantile regression");
+  if (num_reg_continuous_extern > 0) {
+    prepared_context->degree = alloc_vecu(num_reg_continuous_extern);
+    if (prepared_context->degree == NULL) {
+      bw_error_msg = "C_np_regression_bw: failed to allocate degree state";
+      goto cleanup_np_regression_bw_mode;
+    }
+    for (i = 0; i < num_reg_continuous_extern; i++)
+      prepared_context->degree[i] = glp_degree[i];
+  }
+  vector_glp_degree_extern =
+    (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) ?
+    prepared_context->degree : NULL;
   vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = *glp_bernstein;
-  int_glp_basis_extern = *glp_basis;
-  int_nn_k_min_extern =
-    ((BANDWIDTH_reg_extern != BW_FIXED) && (num_reg_continuous_extern > 0)) ? 2 : 1;
+  int_glp_bernstein_extern =
+    (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) ?
+    prepared_context->requested_bernstein : 0;
+  int_glp_basis_extern =
+    (np_lp_engine_extern == NP_LP_ENGINE_GENERAL) ?
+    prepared_context->requested_basis : 1;
+  num_state_var = MAX(num_search_var,
+                      num_var + prepared_context->degree_key_len);
+  int_nn_k_min_extern = myopti[RBW_NNMINI];
+  if(int_nn_k_min_extern != 1 && int_nn_k_min_extern != 2)
+    error("C_np_regression_bw: regression NN minimum must be 1 or 2");
 
   int_TREE_PROFILE_X = myopti[RBW_DOTREEI];
   int_TREE_X = myopti[RBW_DOTREEI];
+  np_regression_bw_kernel_state_configure_or_error(
+    myopti, ckerlb, ckerub, "C_np_regression_bw");
   scale_cat = myopti[RBW_SCATI];
   bwm_use_transform = myopti[RBW_TBNDI];
   if (BANDWIDTH_reg_extern != BW_FIXED)
@@ -15244,19 +21044,34 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
   matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
   matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
+  prepared_context->matrix_x_unordered = matrix_X_unordered_train_extern;
+  prepared_context->matrix_x_ordered = matrix_X_ordered_train_extern;
+  prepared_context->matrix_x_continuous = matrix_X_continuous_train_extern;
 
   vector_Y_extern = alloc_vecd(num_obs_train_extern);
   vector_lsq_scale_extern = lsq_check_mode ? alloc_vecd(num_obs_train_extern) : NULL;
   vector_lsq_q_extern = lsq_check_mode ? alloc_vecd(num_obs_train_extern) : NULL;
+  prepared_context->response = vector_Y_extern;
+  prepared_context->lsq_scale = vector_lsq_scale_extern;
+  prepared_context->lsq_q = vector_lsq_q_extern;
 	
   num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
-  matrix_y = alloc_matd(num_search_var + 1, num_search_var +1);
-  vector_scale_factor = alloc_vecd(num_search_var + 1);
-  vector_scale_factor_startbest = alloc_vecd(num_search_var + 1);
-  vsfh = alloc_vecd(num_search_var + 1);
-  matrix_categorical_vals_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern + num_reg_ordered_extern);
+  matrix_y = prepare_only ? NULL :
+    alloc_matd(num_search_var + 1, num_search_var + 1);
+  vector_scale_factor = alloc_vecd(num_state_var + 1);
+  vector_scale_factor_startbest = prepare_only ? NULL :
+    alloc_vecd(num_search_var + 1);
+  vsfh = prepare_only ? NULL : alloc_vecd(num_search_var + 1);
+  matrix_categorical_vals_extern = alloc_matd(support->max_levels, num_reg_unordered_extern + num_reg_ordered_extern);
+  prepared_context->num_categories = num_categories_extern;
+  prepared_context->powell_directions = matrix_y;
+  prepared_context->scale_factor = vector_scale_factor;
+  prepared_context->scale_factor_startbest = vector_scale_factor_startbest;
+  prepared_context->powell_step = vsfh;
+  prepared_context->matrix_categorical_vals = matrix_categorical_vals_extern;
 
   vector_continuous_stddev = alloc_vecd(num_reg_continuous_extern);
+  prepared_context->continuous_stddev = vector_continuous_stddev;
 
   for(j = 0; j < num_reg_continuous_extern; j++)
     vector_continuous_stddev[j] = mysd[j];
@@ -15301,34 +21116,69 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   bwm_penalty_mode = 0;
   bwm_penalty_value = DBL_MAX;
   if (penalty_mode[0] == 1) {
+    const int penalty_criterion =
+      lsq_check_mode ? RBWM_CVCHECK : myopti[RBW_MI];
     double pmult = penalty_mult[0];
-    double y_mean = 0.0;
-    double mse0 = 0.0;
-    if (pmult < 1.0) pmult = 1.0;
-    for (i = 0; i < num_obs_train_extern; i++)
-      y_mean += vector_Y_extern[i];
-    y_mean /= (double) num_obs_train_extern;
-    for (i = 0; i < num_obs_train_extern; i++) {
-      const double dy = vector_Y_extern[i] - y_mean;
-      mse0 += dy*dy;
-    }
-    mse0 /= (double) num_obs_train_extern;
-    if (mse0 <= 0.0) mse0 = DBL_MIN;
-    if (myopti[RBW_MI] == RBWM_CVAIC) {
-      const double denom = 1.0 - 2.0/((double) num_obs_train_extern);
-      if (denom > 0.0) {
-        const double base_aic = log(mse0) + (1.0/denom);
-        bwm_penalty_value = base_aic + log(pmult);
+    if (penalty_criterion == RBWM_CVCHECK) {
+      double reference = DBL_MAX;
+      if (np_cvc_check_null_reference(
+            vector_Y_extern,
+            vector_lsq_scale_extern,
+            num_obs_train_extern,
+            np_lsq_tau_extern,
+            np_lsq_delta_lower_extern,
+            np_lsq_delta_upper_extern,
+            &reference)) {
+        bwm_penalty_mode = np_minimized_nonnegative_reference_penalty(
+          reference, pmult, &bwm_penalty_value);
+      }
+    } else if (penalty_criterion == RBWM_CVKS) {
+      double reference = DBL_MAX;
+      if (np_cvks_null_reference(
+            vector_Y_extern, num_obs_train_extern, &reference)) {
+        bwm_penalty_mode = np_minimized_nonnegative_reference_penalty(
+          reference, pmult, &bwm_penalty_value);
       }
     } else {
-      bwm_penalty_value = pmult * mse0;
+      double y_mean = 0.0;
+      double mse0 = 0.0;
+      for (i = 0; i < num_obs_train_extern; i++)
+        y_mean += vector_Y_extern[i];
+      y_mean /= (double) num_obs_train_extern;
+      for (i = 0; i < num_obs_train_extern; i++) {
+        const double dy = vector_Y_extern[i] - y_mean;
+        mse0 += dy*dy;
+      }
+      mse0 /= (double) num_obs_train_extern;
+      if (penalty_criterion == RBWM_CVLS) {
+        if (num_obs_train_extern > 1) {
+          const double n = (double)num_obs_train_extern;
+          const double loo_scale = n / (n - 1.0);
+          const double reference = loo_scale * loo_scale * mse0;
+          bwm_penalty_mode = np_minimized_nonnegative_reference_penalty(
+            reference, pmult, &bwm_penalty_value);
+        }
+      } else if (penalty_criterion == RBWM_CVAIC) {
+        if (num_obs_train_extern > 3 &&
+            R_FINITE(mse0) && mse0 > 0.0) {
+          const double n = (double)num_obs_train_extern;
+          const double reference = log(mse0) +
+            (1.0 + 1.0/n)/(1.0 - 3.0/n);
+          bwm_penalty_mode = np_minimized_cvaic_reference_penalty(
+            reference, pmult, &bwm_penalty_value);
+        }
+      } else {
+        if (mse0 <= 0.0) mse0 = DBL_MIN;
+        bwm_penalty_value = pmult * mse0;
+        if (R_FINITE(bwm_penalty_value))
+          bwm_penalty_mode = 1;
+      }
     }
-    if (R_FINITE(bwm_penalty_value))
-      bwm_penalty_mode = 1;
   }
 
   // initialize permutation arrays
   ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
+  prepared_context->tree_permutation = ipt;
   if(!(ipt != NULL)){
     bw_error_msg = "!(ipt != NULL)";
     goto cleanup_np_regression_bw_mode;
@@ -15343,6 +21193,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
   if(int_TREE_X == NP_TREE_TRUE){
     ipt_lookup = (int *)malloc(num_obs_train_extern*sizeof(int));
+    prepared_context->tree_lookup = ipt_lookup;
     if(!(ipt_lookup != NULL)){
       bw_error_msg = "!(ipt_lookup != NULL)";
       goto cleanup_np_regression_bw_mode;
@@ -15350,6 +21201,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
     build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
                  4*num_reg_continuous_extern, ipt, &kdt_extern_X);
+    prepared_context->tree = kdt_extern_X;
     for(i = 0; i < num_obs_train_extern; i++)
       ipt_lookup[ipt[i]] = i;
     ipt_extern_X = ipt;
@@ -15382,45 +21234,60 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
     //boxSearch(kdt_extern, 0, tb, &nl);
   }
 
-  determine_categorical_vals(
-                             num_obs_train_extern,
-                             0,
-                             0,
-                             num_reg_unordered_extern,
-                             num_reg_ordered_extern,
-                             matrix_Y_unordered_train_extern,
-                             matrix_Y_ordered_train_extern,
-                             matrix_X_unordered_train_extern,
-                             matrix_X_ordered_train_extern,
-                             num_categories_extern,
-                             matrix_categorical_vals_extern);
+  if(int_VERBOSE == 1 || int_DEBUG == 1)
+    determine_categorical_vals(
+                               num_obs_train_extern,
+                               0,
+                               0,
+                               num_reg_unordered_extern,
+                               num_reg_ordered_extern,
+                               matrix_Y_unordered_train_extern,
+                               matrix_Y_ordered_train_extern,
+                               matrix_X_unordered_train_extern,
+                               matrix_X_ordered_train_extern,
+                               num_categories_extern,
+                               matrix_categorical_vals_extern);
+  np_categorical_support_copy(support, num_categories_extern,
+                              matrix_categorical_vals_extern);
 
-  if((int_ll_extern == LL_LP) &&
-     (!np_glp_cv_prepare_extern(int_ll_extern,
+  if((np_lp_engine_extern == NP_LP_ENGINE_GENERAL) &&
+     (!np_glp_cv_prepare_extern(np_lp_engine_extern,
                                 num_obs_train_extern,
                                 num_reg_continuous_extern,
                                 matrix_X_continuous_train_extern))){
     bw_error_msg = "failed to prepare LP CV basis cache";
     goto cleanup_np_regression_bw_mode;
   }
+  prepared_context->degree_state_ready = 1;
 
-  vector_extendednn_upper_extern = (!eval_only) ?
+  vector_extendednn_upper_extern = prepare_only ?
     np_continuous_extendednn_upper_alloc(
       BANDWIDTH_reg_extern,
       KERNEL_reg_extern,
       num_obs_train_extern,
-      num_obs_eval_extern,
-      num_reg_continuous_extern,
-      0,
-      matrix_X_continuous_train_extern,
-      matrix_X_continuous_eval_extern) :
-    np_continuous_extendednn_eval_upper_alloc(
-      BANDWIDTH_reg_extern,
       num_obs_train_extern,
       num_reg_continuous_extern,
-      rbw);
+      1,
+      matrix_X_continuous_train_extern,
+      matrix_X_continuous_train_extern) :
+    ((!eval_only) ?
+      np_continuous_extendednn_upper_alloc(
+        BANDWIDTH_reg_extern,
+        KERNEL_reg_extern,
+        num_obs_train_extern,
+        num_obs_train_extern,
+        num_reg_continuous_extern,
+        0,
+        matrix_X_continuous_train_extern,
+        matrix_X_continuous_train_extern) :
+      np_continuous_extendednn_eval_upper_alloc(
+        BANDWIDTH_reg_extern,
+        num_obs_train_extern,
+        num_reg_continuous_extern,
+        rbw));
   int_extendednn_upper_num_extern =
     (vector_extendednn_upper_extern != NULL) ? num_reg_continuous_extern : 0;
+  prepared_context->extendednn_upper = vector_extendednn_upper_extern;
 
   /* Initialize scale factors and Directions for NR modules */
 
@@ -15448,59 +21315,64 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
                                     lbd_init, hbd_init, d_init,
                                     matrix_X_continuous_train_extern,
                                     matrix_Y_continuous_train_extern);
+  for (i = 0; i < prepared_context->degree_key_len; i++)
+    vector_scale_factor[num_var + i + 1] =
+      (double)prepared_context->degree[i];
   if(lsq_check_mode)
     vector_scale_factor[num_var + 1] =
       MIN(MAX(lsq_delta_start, lsq_delta_lower + DBL_EPSILON),
           lsq_delta_upper - DBL_EPSILON);
 
-  initialize_nr_vector_scale_factor(BANDWIDTH_reg_extern,
-                                    0,                /* Not Random (0) Random (1) */
-                                    int_RANDOM_SEED,
-                                    int_LARGE_SF,
-                                    num_obs_train_extern,
-                                    0,
-                                    0,
-                                    0,
-                                    num_reg_continuous_extern,
-                                    num_reg_unordered_extern,
-                                    num_reg_ordered_extern,
-                                    0,
-                                    KERNEL_reg_unordered_extern,
-                                    0,
-                                    scale_cat,
-                                    pow((double)4.0/(double)3.0,0.2),             /* Init for continuous vars */
-                                    nconfac_extern, ncatfac_extern,
-                                    num_categories_extern,
-                                    vector_continuous_stddev,
-                                    vsfh,
-                                    lbc_init, hbc_init, c_init, 
-                                    lbd_init, hbd_init, d_init,
-                                    matrix_X_continuous_train_extern,
-                                    matrix_Y_continuous_train_extern);
+  if(!prepare_only){
+    initialize_nr_vector_scale_factor(BANDWIDTH_reg_extern,
+                                      0,                /* Not Random (0) Random (1) */
+                                      int_RANDOM_SEED,
+                                      int_LARGE_SF,
+                                      num_obs_train_extern,
+                                      0,
+                                      0,
+                                      0,
+                                      num_reg_continuous_extern,
+                                      num_reg_unordered_extern,
+                                      num_reg_ordered_extern,
+                                      0,
+                                      KERNEL_reg_unordered_extern,
+                                      0,
+                                      scale_cat,
+                                      pow((double)4.0/(double)3.0,0.2),
+                                      nconfac_extern, ncatfac_extern,
+                                      num_categories_extern,
+                                      vector_continuous_stddev,
+                                      vsfh,
+                                      lbc_init, hbc_init, c_init,
+                                      lbd_init, hbd_init, d_init,
+                                      matrix_X_continuous_train_extern,
+                                      matrix_Y_continuous_train_extern);
 
-  initialize_nr_directions(BANDWIDTH_reg_extern,
-                           num_obs_train_extern,
-                           num_reg_continuous_extern,
-                           num_reg_unordered_extern,
-                           num_reg_ordered_extern,
-                           0,
-                           0,
-                           0,
-                           vsfh,
-                           num_categories_extern,
-                           matrix_y,
-                           0, int_RANDOM_SEED, 
-                           lbc_dir, dfc_dir, c_dir, initc_dir,
-                           lbd_dir, hbd_dir, d_dir, initd_dir,
-                           matrix_X_continuous_train_extern,
-                           matrix_Y_continuous_train_extern);
-  if(lsq_check_mode){
-    for(i = 1; i <= num_search_var; i++){
-      matrix_y[i][num_var + 1] = 0.0;
-      matrix_y[num_var + 1][i] = 0.0;
+    initialize_nr_directions(BANDWIDTH_reg_extern,
+                             num_obs_train_extern,
+                             num_reg_continuous_extern,
+                             num_reg_unordered_extern,
+                             num_reg_ordered_extern,
+                             0,
+                             0,
+                             0,
+                             vsfh,
+                             num_categories_extern,
+                             matrix_y,
+                             0, int_RANDOM_SEED,
+                             lbc_dir, dfc_dir, c_dir, initc_dir,
+                             lbd_dir, hbd_dir, d_dir, initd_dir,
+                             matrix_X_continuous_train_extern,
+                             matrix_Y_continuous_train_extern);
+    if(lsq_check_mode){
+      for(i = 1; i <= num_search_var; i++){
+        matrix_y[i][num_var + 1] = 0.0;
+        matrix_y[num_var + 1][i] = 0.0;
+      }
+      matrix_y[num_var + 1][num_var + 1] =
+        0.25*(lsq_delta_upper - lsq_delta_lower);
     }
-    matrix_y[num_var + 1][num_var + 1] =
-      0.25*(lsq_delta_upper - lsq_delta_lower);
   }
 
 
@@ -15519,20 +21391,22 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
     goto cleanup_np_regression_bw_mode;
   }
 
-  spinner(0);
 
   bwmfunc_raw = bwmfunc;
-  bwm_num_reg_continuous = num_reg_continuous_extern;
-  bwm_num_reg_unordered = num_reg_unordered_extern;
-  bwm_num_reg_ordered = num_reg_ordered_extern;
-  bwm_num_extra_params = lsq_check_mode ? 1 : 0;
-  bwm_kernel_unordered = KERNEL_reg_unordered_extern;
-  bwm_num_categories = num_categories_extern;
+  bwm_search_context_configure_uniform(
+    num_reg_continuous_extern,
+    num_reg_unordered_extern,
+    num_reg_ordered_extern,
+    degree_search ? prepared_context->degree_key_len :
+      (lsq_check_mode ? 1 : 0),
+    KERNEL_reg_unordered_extern,
+    num_categories_extern);
   bwm_set_floor_context(
     enforce_fixed_feasibility,
     num_var,
     bwm_use_transform,
     KERNEL_reg_extern,
+    KERNEL_reg_unordered_extern,
     KERNEL_reg_unordered_extern,
     BANDWIDTH_reg_extern,
     BANDWIDTH_reg_extern,
@@ -15556,6 +21430,8 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
     goto cleanup_np_regression_bw_mode;
   }
   bwm_reset_counters();
+  if (prepare_only)
+    return;
 
   fret_initial = fret_best = bwmfunc_wrapper(vector_scale_factor);
   iImproved = 0;
@@ -15567,6 +21443,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
         num_var,
         bwm_use_transform,
         KERNEL_reg_extern,
+        KERNEL_reg_unordered_extern,
         KERNEL_reg_unordered_extern,
         BANDWIDTH_reg_extern,
         BANDWIDTH_reg_extern,
@@ -15585,6 +21462,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
     np_copy_scale_factor(vector_scale_factor_startbest, vector_scale_factor, num_search_var);
   }
 
+regression_powell_attempt:
   if(!eval_only){
     powell(0,
            0,
@@ -15652,6 +21530,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
         bwm_use_transform,
         KERNEL_reg_extern,
         KERNEL_reg_unordered_extern,
+        KERNEL_reg_unordered_extern,
         BANDWIDTH_reg_extern,
         BANDWIDTH_reg_extern,
         0,
@@ -15670,6 +21549,45 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
     np_copy_scale_factor(vector_scale_factor_startbest, vector_scale_factor, num_search_var);
   }
 
+  /* A newly admitted discrete NN lower endpoint is not guaranteed to be
+     visited by a continuous direction-set search.  Evaluate that endpoint
+     once and retain it through the same feasible-candidate owner used by all
+     other starts.  The R capability policy is the sole authority that may
+     transmit int_nn_k_min_extern == 1 to this owner. */
+  if (enforce_fixed_feasibility &&
+      int_nn_k_min_extern == 1 &&
+      BANDWIDTH_reg_extern == BW_GEN_NN) {
+    double fret_endpoint;
+    for(i = 1; i <= num_reg_continuous_extern; i++)
+      vector_scale_factor[i] = 1.0;
+    fret_endpoint = bwmfunc_wrapper(vector_scale_factor);
+    if (np_bw_candidate_is_admissible(
+          num_var,
+          bwm_use_transform,
+          KERNEL_reg_extern,
+          KERNEL_reg_unordered_extern,
+          KERNEL_reg_unordered_extern,
+          BANDWIDTH_reg_extern,
+          BANDWIDTH_reg_extern,
+          0,
+          num_obs_train_extern,
+          0,
+          0,
+          0,
+          num_reg_continuous_extern,
+          num_reg_unordered_extern,
+          num_reg_ordered_extern,
+          num_categories_extern,
+          vector_scale_factor) &&
+        ((!have_start_best) || (fret_endpoint < fret_start_best))) {
+      have_start_best = 1;
+      fret_start_best = fret_endpoint;
+      np_copy_scale_factor(vector_scale_factor_startbest,
+                           vector_scale_factor,
+                           num_search_var);
+    }
+  }
+
   if (enforce_fixed_feasibility) {
     if (have_start_best) {
       fret = fret_start_best;
@@ -15682,15 +21600,25 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   iImproved = (enforce_fixed_feasibility && have_start_best) ? (fret_start_best < fret_initial) : (fret < fret_best);
   *timing = timing_extern;
 
-  objective_function_values[0]=fret;
-  objective_function_evals[0]=bwm_eval_count;
-  objective_function_invalid[0]=bwm_invalid_count;
-  bwm_snapshot_fast_counters();
-  fast_eval_total += bwm_fast_eval_count;
+  if (!adaptive_retry_attempted) {
+    objective_function_values[0]=fret;
+    objective_function_evals[0]=bwm_eval_count;
+    objective_function_invalid[0]=bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+  } else {
+    objective_function_values[adaptive_retry_history_index]=fret;
+    objective_function_evals[adaptive_retry_history_index] += bwm_eval_count;
+    objective_function_invalid[adaptive_retry_history_index] += bwm_invalid_count;
+    bwm_snapshot_fast_counters();
+    fast_eval_total += bwm_fast_eval_count;
+    iImproved = adaptive_retry_improved;
+  }
   /* When multistarting save initial minimum of objective function and scale factors */
 
 
-  if((!eval_only) && (iMultistart == IMULTI_TRUE)){
+  if((!eval_only) && (!adaptive_retry_attempted) &&
+     (iMultistart == IMULTI_TRUE)){
     if (enforce_fixed_feasibility) {
       if (have_start_best) {
         have_multistart_best = 1;
@@ -15846,6 +21774,7 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
               bwm_use_transform,
               KERNEL_reg_extern,
               KERNEL_reg_unordered_extern,
+              KERNEL_reg_unordered_extern,
               BANDWIDTH_reg_extern,
               BANDWIDTH_reg_extern,
               0,
@@ -15909,13 +21838,14 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
   if (enforce_fixed_feasibility) {
     double final_raw;
     if (!have_start_best) {
-      bw_error_msg = "C_np_regression_bw: optimizer failed to produce a feasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_regression_bw: optimizer failed to produce a feasible bandwidth candidate";
       goto cleanup_np_regression_bw_mode;
     }
     if (!np_bw_candidate_is_admissible(
           num_var,
           bwm_use_transform,
           KERNEL_reg_extern,
+          KERNEL_reg_unordered_extern,
           KERNEL_reg_unordered_extern,
           BANDWIDTH_reg_extern,
           BANDWIDTH_reg_extern,
@@ -15929,12 +21859,138 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
           num_reg_ordered_extern,
           num_categories_extern,
           vector_scale_factor)) {
-      bw_error_msg = "C_np_regression_bw: optimizer returned an infeasible fixed-bandwidth candidate";
+      bw_error_msg = "C_np_regression_bw: optimizer returned an infeasible bandwidth candidate";
       goto cleanup_np_regression_bw_mode;
     }
     final_raw = bwmfunc_raw_current_scale(vector_scale_factor, num_var);
     if (!R_FINITE(final_raw) || final_raw == DBL_MAX) {
-      bw_error_msg = "C_np_regression_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective";
+      if ((!adaptive_retry_attempted) &&
+          (!eval_only) &&
+          (!int_use_starting_values) &&
+          (BANDWIDTH_reg_extern == BW_ADAP_NN) &&
+          (num_reg_continuous_extern > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+
+        adaptive_retry_history_index =
+          (iImproved > 0) ? iImproved - 1 : 0;
+        adaptive_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = np_ordinary_nn_find_finite_raw_seed_domain(
+          vector_scale_factor,
+          num_reg_continuous_extern,
+          num_obs_train_extern,
+          num_obs_train_extern -
+            ((lsq_check_mode || myopti[RBW_MI] != RBWM_CVAIC) ? 2 : 1),
+          num_var,
+          lsq_check_mode || myopti[RBW_MI] != RBWM_CVAIC,
+          &finite_seed);
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_reg_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   0,
+                                   0,
+                                   0,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          if(lsq_check_mode){
+            for(i = 1; i <= num_search_var; i++){
+              matrix_y[i][num_var + 1] = 0.0;
+              matrix_y[num_var + 1][i] = 0.0;
+            }
+            matrix_y[num_var + 1][num_var + 1] =
+              0.25*(lsq_delta_upper - lsq_delta_lower);
+          }
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_search_var);
+          adaptive_retry_attempted = 1;
+          goto regression_powell_attempt;
+        }
+      }
+      if ((!adaptive_retry_attempted) &&
+          (!eval_only) &&
+          (!int_use_starting_values) &&
+          (BANDWIDTH_reg_extern == BW_GEN_NN) &&
+          (num_reg_continuous_extern > 0) &&
+          (num_obs_train_extern >= 3)) {
+        double finite_seed = DBL_MAX;
+        int found_finite_seed;
+
+        adaptive_retry_history_index =
+          (iImproved > 0) ? iImproved - 1 : 0;
+        adaptive_retry_improved = iImproved;
+        bwm_reset_counters();
+        found_finite_seed = np_ordinary_nn_find_finite_raw_seed_domain(
+          vector_scale_factor,
+          num_reg_continuous_extern,
+          num_obs_train_extern,
+          num_obs_train_extern -
+            ((lsq_check_mode || myopti[RBW_MI] != RBWM_CVAIC) ? 2 : 1),
+          num_var,
+          lsq_check_mode || myopti[RBW_MI] != RBWM_CVAIC,
+          &finite_seed);
+        if (found_finite_seed &&
+            bwm_penalty_mode == 1 &&
+            (!(bwm_penalty_value > finite_seed))) {
+          found_finite_seed = np_minimized_seed_dominating_penalty(
+            finite_seed, penalty_mult[0], &bwm_penalty_value);
+        }
+        if (found_finite_seed) {
+          initialize_nr_directions(BANDWIDTH_reg_extern,
+                                   num_obs_train_extern,
+                                   num_reg_continuous_extern,
+                                   num_reg_unordered_extern,
+                                   num_reg_ordered_extern,
+                                   0,
+                                   0,
+                                   0,
+                                   vsfh,
+                                   num_categories_extern,
+                                   matrix_y,
+                                   0, int_RANDOM_SEED,
+                                   lbc_dir, dfc_dir, c_dir, initc_dir,
+                                   lbd_dir, hbd_dir, d_dir, initd_dir,
+                                   matrix_X_continuous_train_extern,
+                                   matrix_Y_continuous_train_extern);
+          if(lsq_check_mode){
+            for(i = 1; i <= num_search_var; i++){
+              matrix_y[i][num_var + 1] = 0.0;
+              matrix_y[num_var + 1][i] = 0.0;
+            }
+            matrix_y[num_var + 1][num_var + 1] =
+              0.25*(lsq_delta_upper - lsq_delta_lower);
+          }
+          fret_initial = fret_best = fret_start_best = fret = finite_seed;
+          have_start_best = 1;
+          have_multistart_best = 0;
+          np_copy_scale_factor(vector_scale_factor_startbest,
+                               vector_scale_factor,
+                               num_search_var);
+          adaptive_retry_attempted = 1;
+          goto regression_powell_attempt;
+        }
+      }
+      bw_error_msg = "C_np_regression_bw: optimizer returned a bandwidth candidate with invalid raw objective";
       goto cleanup_np_regression_bw_mode;
     }
     fret = final_raw;
@@ -15965,544 +22021,73 @@ static void np_regression_bw_mode(double * runo, double * rord, double * rcon, d
 
 cleanup_np_regression_bw_mode:
   /* Free data objects */
-  bwm_clear_floor_context();
-  bwm_nn_cache_free();
-  bwm_objective_cache_free();
-  safe_free(vector_extendednn_upper_extern);
-  vector_extendednn_upper_extern = NULL;
-  int_extendednn_upper_num_extern = 0;
-  int_TREE_PROFILE_X = NP_TREE_FALSE;
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-
-  safe_free(vector_Y_extern);
-  safe_free(vector_lsq_scale_extern);
-  safe_free(vector_lsq_q_extern);
-  vector_lsq_scale_extern = NULL;
-  vector_lsq_loss_extern = NULL;
-  vector_lsq_q_extern = NULL;
-  np_lsq_tau_extern = 0.5;
-  np_lsq_delta_lower_extern = DBL_EPSILON;
-  np_lsq_delta_upper_extern = 1.0-DBL_EPSILON;
-
-  free_mat(matrix_y, num_search_var + 1);
-  safe_free(vector_scale_factor);
-  safe_free(vector_scale_factor_startbest);
-  safe_free(vsfh);
-  safe_free(num_categories_extern);
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
-
-  free(vector_continuous_stddev);
-
-  safe_free(ipt);
-  safe_free(ipt_lookup);
-  ipt_extern_X = NULL;
-  ipt_lookup_extern_X = NULL;
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-
-  np_glp_cv_clear_extern();
-  np_cont_largeh_cache_clear_extern();
-  np_reg_cv_core_clear_extern();
-
-  int_cker_bound_extern = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  np_reset_y_side_extern();
-  vector_glp_degree_extern = NULL;
-  vector_glp_gradient_order_extern = NULL;
-  int_glp_bernstein_extern = 0;
-  int_glp_basis_extern = 1;
-  np_clear_estimator_extern_aliases();
-  int_nn_k_min_extern = 1;
-  bwm_num_extra_params = 0;
+  np_regression_prepared_context_destroy(prepared_context);
 
   if (bw_error_msg != NULL)
-    error("%s", bw_error_msg);
+    np_bandwidth_candidate_error(bw_error_msg, myopti[RBW_REGI]);
 
   //fprintf(stderr,"\nNP TOASTY\n");
   return ;
   
 }
 
-void np_regression_bw(double * runo, double * rord, double * rcon, double * y,
-                      double * mysd, int * myopti, double * myoptd, double * rbw, double * fval,
-                      double * objective_function_values, double * objective_function_evals,
-                      double * objective_function_invalid, double * timing,
-                      double * objective_function_fast,
-                      int * penalty_mode, double * penalty_mult,
-                      int * glp_degree,
-                      int * glp_bernstein,
-                      int * glp_basis,
-                      double * ckerlb, double * ckerub){
-  int_nn_k_min_extern = 1;
-  np_regression_bw_mode(runo, rord, rcon, y,
-                        mysd, myopti, myoptd, rbw, fval,
-                        objective_function_values, objective_function_evals,
-                        objective_function_invalid, timing,
-                        objective_function_fast,
-                        penalty_mode, penalty_mult,
-                        glp_degree, glp_bernstein, glp_basis,
-                        ckerlb, ckerub, 0, 0, NULL, 0.5, 0.5,
-                        DBL_EPSILON, 1.0 - DBL_EPSILON, NULL);
-}
+/* One fitted invocation owns these buffers; globals are borrowed views. */
+typedef struct {
+  double **x_train[3], **x_eval[3];
+  int x_columns[3], num_var;
+  double *y_train, *y_eval, *mean, *mean_error, *scale;
+  double **gradient, **gradient_error, **hc0_gradient, **categories;
+  int *category_counts, *training_order, *evaluation_order;
+  KDT *outer_tree, *training_tree;
+  int active;
+  int fit_status;
+  NPNNZeroRadiusInfo zero_radius_info;
+} NPRegressionFittedOwner;
 
+static void np_regression_fitted_clear(NPRegressionFittedOwner *owner)
+{
+  if(!owner->active)
+    return;
 
-void np_regression(double * tuno, double * tord, double * tcon, double * ty,
-                   double * euno, double * eord, double * econ, double * ey,
-                   double * rbw, 
-                   double * mcv, double * padnum, 
-                   double * nconfac, double * ncatfac, double * mysd,
-                   int * myopti, 
-                   int * glp_degree,
-                   int * glp_gradient_order,
-                   int * glp_bernstein,
-                   int * glp_basis,
-                   double * cm, double * cmerr, double * g, double *gerr, 
-                   double * xtra,
-                   double * ckerlb, double * ckerub){
-
-  double * vector_scale_factor, * ecm = NULL, * ecmerr = NULL, ** eg = NULL, **egerr = NULL;
-  double * lambda, ** matrix_bandwidth;
-  double RS, MSE, MAE, MAPE, CORR, SIGN, pad_num;
-
-  int i,j, num_var;
-  int ey_is_ty, do_grad, train_is_eval, num_obs_eval_alloc, max_lev, old_reg;
-
-  int * ipt = NULL, * ipe = NULL;  // point permutation, see tree.c
-  /* match integer options with their globals */
-
-  num_reg_continuous_extern = myopti[REG_NCONI];
-  num_reg_unordered_extern = myopti[REG_NUNOI];
-  num_reg_ordered_extern = myopti[REG_NORDI];
-  np_reset_y_side_extern();
-
-  num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
-
-  train_is_eval = myopti[REG_TISEI];
-  ey_is_ty = myopti[REG_EY];
-
-  num_obs_train_extern = myopti[REG_TNOBSI];
-  num_obs_eval_extern = myopti[REG_ENOBSI];
-
-  if(train_is_eval && (num_obs_eval_extern != num_obs_train_extern)){
-    REprintf("\n(np_regression): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
-    error("\n(np_regression): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
+  for(int k = 0; k < 3; k++) {
+    free_mat(owner->x_train[k], owner->x_columns[k]);
+    owner->x_train[k] = NULL;
+    free_mat(owner->x_eval[k], owner->x_columns[k]);
+    owner->x_eval[k] = NULL;
   }
+  free(owner->training_order);
+  owner->training_order = NULL;
+  free(owner->evaluation_order);
+  owner->evaluation_order = NULL;
+  if(owner->training_tree != NULL)
+    free_kdtree(&owner->training_tree);
+  if(owner->outer_tree != NULL)
+    free_kdtree(&owner->outer_tree);
+  free_tmat(owner->hc0_gradient);
+  owner->hc0_gradient = NULL;
+  free_mat(owner->gradient, owner->num_var);
+  owner->gradient = NULL;
+  free_mat(owner->gradient_error, owner->num_var);
+  owner->gradient_error = NULL;
+  free_mat(owner->categories, owner->x_columns[0] + owner->x_columns[1]);
+  owner->categories = NULL;
+  free(owner->y_train);
+  owner->y_train = NULL;
+  free(owner->y_eval);
+  owner->y_eval = NULL;
+  free(owner->mean);
+  owner->mean = NULL;
+  free(owner->mean_error);
+  owner->mean_error = NULL;
+  free(owner->category_counts);
+  owner->category_counts = NULL;
+  free(owner->scale);
+  owner->scale = NULL;
 
-  KERNEL_reg_extern = myopti[REG_CKRNEVI];
-  KERNEL_reg_unordered_extern = myopti[REG_UKRNEVI];
-  KERNEL_reg_ordered_extern = myopti[REG_OKRNEVI];
-
-  vector_ckerlb_extern = ckerlb;
-  vector_ckerub_extern = ckerub;
-  int_cker_bound_extern = np_has_finite_cker_bounds(ckerlb, ckerub, num_reg_continuous_extern);
-
-  int_LARGE_SF = myopti[REG_LSFI];
-  int_MINIMIZE_IO = myopti[REG_MINIOI];
-  BANDWIDTH_reg_extern = myopti[REG_BWI];
-
-  do_grad = myopti[REG_GRAD];
-  int_ll_extern = myopti[REG_LL];
-  vector_glp_degree_extern = glp_degree;
-  vector_glp_gradient_order_extern = glp_gradient_order;
-  int_glp_bernstein_extern = *glp_bernstein;
-  int_glp_basis_extern = *glp_basis;
-
-  max_lev = myopti[REG_MLEVI];
-  pad_num = *padnum;
-
-  nconfac_extern = *nconfac;
-  ncatfac_extern = *ncatfac;
-
-  int_TREE_X = myopti[REG_DOTREEI];
-  int_TREE_PROFILE_X = myopti[REG_DOTREEI];
-  old_reg = myopti[REG_OLDREGI];
-
-#ifdef MPI2
-  num_obs_eval_alloc = MAX((int)ceil((double) num_obs_eval_extern / (double) iNum_Processors),1)*iNum_Processors;
-#else
-  num_obs_eval_alloc = num_obs_eval_extern;
-#endif
-
-
-  /* Allocate memory for objects */
-
-  matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
-  matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
-  matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
-
-  vector_Y_extern = alloc_vecd(num_obs_train_extern);
-
-  if(!train_is_eval){
-    matrix_X_unordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_unordered_extern);
-    matrix_X_ordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_ordered_extern);
-    matrix_X_continuous_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_continuous_extern);
-
-    if(!ey_is_ty)
-      vector_Y_eval_extern = alloc_vecd(num_obs_eval_extern);
-    else
-      vector_Y_eval_extern = NULL;
-
-  } else {
-    matrix_X_unordered_eval_extern = matrix_X_unordered_train_extern;
-    matrix_X_ordered_eval_extern = matrix_X_ordered_train_extern;
-    matrix_X_continuous_eval_extern = matrix_X_continuous_train_extern;
-
-    if(!ey_is_ty)
-      vector_Y_eval_extern = alloc_vecd(num_obs_eval_extern);
-    else
-      vector_Y_eval_extern = vector_Y_extern;
-
-  }
-
-  ecm = alloc_vecd(num_obs_eval_alloc);
-  ecmerr = alloc_vecd(num_obs_eval_alloc);
-  
-
-  eg = alloc_matd(num_obs_eval_alloc, num_var);
-  egerr = alloc_matd(num_obs_eval_alloc, num_var);
-  
-  num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
-  vector_scale_factor = alloc_vecd(num_var + 1);
-  matrix_categorical_vals_extern = alloc_matd(max_lev, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  lambda =  alloc_vecd(num_reg_unordered_extern+num_reg_ordered_extern);
-  matrix_bandwidth = alloc_matd((BANDWIDTH_reg_extern==BW_GEN_NN)?num_obs_eval_extern:
-                                ((BANDWIDTH_reg_extern==BW_ADAP_NN)?num_obs_train_extern:1),num_reg_continuous_extern);  
-
-  vector_continuous_stddev_extern = mysd;
-  /* train */
-
-  for( j=0;j<num_reg_unordered_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_unordered_train_extern[j][i]=tuno[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_ordered_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_ordered_train_extern[j][i]=tord[j*num_obs_train_extern+i];
-
-  for( j=0;j<num_reg_continuous_extern;j++)
-    for( i=0;i<num_obs_train_extern;i++ )
-      matrix_X_continuous_train_extern[j][i]=tcon[j*num_obs_train_extern+i];
-
-  for( i=0;i<num_obs_train_extern;i++ )
-    vector_Y_extern[i] = ty[i];
-
-  /* eval */
-  if(!train_is_eval){
-    for( j=0;j<num_reg_unordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_unordered_eval_extern[j][i]=euno[j*num_obs_eval_extern+i];
-
-    for( j=0;j<num_reg_ordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_ordered_eval_extern[j][i]=eord[j*num_obs_eval_extern+i];
-
-    for( j=0;j<num_reg_continuous_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_continuous_eval_extern[j][i]=econ[j*num_obs_eval_extern+i];
-  }
-
-  if (!ey_is_ty)
-    for(i=0;i<num_obs_eval_extern;i++)
-      vector_Y_eval_extern[i] = ey[i];
-
-  /*  bandwidths/scale factors */
-
-  for( i=0; i<num_var; i++ )
-    vector_scale_factor[i+1] = rbw[i];
-
-  /* fix up categories */
-
-  for(j=0; j < (num_reg_unordered_extern + num_reg_ordered_extern); j++){
-    i = 0;
-    do { 
-      matrix_categorical_vals_extern[j][i] = mcv[j*max_lev+i];
-    } while(++i < max_lev && mcv[j*max_lev+i] != pad_num);
-    num_categories_extern[j] = i;
-  }
-
-  ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-  if(!(ipt != NULL))
-    error("!(ipt != NULL)");
-
-  for(i = 0; i < num_obs_train_extern; i++){
-    ipt[i] = i;
-  }
-
-  if(!train_is_eval) {
-    ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
-    if(!(ipe != NULL))
-      error("!(ipe != NULL)");
-
-    for(i = 0; i < num_obs_eval_extern; i++){
-      ipe[i] = i;
-    }
-  } else {
-    ipe = ipt;
-  }
-
-  // attempt tree build, if enabled 
-  int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    if((BANDWIDTH_reg_extern != BW_ADAP_NN) || ((BANDWIDTH_reg_extern == BW_ADAP_NN) && train_is_eval)){
-      build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
-                   4*num_reg_continuous_extern, ipt, &kdt_extern_X);
-
-      //put training data into tree-order using the index array
-
-      for( j=0;j<num_reg_unordered_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_unordered_train_extern[j][i]=tuno[j*num_obs_train_extern+ipt[i]];
-    
-    
-      for( j=0;j<num_reg_ordered_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_ordered_train_extern[j][i]=tord[j*num_obs_train_extern+ipt[i]];
-
-      for( j=0;j<num_reg_continuous_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_continuous_train_extern[j][i]=tcon[j*num_obs_train_extern+ipt[i]];
-
-      /* response variable */
-      for( i=0;i<num_obs_train_extern;i++ )
-        vector_Y_extern[i] = ty[ipt[i]];
-
-    } else {
-      build_kdtree(matrix_X_continuous_eval_extern, num_obs_eval_extern, num_reg_continuous_extern, 
-                   4*num_reg_continuous_extern, ipe, &kdt_extern_X);
-
-      for( j=0;j<num_reg_unordered_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_unordered_eval_extern[j][i]=euno[j*num_obs_eval_extern+ipe[i]];
-
-      for( j=0;j<num_reg_ordered_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_ordered_eval_extern[j][i]=eord[j*num_obs_eval_extern+ipe[i]];
-
-      for( j=0;j<num_reg_continuous_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_continuous_eval_extern[j][i]=econ[j*num_obs_eval_extern+ipe[i]];
-
-      if(!ey_is_ty)
-        for(i=0;i<num_obs_eval_extern;i++)
-          vector_Y_eval_extern[i] = ey[ipe[i]];
-
-    }
-  }
-
-
-  /* Conduct estimation */
-	
-  /* 
-     nb - KERNEL_(|un)ordered_den are set to zero upon declaration 
-     - they have only one kernel type each at the moment 
-  */
-
-  if(old_reg){
-    kernel_estimate_regression_categorical(int_ll_extern,
-                                           KERNEL_reg_extern,
-                                           KERNEL_reg_unordered_extern,
-                                           KERNEL_reg_ordered_extern,
-                                           BANDWIDTH_reg_extern,
-                                           num_obs_train_extern,
-                                           num_obs_eval_extern,
-                                           num_reg_unordered_extern,
-                                           num_reg_ordered_extern,
-                                           num_reg_continuous_extern,
-                                           /* Train */
-                                           matrix_X_unordered_train_extern,
-                                           matrix_X_ordered_train_extern,
-                                           matrix_X_continuous_train_extern,
-                                           /* Eval */
-                                           matrix_X_unordered_eval_extern,
-                                           matrix_X_ordered_eval_extern,
-                                           matrix_X_continuous_eval_extern,
-                                           /* Bandwidth */
-                                           matrix_X_continuous_train_extern,
-                                           vector_Y_extern,
-                                           vector_Y_eval_extern,
-                                           &vector_scale_factor[1],
-                                           num_categories_extern,
-                                           ecm,
-                                           eg,
-                                           ecmerr,
-                                           egerr,
-                                           &RS,
-                                           &MSE,
-                                           &MAE,
-                                           &MAPE,
-                                           &CORR,
-                                           &SIGN);
-
-    if (do_grad){
-      kernel_bandwidth_mean(KERNEL_reg_extern,
-                            BANDWIDTH_reg_extern,
-                            num_obs_train_extern,
-                            num_obs_eval_extern,
-                            0,
-                            0,
-                            0,
-                            num_reg_continuous_extern,
-                            num_reg_unordered_extern,
-                            num_reg_ordered_extern,
-                            np_mpi_local_regression_active() ? 1 : 0,
-                            &vector_scale_factor[1],
-                            /* Not used */
-                            matrix_Y_continuous_train_extern,
-                            /* Not used */
-                            matrix_Y_continuous_train_extern,
-                            matrix_X_continuous_train_extern,
-                            matrix_X_continuous_eval_extern,
-                            matrix_bandwidth,/* Not used */
-                            matrix_bandwidth,
-                            lambda);
-      kernel_estimate_categorical_gradient_ocg_fast(1,
-                                                    NULL,
-                                                    0,
-                                                    KERNEL_reg_extern,
-                                                    KERNEL_reg_unordered_extern,
-                                                    KERNEL_reg_ordered_extern,
-                                                    BANDWIDTH_reg_extern,
-                                                    int_ll_extern,
-                                                    0,
-                                                    num_obs_train_extern,
-                                                    num_obs_eval_extern,
-                                                    num_reg_unordered_extern,
-                                                    num_reg_ordered_extern,
-                                                    num_reg_continuous_extern,
-                                                    vector_Y_extern,
-                                                    matrix_X_unordered_train_extern,
-                                                    matrix_X_ordered_train_extern,
-                                                    matrix_X_continuous_train_extern,
-                                                    matrix_X_unordered_eval_extern,
-                                                    matrix_X_ordered_eval_extern,
-                                                    matrix_X_continuous_eval_extern,
-                                                    matrix_bandwidth,
-                                                    NULL,
-                                                    lambda,
-                                                    num_categories_extern,
-                                                    matrix_categorical_vals_extern,
-                                                    ecm,
-                                                    &eg[num_reg_continuous_extern]);
-
-    }
-  } else {
-
-    kernel_estimate_regression_categorical_tree_np(int_ll_extern,
-                                                   KERNEL_reg_extern,
-                                                   KERNEL_reg_unordered_extern,
-                                                   KERNEL_reg_ordered_extern,
-                                                   BANDWIDTH_reg_extern,
-                                                   num_obs_train_extern,
-                                                   num_obs_eval_extern,
-                                                   num_reg_unordered_extern,
-                                                   num_reg_ordered_extern,
-                                                   num_reg_continuous_extern,
-                                                   /* Train */
-                                                   matrix_X_unordered_train_extern,
-                                                   matrix_X_ordered_train_extern,
-                                                   matrix_X_continuous_train_extern,
-                                                   /* Eval */
-                                                   matrix_X_unordered_eval_extern,
-                                                   matrix_X_ordered_eval_extern,
-                                                   matrix_X_continuous_eval_extern,
-                                                   vector_Y_extern,
-                                                   vector_Y_eval_extern,
-                                                   &vector_scale_factor[1],
-                                                   num_categories_extern,
-                                                   matrix_categorical_vals_extern,
-                                                   ecm,
-                                                   do_grad ? eg : NULL,
-                                                   ecmerr,
-                                                   do_grad ? egerr : NULL,
-                                                   &RS,
-                                                   &MSE,
-                                                   &MAE,
-                                                   &MAPE,
-                                                   &CORR,
-                                                   &SIGN);
-
-
-  }
-
-  for(i=0;i<num_obs_eval_extern;i++)
-    cm[ipe[i]] = ecm[i];
-      
-  for(i=0;i<num_obs_eval_extern;i++)
-    cmerr[ipe[i]] = ecmerr[i];
-
-
-  if(do_grad){
-    for(j=0;j<num_var;j++)
-      for(i=0;i<num_obs_eval_extern;i++)
-        g[j*num_obs_eval_extern+ipe[i]]=eg[j][i];
-
-    for(j=0;j<num_reg_continuous_extern;j++)
-      for(i=0;i<num_obs_eval_extern;i++)
-        gerr[j*num_obs_eval_extern+ipe[i]]=egerr[j][i];
-  }
-
-
-  /* write the return values */
-
-
-  xtra[0] = RS;
-  xtra[1] = MSE;
-  xtra[2] = MAE;
-  xtra[3] = MAPE;
-  xtra[4] = CORR;
-  xtra[5] = SIGN;
-
-  /* clean up and wave goodbye */
-
-  free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-  free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-  free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-
-  if(!train_is_eval){
-    free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
-    free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
-    free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
-  }
-
-  safe_free(ipt);
-
-  if(!train_is_eval)
-    safe_free(ipe);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-
-  free_mat(eg, num_var);
-  free_mat(egerr, num_var);
-  
-  free_mat(matrix_bandwidth, num_reg_continuous_extern);
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
-
-  safe_free(vector_Y_extern);
-  if(!ey_is_ty)
-    safe_free(vector_Y_eval_extern);
-
-  safe_free(ecm);
-  safe_free(ecmerr);
-
-  safe_free(num_categories_extern);
-  safe_free(vector_scale_factor);
   np_clear_estimator_extern_aliases();
-
-  safe_free(lambda);
-
+  vector_Y_extern = NULL;
+  vector_Y_eval_extern = NULL;
+  int_TREE_X = NP_TREE_FALSE;
   int_cker_bound_extern = 0;
   vector_ckerlb_extern = NULL;
   vector_ckerub_extern = NULL;
@@ -16512,629 +22097,100 @@ void np_regression(double * tuno, double * tord, double * tcon, double * ty,
   int_glp_bernstein_extern = 0;
   int_glp_basis_extern = 1;
   int_TREE_PROFILE_X = NP_TREE_FALSE;
-
-  return;
+  owner->active = 0;
 }
 
-void np_kernelsum(double * tuno, double * tord, double * tcon, 
+static void np_regression_fitted_unwind(void *data, Rboolean jump)
+{
+  if(jump)
+    np_regression_fitted_clear((NPRegressionFittedOwner *)data);
+}
+
+typedef struct {
+  NPRegressionFittedOwner owner;
+  double * tuno;
+  double * tord;
+  double * tcon;
+  double * ty;
+  double * euno;
+  double * eord;
+  double * econ;
+  double * ey;
+  double * rbw;
+  double * mcv;
+  double * padnum;
+  double * nconfac;
+  double * ncatfac;
+  double * mysd;
+  int * myopti;
+  int * glp_degree;
+  int * glp_gradient_order;
+  int * glp_bernstein;
+  int * glp_basis;
+  double * cm;
+  double * cmerr;
+  double * g;
+  double *gerr;
+  double * xtra;
+  double * ckerlb;
+  double * ckerub;
+  const NPContinuousKernelRoute *kernel_route;
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics;
+  int categorical_compress;
+  NPRegressionLPEmptyRows *empty_rows;
+  const NPRegressionGradientRequest *gradient_request;
+  int *variance_unavailable;
+  int **gradient_zero_out;
+  NPRegressionFitProjection *fit_projection;
+} NPRegressionFittedCall;
+
+#include "conditional_literal/entry_np_regression_fitted_execute.inc"
+#line 24260 "np.c"
+
+#include "conditional_literal/entry_np_regression.inc"
+#line 24331 "np.c"
+
+#include "conditional_literal/entry_np_kernelsum_common.inc"
+#line 25169 "np.c"
+
+void np_kernelsum(double * tuno, double * tord, double * tcon,
                   double * ty, double * weights,
-                  double * euno, double * eord, double * econ, 
+                  double * euno, double * eord, double * econ,
                   double * bw,
-                  double * mcv, double * padnum, 
+                  double * mcv, double * padnum,
                   int * operator,
-                  int * myopti, double * kpow, 
+                  int * myopti, double * kpow,
                   double * weighted_sum, double * weighted_p_sum,
                   double * kernel_weights,
                   double * permutation_kernel_weights,
                   double * ckerlb, double * ckerub){
-
-  int * ipt = NULL, * ipe = NULL;  // point permutation, see tree.c
-      
-  /* the ys are the weights */
-
-  double * vector_scale_factor, * ksum, * p_ksum = NULL, pad_num, * kw = NULL, * pkw = NULL;
-  int i,j,k, num_var, num_obs_eval_alloc;
-  int no_y, leave_one_out, train_is_eval, do_divide_bw;
-  int max_lev, no_weights, sum_element_length, return_kernel_weights;
-  int p_operator, do_score, do_ocg, p_nvar = 0;
-  int suppress_parallel_ksum = 0;
-
-  int use_tree = 0;
-  int allocated_X_train = 1, allocated_X_eval = 1;
-  int allocated_Y = 1, allocated_W = 1;
-  int ksum_is_output = 0, pksum_is_output = 0, kw_is_output = 0, pkw_is_output = 0;
-
-  struct th_table * otabs = NULL;
-  struct th_entry * ret = NULL;
-  int ** matrix_ordered_indices = NULL;
-
-  int ncol_Y, ncol_W;
-
-  int * kernel_c = NULL, * kernel_u = NULL, * kernel_o = NULL;
-
-  int npks_err = 0;
-
-  /* match integer options with their globals */
-
-  num_reg_continuous_extern = myopti[KWS_NCONI];
-  num_reg_unordered_extern = myopti[KWS_NUNOI];
-  num_reg_ordered_extern = myopti[KWS_NORDI];
-
-  num_var = num_reg_ordered_extern + num_reg_continuous_extern + num_reg_unordered_extern;
-
-  num_obs_train_extern = myopti[KWS_TNOBSI];
-  num_obs_eval_extern = myopti[KWS_ENOBSI];
-
-  KERNEL_reg_extern = myopti[KWS_CKRNEVI];
-  KERNEL_reg_unordered_extern = myopti[KWS_UKRNEVI];
-  KERNEL_reg_ordered_extern = myopti[KWS_OKRNEVI];
-  vector_ckerlb_extern = ckerlb;
-  vector_ckerub_extern = ckerub;
-  int_cker_bound_extern = np_has_finite_cker_bounds(ckerlb, ckerub, num_reg_continuous_extern);
-
-  int_LARGE_SF = myopti[KWS_LSFI];
-  int_MINIMIZE_IO = myopti[KWS_MINIOI];
-  BANDWIDTH_reg_extern = myopti[KWS_BWI];
-
-  train_is_eval = myopti[KWS_TISEI];
-  // no_y = myopti[KWS_NOYI];
-  leave_one_out = myopti[KWS_LOOI];
-  do_divide_bw = myopti[KWS_BDIVI];
-  
-  max_lev = myopti[KWS_MLEVI];
-  pad_num = *padnum;
-
-  /* the y and weight matrices will be contained in these variables */
-  ncol_Y = myopti[KWS_YNCOLI];
-  ncol_W = myopti[KWS_WNCOLI];
-
-  int_TREE_X = myopti[KWS_DOTREEI];
-  return_kernel_weights = myopti[KWS_RKWI];
-  p_operator = myopti[KWS_POPI];
-  do_score = myopti[KWS_PSCOREI];
-  do_ocg = myopti[KWS_POCGI];
-  suppress_parallel_ksum = myopti[KWS_SPARI];
-
-  nconfac_extern = ncatfac_extern = 0.0;
-
-  no_y = (ncol_Y == 0);
-  no_weights = (ncol_W == 0);
-
-  sum_element_length = (no_y ? 1 : ncol_Y)*(no_weights ? 1 : ncol_W);
-
-  use_tree = (int_TREE_X == NP_TREE_TRUE);
-
-#ifdef MPI2
-  num_obs_eval_alloc = MAX(ceil((double) num_obs_eval_extern / (double) iNum_Processors),1)*iNum_Processors;
-#else
-  num_obs_eval_alloc = num_obs_eval_extern;
-#endif
-
-  if(train_is_eval && (num_obs_eval_extern != num_obs_train_extern)){
-    REprintf("\n(np_kernelsum): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
-    error("\n(np_kernelsum): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
-  }
-
-  /* allocate */
-
-  if(use_tree){
-    matrix_X_unordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_unordered_extern);
-    matrix_X_ordered_train_extern = alloc_matd(num_obs_train_extern, num_reg_ordered_extern);
-    matrix_X_continuous_train_extern = alloc_matd(num_obs_train_extern, num_reg_continuous_extern);
-  } else {
-    allocated_X_train = 0;
-    matrix_X_unordered_train_extern = (num_reg_unordered_extern > 0) ?
-      (double **)R_alloc((size_t)num_reg_unordered_extern, sizeof(double*)) : NULL;
-    matrix_X_ordered_train_extern = (num_reg_ordered_extern > 0) ?
-      (double **)R_alloc((size_t)num_reg_ordered_extern, sizeof(double*)) : NULL;
-    matrix_X_continuous_train_extern = (num_reg_continuous_extern > 0) ?
-      (double **)R_alloc((size_t)num_reg_continuous_extern, sizeof(double*)) : NULL;
-
-    for(j = 0; j < num_reg_unordered_extern; j++)
-      matrix_X_unordered_train_extern[j] = tuno + j*num_obs_train_extern;
-    for(j = 0; j < num_reg_ordered_extern; j++)
-      matrix_X_ordered_train_extern[j] = tord + j*num_obs_train_extern;
-    for(j = 0; j < num_reg_continuous_extern; j++)
-      matrix_X_continuous_train_extern[j] = tcon + j*num_obs_train_extern;
-  }
-  
-  /* for the moment we will just allocate a vector of ones */
-  /* vector_Y_extern = (no_y)?NULL:alloc_vecd(num_obs_train_extern); */
-
-  if(use_tree){
-    matrix_Y_continuous_train_extern = alloc_matd(num_obs_train_extern, ncol_Y);
-    matrix_Y_ordered_train_extern = alloc_matd(num_obs_train_extern, ncol_W);
-  } else {
-    allocated_Y = 0;
-    allocated_W = 0;
-    matrix_Y_continuous_train_extern = (ncol_Y > 0) ?
-      (double **)R_alloc((size_t)ncol_Y, sizeof(double*)) : NULL;
-    matrix_Y_ordered_train_extern = (ncol_W > 0) ?
-      (double **)R_alloc((size_t)ncol_W, sizeof(double*)) : NULL;
-
-    for(j = 0; j < ncol_Y; j++)
-      matrix_Y_continuous_train_extern[j] = ty + j*num_obs_train_extern;
-    for(j = 0; j < ncol_W; j++)
-      matrix_Y_ordered_train_extern[j] = weights + j*num_obs_train_extern;
-  }
-
-  num_categories_extern = alloc_vecu(num_reg_unordered_extern+num_reg_ordered_extern);
-  matrix_categorical_vals_extern = alloc_matd(max_lev, num_reg_unordered_extern + num_reg_ordered_extern);
-
-  vector_scale_factor = alloc_vecd(num_var + 1);
-  if(!use_tree && (num_obs_eval_alloc == num_obs_eval_extern)){
-    ksum = weighted_sum;
-    ksum_is_output = 1;
-  } else {
-    if(np_int_product_overflows(num_obs_eval_alloc, sum_element_length))
-      error("C_np_kernelsum: requested kernel-sum buffer is too large");
-    ksum = alloc_vecd(num_obs_eval_alloc*sum_element_length);
-  }
-
-  if((p_operator != OP_NOOP) || do_ocg){
-    p_nvar = ((p_operator != OP_NOOP) ? num_reg_continuous_extern : 0) + ((do_score || do_ocg) ? num_reg_unordered_extern + num_reg_ordered_extern : 0);
-    if(!use_tree && (num_obs_eval_alloc == num_obs_eval_extern)){
-      p_ksum = weighted_p_sum;
-      pksum_is_output = 1;
-    } else {
-      if(np_int_product3_overflows(num_obs_eval_alloc, sum_element_length, p_nvar))
-        error("C_np_kernelsum: requested derivative kernel-sum buffer is too large");
-      p_ksum = alloc_vecd(num_obs_eval_alloc*sum_element_length*p_nvar);
-    }
-  }
-
-  if(!train_is_eval){
-    if(use_tree){
-      matrix_X_unordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_unordered_extern);
-      matrix_X_ordered_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_ordered_extern);
-      matrix_X_continuous_eval_extern = alloc_matd(num_obs_eval_extern, num_reg_continuous_extern);
-    } else {
-      allocated_X_eval = 0;
-      matrix_X_unordered_eval_extern = (num_reg_unordered_extern > 0) ?
-        (double **)R_alloc((size_t)num_reg_unordered_extern, sizeof(double*)) : NULL;
-      matrix_X_ordered_eval_extern = (num_reg_ordered_extern > 0) ?
-        (double **)R_alloc((size_t)num_reg_ordered_extern, sizeof(double*)) : NULL;
-      matrix_X_continuous_eval_extern = (num_reg_continuous_extern > 0) ?
-        (double **)R_alloc((size_t)num_reg_continuous_extern, sizeof(double*)) : NULL;
-
-      for(j = 0; j < num_reg_unordered_extern; j++)
-        matrix_X_unordered_eval_extern[j] = euno + j*num_obs_eval_extern;
-      for(j = 0; j < num_reg_ordered_extern; j++)
-        matrix_X_ordered_eval_extern[j] = eord + j*num_obs_eval_extern;
-      for(j = 0; j < num_reg_continuous_extern; j++)
-        matrix_X_continuous_eval_extern[j] = econ + j*num_obs_eval_extern;
-    }
-  } else {
-    matrix_X_unordered_eval_extern = matrix_X_unordered_train_extern;
-    matrix_X_ordered_eval_extern = matrix_X_ordered_train_extern;
-    matrix_X_continuous_eval_extern = matrix_X_continuous_train_extern;
-  }
-
-  /* train */
-
-  if(use_tree){
-    for( j=0;j<num_reg_unordered_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_unordered_train_extern[j][i]=tuno[j*num_obs_train_extern+i];
-
-    for( j=0;j<num_reg_ordered_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_ordered_train_extern[j][i]=tord[j*num_obs_train_extern+i];
-
-    for( j=0;j<num_reg_continuous_extern;j++)
-      for( i=0;i<num_obs_train_extern;i++ )
-        matrix_X_continuous_train_extern[j][i]=tcon[j*num_obs_train_extern+i];
-
-    for( j = 0; j < ncol_Y; j++ )
-      for( i = 0; i < num_obs_train_extern; i++ )
-        matrix_Y_continuous_train_extern[j][i] = ty[j*num_obs_train_extern+i];
-
-    for( j = 0; j < ncol_W; j++ )
-      for( i = 0; i < num_obs_train_extern; i++ )
-        matrix_Y_ordered_train_extern[j][i] = weights[j*num_obs_train_extern+i];
-  }
-
-  if(use_tree && !train_is_eval){
-    for( j=0;j<num_reg_unordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_unordered_eval_extern[j][i]=euno[j*num_obs_eval_extern+i];
-
-    for( j=0;j<num_reg_ordered_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_ordered_eval_extern[j][i]=eord[j*num_obs_eval_extern+i];
-
-    for( j=0;j<num_reg_continuous_extern;j++)
-      for( i=0;i<num_obs_eval_extern;i++ )
-        matrix_X_continuous_eval_extern[j][i]=econ[j*num_obs_eval_extern+i];
-  }
-
-  if(use_tree){
-    ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-    if(!(ipt != NULL))
-      error("!(ipt != NULL)");
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt[i] = i;
-    }
-
-    if(!train_is_eval) {
-      ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
-      if(!(ipe != NULL))
-        error("!(ipe != NULL)");
-
-      for(i = 0; i < num_obs_eval_extern; i++){
-        ipe[i] = i;
-      }
-    } else {
-      ipe = ipt;
-    }
-  } else {
-    ipt = (int *)malloc(num_obs_train_extern*sizeof(int));
-    if(!(ipt != NULL))
-      error("!(ipt != NULL)");
-
-    for(i = 0; i < num_obs_train_extern; i++){
-      ipt[i] = i;
-    }
-
-    if(!train_is_eval){
-      ipe = (int *)malloc(num_obs_eval_extern*sizeof(int));
-      if(!(ipe != NULL))
-        error("!(ipe != NULL)");
-
-      for(i = 0; i < num_obs_eval_extern; i++){
-        ipe[i] = i;
-      }
-    } else {
-      ipe = ipt;
-    }
-  }
-
-  // attempt tree build, if enabled 
-  int_TREE_X = int_TREE_X && ((num_reg_continuous_extern != 0) ? NP_TREE_TRUE : NP_TREE_FALSE);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    if((BANDWIDTH_reg_extern != BW_ADAP_NN) || ((BANDWIDTH_reg_extern == BW_ADAP_NN) && train_is_eval)){
-      build_kdtree(matrix_X_continuous_train_extern, num_obs_train_extern, num_reg_continuous_extern, 
-                   4*num_reg_continuous_extern, ipt, &kdt_extern_X);
-
-      for( j=0;j<num_reg_unordered_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_unordered_train_extern[j][i]=tuno[j*num_obs_train_extern+ipt[i]];
-    
-    
-      for( j=0;j<num_reg_ordered_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_ordered_train_extern[j][i]=tord[j*num_obs_train_extern+ipt[i]];
-
-      for( j=0;j<num_reg_continuous_extern;j++)
-        for( i=0;i<num_obs_train_extern;i++ )
-          matrix_X_continuous_train_extern[j][i]=tcon[j*num_obs_train_extern+ipt[i]];
-
-      for( j = 0; j < ncol_Y; j++ )
-        for( i = 0; i < num_obs_train_extern; i++ )
-          matrix_Y_continuous_train_extern[j][i] = ty[j*num_obs_train_extern+ipt[i]];
-
-      for( j = 0; j < ncol_W; j++ )
-        for( i = 0; i < num_obs_train_extern; i++ )
-          matrix_Y_ordered_train_extern[j][i] = weights[j*num_obs_train_extern+ipt[i]];
-
-    } else {
-      build_kdtree(matrix_X_continuous_eval_extern, num_obs_eval_extern, num_reg_continuous_extern, 
-                   4*num_reg_continuous_extern, ipe, &kdt_extern_X);
-
-
-      for( j=0;j<num_reg_unordered_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_unordered_eval_extern[j][i]=euno[j*num_obs_eval_extern+ipe[i]];
-
-      for( j=0;j<num_reg_ordered_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_ordered_eval_extern[j][i]=eord[j*num_obs_eval_extern+ipe[i]];
-
-      for( j=0;j<num_reg_continuous_extern;j++)
-        for( i=0;i<num_obs_eval_extern;i++ )
-          matrix_X_continuous_eval_extern[j][i]=econ[j*num_obs_eval_extern+ipe[i]];
-
-    }
-  }
-
-
-
-  /* bandwidths */
-  for( i=0; i<num_var; i++ )
-    vector_scale_factor[i+1] = bw[i];
-  
-  /* fix up categories */
-
-  for(j=0; j<num_reg_unordered_extern; j++){
-    i = 0;
-    do { 
-      matrix_categorical_vals_extern[j][i] = mcv[j*max_lev+i];
-    } while(++i < max_lev && mcv[j*max_lev+i] != pad_num);
-    num_categories_extern[j] = i;
-  }
-
-  if(do_ocg && (num_reg_ordered_extern > 0)){
-    if(num_obs_eval_extern < 0 ||
-       (size_t)num_obs_eval_extern > SIZE_MAX / (size_t)num_reg_ordered_extern ||
-       ((size_t)num_reg_ordered_extern * (size_t)num_obs_eval_extern) > SIZE_MAX / sizeof(int))
-      error("ordered index buffer size overflow");
-
-    size_t ordered_index_count = (size_t)num_reg_ordered_extern * (size_t)num_obs_eval_extern;
-    otabs = (struct th_table *)malloc(num_reg_ordered_extern*sizeof(struct th_table));
-    matrix_ordered_indices = (int **)malloc(num_reg_ordered_extern*sizeof(int *));
-    int * tc = (int *)malloc(ordered_index_count*sizeof(int));
-    if(tc == NULL)
-      error("failed to allocate ordered index buffer");
-    for(i = 0; i < num_reg_ordered_extern; i++)
-      matrix_ordered_indices[i] = tc + i*num_obs_eval_extern;
-  }
-
-  for(j=num_reg_unordered_extern, k = 0; j < (num_reg_unordered_extern+num_reg_ordered_extern); j++, k++){
-    i = 0;
-
-    do { 
-      matrix_categorical_vals_extern[j][i] = mcv[j*max_lev+i];
-    } while(++i < max_lev && mcv[j*max_lev+i] != pad_num);
-    num_categories_extern[j] = i;
-
-    if(do_ocg){
-      if(thcreate_r((size_t)ceil(1.6*num_categories_extern[j]), otabs + k) == TH_ERROR)
-        error("hash table creation failed");
-
-      for(i = 0; i < num_categories_extern[j]; i++){
-        struct th_entry centry;
-        centry.key.dkey = matrix_categorical_vals_extern[j][i];
-        centry.data = i;
-
-        if(thsearch_r(&centry, TH_ENTER, &ret, otabs+k) == TH_FAILURE)
-          error("insertion into hash table failed");
-      }
-      
-      // now do lookups
-      struct th_entry te;
-      te.key.dkey = pad_num;
-      te.data = -1;
-
-      ret = &te;
-      for(i = 0; i < num_obs_eval_extern; i++){
-        if(ret->key.dkey != matrix_X_ordered_eval_extern[k][i]){
-          te.key.dkey = matrix_X_ordered_eval_extern[k][i];
-          if(thsearch_r(&te, TH_SEARCH, &ret, otabs+k) == TH_FAILURE)
-            error("hash table lookup failed (which should be impossible)");
-
-        } 
-
-        matrix_ordered_indices[k][i] = ret->data;
-      }
-    }
-  }
-
-  if(return_kernel_weights){
-    if(!use_tree && (BANDWIDTH_reg_extern != BW_ADAP_NN) && (num_obs_eval_alloc == num_obs_eval_extern)){
-      kw = kernel_weights;
-      kw_is_output = 1;
-    } else {
-      if(np_int_product_overflows(num_obs_train_extern, num_obs_eval_extern))
-        error("C_np_kernelsum: requested kernel-weight buffer is too large");
-      kw = alloc_vecd(num_obs_train_extern*num_obs_eval_extern);
-    }
-  }
-
-  if(return_kernel_weights && (p_nvar > 0)){
-    if(np_int_product3_overflows(num_obs_train_extern, num_obs_eval_extern, p_nvar))
-      error("C_np_kernelsum: requested derivative kernel-weight buffer is too large");
-    pkw = alloc_vecd(num_obs_train_extern*num_obs_eval_extern*p_nvar);
-  }
-  
-  kernel_c = (int *)malloc(sizeof(int)*num_reg_continuous_extern);
-
-  for(i = 0; i < num_reg_continuous_extern; i++)
-    kernel_c[i] = KERNEL_reg_extern;
-
-  kernel_u = (int *)malloc(sizeof(int)*num_reg_unordered_extern);
-
-  for(i = 0; i < num_reg_unordered_extern; i++)
-    kernel_u[i] = KERNEL_reg_unordered_extern;
-
-  kernel_o = (int *)malloc(sizeof(int)*num_reg_ordered_extern);
-
-  for(i = 0; i < num_reg_ordered_extern; i++)
-    kernel_o[i] = KERNEL_reg_ordered_extern;
-
-  int *bpso = NULL;
-  {
-    const int bpso_len = num_reg_continuous_extern + num_reg_unordered_extern + num_reg_ordered_extern;
-    if(bpso_len > 0){
-      const int do_perm = (p_operator != OP_NOOP);
-      const int doscoreocg = (do_score || do_ocg);
-
-      bpso = (int *)R_alloc((size_t)bpso_len, sizeof(int));
-      for(i = 0; i < num_reg_continuous_extern; i++)
-        bpso[i] = do_perm;
-      for(i = num_reg_continuous_extern; i < bpso_len; i++)
-        bpso[i] = doscoreocg;
-    }
-  }
-  
-  
-  npks_err = kernel_weighted_sum_np(kernel_c,
-                                      kernel_u,
-                                      kernel_o,
-                                      BANDWIDTH_reg_extern,
-                                      num_obs_train_extern,
-                                      num_obs_eval_extern,
-                                      num_reg_unordered_extern,
-                                      num_reg_ordered_extern,
-                                      num_reg_continuous_extern,
-                                      leave_one_out,
-                                      0,
-                                      (int)(*kpow),
-                                      do_divide_bw,
-                                      (BANDWIDTH_reg_extern == BW_ADAP_NN) ? do_divide_bw : 0,
-                                      0, //not symmetric
-                                      0, //disable 'twisting'
-                                      0, // do not drop train
-                                      0, // do not drop train
-                                      operator,
-                                      p_operator,
-                                      do_score,
-                                      do_ocg, // no ocg (for now)
-                                      bpso,
-                                      suppress_parallel_ksum,
-                                      ncol_Y,
-                                      ncol_W,
-                                      int_TREE_X,
-                                      0,
-                                      kdt_extern_X,
-                                      NULL, NULL, NULL,
-                                      matrix_X_unordered_train_extern,
-                                      matrix_X_ordered_train_extern,
-                                      matrix_X_continuous_train_extern,
-                                      matrix_X_unordered_eval_extern,
-                                      matrix_X_ordered_eval_extern,
-                                      matrix_X_continuous_eval_extern,
-                                      /* ys matrix */
-                                      matrix_Y_continuous_train_extern,
-                                      /* weights matrix */
-                                      matrix_Y_ordered_train_extern,
-                                      NULL,
-                                      &vector_scale_factor[1],
-                                      0,NULL,NULL,NULL,
-                                      num_categories_extern,
-                                      matrix_categorical_vals_extern,
-                                      matrix_ordered_indices,
-                                      ksum,
-                                      p_ksum,
-                                      kw,
-                                      pkw);
-  if(npks_err != 0){
-    error("kernel_weighted_sum_np failed with code %d", npks_err);
-  }
-
-
-  if(!npks_err){
-    if(use_tree || !ksum_is_output){
-      for(j = 0; j < num_obs_eval_extern; j++)
-        for(i = 0; i < sum_element_length; i++)
-          weighted_sum[ipe[j]*sum_element_length + i] = ksum[j*sum_element_length+i];
-    }
-
-    if(return_kernel_weights){
-      if(use_tree || (BANDWIDTH_reg_extern == BW_ADAP_NN) || !kw_is_output){
-        if(BANDWIDTH_reg_extern != BW_ADAP_NN){ // adaptive weights are currently returned transposed...
-          for(j = 0; j < num_obs_eval_extern; j++)
-            for(i = 0; i < num_obs_train_extern; i++)
-              kernel_weights[ipe[j]*num_obs_train_extern + ipt[i]] = kw[j*num_obs_train_extern + i];
-        } else {
-          for(j = 0; j < num_obs_train_extern; j++)
-            for(i = 0; i < num_obs_eval_extern; i++)
-              kernel_weights[ipe[i]*num_obs_train_extern + ipt[j]] = kw[j*num_obs_eval_extern + i];      
-        }
-      }
-    }
-
-    if(return_kernel_weights && (p_nvar > 0) && (pkw != NULL)){
-      if(BANDWIDTH_reg_extern != BW_ADAP_NN){
-        for(k = 0; k < p_nvar; k++){
-          const int koff = k*num_obs_train_extern*num_obs_eval_extern;
-          for(j = 0; j < num_obs_eval_extern; j++)
-            for(i = 0; i < num_obs_train_extern; i++)
-              permutation_kernel_weights[koff + ipe[j]*num_obs_train_extern + ipt[i]] =
-                pkw[koff + j*num_obs_train_extern + i];
-        }
-      } else {
-        for(k = 0; k < p_nvar; k++){
-          const int koff = k*num_obs_train_extern*num_obs_eval_extern;
-          for(j = 0; j < num_obs_train_extern; j++)
-            for(i = 0; i < num_obs_eval_extern; i++)
-              permutation_kernel_weights[koff + ipe[i]*num_obs_train_extern + ipt[j]] =
-                pkw[koff + j*num_obs_eval_extern + i];
-        }
-      }
-    }
-
-    if(p_nvar > 0){
-      if(use_tree || !pksum_is_output){
-        for(k = 0; k < p_nvar; k++){
-          const int kidx = k*num_obs_eval_extern*sum_element_length;
-          for(j = 0; j < num_obs_eval_extern; j++)
-            for(i = 0; i < sum_element_length; i++)
-              weighted_p_sum[kidx + ipe[j]*sum_element_length + i] = p_ksum[kidx + j*sum_element_length + i];
-        }
-      }
-    }
-
-  }
-  /* clean up */
-
-  if(allocated_X_train){
-    free_mat(matrix_X_unordered_train_extern, num_reg_unordered_extern);
-    free_mat(matrix_X_ordered_train_extern, num_reg_ordered_extern);
-    free_mat(matrix_X_continuous_train_extern, num_reg_continuous_extern);
-  }
-  
-  if(!train_is_eval && allocated_X_eval){
-    free_mat(matrix_X_unordered_eval_extern, num_reg_unordered_extern);
-    free_mat(matrix_X_ordered_eval_extern, num_reg_ordered_extern);
-    free_mat(matrix_X_continuous_eval_extern, num_reg_continuous_extern);
-  }
-
-  free_mat(matrix_categorical_vals_extern, num_reg_unordered_extern+num_reg_ordered_extern);
-  if(allocated_Y)
-    free_mat(matrix_Y_continuous_train_extern, ncol_Y);
-  if(allocated_W)
-    free_mat(matrix_Y_ordered_train_extern, ncol_W);
-
-  safe_free(num_categories_extern);
-  safe_free(vector_scale_factor);
-  if(!ksum_is_output)
-    safe_free(ksum);
-
-  if(!kw_is_output)
-    safe_free(kw);
-  if(!pkw_is_output)
-    safe_free(pkw);
-
-  safe_free(ipt);
-
-  free(kernel_c);
-  free(kernel_u);
-  free(kernel_o);
-
-  if(!train_is_eval)
-    safe_free(ipe);
-
-  if(int_TREE_X == NP_TREE_TRUE){
-    free_kdtree(&kdt_extern_X);
-    int_TREE_X = NP_TREE_FALSE;
-  }
-
-  if(p_nvar > 0){
-    if(!pksum_is_output)
-      safe_free(p_ksum);
-  }
-
-  if(do_ocg && (num_reg_ordered_extern > 0)){
-
-    for(k = 0; k < num_reg_ordered_extern; k++){
-      thdestroy_r(otabs+k);
-    }
-    free(otabs);
-    free(matrix_ordered_indices[0]);
-    free(matrix_ordered_indices);
-  }
-
-  int_cker_bound_extern = 0;
-  vector_ckerlb_extern = NULL;
-  vector_ckerub_extern = NULL;
-  np_reset_y_side_extern();
-  np_clear_estimator_extern_aliases();
-  num_obs_train_extern = 0;
-  num_obs_eval_extern = 0;
-
-  return;
+  np_kernelsum_common(tuno, tord, tcon, ty, weights,
+                      euno, eord, econ, bw, mcv, padnum,
+                      operator, myopti, kpow,
+                      weighted_sum, NULL, weighted_p_sum,
+                      kernel_weights, permutation_kernel_weights,
+                      ckerlb, ckerub, NULL, 0);
+}
+
+void np_kernelsum_power12(double * tuno, double * tord, double * tcon,
+                          double * ty, double * weights,
+                          double * euno, double * eord, double * econ,
+                          double * bw,
+                          double * mcv, double * padnum,
+                          int * operator,
+                          int * myopti, double * kpow,
+                          double * weighted_sum,
+                          double * weighted_sum_power2,
+                          double * weighted_p_sum,
+                          double * kernel_weights,
+                          double * permutation_kernel_weights,
+                          double * ckerlb, double * ckerub){
+  np_kernelsum_common(tuno, tord, tcon, ty, weights,
+                      euno, eord, econ, bw, mcv, padnum,
+                      operator, myopti, kpow,
+                      weighted_sum, weighted_sum_power2, weighted_p_sum,
+                      kernel_weights, permutation_kernel_weights,
+                      ckerlb, ckerub, NULL, 0);
 }
 
 
@@ -17142,7 +22198,7 @@ void np_quantile_conditional(double * tc_con,
                              double * tu_uno, double * tu_ord, double * tu_con,
                              double * eu_uno, double * eu_ord, double * eu_con,
                              double * quantile,
-                             double * mybw, 
+                             double * mybw,
                              double * mcv, double *padnum,
                              double * nconfac, double * ncatfac, double * mysd,
                              int * myopti, double * myoptd,
@@ -17184,7 +22240,7 @@ void np_quantile_conditional(double * tc_con,
   num_obs_train_extern = myopti[CQ_TNOBSI];
   num_obs_eval_extern = myopti[CQ_ENOBSI];
 
-  if((train_is_eval = myopti[CQ_TISEI]) && 
+  if((train_is_eval = myopti[CQ_TISEI]) &&
      (num_obs_eval_extern != num_obs_train_extern)){
     REprintf("\n(np_quantile_conditional): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
     error("\n(np_quantile_conditional): consistency check failed, train_is_eval but num_obs_train_extern != num_obs_eval_extern. bailing\n");
@@ -17228,7 +22284,9 @@ void np_quantile_conditional(double * tc_con,
   vector_continuous_stddev_extern = mysd;
 
 #ifdef MPI2
-  num_obs_eval_alloc = MAX(ceil((double) num_obs_eval_extern / (double) iNum_Processors),1)*iNum_Processors;
+  num_obs_eval_alloc =
+    np_mpi_padded_count_or_error(num_obs_eval_extern,
+                                 "np_quantile_conditional");
 #else
   num_obs_eval_alloc = num_obs_eval_extern;
 #endif
@@ -17433,3 +22491,221 @@ void np_quantile_conditional(double * tc_con,
 
   return ;
 }
+
+/* Private plot inference: new np.c entry, after its existing support/matrix parsers.
+ * Reuses np_categorical_support_parse without changing that shared parser.
+ * The numerical/gate scope and unwind cleanup remain owned by jksum.c.
+ */
+extern SEXP np_plot_gate_dispatch_native(SEXP, SEXP, SEXP, int,
+                                        const int *, const double *const *);
+
+SEXP C_np_plot_gate_dispatch(SEXP kind, SEXP native_args, SEXP geometry)
+{
+  if(TYPEOF(geometry) != VECSXP || XLENGTH(geometry) != 6)
+    error("plot gate geometry must have exactly six fields");
+  SEXP train = VECTOR_ELT(geometry, 0), support = VECTOR_ELT(geometry, 3);
+  if(TYPEOF(train) != VECSXP || XLENGTH(train) != 3)
+    error("plot gate training geometry must have exactly three groups");
+  int n = 0, dimensions[4] = {0, 0, 0, 0};
+  SEXP data[4] = {R_NilValue, R_NilValue, VECTOR_ELT(train, 0), VECTOR_ELT(train, 1)};
+  for(int group = 0; group < 3; ++group) {
+    int rows = 0, columns = 0;
+    SEXP x = VECTOR_ELT(train, group);
+    np_matrix_dims_or_zero(x, &rows, &columns);
+    if(TYPEOF(x) != REALSXP || rows <= 0 || columns < 0 ||
+       XLENGTH(x) != (R_xlen_t)rows*columns || (group > 0 && rows != n))
+      error("plot gate complete training geometry dimensions differ");
+    n = rows;
+    if(group < 2) dimensions[group+2] = columns;
+  }
+  const NPCategoricalSupport parsed =
+    np_categorical_support_parse(support, n, dimensions, data);
+  return np_plot_gate_dispatch_native(kind, native_args, geometry,
+    parsed.columns, parsed.counts, parsed.values);
+}
+
+#include "np_plot_regression_gradient_projection.h"
+
+#include "np_plot_beta_moment_entry.h"
+
+/* Conditional-family literal categorical policy. The incumbent definitions above
+ * retain their original call graph; these entries reuse the same canonical bodies
+ * with an explicit, immutable native owner binding. No runtime global override. */
+#include "conditional_literal.h"
+#define NP_CF316_LITERAL_ENTRIES 1
+#define C_np_regression C_np_regression_conditional_literal
+#define np_regression np_regression_conditional_literal
+#define np_regression_fitted_execute np_regression_fitted_execute_conditional_literal
+#define C_np_kernelsum C_np_kernelsum_conditional_literal
+#define np_kernelsum_common np_kernelsum_common_conditional_literal
+#define C_np_regression_lp_apply_conditional_ctx C_np_regression_lp_apply_conditional_ctx_literal
+#define np_regression_lp_apply_conditional_impl np_regression_lp_apply_conditional_impl_literal
+#define kernel_estimate_regression_categorical_tree_np kernel_estimate_regression_categorical_tree_np_conditional_literal
+#define kernel_weighted_sum_np kernel_weighted_sum_np_conditional_literal
+#define kernel_weighted_sum_np_fold_route kernel_weighted_sum_np_fold_route_conditional_literal
+#define kernel_weighted_sum_np_route kernel_weighted_sum_np_route_conditional_literal
+#define kernel_weighted_sum_np_power12 kernel_weighted_sum_np_power12_conditional_literal
+#define np_regression_lp_hat_matrix np_regression_lp_hat_matrix_conditional_literal
+#define np_beta_scaled_row_context_prepare np_beta_scaled_row_context_prepare_conditional_literal
+#define np_plot_gate_dispatch_native np_plot_gate_dispatch_native_conditional_literal
+SEXP C_np_regression(SEXP tuno,
+                     SEXP tord,
+                     SEXP tcon,
+                     SEXP ty,
+                     SEXP euno,
+                     SEXP eord,
+                     SEXP econ,
+                     SEXP ey,
+                     SEXP rbw,
+                     SEXP mcv,
+                     SEXP padnum,
+                     SEXP nconfac,
+                     SEXP ncatfac,
+                     SEXP mysd,
+                     SEXP myopti,
+                     SEXP glp_degree,
+                     SEXP glp_gradient_order,
+                     SEXP glp_bernstein,
+                     SEXP glp_basis,
+                     SEXP enrow,
+                     SEXP ncol,
+                     SEXP output_request,
+                     SEXP ckerlb,
+                     SEXP ckerub);
+void np_regression(double * tuno, double * tord, double * tcon, double * ty,
+                   double * euno, double * eord, double * econ, double * ey,
+                   double * rbw,
+                   double * mcv, double * padnum,
+                   double * nconfac, double * ncatfac, double * mysd,
+                   int * myopti,
+                   int * glp_degree,
+                   int * glp_gradient_order,
+                   int * glp_bernstein,
+                   int * glp_basis,
+                   double * cm, double * cmerr, double * g, double *gerr,
+                   double * xtra,
+                   double * ckerlb, double * ckerub,
+                   const NPContinuousKernelRoute *kernel_route,
+                   NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+                   int categorical_compress,
+                   NPRegressionLPEmptyRows *empty_rows,
+                   const NPRegressionGradientRequest *gradient_request,
+                   int *variance_unavailable, int **gradient_zero_out,
+                   NPRegressionFitProjection *fit_projection);
+static SEXP np_regression_fitted_execute(void *data);
+SEXP C_np_kernelsum(SEXP tuno,
+                    SEXP tord,
+                    SEXP tcon,
+                    SEXP ty,
+                    SEXP weights,
+                    SEXP euno,
+                    SEXP eord,
+                    SEXP econ,
+                    SEXP bw,
+                    SEXP mcv,
+                    SEXP padnum,
+                    SEXP op,
+                    SEXP myopti,
+                    SEXP kpow,
+                    SEXP ksum_len,
+                    SEXP pksum_len,
+                    SEXP kw_len,
+                    SEXP ckerlb,
+                    SEXP ckerub);
+static void np_kernelsum_common(double * tuno, double * tord, double * tcon,
+                                double * ty, double * weights,
+                                double * euno, double * eord, double * econ,
+                                double * bw,
+                                double * mcv, double * padnum,
+                                int * operator,
+                                int * myopti, double * kpow,
+                                double * weighted_sum,
+                                double * weighted_sum_power2,
+                                double * weighted_p_sum,
+                                double * kernel_weights,
+                                double * permutation_kernel_weights,
+                                double * ckerlb, double * ckerub,
+                                const int *eval_to_train, int fold_requested);
+SEXP C_np_regression_lp_apply_conditional_ctx(SEXP txuno,
+                                              SEXP txord,
+                                              SEXP txcon,
+                                              SEXP exuno,
+                                              SEXP exord,
+                                              SEXP excon,
+                                              SEXP rhs,
+                                              SEXP rbw,
+                                              SEXP bwtype,
+                                              SEXP kernel_x,
+                                              SEXP kernel_xu,
+                                              SEXP kernel_xo,
+                                              SEXP use_tree,
+                                              SEXP glp_degree,
+                                              SEXP glp_gradient_order,
+                                              SEXP glp_bernstein,
+                                              SEXP glp_basis,
+                                              SEXP continuous_kernel_family,
+                                              SEXP continuous_kernel_order,
+                                              SEXP ckerlb,
+                                              SEXP ckerub,
+                                              SEXP categorical_compress,
+                                              SEXP return_hat,
+                                              SEXP train_is_eval,
+                                              SEXP leave_one_out,
+                                              SEXP allow_empty_rows,
+                                              SEXP declared_support);
+static SEXP np_regression_lp_apply_conditional_impl(SEXP txuno,
+                                                     SEXP txord,
+                                                     SEXP txcon,
+                                                     SEXP exuno,
+                                                     SEXP exord,
+                                                     SEXP excon,
+                                                     SEXP rhs,
+                                                     SEXP rbw,
+                                                     SEXP bwtype,
+                                                     SEXP kernel_x,
+                                                     SEXP kernel_xu,
+                                                     SEXP kernel_xo,
+                                                     SEXP use_tree,
+                                                     SEXP glp_degree,
+                                                     SEXP glp_gradient_order,
+                                                     SEXP glp_bernstein,
+                                                     SEXP glp_basis,
+                                                     SEXP continuous_kernel_family,
+                                                     SEXP continuous_kernel_order,
+                                                     SEXP ckerlb,
+                                                     SEXP ckerub,
+                                                     SEXP categorical_compress,
+                                                     SEXP return_hat,
+                                                     SEXP train_is_eval,
+                                                     SEXP leave_one_out,
+                                                     SEXP sigtest_mode,
+                                                     SEXP sigtest_coordinate,
+                                                     SEXP sigtest_response_ready,
+                                                     SEXP sigtest_pivotal,
+                                                     SEXP sigtest_null_mean,
+                                                     SEXP sigtest_residual_pool,
+                                                     SEXP allow_empty_rows,
+                                                     SEXP declared_support);
+#include "conditional_literal/entry_C_np_regression.inc"
+#include "conditional_literal/entry_np_regression.inc"
+#include "conditional_literal/entry_np_regression_fitted_execute.inc"
+#include "conditional_literal/entry_C_np_kernelsum.inc"
+#include "conditional_literal/entry_np_kernelsum_common.inc"
+#include "conditional_literal/entry_C_np_regression_lp_apply_conditional_ctx.inc"
+#include "conditional_literal/entry_np_regression_lp_apply_conditional_impl.inc"
+#undef np_plot_gate_dispatch_native
+#undef np_beta_scaled_row_context_prepare
+#undef np_regression_lp_hat_matrix
+#undef kernel_weighted_sum_np_power12
+#undef kernel_weighted_sum_np_route
+#undef kernel_weighted_sum_np_fold_route
+#undef kernel_weighted_sum_np
+#undef kernel_estimate_regression_categorical_tree_np
+#undef np_regression_lp_apply_conditional_impl
+#undef C_np_regression_lp_apply_conditional_ctx
+#undef np_kernelsum_common
+#undef C_np_kernelsum
+#undef np_regression_fitted_execute
+#undef np_regression
+#undef C_np_regression
+#undef NP_CF316_LITERAL_ENTRIES

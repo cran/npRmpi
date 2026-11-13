@@ -6,12 +6,13 @@ progress_time_counter <- function(start = 0, by = 0.6) {
   }
 }
 
-shadow_bootstrap_signature <- function(shadow) {
+shadow_npsigtest_signature <- function(shadow) {
   lines <- vapply(shadow$trace, `[[`, character(1L), "line")
   events <- vapply(shadow$trace, `[[`, character(1L), "event")
-  keep <- grepl("^\\[npRmpi\\] Bootstrap replications", lines)
+  keep <- grepl("^\\[npRmpi\\] Testing ", lines)
 
   data.frame(
+    id = vapply(shadow$trace, `[[`, character(1L), "id")[keep],
     event = events[keep],
     line = lines[keep],
     stringsAsFactors = FALSE
@@ -19,8 +20,51 @@ shadow_bootstrap_signature <- function(shadow) {
 }
 
 shadow_lines <- function(shadow) {
-  shadow_bootstrap_signature(shadow)$line
+  shadow_npsigtest_signature(shadow)$line
 }
+
+expect_live_sigtest_progress <- function(shadow, joint) {
+  signature <- shadow_npsigtest_signature(shadow)
+  lines <- signature$line
+  expect_length(unique(signature$id), 1L)
+  # Legacy can suppress a duplicate final line; single-line teardown has its
+  # explicit finish assertion below. Neither renderer may end in abort.
+  expect_true(tail(signature$event, 1L) %in% c("render", "finish"))
+  expect_true(all(grepl("rep [0-9]+/9", lines)))
+  target <- if(joint) rep(1L,length(lines)) else
+    as.integer(sub(".*target ([0-9]+)/2.*", "\\1", lines))
+  reps <- as.integer(sub(".*rep ([0-9]+)/9.*", "\\1", lines))
+  expect_true(all(diff(target) >= 0))
+  for(t in unique(target)) {
+    r <- reps[target==t]
+    expect_identical(r[1L],0L)
+    expect_identical(tail(r,1L),9L)
+    expect_true(all(diff(r)>=0L))
+  }
+}
+
+test_that("npsigtest renderers agree for the same logical event sequence", {
+  old <- options(np.messages=TRUE,np.progress.start.grace.known.sec=0)
+  on.exit(options(old),add=TRUE)
+  drive <- function() {
+    ns <- asNamespace("npRmpi")
+    state <- get(".np_npsig_progress_begin",ns)(c("x1","x2"),9L,FALSE)
+    for(target in 1:2) {
+      get(".np_npsig_progress_target",ns)(state,paste0("x",target),target)
+      for(rep in c(0L,3L,6L,9L))
+        get(".np_progress_step_at",ns)(state,get(".np_progress_now",ns)(),
+                                      done=rep,force=TRUE)
+      get(".np_npsig_progress_complete",ns)(state)
+    }
+    get(".np_progress_end",ns)(state)
+  }
+  legacy <- capture_progress_shadow_trace(drive(),force_renderer="legacy",
+                                          now=progress_time_counter())
+  single <- capture_progress_shadow_trace(drive(),force_renderer="single_line",
+                                          now=progress_time_counter())
+  expect_identical(shadow_npsigtest_signature(single),
+                   shadow_npsigtest_signature(legacy))
+})
 
 skip_live_route_slice <- function() {
   skip_on_cran()
@@ -43,7 +87,7 @@ make_sigtest_fixture <- function(seed = 42, n = 30) {
   list(bw = bw)
 }
 
-test_that("npsigtest joint single-line bootstrap progress matches legacy semantics", {
+test_that("npsigtest joint progress has one immediate call-wide owner", {
   skip_on_cran()
   skip_live_route_slice()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
@@ -55,26 +99,32 @@ test_that("npsigtest joint single-line bootstrap progress matches legacy semanti
   on.exit(options(old_opts), add = TRUE)
 
   legacy <- capture_progress_shadow_trace(
-    npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = TRUE, index = 1),
+    npsigtest_fun(bws = fixture$bw, B = 9, joint = TRUE, index = 1),
     force_renderer = "legacy",
     now = progress_time_counter()
   )
 
   single_line <- capture_progress_shadow_trace(
-    npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = TRUE, index = 1),
+    npsigtest_fun(bws = fixture$bw, B = 9, joint = TRUE, index = 1),
     force_renderer = "single_line",
     now = progress_time_counter()
   )
 
   lines <- shadow_lines(single_line)
+  legacy.signature <- shadow_npsigtest_signature(legacy)
+  single.signature <- shadow_npsigtest_signature(single_line)
 
   expect_s3_class(single_line$value, "sigtest")
-  expect_equal(shadow_bootstrap_signature(single_line), shadow_bootstrap_signature(legacy))
-  expect_true(any(grepl("^\\[npRmpi\\] Bootstrap replications [0-9]+/9 \\([0-9]+\\.[0-9]%.*, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$", lines)))
-  expect_true(any(grepl("^\\[npRmpi\\] Bootstrap replications 9/9 \\([0-9]+\\.[0-9]%.*, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$", lines)))
+  expect_live_sigtest_progress(legacy, joint=TRUE)
+  expect_live_sigtest_progress(single_line, joint=TRUE)
+  expect_match(lines[[1L]], "rep 0/9, elapsed 0\\.0s, eta estimating")
+  expect_true(any(grepl("rep 9/9", lines, fixed = TRUE)))
+  expect_false(any(grepl("target", lines, fixed = TRUE)))
+  expect_length(unique(single.signature$id), 1L)
+  expect_identical(tail(single.signature$event, 1L), "finish")
 })
 
-test_that("npsigtest individual single-line bootstrap progress matches legacy semantics", {
+test_that("npsigtest individual progress uses completed predictors for ETA", {
   skip_on_cran()
   skip_live_route_slice()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
@@ -86,23 +136,32 @@ test_that("npsigtest individual single-line bootstrap progress matches legacy se
   on.exit(options(old_opts), add = TRUE)
 
   legacy <- capture_progress_shadow_trace(
-    npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = FALSE, index = c(1, 2)),
+    npsigtest_fun(bws = fixture$bw, B = 9, joint = FALSE, index = c(1, 2)),
     force_renderer = "legacy",
     now = progress_time_counter()
   )
 
   single_line <- capture_progress_shadow_trace(
-    npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = FALSE, index = c(1, 2)),
+    npsigtest_fun(bws = fixture$bw, B = 9, joint = FALSE, index = c(1, 2)),
     force_renderer = "single_line",
     now = progress_time_counter()
   )
 
   lines <- shadow_lines(single_line)
+  legacy.signature <- shadow_npsigtest_signature(legacy)
+  single.signature <- shadow_npsigtest_signature(single_line)
 
   expect_s3_class(single_line$value, "sigtest")
-  expect_equal(shadow_bootstrap_signature(single_line), shadow_bootstrap_signature(legacy))
-  expect_true(sum(grepl("^\\[npRmpi\\] Bootstrap replications [0-9]+/9 ", lines)) >= 2L)
-  expect_true(sum(grepl("^\\[npRmpi\\] Bootstrap replications 9/9 ", lines)) >= 2L)
+  expect_live_sigtest_progress(legacy, joint=FALSE)
+  expect_live_sigtest_progress(single_line, joint=FALSE)
+  expect_match(lines[[1L]], "Testing x1 \\(target 1/2, rep 0/9")
+  expect_match(lines[[1L]], "eta estimating")
+  expect_true(any(grepl("Testing x2 (target 2/2, rep 0/9", lines, fixed = TRUE)))
+  expect_true(any(grepl("Testing x2 (target 2/2, rep 9/9", lines, fixed = TRUE)))
+  expect_false(any(grepl("Testing x2 (target 1/2", lines, fixed = TRUE)))
+  expect_false(any(grepl("of \\(1,2\\)", lines)))
+  expect_length(unique(single.signature$id), 1L)
+  expect_identical(tail(single.signature$event, 1L), "finish")
 })
 
 test_that("npsigtest progress respects np.messages FALSE", {
@@ -117,7 +176,7 @@ test_that("npsigtest progress respects np.messages FALSE", {
   on.exit(options(old_opts), add = TRUE)
 
   res <- capture_progress_shadow_trace(
-    npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = TRUE, index = 1),
+    npsigtest_fun(bws = fixture$bw, B = 9, joint = TRUE, index = 1),
     now = progress_time_counter()
   )
 
@@ -136,18 +195,112 @@ test_that("npsigtest progress respects suppressMessages", {
   on.exit(options(old_opts), add = TRUE)
 
   res <- capture_progress_shadow_trace(
-    suppressMessages(npsigtest_fun(bws = fixture$bw, boot.num = 9, joint = TRUE, index = 1)),
+    suppressMessages(npsigtest_fun(bws = fixture$bw, B = 9, joint = TRUE, index = 1)),
     now = progress_time_counter()
   )
 
   expect_length(res$trace, 0)
 })
 
-test_that("npsigtest source routes use canonical bootstrap surface tags", {
+test_that("npsigtest source routes use the shared significance progress owner", {
   src <- paste(
     installed_function_text("npsigtest.rbandwidth"),
     installed_function_text("npsigtest.default"),
     sep = "\n"
   )
-  expect_true(grepl('surface = "bootstrap"', src, fixed = TRUE))
+  expect_true(grepl(".np_npsig_progress_begin(", src, fixed = TRUE))
+})
+# npRmpi active-target/replication state boundaries.
+
+test_that("npsigtest reordered targets keep their requested ordinal", {
+  skip_on_cran()
+  skip_live_route_slice()
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  fixture <- make_sigtest_fixture(seed = 109)
+  old <- options(np.messages = TRUE, np.progress.start.grace.known.sec = 0)
+  on.exit(options(old), add = TRUE)
+  result <- capture_progress_shadow_trace(
+    npsigtest_fun(bws = fixture$bw, B = 9, index = c(2, 1)),
+    now = progress_time_counter())
+  lines <- shadow_lines(result)
+  expect_match(lines[[1L]], "Testing x2 \\(target 1/2, rep 0/9")
+  expect_true(any(grepl("Testing x1 (target 2/2, rep 0/9", lines, fixed = TRUE)))
+})
+
+test_that("npsigtest progress separates active ordinal and fractional work", {
+  fields <- getFromNamespace(".np_npsig_progress_fields", "npRmpi")
+  state <- new.env(parent = emptyenv())
+  state$started <- 0
+  state$npsig.completed <- 0L
+  state$npsig.target <- 1L
+  state$npsig.total <- 3L
+  state$npsig.B <- 10L
+  state$npsig.joint <- FALSE
+  state$npsig.skipped <- FALSE
+  expect_identical(fields(state, 0L, NULL, 0),
+    c("target 1/3", "rep 0/10", "elapsed 0.0s", "eta estimating"))
+  expect_identical(fields(state, 5L, NULL, 2),
+    c("target 1/3", "rep 5/10", "elapsed 2.0s", "eta 10.0s"))
+  state$npsig.completed <- 1L
+  state$npsig.target <- 2L
+  expect_identical(fields(state, 0L, NULL, 4),
+    c("target 2/3", "rep 0/10", "elapsed 4.0s", "eta 8.0s"))
+  state$npsig.completed <- 2L
+  state$npsig.skipped <- TRUE
+  expect_identical(fields(state, 0L, NULL, 4),
+    c("target 2/3", "rep skipped", "elapsed 4.0s", "eta 2.0s"))
+  state$npsig.completed <- 3L
+  state$npsig.target <- 3L
+  expect_identical(tail(fields(state, 0L, NULL, 4), 1), "eta 0s")
+  compact <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
+  line <- "[np] Testing nonwhite (target 3/6, rep 145/999, elapsed 69.8s, eta 139.6s)"
+  for (width in c(40L, 60L, 80L)) {
+    out <- compact(line, width)
+    expect_lte(nchar(out, type = "width"), width)
+    expect_match(out, "(target|tgt) 3/6")
+  }
+})
+
+test_that("analytic non-rejection does not report simulated draws", {
+  skip_on_cran()
+  skip_live_route_slice()
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  set.seed(133)
+  d <- data.frame(z = factor(rep(0:1, 15)))
+  y <- rnorm(30)
+  bw <- getFromNamespace("npregbw", "npRmpi")(
+    d, y, bws = .5, bandwidth.compute = FALSE)
+  old <- options(np.messages = TRUE, np.progress.start.grace.known.sec = 0)
+  on.exit(options(old), add = TRUE)
+  result <- capture_progress_shadow_trace(
+    npsigtest_fun(bws = bw, B = 9), now = progress_time_counter())
+  lines <- shadow_lines(result)
+  expect_true(any(grepl("rep skipped", lines, fixed = TRUE)))
+  expect_false(any(grepl("rep 9/9", lines, fixed = TRUE)))
+  expect_identical(unname(result$value$P), 1)
+  expect_true(all(is.na(result$value$In.bootstrap)))
+  expect_identical(tail(shadow_npsigtest_signature(result)$event, 1L), "finish")
+})
+
+test_that("npsigtest restores the native heartbeat owner after an error", {
+  skip_on_cran()
+  skip_live_route_slice()
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  fixture <- make_sigtest_fixture(seed = 219)
+  runtime <- getFromNamespace(".np_progress_runtime", "npRmpi")
+  previous <- runtime$fit_forward
+  old <- options(np.messages = TRUE)
+  on.exit(options(old), add = TRUE)
+  result <- with_nprmpi_progress_bindings(
+    list(.npreg_complete = function(...) stop("progress cleanup sentinel")),
+    capture_progress_shadow_trace(
+      tryCatch(npsigtest_fun(bws = fixture$bw, B = 9), error = identity),
+      now = progress_time_counter()))
+  expect_match(conditionMessage(result$value), "progress cleanup sentinel")
+  expect_identical(runtime$fit_forward, previous)
+  expect_length(unique(vapply(result$trace, `[[`, character(1), "id")), 1L)
+  expect_identical(tail(shadow_npsigtest_signature(result)$event, 1L), "abort")
 })

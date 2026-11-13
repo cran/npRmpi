@@ -4,7 +4,12 @@
   if (ncol(xeval) == 0L) {
     split(seq_len(nrow(xeval)), factor(rep.int("all", nrow(xeval))), drop = TRUE)
   } else {
-    groups <- do.call(interaction, c(unname(xeval), list(drop = TRUE, lex.order = TRUE)))
+    # factor(numeric) formats labels before matching and may merge distinct
+    # doubles at a large origin. Match the numeric domain before formatting.
+    coded <- lapply(xeval, function(x) {
+      if (is.numeric(x)) match(x, sort(unique(x))) else x
+    })
+    groups <- do.call(interaction, c(unname(coded), list(drop = TRUE, lex.order = TRUE)))
     split(seq_len(nrow(xeval)), groups, drop = TRUE)
   }
 }
@@ -137,7 +142,8 @@
       txdat = slice.context$txdat,
       tydat = slice.context$tydat,
       exdat = slice.context$txdat,
-      eydat = slice.context$tydat
+      eydat = slice.context$tydat,
+      allow.external = FALSE
     )
     target.scope <- "fitted"
   } else {
@@ -212,7 +218,10 @@
       tydat = target.context$tydat,
       exdat = grid.eval$exdat,
       eydat = grid.eval$eydat,
-      proper = FALSE
+      proper = FALSE,
+      se = FALSE,
+      .np.require.complete = !isTRUE(target.context[["allow.external", exact = TRUE]]),
+      .np.defer.empty.rows = TRUE
     ),
     error = function(e) e
   )
@@ -226,11 +235,16 @@
     return(list(applied = FALSE, reason = "slice_eval_failed", proper.info = info))
   }
 
+  slice.rows <- .np_conditional_proper_slice_rows(
+    object, grid.fit, grid.eval, nrow(target.context$eydat))
   grid.proper <- .np_condens_apply_proper_grid(
     object = grid.fit,
     proper.method = proper.method,
     proper.control = proper.control
   )
+  for (key in c(".np.empty.base.rows", ".np.empty.rows"))
+    if (!is.null(attr(slice.rows, key, exact = TRUE)))
+      attr(grid.proper, key) <- attr(slice.rows, key, exact = TRUE)
   if (!isTRUE(grid.proper$applied))
     return(grid.proper)
 
@@ -263,10 +277,14 @@
   info$internal.grid.size <- length(grid.eval$y.grid)
   info$request.nobs <- nrow(target.context$eydat)
 
-  list(
+  out <- list(
     applied = TRUE,
     condens = repaired,
     condens.raw = if (isTRUE(proper.control$store.raw)) as.double(object$condens) else NULL,
     proper.info = info
   )
+  for (key in c(".np.empty.base.rows", ".np.empty.rows"))
+    if (!is.null(attr(slice.rows, key, exact = TRUE)))
+      attr(out, key) <- attr(slice.rows, key, exact = TRUE)
+  out
 }

@@ -69,7 +69,7 @@ test_that("npscoef iterated fits preserve residual identity when errors are requ
       tydat = fixture$ydat,
       iterate = TRUE,
       residuals = TRUE,
-      errors = TRUE,
+      se = TRUE,
       maxiter = 50L,
       tol = 1e-8
     ),
@@ -133,10 +133,6 @@ test_that("npscoef fast large-h gate rejects unsafe kernel metadata and non-fini
   expect_false(npRmpi:::.npscoefbw_fast_eligible(safe, zbad))
   expect_false(npRmpi:::.npscoefbw_fast_eligible(
     make_bw(ckertype = "epanechnikov", ckerorder = 4L),
-    fixture$zdat
-  ))
-  expect_false(npRmpi:::.npscoefbw_fast_eligible(
-    make_bw(ckertype = "truncated gaussian", ckerorder = 2L),
     fixture$zdat
   ))
   expect_false(npRmpi:::.npscoefbw_fast_eligible(

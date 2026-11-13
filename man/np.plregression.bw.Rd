@@ -38,7 +38,7 @@ npplregbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-            degree.min = NULL,
+          degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -99,6 +99,13 @@ These arguments identify the linear, nonparametric, formula, and bandwidth input
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -366,6 +373,23 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  The primary response must be a one-dimensional numeric (integer or double)
+  vector. Factors and ordered factors are not accepted as primary responses,
+  including retained responses used in a new fit or bandwidth search.
+  Categorical predictors retain their existing support. Internal auxiliary
+  responses used to represent predictors retain their established encoding.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -527,6 +551,9 @@ or standard-deviation factors.
 }
 
 \section{Book And Method Pointers}{
+  The component regression searches inherit numerical ridging from
+  \code{\link{npregbw}}; its motivation is described in \code{\link{npreg}}.
+
   \code{npplregbw} selects the bandwidths and, for local-polynomial
   routes, child-specific degree/search metadata used by
   \code{\link{npplreg}}. The target model is

@@ -55,6 +55,7 @@
                                               bw.y,
                                               Srho.univar,
                                               method,
+                                              fast.fixed.gaussian = FALSE,
                                               progress = NULL,
                                               comm = 1L) {
   boot.num <- nrow(plan$x)
@@ -64,23 +65,35 @@
   size <- mpi.comm.size(comm)
   rank <- mpi.comm.rank(comm)
 
-  local.idx <- seq.int(rank + 1L, boot.num, by = size)
+  local.idx <- seq_len(boot.num)
+  local.idx <- local.idx[(local.idx - 1L) %% size == rank]
   .npRmpi_bootstrap_transport_trace(
     what = "npunitest",
     event = "fanout.collective.start",
     fields = list(rank = rank, size = size, B = boot.num, local = length(local.idx))
   )
 
-  local.Srho <- numeric(length(local.idx))
-
-  for (jj in seq_along(local.idx)) {
-    b <- local.idx[[jj]]
-    data.null.x <- data.null[plan$x[b, ]]
-    data.null.y <- data.null[plan$y[b, ]]
-    local.Srho[[jj]] <- .npRmpi_with_local_regression(
-      Srho.univar(data.null.x, data.null.y, bw.x, bw.y, method = method)
-    )
-  }
+  chunk.size <- if (isTRUE(fast.fixed.gaussian)) .np_entropy_count_chunk_size(
+    length(data.null), bytes.per.support = 80, max.chunk = 16L) else 1L
+  local.Srho <- as.numeric(unlist(.npRmpi_bootstrap_collective_apply(
+    boot.num, chunk.size, function(ids, pos) {
+      if (isTRUE(fast.fixed.gaussian)) {
+        support.length <- length(data.null)
+        counts.x <- vapply(ids,
+          function(b) tabulate(plan$x[b, ], nbins = support.length),
+          integer(support.length))
+        counts.y <- vapply(ids,
+          function(b) tabulate(plan$y[b, ], nbins = support.length),
+          integer(support.length))
+        .np_entropy_compute(expr = .Call(
+          "C_np_entropy_univariate_summation_counts", as.double(data.null),
+          matrix(as.double(counts.x), nrow = support.length),
+          matrix(as.double(counts.y), nrow = support.length),
+          as.double(c(bw.x, bw.y)), PACKAGE = "npRmpi"))
+      } else .npRmpi_with_local_regression(Srho.univar(
+        data.null[plan$x[ids, ]], data.null[plan$y[ids, ]],
+        bw.x, bw.y, method = method))
+    }, progress = progress, comm = comm), use.names = FALSE))
 
   invisible(gc(FALSE))
 
@@ -103,7 +116,7 @@
     }
 
     if (!is.null(progress))
-      progress <- .np_progress_step(progress, done = boot.num)
+      .np_progress_activity_step(progress, done = boot.num)
     .npRmpi_bootstrap_transport_trace(
       what = "npunitest",
       event = "fanout.collective.done",
@@ -125,29 +138,33 @@ npunitest <- function(data.x = NULL,
                       data.y = NULL,
                       method = c("integration","summation"),
                       bootstrap = TRUE,
-                      boot.num = 399,
+                      B = 399,
                       bw.x = NULL,
                       bw.y = NULL,                         
                       random.seed = 42,
                       ...) {
+
+  if (...length())
+    npRejectLegacyBootstrapCount(names(list(...)), "npunitest")
   .npRmpi_require_active_slave_pool(where = "npunitest()")
   if (.npRmpi_autodispatch_active())
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npunitest"))
 
   if(is.null(data.x) || is.null(data.y)) stop(" you must enter data vectors for x and y")
   if(is.data.frame(data.x) || is.data.frame(data.y)) stop(" you must enter data vectors (not data frames)")
   if(!identical(class(data.x), class(data.y))) stop(" data vectors must be of same data type")
   if((ncol(data.frame(data.x)) != 1) ||( ncol(data.frame(data.y)) != 1)) stop(" data vectors must have one dimension only")
-  if(boot.num < 9) stop(" number of bootstrap replications must be >= 9")
-  if(is.numeric(data.x) && (max(data.x) < min(data.y) || max(data.y) < min(data.x))) .np_warning("non-overlapping empirical distributions (see `Details' in ?npunidist)")
+  if(B < 9) stop(" number of bootstrap replications must be >= 9")
 
   method <- match.arg(method)
+  entropy.fast.gaussian <- .np_entropy_uses_default_fixed_gaussian(list(...))
 
   ## Save seed prior to setting
 
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
-  .np_progress_note("Computing bandwidths")
+  seed.state <- .np_rng_scope_capture(collective = .npRmpi_rng_scope_collective(),
+                                      same.kind = TRUE)
+  on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+  .np_rng_scope_seed(seed.state, random.seed)
 
   ## If of type ts convert to numeric to handle time series data
 
@@ -156,40 +173,30 @@ npunitest <- function(data.x = NULL,
 
   ## Remove NAs
 
-  data.x <- na.omit(data.x)
-  data.y <- na.omit(data.y)
+  data.x <- .np_entropy_complete_sample(data.x)
+  data.y <- .np_entropy_complete_sample(data.y)
+  if(is.numeric(data.x) && (max(data.x) < min(data.y) || max(data.y) < min(data.x)))
+    .np_warning("non-overlapping empirical distributions (see `Details' in ?npunitest)")
+  if (is.factor(data.x)) {
+    support <- .np_entropy_factor_support(data.x, data.y)
+    data.x <- support$x
+    data.y <- support$y
+    discrete.evaluation <- support$evaluation
+  }
 
   ## Note - this function accepts numeric and factors/ordered,
   ## however, factors must be integers.
 
   if(is.numeric(data.x)) {
-    if(is.null(bw.x)) bw.x <- bw.SJ(data.x)
-    if(is.null(bw.y)) bw.y <- bw.SJ(data.y)
+    if(is.null(bw.x)) bw.x <- .np_progress_activity_run("Computing bandwidths", bw.SJ(data.x))
+    if(is.null(bw.y)) bw.y <- .np_progress_activity_run("Computing bandwidths", bw.SJ(data.y))
   } else {
     ## Optimal bandwidth for factor (unordered) used for both
     ## (plug-in).
-    if(is.null(bw.x)) {
-      n <- length(data.x)
-      c <- length(unique(data.x))
-      if(c <= 1) stop("data.x must contain at least two distinct factor levels")
-      xeval <- unique(data.x)
-      p <- fitted(npudens(tdat=data.x,edat=xeval,bws=0,...))
-      sum.Lambda3 <- c/(c-1)*sum(p*(1-p))
-      sum.Lambda2.minus.Lambda1.sq <- c^2/((c-1)^2)*sum(p*(1-p))
-      n.sum.Lambda1.sq <- n*sum(((1-c*p)/(c-1))^2)
-      bw.x <- sum.Lambda3/(sum.Lambda2.minus.Lambda1.sq+n.sum.Lambda1.sq)
-    }
-    if(is.null(bw.y)) {
-      n <- length(data.y)
-      c <- length(unique(data.y))
-      if(c <= 1) stop("data.y must contain at least two distinct factor levels")
-      yeval <- unique(data.y)
-      p <- fitted(npudens(tdat=data.y,edat=xeval,bws=0,...))
-      sum.Lambda3 <- c/(c-1)*sum(p*(1-p))
-      sum.Lambda2.minus.Lambda1.sq <- c^2/((c-1)^2)*sum(p*(1-p))
-      n.sum.Lambda1.sq <- n*sum(((1-c*p)/(c-1))^2)
-      bw.y <- sum.Lambda3/(sum.Lambda2.minus.Lambda1.sq+n.sum.Lambda1.sq)
-    }
+    if(is.null(bw.x))
+      bw.x <- .np_entropy_discrete_plugin_bw(data.x, "data.x", ...)
+    if(is.null(bw.y))
+      bw.y <- .np_entropy_discrete_plugin_bw(data.y, "data.y", ...)
   }
 	
   ## Hellinger distance (Srho) between the densities. This function
@@ -208,6 +215,11 @@ npunitest <- function(data.x = NULL,
         ## evaluating. This is proper and avoids division by
         ## zero. Note the difference between integration and summation
         ## in this case when the variables do not share common support.
+        if(entropy.fast.gaussian) {
+          return(.np_entropy_univariate_gaussian_summation(
+            data.x, data.y, bw.x, bw.y
+          ))
+        }
         f.data.x <- fitted(npudens(tdat=data.x,edat=data.x,bws=bw.x,...))
         f.data.y <- fitted(npudens(tdat=data.y,edat=data.x,bws=bw.y,...))
         summand <- f.data.y/f.data.x
@@ -225,31 +237,33 @@ npunitest <- function(data.x = NULL,
         return(Srho)
       } else {
         ## Integration
-        h <- function(x,data.x,data.y) {
-          f.data.x <- fitted(npudens(tdat=data.x,edat=x,bws=bw.x,...))
-          f.data.y <- fitted(npudens(tdat=data.y,edat=x,bws=bw.y,...))
-          return(0.5*(sqrt(f.data.x)-sqrt(f.data.y))**2)
+        if(entropy.fast.gaussian) {
+          return(.np_entropy_univariate_gaussian_integral(
+            data.x, data.y, bw.x, bw.y
+          ))
+        } else {
+          h <- function(x,data.x,data.y) {
+            f.data.x <- fitted(npudens(tdat=data.x,edat=x,bws=bw.x,...))
+            f.data.y <- fitted(npudens(tdat=data.y,edat=x,bws=bw.y,...))
+            return(0.5*(sqrt(f.data.x)-sqrt(f.data.y))**2)
+          }
+          return.integrate <- integrate(h,-Inf,Inf,subdivisions=1e+05,stop.on.error=FALSE,data.x=data.x,data.y=data.y)
+          if(return.integrate$message != "OK") .np_warning(return.integrate$message)
+          return(return.integrate$value)
         }
-        return.integrate <- integrate(h,-Inf,Inf,subdivisions=1e+05,stop.on.error=FALSE,data.x=data.x,data.y=data.y)      
-        if(return.integrate$message != "OK") .np_warning(return.integrate$message)
-        return(return.integrate$value)
       }
     } else {
-      xeval <- unique(data.x)
-      p.data.x <- fitted(npudens(tdat=data.x,edat=xeval,bws=bw.x,...))
-      p.data.y <- fitted(npudens(tdat=data.y,edat=xeval,bws=bw.y,...))   
-      ## Sum the information function over the unique probabilities and
-      ## return.
-      return(sum(0.5*(sqrt(p.data.x)-sqrt(p.data.y))**2))
+      return(.np_entropy_discrete_distance(
+        data.x, data.y, bw.x, bw.y, discrete.evaluation, ...))
     }
   }
 
   
   ## Compute the test statistic
 
-  .np_progress_note("Computing test statistic")
 
-  test.stat <- Srho.univar(data.x,data.y,bw.x,bw.y,method=method)
+  test.stat <- .np_progress_activity_run("Computing entropy statistic",
+    Srho.univar(data.x,data.y,bw.x,bw.y,method=method))
 
   if(bootstrap) {
     
@@ -269,22 +283,25 @@ npunitest <- function(data.x = NULL,
         data.null <- c(data.x,data.y)
       } else {
         if(is.ordered(data.x)) {
-          data.null <- ordered(c(as.character(data.x),as.character(data.y)))
+          data.null <- .np_factor_with_levels(c(as.character(data.x),as.character(data.y)),
+                               levels = levels(data.x), ordered = TRUE)
         } else {
-          data.null <- factor(c(as.character(data.x),as.character(data.y)))
+          data.null <- .np_factor_with_levels(c(as.character(data.x),as.character(data.y)),
+                              levels = levels(data.x))
         }
       }
       
     }
     
-    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
+    progress <- .np_progress_activity_begin(B, "Bootstrap replications", detail = NULL)
+    on.exit(.np_progress_activity_end(progress), add = TRUE)
 
     if (.npRmpi_unit_collective_context()) {
       plan <- .npRmpi_unit_bootstrap_index_plan(
         pool.n = length(data.null),
         n.x = length(data.x),
         n.y = length(data.y),
-        boot.num = boot.num
+        boot.num = B
       )
       post.boot.seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
       resampled.stat <- .npRmpi_unit_collective_bootstrap(
@@ -294,13 +311,40 @@ npunitest <- function(data.x = NULL,
         bw.y = bw.y,
         Srho.univar = Srho.univar,
         method = method,
+        fast.fixed.gaussian = method == "summation" &&
+          is.numeric(data.x) && entropy.fast.gaussian,
         progress = progress
       )
       assign(".Random.seed", post.boot.seed, envir = .GlobalEnv)
+    } else if(method == "integration" && is.numeric(data.x) &&
+              entropy.fast.gaussian) {
+      bootstrap.result <- .np_entropy_univariate_iid_bootstrap(
+        data.null = data.null,
+        size.x = length(data.x),
+        size.y = length(data.y),
+        bw.x = bw.x,
+        bw.y = bw.y,
+        boot.num = B,
+        progress = progress
+      )
+      resampled.stat <- bootstrap.result$values
+      progress <- bootstrap.result$progress
+    } else if(method == "summation" && is.numeric(data.x) &&
+              entropy.fast.gaussian) {
+      bootstrap.result <- .np_entropy_univariate_iid_summation_bootstrap(
+        data.null = data.null,
+        size.x = length(data.x),
+        size.y = length(data.y),
+        bw.x = bw.x,
+        bw.y = bw.y,
+        boot.num = B,
+        progress = progress
+      )
+      resampled.stat <- bootstrap.result$values
+      progress <- bootstrap.result$progress
     } else {
-      resampled.stat <- numeric(boot.num)
-      for (b in seq_len(boot.num)) {
-        progress <- .np_progress_step(progress, done = b)
+      resampled.stat <- numeric(B)
+      for (b in seq_len(B)) {
 
         ## Need to think this through... is the null one density? If so
         ## resample from that density for both x and y?
@@ -311,25 +355,26 @@ npunitest <- function(data.x = NULL,
         data.null.y <- data.null[sample.int(length(data.null), size = length(data.y), replace = TRUE)]
 
         resampled.stat[b] <- Srho.univar(data.null.x,data.null.y,bw.x,bw.y,method=method)
+        .np_progress_activity_step(progress, done = b)
       }
     }
 
-    progress <- .np_progress_end(progress)
+    .np_progress_activity_end(progress, completed = TRUE)
     
-    p.value <- mean(resampled.stat > test.stat)
+    p.value <- .np_bootstrap_upper_tail_pvalue(resampled.stat, test.stat)
     
   }
 
   ## Restore seed
 
-  .np_seed_exit(seed.state, remove_if_absent = TRUE)
+  .np_rng_scope_restore(seed.state)
 
   if(bootstrap) {
     unitest(Srho = test.stat,
                Srho.bootstrap = resampled.stat,
                P = p.value,
                bootstrap = bootstrap,
-               boot.num = boot.num,
+               boot.num = B,
                bw.x = bw.x,
                bw.y = bw.y)
   } else {

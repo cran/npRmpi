@@ -1,5 +1,6 @@
 %
 \name{npreg}
+\encoding{UTF-8}
 \alias{npreg}
 \alias{npreg.default}
 \alias{npreg.formula}
@@ -21,15 +22,17 @@
 npreg(bws, \dots)
 
 \method{npreg}{formula}(bws, 
-      data = NULL, 
+      data = NULL,
       newdata = NULL, 
-      y.eval = FALSE, 
+      y.eval = FALSE,
+      se = FALSE,
       \dots)
 
 \method{npreg}{default}(bws, 
       txdat, 
-      tydat, 
-      nomad = FALSE, 
+      tydat,
+      nomad = FALSE,
+      se = FALSE,
       \dots)
 
 \method{npreg}{rbandwidth}(bws,
@@ -40,6 +43,7 @@ npreg(bws, \dots)
       gradient.order = 1L,
       gradients = FALSE,
       residuals = FALSE,
+      se = FALSE,
       \dots)
 }
 
@@ -59,6 +63,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -78,7 +89,8 @@ These arguments identify the bandwidth specification, formula/data interface, an
   \item{tydat}{
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{txdat}. Defaults to the corresponding
+    \code{txdat}. Factors and ordered factors are not supported, including
+    categorical child bandwidths extracted from a partially linear model. Defaults to the corresponding
     training data recoverable from the bandwidth object in the current
     session.
   }
@@ -109,6 +121,19 @@ This argument controls the recommended automatic local-polynomial NOMAD route, w
 These arguments control where the regression is evaluated and which fitted quantities are returned.
 }
 
+  \item{se}{
+    a logical value indicating whether the residual-normalized sandwich
+    standard errors described below are computed and retained.
+    Defaults to \code{FALSE}.
+    With \code{se = FALSE}, fitted values and any requested
+    gradients are still computed, but the returned \code{merr} and
+    \code{gerr} components are \code{NULL}; \code{se()} and
+    \code{gradients(..., se = TRUE)} then fail with a message directing
+    the user to refit or re-evaluate with \code{se = TRUE}. This option
+    controls fit/evaluation output only and is not forwarded to bandwidth
+    selection.
+  }
+
   \item{exdat}{
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
@@ -119,7 +144,12 @@ These arguments control where the regression is evaluated and which fitted quant
   \item{eydat}{
     a one (1) dimensional numeric or integer vector of the true values
     of the dependent variable. Optional, and used only to calculate the
-    true errors.
+    true errors. When evaluation predictors are supplied without evaluation
+    outcomes, goodness-of-fit scores (including \code{R2} and \code{MSE}) are
+    unavailable and reported as \code{NA}; no additional training fit is
+    performed for these diagnostics.
+    When supplied, this response must also be numeric; factors and ordered
+    factors are not supported.
   }
 
 
@@ -128,7 +158,8 @@ These arguments control where the regression is evaluated and which fitted quant
     integer (or integer vector with one entry per continuous predictor)
     specifying derivative order(s). Defaults to \code{1L}. Orders
     exceeding \code{degree} for a variable are returned as
-    \code{NA}. Higher-order derivatives are available for continuous
+    \code{NA}, apart from the established all-degree-zero first-derivative
+    compatibility route. Higher-order derivatives are available for continuous
     predictors when the requested order does not exceed the
     corresponding local-polynomial degree.
   }
@@ -143,6 +174,11 @@ These arguments control where the regression is evaluated and which fitted quant
     unordered predictors the gradient columns are first-order
     effects/contrasts where supported; \code{gradient.order} controls
     derivative order for continuous predictors.
+    Plotting retains one panel per requested predictor: an unavailable
+    continuous derivative is shown as an empty, correctly labelled panel when
+    another continuous derivative or categorical effect is available. A
+    request for which no component is available is rejected with the affected
+    orders and degrees reported.
   }
 
 
@@ -187,6 +223,37 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   }
 }
 \details{
+  With generalized nearest-neighbor bandwidths, query identity matters when
+  selecting a radius: a training observation excludes its own occurrence,
+  whereas explicit evaluation data remain external queries even if their
+  values equal training observations. Consequently,
+  \code{predict(fit, newdata = training.data)} can differ from
+  \code{fitted(fit)}. This does not omit the training contribution from the
+  fitted estimator. See \code{\link{np.kernels}} for the radius convention.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} supplies \code{exdat};
+  explicitly supplied native evaluation arguments take precedence. This
+  evaluates at the requested rows without repeating bandwidth selection.
+
   Documentation guide: see \code{\link{npregbw}} for bandwidth
   selection and search controls, \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, \code{\link{plot}},
@@ -262,9 +329,151 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
   order Gaussian and Epanechnikov kernels, and the uniform
-  kernel. Unordered discrete data types use a variation on Aitchison and
+  kernel. Beta associated kernels of orders 2, 4, 6, and 8 are also available
+  for local-constant and local-polynomial regression. Unordered
+  discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  For \code{ckertype="beta"}, suppose continuous predictor \eqn{j} has
+  declared finite support \eqn{[a_j,b_j]}, width
+  \eqn{L_j=b_j-a_j}, public metric bandwidth \eqn{h_j}, evaluation coordinate
+  \eqn{x_j}, and observation \eqn{X_{ij}}. Define
+  \deqn{t_j=(x_j-a_j)/L_j,\quad z_{ij}=(X_{ij}-a_j)/L_j,\quad
+        \tau_j=(L_j/h_j)^2.}
+  The local-constant product weight is
+  \deqn{K_i(x)=\prod_j \left\{\frac{1}{L_j}
+    \frac{z_{ij}^{t_j\tau_j}(1-z_{ij})^{(1-t_j)\tau_j}}
+    {B(1+t_j\tau_j,1+(1-t_j)\tau_j)}\right\},}
+  and the fitted conditional mean is the Nadaraya--Watson ratio
+  \deqn{\widehat m(x)=\frac{\sum_i K_i(x)Y_i}{\sum_i K_i(x)}.}
+  This uses Chen's evaluation-centred beta associated-kernel contribution
+  inside the established \pkg{np} local-constant ratio. It should not be
+  confused with the Gasser--Muller beta regression smoother studied by Chen
+  (2000). The support scale is already present in each contribution, and the
+  implementation applies neither the legacy \eqn{1/h_j} factor nor the generic
+  bounded-kernel normalizer. Although that normalizer cancels from ordinary
+  local-constant numerator/denominator ratios, the beta kernel is not merely
+  such a correction: its shape parameters change with the evaluation point.
+
+  At orders 4, 6, and 8, each displayed order-2 coordinate factor is replaced
+  by the signed Igarashi--Kakizawa multiscale combination documented in
+  \code{\link{np.kernels}}. The resulting product weights and denominator may
+  be signed; no absolute-value, order-2 substitution, or positivity repair is
+  applied.
+
+  Products and ratios are evaluated in the log domain, so representable beta
+  regression results are retained even when every unscaled product would
+  underflow to zero. In the local-constant case,
+  \eqn{\ell_i(x)=K_i(x)/\sum_r K_r(x)}. The reported standard error uses
+  the residual-normalized sandwich formula below, also for beta kernels;
+  it is not a local residual-variance estimate multiplied by an
+  effective-sample factor.
+
+  The beta regression route requires \code{ckerorder} in
+  \code{c(2,4,6,8)} and finite fixed or sample-range bounds for each continuous
+  predictor. It supports local-constant, local-linear and local-polynomial
+  fits, including mixed continuous and categorical predictors. Local-constant
+  first derivatives requested with \code{gradients=TRUE} are analytic C
+  implementations; their standard errors use the derivative of the normalized
+  weights. At exact support endpoints,
+  normalized numerator/denominator jumps are cancelled first. A genuine
+  estimator jump is returned as a signed infinity with \code{gerr=NA}; an
+  indeterminate numerical cancellation is returned as \code{NA} with a
+  warning. This extended-real gradient is retained in fitted and plot-data
+  objects. Plot methods omit the non-finite coordinate only from their
+  temporary drawing geometry, so an endpoint singularity breaks the plotted
+  line without changing the returned estimate. Manual and
+  cross-validated bandwidth objects support fixed, generalized-NN, and
+  adaptive-NN modes. An evaluation point
+  with no supported observation weight also produces an explicit error.
+
+  For ordinary adaptive-NN local-constant regression, an external evaluation
+  row with zero total kernel weight has an undefined fitted value and is
+  returned as \code{NA}, together with its requested gradients and standard
+  errors. A single warning identifies affected rows. Valid rows are retained;
+  internal computations that require these fits do not silently omit them.
+
+  \subsection{Standard Errors}{
+  Ordinary regression standard errors use a residual-normalized sandwich
+  for the actual fitted linear map, conditional on the selected bandwidths,
+  polynomial specification and realized predictor geometry. Let \eqn{S}
+  map training responses to their fitted values, let \eqn{e=(I-S)Y}, and
+  define
+  \deqn{q_i=\sum_j(\delta_{ij}-S_{ij})^2.}
+  For \eqn{q_i>0}, the normalized training residual is
+  \eqn{z_i=e_i/\sqrt{q_i}}. This is the pre-smoothing residual normalization
+  in Ruppert, Wand, Holst, and \enc{Hössjer}{Hossjer}
+  (1997, Section 1.1, equation (3)),
+  not their separate variance-function smoothing procedure. If
+  \eqn{\ell_i(x)} is the influence of response \eqn{Y_i} on the fitted mean
+  at \eqn{x}, the reported standard error is
+  \deqn{\operatorname{se}\{\widehat m(x)\}
+    =\left\{\sum_i \ell_i(x)^2 z_i^2\right\}^{1/2}.}
+  A derivative uses its corresponding influence row. A categorical finite
+  difference uses the difference between the two endpoint influence rows,
+  retaining their covariance. Its estimate and error use the same paired
+  influence calculation rather than subtracting nearly equal fitted values.
+  Requesting or omitting standard errors does not change the computation
+  of a requested categorical effect.
+
+  For generalized nearest-neighbor bandwidths, categorical effects at fitted
+  training rows retain that row's training identity when selecting the radius
+  for both endpoints, for all regression types, polynomial degrees and bases.
+  The identity is excluded only from radius selection, not from the fitted
+  response weights. Explicit evaluation data use external-query radii, even
+  when their coordinates equal training observations. Consequently fitted-row
+  and explicitly evaluated effects can differ under this bandwidth type.
+
+  The training smoother and influence rows use the actual fitted basis
+  and accepted regularized solve where needed. The residual-row norm is
+  not generally \eqn{1-S_{ii}}; that identity requires a symmetric,
+  idempotent projection. Nor is \eqn{q_i} necessarily at most one.
+  No additional degrees-of-freedom multiplier or positive variance floor
+  is applied. The corresponding influence representation is used without
+  retaining a full training-by-training matrix.
+
+  Treating the smoother as fixed, under independent homoskedastic errors
+  and a mean reproduced by that smoother,
+  \eqn{E(e_i^2\mid X)=\sigma^2q_i}. The normalization corrects fitted
+  residual noise contraction in that setting, not smoothing bias.
+  With a general mean, squared residual bias also contributes.
+  Under heteroskedasticity, \eqn{e_i^2/q_i} mixes donor variances and need
+  not be unbiased for the variance of observation \eqn{i}. Finite-sample
+  calibration under arbitrary bias, heteroskedasticity or model selection
+  is not guaranteed.
+
+  A zero residual-row norm leaves no residual information for that donor.
+  Requested errors depending on such unidentified information are
+  \code{NA}, with a warning; finite point estimates remain available.
+  A separately certified zero influence does not require that donor's
+  variance. Small positive residual norms are not replaced by zero or
+  by a numerical variance floor.
+
+  This convention applies to fixed, generalized-NN and adaptive-NN
+  bandwidths and beta kernels on supported regression routes.
+  External evaluation errors use the training smoother's normalized
+  residuals, not residuals centred on each external evaluation mean.
+  Bandwidth- and degree-selection uncertainty is not incorporated.
+  \code{se()}, derivative-error accessors, prediction standard errors and
+  asymptotic plot intervals consume the corresponding retained errors.
+  Pivotal \code{\link{npsigtest}} statistics use these gradient
+  errors, recomputed from each bootstrap response when bootstrapping.
+  }
+
+  \subsection{Numerical Ridging}{
+  Local-linear and local-polynomial moment solves use numerical ridging
+  when needed, motivated by Seifert and Gasser (2000). The package uses
+  bounded implementation-specific ridge policies, not that paper's complete
+  data-adaptive ridge selector. Ridging stabilizes the fit; it is distinct
+  from the residual normalization above, which uses the actual accepted
+  smoother, including any ridge adjustment.
+  A local system with fewer nonzero-weight donor rows than basis
+  coefficients is structurally rank deficient and uses this same ridge
+  policy for fitting and related hat operators. Bootstrap multiplicities
+  do not create additional independent donor rows. This check does not
+  assert full rank when the donor count reaches the basis dimension.
+  }
 
   When bandwidths are obtained with \code{regtype="lp"}, C-level
   \code{npreg} supports heterogeneous continuous polynomial degrees via
@@ -277,15 +486,39 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   multi-indices \eqn{\alpha}{alpha} with
   \eqn{\alpha_j \le d_j}{alpha[j] <= d[j]} and
   \eqn{0<\sum_j \alpha_j \le \max_j d_j}{0<sum(alpha)<=max(d)} plus
-  an intercept. The optional flag \code{bernstein.basis}
-  controls basis construction: \code{FALSE} (default) uses raw
-  local-polynomial powers, while \code{TRUE} uses a Bernstein/B-spline basis. The
+  an intercept. Thus, for \eqn{d=(2,1)}{d=(2,1)}, GLP contains
+  \eqn{1,x_1,x_1^2,x_2,x_1x_2}{1, x1, x1^2, x2, x1*x2}; the additive
+  basis omits \eqn{x_1x_2}{x1*x2}, while the tensor basis additionally
+  contains \eqn{x_1^2x_2}{x1^2*x2}.
+
+  The optional flag \code{bernstein.basis} controls basis construction:
+  \code{FALSE} (default) uses raw local-polynomial powers. These can be
+  numerically unstable, particularly above degree one or when predictor
+  offsets are large relative to their spread. The option
+  \code{bernstein.basis=TRUE} is provided to improve numerical conditioning;
+  it does not remedy genuine collinearity. Centring/scaling continuous
+  predictors is another explicit user choice. Existing conditioning warnings
+  and errors assess the selected basis; numerical rank deficiency need not
+  imply genuinely redundant predictors. No automatic basis switch is made.
+  For
+  \code{basis="glp"}, the historical selector \code{TRUE} uses a
+  degree-graded, orthonormal shifted-Legendre representation. On the unit-scaled support
+  \eqn{u\in[0,1]}{u in [0,1]}, its order-\eqn{k}{k} factor is
+  \eqn{\sqrt{2k+1}P_k(2u-1)}{sqrt(2*k+1) P[k](2*u-1)}, where
+  \eqn{P_k}{P[k]} is a Legendre polynomial. This is an exact
+  degree-\eqn{k}{k} linear combination of Bernstein polynomials and, because
+  the GLP multi-index set is downward closed, spans exactly the same
+  heterogeneous polynomial space as the raw representation. It is evaluated
+  by a deterministic Legendre recurrence, not by sample-dependent
+  Gram--Schmidt or QR orthogonalization. Additive and
+  tensor bases retain their fixed-coordinate-degree Bernstein
+  representation. The
   homogeneous degree-0 and degree-1 cases remain
   equivalent to \code{lc} and \code{ll}, respectively. For continuous
   predictors, \code{gradients=TRUE} returns the derivative order(s)
   requested by \code{gradient.order}; the associated \code{gerr}
   entries are standard errors for those same derivative orders. Both
-  raw and Bernstein/B-spline bases report fitted values and derivatives
+  raw and shifted-Legendre representations report fitted values and derivatives
   on the original response/predictor scale. In mixed-data GLP settings,
   unordered and ordered predictors contribute first-order
   effects/contrasts rather than higher-order derivatives.
@@ -333,13 +566,35 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   and \code{\link{plot}} support objects of this type. The returned object
   has the following components:
 
+  With \code{se.fit=TRUE}, \code{predict()} returns \code{fit},
+  \code{se.fit}, \code{df}, and \code{residual.scale}. The last field
+  uses training MSE in its historical units, not its square root or an
+  evaluation MSE. It reuses a known training fit's MSE without an additional
+  fit. It is \code{NA} when training MSE is unavailable, including an object
+  created at external evaluation points or scored against explicit
+  \code{eydat}, and external predictions with explicit training-data or
+  model-frame overrides. A prediction evaluated on replacement training data
+  can use that new training fit's MSE. Evaluation outcomes do not substitute
+  for training residual information.
+
 
   \item{eval}{ evaluation points }
   \item{mean}{ estimates of the regression function (conditional mean) at the
-  evaluation points }
-  \item{merr}{ standard errors of the regression function estimates }
-  \item{grad}{ estimates of the gradients at each evaluation point }
-  \item{gerr}{ standard errors of the gradient estimates }
+  evaluation points. An evaluation row whose required kernel normalization is
+  exactly zero or non-finite is returned as \code{NA}; other rows remain
+  available. }
+  \item{merr}{ standard errors of the regression function estimates, or
+    \code{NULL} when \code{se = FALSE}. Undefined normalization rows are
+    returned as \code{NA}. Requested errors depending on unidentified
+    training residual information are also \code{NA}; finite point
+    estimates are retained. See the Standard Errors subsection. }
+  \item{grad}{ estimates of the gradients at each evaluation point. Undefined
+    normalization rows are returned as \code{NA}. }
+  \item{gerr}{ standard errors of the gradient estimates, or \code{NULL}
+    when \code{se = FALSE}. Undefined normalization rows are returned as
+    \code{NA}. Requested errors depending on unidentified training
+    residual information are also \code{NA}, separately from certified
+    zero effects. See the Standard Errors subsection. }
   \item{resid}{ if \code{residuals = TRUE}, in-sample or out-of-sample
     residuals where appropriate (or possible) }
   \item{R2}{ coefficient of determination (Doksum and Samarov (1995))}
@@ -359,9 +614,16 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   are normalized generalized product-kernel weights over the continuous,
   unordered, and ordered components of \eqn{X}. Local-polynomial
   regression replaces this scalar weighted average by a weighted least
-  squares fit in powers of the continuous coordinates around \eqn{x};
-  the fitted intercept is the estimate of \eqn{m(x)} and the fitted
-  slope terms give the reported gradients where available.
+  squares fit in powers \eqn{b(X_i)}{b(X[i])} of the original continuous
+  coordinates, with kernel weights centered at \eqn{x}. If
+  \eqn{\widehat\beta_x}{beta-hat[x]} denotes that local weighted fit, the
+  reported level and derivative are respectively
+  \eqn{b(x)^T\widehat\beta_x}{b(x)' beta-hat[x]} and
+  \eqn{D^\gamma b(x)^T\widehat\beta_x}{D^gamma b(x)' beta-hat[x]}.
+  For the downward-closed GLP space this uncentered representation is
+  numerically equivalent, up to floating-point solution paths, to fitting
+  powers of \eqn{X_i-x}{X[i]-x} and reading the corresponding intercept and
+  derivative coefficients.
 
   For book-length derivations, see Li and Racine (2007), Chapter 2
   \emph{Regression}, especially Sections 2.1, 2.2, 2.4, and 2.5, and
@@ -379,6 +641,24 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   Cheng, M.-Y. and P. Hall and D.M. Titterington (1997), \dQuote{On the
   shrinkage of local linear curve estimators,} Statistics and Computing,
   7, 11-17.
+
+  Chen, S.X. (1999), \dQuote{Beta kernel estimators for density functions,}
+  Computational Statistics and Data Analysis, 31, 131-145.
+
+  Chen, S.X. (2000), \dQuote{Beta kernel smoothers for regression curves,}
+  Statistica Sinica, 10, 73-91.
+
+  Igarashi, G. and Kakizawa, Y. (2020), \dQuote{Higher-order bias corrections
+  for asymmetric kernel density estimators,} Journal of Nonparametric
+  Statistics, 32(3), 716--752. doi:10.1080/10485252.2020.1770754.
+
+  Cohen, A. and G. Migliorati (2018), \dQuote{Multivariate approximation
+  in downward closed polynomial spaces,} in R. Cools and D. Nuyens (eds.),
+  \emph{Contemporary Computational Mathematics}, Springer, 233-282.
+
+  Dung, D. and T. Ullrich (2011), \dQuote{Whitney type inequalities for
+  local anisotropic polynomial approximation,} Journal of Approximation
+  Theory, 163, 1590-1605.
 
   Fan, J. and I. Gijbels (1996), \emph{Local Polynomial Modelling and
   Its Applications,} Chapman and Hall.
@@ -407,6 +687,19 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
     regression functions with both categorical and continuous data,}
   Journal of Econometrics, 119, 99-130.
 
+  Ruppert, D. and M.P. Wand (1994), \dQuote{Multivariate locally weighted
+  least squares regression,} The Annals of Statistics, 22, 1346-1370.
+
+  Ruppert, D., M.P. Wand, U. Holst, and O. \enc{Hössjer}{Hossjer} (1997),
+  \dQuote{Local Polynomial Variance-Function Estimation,}
+  Technometrics, 39(3), 262-273.
+  \doi{10.1080/00401706.1997.10485117}.
+
+  Seifert, B. and T. Gasser (2000),
+  \dQuote{Data Adaptive Ridging in Local Polynomial Regression,}
+  Journal of Computational and Graphical Statistics, 9(2), 338-360.
+  \doi{10.1080/10618600.2000.10474884}.
+
   Wang, M.C. and J. van Ryzin (1981), \dQuote{A class of smooth
     estimators for discrete distributions,} Biometrika, 68, 301-309.
 
@@ -423,13 +716,46 @@ Further arguments are passed to \code{\link{npregbw}} when bandwidths are comput
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available. With explicit replacement
+  training data, an explicit \code{na.action} overrides the retained policy,
+  including \code{NULL}; any incomplete rows subsequently excluded by native
+  fitting are recorded in the effective training sample. User formula and
+  custom-function environments remain available and can retain unrelated
+  caller objects in serialized files. See \code{\link{npregbw}} for storage
+  and missing-value policy details.
+}
+
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{

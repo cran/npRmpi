@@ -1,5 +1,13 @@
 \name{npregivderiv}
 \alias{npregivderiv}
+\alias{npregivderiv.default}
+\alias{npregivderiv.formula}
+\alias{summary.npregivderiv}
+\alias{print.summary.npregivderiv}
+\alias{fitted.npregivderiv}
+\alias{gradients.npregivderiv}
+\alias{residuals.npregivderiv}
+\alias{plot.npregivderiv}
 
 \title{
 Nonparametric Instrumental Derivatives
@@ -16,7 +24,9 @@ function \eqn{\varphi'}{phi'} is the solution of an ill-posed inverse
 problem, and is computed using Landweber-Fridman regularization.
 }
 \usage{
-npregivderiv(y,
+npregivderiv(y, \dots)
+
+\method{npregivderiv}{default}(y,
              z,
              w,
              x = NULL,
@@ -32,12 +42,57 @@ npregivderiv(y,
              start.from = c("Eyz","EEywz"),
              starting.values = NULL,
              stop.on.increase = TRUE,
+             regtype = c("ll","lc","lp"),
+             degree = NULL,
+             nomad = FALSE,
              ...)
+
+\method{npregivderiv}{formula}(y,
+             data = NULL,
+             subset,
+             na.action,
+             newdata = NULL,
+             zeval = NULL,
+             weval = NULL,
+             xeval = NULL,
+             ...)
+
+\method{plot}{npregivderiv}(x, gradients = TRUE,
+             data_overlay = TRUE, data_rug = FALSE,
+        output = c("plot", "data", "plot-data"), ...)
 }
 \arguments{
 \subsection{Data, Bandwidth Inputs And Formula Interface}{
 These arguments identify the response, endogenous variables, instruments, exogenous covariates, and evaluation data.
 }
+
+  \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
+    an optional data frame used with the formula interface. This estimator
+    accepts \code{y ~ z | w}. The shared parser recognizes the optional
+    \code{| x} partition but this univariate derivative operator rejects it
+    explicitly; see Details.
+  }
+
+  \item{subset}{
+    an optional expression selecting training rows in the formula interface.
+  }
+
+  \item{na.action}{
+    a function specifying missing-value handling for the formula model frame.
+  }
+
+  \item{newdata}{
+    an optional data frame supplying fit-time values of formula variable
+    \code{z} at which to evaluate the structural derivative. It may contain
+    any positive number of rows. Explicit \code{zeval} takes precedence.
+  }
 
   \item{w}{
     a \eqn{q}-variate data frame of instruments. The data types may be
@@ -46,41 +101,65 @@ These arguments identify the response, endogenous variables, instruments, exogen
   }
 
   \item{weval}{
-    a \eqn{q}-variate data frame of instruments on which the regression
-    will be estimated (evaluation data). By default, evaluation
-    takes place on the data provided by \code{w}.
+    retained for compatibility. The inverse problem is defined on the
+    training instruments, so a supplied value must equal \code{w}; use
+    \code{zeval} to request derivative evaluation.
   }
 
   \item{x}{
-    an \eqn{r}-variate data frame of exogenous regressors. The data
-    types may be continuous, discrete (unordered and ordered factors),
-    or some combination thereof.
+    for \code{npregivderiv.default}, reserved for interface compatibility. The present derivative estimator
+    supports one univariate endogenous \code{z} and does not yet support a
+    separate exogenous \code{x}; a non-\code{NULL} value fails explicitly. For
+    \code{plot.npregivderiv}, an \code{npregivderiv} object.
   }
 
   \item{xeval}{
-    an \eqn{r}-variate data frame of exogenous regressors on which the
-    regression will be estimated (evaluation data). By default,
-    evaluation takes place on the data provided by \code{x}.
+    reserved with \code{x}; it is not available until the derivative operator
+    supports separate exogenous regressors.
   }
 
 
   \item{y}{
-    a one (1) dimensional numeric or integer vector of dependent data, each
-    element \eqn{i} corresponding to each observation (row) \eqn{i} of
-    \code{z}.
+    a one (1) dimensional numeric or integer vector of dependent data, or a
+    formula using the explicit IV grammar described under \code{data}. Each
+    response element \eqn{i} corresponds to row \eqn{i} of \code{z}.
   }
 
 
   \item{z}{
-    a \eqn{p}-variate data frame of endogenous regressors. The data
-    types may be continuous, discrete (unordered and ordered factors),
-    or some combination thereof.
+    one finite continuous numeric endogenous regressor with at least two
+    distinct support points.
   }
 
   \item{zeval}{
-    a \eqn{p}-variate data frame of endogenous regressors on which the
-    regression will be estimated (evaluation data). By default, evaluation
-    takes place on the data provided by \code{z}.
+    finite values of the endogenous regressor at which to evaluate the
+    structural derivative. The training inverse problem, residuals, centering,
+    stopping rule, and selected state remain based on \code{z} and \code{w}.
+    By default no separate evaluation surface is stored.
+  }
+
+  \item{gradients}{
+    logical; display the structural derivative when \code{TRUE}, the default,
+    or the reconstructed training structural function when \code{FALSE}.
+    Derivative displays use \code{zeval} and \code{phi.prime.eval} when a
+    separate evaluation grid was supplied.
+  }
+
+  \item{output}{Plot return mode: \code{"plot"} draws; \code{"data"}
+    returns \code{\link{np_plot_data}}; \code{"plot-data"} does both.}
+
+  \item{data_overlay}{
+    logical; overlay the training response on a structural-function display.
+    The default is \code{TRUE}, as for \code{plot.npregression}. It is ignored
+    when \code{gradients=TRUE} because response values and derivatives do not
+    share a common vertical scale. When limits are not supplied, the structural
+    curve and response are both included in the displayed range.
+  }
+
+  \item{data_rug}{
+    logical; add a rug showing the training \code{z} support. The default is
+    \code{FALSE}, and it applies to both derivative and structural-function
+    displays.
   }
 
 \subsection{Iteration Controls}{
@@ -101,8 +180,9 @@ These arguments control derivative iteration and reproducibility settings.
 
 
   \item{iterate.max}{
-    an integer indicating the maximum number of iterations permitted
-    before termination occurs for Landweber-Fridman iteration.
+    an integer indicating the maximum number of complete positive
+    Landweber-Fridman states to evaluate. The initialization state is
+    numbered zero and does not consume this budget.
   }
 
 
@@ -114,6 +194,8 @@ These arguments control derivative iteration and reproducibility settings.
 
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This ensures
     replicability of the numerical search. Defaults to 42.
   }
@@ -132,15 +214,19 @@ These arguments control residual smoothing and the initial derivative path.
 
 
 \item{start.from}{ a character string indicating whether to start from
-  \eqn{E(Y|z)} (default, \code{"Eyz"}) or from \eqn{E(E(Y|z)|z)} (this can
+  \eqn{E(Y|z)} (default, \code{"Eyz"}) or from \eqn{E(E(Y|w)|z)} (this can
   be overridden by providing \code{starting.values} below)
 }  
 
-\item{starting.values}{ a value indicating whether to commence
-  Landweber-Fridman assuming
-  \eqn{\varphi'_{-1}=starting.values}{phi'[-1]=starting.values} (proper
-  Landweber-Fridman) or instead begin from \eqn{E(y|z)} (defaults to
-  \code{NULL}, see details below)
+\item{starting.values}{ an optional vector supplying the derivative
+  immediately before the first reported Landweber-Fridman update. When
+  omitted, the initialization derivative is obtained from \code{start.from}
+  (see details below). A separate \code{zeval} grid is not accepted with a
+  supplied initialization because no interpolation rule for the externally
+  supplied derivative has been declared. Repeated training values of
+  \code{z} must have identical supplied derivative values; conflicting
+  values do not define a single-valued function and are rejected before
+  bandwidth preparation.
 }
 
   \item{stop.on.increase}{
@@ -150,32 +236,109 @@ These arguments control residual smoothing and the initial derivative path.
     but increased).
   }
 
+\subsection{Regression Smoothing Controls}{
+These arguments control all internal \code{npreg} stages consistently.
+}
+
+  \item{regtype}{
+    a fixed regression type: \code{"ll"} (the default), \code{"lc"}, or
+    \code{"lp"}. The default applies local-linear, degree-one smoothing to
+    every internal stage containing continuous predictors, matching the
+    default polynomial order of \code{npregiv}. A categorical-only internal
+    stage uses local constant because no continuous polynomial term exists.
+    Supply \code{regtype="lc"} to recover the former omitted-default
+    computation.
+  }
+
+  \item{degree}{
+    one nonnegative integer required with \code{regtype="lp"}. It is expanded
+    only across the continuous coordinates of each internal regression stage;
+    vectors are not recycled across heterogeneous stages, and a
+    categorical-only stage uses local constant.
+  }
+
+  \item{nomad}{
+    logical or \code{"auto"}. Only \code{FALSE} is currently supported for
+    the multi-stage derivative estimator. Other values fail explicitly until
+    the stage-wise search/state contract is validated.
+  }
+
 
 \subsection{Additional Arguments}{
 Further arguments are passed to \code{\link{npreg}} and \code{\link{npksum}}.
 }
 
-  \item{...}{ 
-    additional arguments supplied to \code{\link{npreg}} and \code{\link{npksum}}.
+  \item{...}{
+    Only fixed bandwidths are currently supported. Supplying
+    \code{bwtype="generalized_nn"} or \code{bwtype="adaptive_nn"} raises an
+    informative error; use \code{bwtype="fixed"} (the default).
+    Additional arguments supplied to \code{\link{npreg}} and
+    \code{\link{npksum}}. The private integral kernel sum in the empirical
+    adjoint always uses \code{bandwidth.divide = TRUE}, as required for the
+    ordinary CDF normalization; a \code{bandwidth.divide} value in
+    \code{...} continues to be supplied to \code{npreg} but does not override
+    this internal normalization. Likewise, \code{ukertype} and
+    \code{okertype} in \code{...} control applicable internal regressions,
+    while the private adjoint retains its required
+    \code{ukertype = "liracine"} and \code{okertype = "liracine"}. For the
+    plot method, graphical arguments control the fitted curve and base-graphics
+    frame as applicable. Explicit \code{xlim} and \code{ylim} are honored;
+    automatic limits include every active curve, overlay, and rug layer.
   }
 
 }
 \details{
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
+  Local-polynomial nuisance fits may use numerical diagonal ridging.
+  For its Seifert--Gasser motivation, see \code{\link{npreg}}.
+  This is distinct from regularization of the instrumental-variable
+  inverse problem and does not apply the ordinary-regression residual
+  uncertainty correction to IV inference.
+
   Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
+  The formula interface uses explicit role order:
+  \code{y ~ z | w} and \code{y ~ z | w | x}. Additive transformations and
+  factors are retained through \code{model.frame}. Dot expansion and formula
+  interaction operators are rejected because they do not identify a unique
+  mixed-data kernel role; create an explicit transformed variable (for example
+  with \code{I(a * b)}) instead. Native vector/data-frame calls remain
+  supported unchanged.
 
-  Note that Landweber-Fridman iteration presumes that
-  \eqn{\varphi_{-1}=0}{phi[-1]=0}, and so for derivative estimation we
-  commence iterating from a model having derivatives all equal to
-  zero. Given this starting point it may require a fairly large number
-  of iterations in order to converge. Other perhaps more reasonable
-  starting values might present themselves. When \code{start.phi.zero}
-  is set to \code{FALSE} iteration will commence instead using
-  derivatives from the conditional mean model \eqn{E(y|z)}. Should the
-  default iteration terminate quickly or you are concerned about your
-  results, it would be prudent to verify that this alternative starting
-  value produces the same result. Also, check the norm.stop vector for
-  any anomalies (such as the error criterion increasing immediately).
+  The current derivative operator is univariate in \code{z}. Consequently,
+  although the shared parser recognizes the package-wide optional \code{| x}
+  partition, \code{npregivderiv} rejects it explicitly rather than silently
+  changing the derivative target. Post-fit \code{predict()} is not available;
+  use fit-time \code{newdata} or the native evaluation arguments.
+
+  Fit-time evaluation is output-only. Conditional regressions, the empirical
+  adjoint, fitted-residual centering, structural integration, stopping values,
+  and state selection are always computed on aligned training rows. A separate
+  \code{zeval} accumulates the derivative corrections from those same training
+  states into \code{phi.prime.eval} and \code{phi.prime.eval.mat}; it cannot
+  change \code{phi}, \code{phi.prime}, their training paths, or
+  \code{norm.stop}. Structural levels at arbitrary new points are not returned
+  because this derivative estimator's integration and centering normalization
+  is defined on the training support.
+
+
+  Let \eqn{\varphi'_0}{phi'[0]} denote the initialization derivative,
+  obtained from \code{start.from} or supplied directly through
+  \code{starting.values}. Its integrated and centered curve is
+  \eqn{\varphi_0}{phi[0]}. This state is retained in
+  \code{starting.values.phi.prime} and \code{starting.values.phi}; it is
+  not a column of the positive-iteration matrices. For \eqn{N=1,2,\ldots},
+  iteration \eqn{N} means exactly \eqn{N} completed residual-correction
+  updates after this initialization. Column \eqn{N} of
+  \code{phi.prime.mat} and \code{phi.mat} therefore contains the coherent
+  pair \eqn{(\varphi'_N,\varphi_N)}{(phi'[N],phi[N])}, and
+  \code{norm.stop[N]} is evaluated at that same state using the multiplier
+  \eqn{N}. Check the stopping vector for anomalies such as an immediate
+  increase.
   
   Landweber-Fridman iteration uses an optimal stopping rule based upon
   \eqn{||E(y|w)-E(\varphi_k(z,x)|w)||^2 }{||E(y|w)-E(phi(z,x)|w)||^2
@@ -199,23 +362,47 @@ Further arguments are passed to \code{\link{npreg}} and \code{\link{npksum}}.
   as the residuals evolve incrementally while still guarding against
   local optima.
 
-  Iteration will terminate when either the change in the value of
-  \eqn{||(E(y|w)-E(\varphi_k(z,x)|w))/E(y|w)||^2
-  }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } from iteration to iteration is
-  less than \code{iterate.diff.tol} or we hit \code{iterate.max} or
-  \eqn{||(E(y|w)-E(\varphi_k(z,x)|w))/E(y|w)||^2
-  }{||(E(y|w)-E(phi(z,x)|w))/E(y|w)||^2 } stops falling in value and
-  starts rising.  }
+  With \code{iterate.break=TRUE}, iteration can stop after the stopping rule
+  turns upward once the initial guard interval has passed; otherwise all
+  states through \code{iterate.max} are evaluated. The selected state is then
+  obtained from the computed stopping profile.  }
 
 \value{
 
   \code{npregivderiv} returns a \code{npregivderiv} object.  The
-    generic functions \code{\link{print}}, \code{\link{summary}}, and
-    \code{\link{plot}} support objects of this type.
+    generic functions \code{\link{print}}, \code{\link{summary}},
+    \code{\link{plot}}, \code{\link{fitted}}, \code{\link{residuals}}, and
+    \code{\link{gradients}} support objects of this type. \code{fitted}
+    returns the reconstructed training structural function while \code{gradients}
+    returns the training derivative estimate. Residuals use the aligned
+    training structural curve even when a separate evaluation grid was
+    supplied. For formula fits using an exclusion-style
+    \code{na.action}, these accessors restore omitted rows. \code{summary}
+    returns a structured
+    \code{summary.npregivderiv} object with a dedicated print method. The
+    printed smoothing description reports the effective continuous-stage
+    policy using the same \code{Kernel Regression Estimator:} labels as
+    \code{npreg}: \code{Local-Constant}, \code{Local-Linear}, or, for
+    \code{regtype="lp"}, the local-polynomial degree and basis details.
+
+    The plot method displays the derivative by default, preserving the
+    estimator family's primary target. Set \code{gradients=FALSE} to display
+    the reconstructed training structural function. The training response is
+    overlaid only on that level display; \code{data_rug=TRUE} adds the training
+    support without replacing an available derivative evaluation curve.
 
   \code{npregivderiv} returns a list with components \code{phi.prime},
-  \code{phi}, \code{num.iterations}, \code{norm.stop} and
-  \code{convergence}.
+  \code{phi}, \code{phi.prime.mat}, \code{phi.mat}, and, when a separate
+  evaluation grid was supplied, \code{phi.prime.eval} and
+  \code{phi.prime.eval.mat},
+  \code{num.iterations}, \code{norm.stop}, \code{convergence}, and the
+  initialization components \code{starting.values.phi.prime} and
+  \code{starting.values.phi}. \code{num.iterations} is the selected state
+  returned in \code{phi.prime} and \code{phi}; the number of states evaluated,
+  including any stopping-rule overshoot, is \code{length(norm.stop)}. The
+  compact \code{bws}, \code{smoothing.spec}, and \code{stage.specs}
+  components record stage bandwidth payloads and requested/effective
+  fixed-degree smoothing state without replacing the legacy bandwidth fields.
   
 }
 
@@ -272,119 +459,55 @@ Further arguments are passed to \code{\link{npreg}} and \code{\link{npksum}}.
 }
 \examples{
 \dontrun{
-## Not run in checks: excluded to keep MPI examples stable and check times short.
-## The following example is adapted for interactive parallel execution
-## in R. Here we spawn 1 slave so that there will be two compute nodes
-## (master and slave).  Kindly see the batch examples in the demos
-## directory (npRmpi/demos) and study them carefully. Also kindly see
-## the more extensive examples in the np package itself. See the npRmpi
-## vignette for further details on running parallel np programs via
-## vignette("npRmpi_getting_started", package = "npRmpi").
+## This illustration was made possible by Samuele Centorrino
+## <samuele.centorrino@univ-tlse1.fr>
 
-## Start npRmpi for interactive execution. If slaves are already running and
-## `options(npRmpi.reuse.slaves=TRUE)` (default on some systems), this will
-## reuse the existing pool instead of respawning. To change the number of
-## slaves, call `npRmpi.quit(force=TRUE)` then restart.
+npRmpi.init(nslaves = 1)
 
-force.run <- nzchar(Sys.getenv("NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK"))
+set.seed(42)
+n <- 500
+trim <- 0.005
 
-in.check <- !force.run && (
-            nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_")) ||
-            nzchar(Sys.getenv("_R_CHECK_INTERNALS2_")) ||
-            nzchar(Sys.getenv("_R_CHECK_CRAN_INCOMING_")) ||
-            nzchar(Sys.getenv("_R_CHECK_EXAMPLE_TIMING_THRESHOLD_"))
-          )
-
-if (!in.check) {
-npRmpi.init(nslaves=1)
-
-# ## This illustration was made possible by Samuele Centorrino
-# ## <samuele.centorrino@univ-tlse1.fr>
-# 
-# set.seed(42)
-# n <- 1500
-# 
-# ## For trimming the plot (trim .5\% from each tail)
-# 
-# trim <- 0.005
-# 
-# ## The DGP is as follows:
-# 
-# ## 1) y = phi(z) + u
-# 
-# ## 2) E(u|z) != 0 (endogeneity present)
-# 
-# ## 3) Suppose there exists an instrument w such that z = f(w) + v and
-# ## E(u|w) = 0
-# 
-# ## 4) We generate v, w, and generate u such that u and z are
-# ## correlated. To achieve this we express u as a function of v (i.e. u =
-# ## gamma v + eps)
-# 
-# v <- rnorm(n,mean=0,sd=0.27)
-# eps <- rnorm(n,mean=0,sd=0.05)
-# u <- -0.5*v + eps
-# w <- rnorm(n,mean=0,sd=1)
-# 
-# ## In Darolles et al (2011) there exist two DGPs. The first is
-# ## phi(z)=z^2 and the second is phi(z)=exp(-abs(z)) (which is
-# ## discontinuous and has a kink at zero).
-# 
-# fun1 <- function(z) { z^2 }
-# fun2 <- function(z) { exp(-abs(z)) }
-# 
-# z <- 0.2*w + v
-# 
-# ## Generate two y vectors for each function.
-# 
-# y1 <- fun1(z) + u
-# y2 <- fun2(z) + u
-# 
-# ## You set y to be either y1 or y2 (ditto for phi) depending on which
-# ## DGP you are considering:
-# 
-# y <- y1
-# phi <- fun1
-# 
-# ## Sort on z (for plotting)
-# 
-# ivdata <- data.frame(y,z,w,u,v)
-# ivdata <- ivdata[order(ivdata$z),]
-# rm(y,z,w,u,v)
-# 
-# model.ivderiv <- with(ivdata, npregivderiv(y=y, z=z, w=w))
-# 
-# ylim <-c(quantile(model.ivderiv$phi.prime,trim),
-#          quantile(model.ivderiv$phi.prime,1-trim))
-# 
-# plot(z,model.ivderiv$phi.prime,
-#      xlim=quantile(z,c(trim,1-trim)),
-#      main="",
-#      ylim=ylim,
-#      xlab="Z",
-#      ylab="Derivative",
-#      type="l",
-#      lwd=2)
-# rug(z)     
-# 
-## For the interactive run only we close the slaves perhaps to proceed
-## with other examples and so forth. This is redundant in batch mode.
-
-## Note: on some systems (notably macOS+MPICH), repeatedly spawning and
-## tearing down slaves in the same R session can lead to hangs/crashes.
-## npRmpi may therefore keep slave daemons alive by default and
-## `npRmpi.quit()` performs a "soft close". Use `force=TRUE` to
-## actually shut down the slaves.
+## Endogenous-regressor DGP:
 ##
-## You can disable reuse via `options(npRmpi.reuse.slaves=FALSE)` or by
-## setting the environment variable `NP_RMPI_NO_REUSE_SLAVES=1` before
-## loading the package.
+## y = phi(z) + u
+## E(u | z) != 0
+## z = 0.2 w + v
+## E(u | w) = 0
 
-npRmpi.quit()               ## soft close (may keep slaves alive)
-## npRmpi.quit(force=TRUE)  ## hard close
-} else {
-  message("Skipping MPI spawn in check context (set NP_RMPI_RUN_MPI_EXAMPLES_IN_CHECK=1).")
-}
+v <- rnorm(n, mean = 0, sd = 0.27)
+eps <- rnorm(n, mean = 0, sd = 0.05)
+u <- -0.5 * v + eps
+w <- rnorm(n)
+
+phi <- function(z) z^2
+phi.prime <- function(z) 2 * z
+
+z <- 0.2 * w + v
+y <- phi(z) + u
+
+ivdata <- data.frame(y, z, w)
+ivdata <- ivdata[order(ivdata$z), ]
+
+model.ivderiv <- npregivderiv(y ~ z | w, data = ivdata)
+deriv.iv <- gradients(model.ivderiv)
+
+## Restrict the display to the central 99 percent of the z observations.
+
+zlim <- quantile(ivdata$z, c(trim, 1 - trim))
+keep <- ivdata$z >= zlim[1L] & ivdata$z <= zlim[2L]
+
+plot(ivdata$z[keep], deriv.iv[keep],
+     main = "",
+     xlab = "Z",
+     ylab = "Derivative",
+     type = "l",
+     lwd = 2)
+
+curve(phi.prime(x), add = TRUE, col = 2, lty = 2, lwd = 2)
+rug(ivdata$z[keep])
+
+npRmpi.quit()
 } % enddontrun
 }
 \keyword{ instrument }

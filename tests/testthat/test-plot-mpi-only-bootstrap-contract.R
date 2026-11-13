@@ -103,6 +103,7 @@ test_that("plot method entrypoint fails fast for bootstrap inside mpi.bcast.cmd 
     .npRmpi_guard_no_auto_object_in_manual_bcast = function(obj, where = "plot()") invisible(FALSE),
     .npRmpi_autodispatch_called_from_bcast = function() TRUE,
     .np_with_seed = function(seed, expr) force(expr),
+    .np_plot_data_finish = function(value, ...) value,
     .package = "npRmpi"
   )
 
@@ -128,6 +129,7 @@ test_that("plot method entrypoint allows non-bootstrap inside mpi.bcast.cmd cont
     .npRmpi_guard_no_auto_object_in_manual_bcast = function(obj, where = "plot()") invisible(FALSE),
     .npRmpi_autodispatch_called_from_bcast = function() TRUE,
     .np_with_seed = function(seed, expr) force(expr),
+    .np_plot_data_finish = function(value, ...) value,
     .package = "npRmpi"
   )
 
@@ -247,10 +249,12 @@ test_that("wild fanout master-assist uses master chunk when workers are active",
   qenv$progress <- integer()
 
   local_mocked_bindings(
+    .npRmpi_fanout_native = function(action, ...) if (action == "poll") 1L else NULL,
     .npRmpi_has_active_slave_pool = function(comm = 1L) TRUE,
     .npRmpi_master_only_mode = function(comm = 1L) FALSE,
     .npRmpi_bootstrap_worker_count = function(comm = 1L) 1L,
-    .np_plot_bootstrap_progress_begin = function(total, label) list(total = as.integer(total)),
+    .np_plot_bootstrap_progress_begin = function(total, label, unit = "rep")
+      list(total = as.integer(total), enabled = TRUE),
     .np_plot_progress_tick = function(state, done, force = FALSE) {
       qenv$progress <- c(qenv$progress, as.integer(done))
       state
@@ -258,9 +262,17 @@ test_that("wild fanout master-assist uses master chunk when workers are active",
     .np_plot_progress_end = function(state) invisible(NULL),
     mpi.any.source = function() 0L,
     mpi.any.tag = function() 0L,
+    .npRmpi_fanout_new = function(comm, workers, n, scheduler, weights = NULL)
+      getFromNamespace(".npRmpi_fanout_metadata", "npRmpi")(
+        comm, workers, n, scheduler, weights, "test-session", "test-operation", 18432L),
     mpi.bcast.cmd = function(...) invisible(NULL),
-    mpi.bcast.Robj = function(...) invisible(NULL),
-    mpi.send.Robj = function(obj, dest, tag, comm = 1L) {
+    .npRmpi_bcast_prepared = function(tmp, ...) {
+      qenv$header <- unserialize(tmp)$transaction
+      invisible(NULL)
+    },
+    mpi.send = function(x, type, dest, tag, comm = 1L) {
+      obj <- unserialize(x)
+      envelope <- getFromNamespace(".npRmpi_fanout_envelope", "npRmpi")
       if (is.list(obj) && !is.null(obj$task_indices) && !is.null(obj$tasks)) {
         task.parts <- lapply(obj$tasks, function(task) {
           matrix(
@@ -269,20 +281,22 @@ test_that("wild fanout master-assist uses master chunk when workers are active",
             ncol = 1L
           )
         })
-        qenv$queue[[length(qenv$queue) + 1L]] <<- list(
+        qenv$queue[[length(qenv$queue) + 1L]] <- list(
           src = as.integer(dest),
           tag = as.integer(tag),
-          payload = list(
-            progress_only = TRUE,
-            boot = sum(vapply(obj$tasks, function(task) as.integer(task$bsz), integer(1L)))
-          )
+          payload = envelope(qenv$header, "progress", value =
+            sum(vapply(obj$tasks, function(task) as.integer(task$bsz), integer(1L))))
         )
-        qenv$queue[[length(qenv$queue) + 1L]] <<- list(
+        qenv$queue[[length(qenv$queue) + 1L]] <- list(
           src = as.integer(dest),
           tag = as.integer(tag),
-          payload = list(task_indices = obj$task_indices, parts = task.parts)
+          payload = envelope(qenv$header, "result", obj$task_indices, task.parts)
         )
       }
+      qenv$queue[[length(qenv$queue) + 1L]] <- list(src = as.integer(dest),
+        tag = qenv$header$control, payload = envelope(qenv$header, "terminal"))
+      qenv$queue[[length(qenv$queue) + 1L]] <- list(src = as.integer(dest),
+        tag = qenv$header$control, payload = envelope(qenv$header, "closed"))
       invisible(NULL)
     },
     mpi.iprobe = function(source, tag, comm = 1L) length(qenv$queue) > 0L,
@@ -290,11 +304,11 @@ test_that("wild fanout master-assist uses master chunk when workers are active",
       stopifnot(length(qenv$queue) > 0L)
       c(as.integer(qenv$queue[[1L]]$src), as.integer(qenv$queue[[1L]]$tag))
     },
-    mpi.recv.Robj = function(source, tag, comm = 1L) {
+    .npRmpi_recv_raw_probed = function(srctag, comm = 1L, status = 0L) {
       stopifnot(length(qenv$queue) > 0L)
       payload <- qenv$queue[[1L]]$payload
-      qenv$queue[[1L]] <<- NULL
-      payload
+      qenv$queue <- qenv$queue[-1L]
+      serialize(payload, NULL)
     },
     .package = "npRmpi"
   )
@@ -331,22 +345,50 @@ test_that("wild fanout master-assist uses master chunk when workers are active",
   expect_true(any(grepl("event=fanout.master_local_chunk.done", lines, fixed = TRUE)))
 })
 
-test_that("wild fanout fails fast on dispatch timeout when worker replies stall", {
+test_that("wild fanout timeout drains healthy replies before returning its condition", {
   run_fanout <- getFromNamespace(".npRmpi_bootstrap_run_fanout", "npRmpi")
   withr::local_options(npRmpi.bootstrap.dispatch.timeout.sec = 0.02)
   quit.state <- new.env(parent = emptyenv())
   quit.state$calls <- 0L
+  quit.state$queue <- list()
 
   local_mocked_bindings(
+    .npRmpi_fanout_native = function(action, ...) if (action == "poll") 1L else NULL,
     .npRmpi_has_active_slave_pool = function(comm = 1L) TRUE,
     .npRmpi_master_only_mode = function(comm = 1L) FALSE,
     .npRmpi_bootstrap_worker_count = function(comm = 1L) 1L,
     mpi.any.source = function() 0L,
     mpi.any.tag = function() 0L,
+    .npRmpi_fanout_new = function(comm, workers, n, scheduler, weights = NULL) {
+      quit.state$tx <- getFromNamespace(".npRmpi_fanout_metadata", "npRmpi")(
+        comm, workers, n, scheduler, weights, "test-session", "test-operation", 18432L)
+      quit.state$tx
+    },
     mpi.bcast.cmd = function(...) invisible(NULL),
-    mpi.bcast.Robj = function(...) invisible(NULL),
-    mpi.send.Robj = function(...) invisible(NULL),
-    mpi.iprobe = function(source, tag, comm = 1L) FALSE,
+    .npRmpi_bcast_prepared = function(tmp, ...) {
+      quit.state$header <- unserialize(tmp)$transaction
+      invisible(NULL)
+    },
+    mpi.send = function(x, type, dest, tag, comm = 1L) {
+      envelope <- getFromNamespace(".npRmpi_fanout_envelope", "npRmpi")
+      obj <- unserialize(x)
+      if (is.list(obj)) quit.state$queue[[length(quit.state$queue) + 1L]] <-
+        list(tag = as.integer(tag), payload = envelope(quit.state$header, "result",
+          obj$task_indices, lapply(obj$tasks, function(task) matrix(1, task$bsz, 1L))))
+      quit.state$queue[[length(quit.state$queue) + 1L]] <- list(tag = 18432L,
+        payload = envelope(quit.state$header, "terminal"))
+      quit.state$queue[[length(quit.state$queue) + 1L]] <- list(tag = 18432L,
+        payload = envelope(quit.state$header, "closed"))
+      invisible(NULL)
+    },
+    mpi.iprobe = function(source, tag, comm = 1L)
+      identical(quit.state$tx$phase, "draining") && length(quit.state$queue) > 0L,
+    mpi.get.sourcetag = function() c(1L, quit.state$queue[[1L]]$tag),
+    .npRmpi_recv_raw_probed = function(srctag, comm = 1L, status = 0L) {
+      bytes <- serialize(quit.state$queue[[1L]]$payload, NULL)
+      quit.state$queue <- quit.state$queue[-1L]
+      bytes
+    },
     npRmpi.quit = function(...) {
       quit.state$calls <- quit.state$calls + 1L
       invisible(TRUE)
@@ -374,10 +416,8 @@ test_that("wild fanout fails fast on dispatch timeout when worker replies stall"
   )
   expect_s3_class(err, "error")
   expect_match(conditionMessage(err), "dispatch timeout waiting on worker results")
-  expect_match(
-    conditionMessage(err),
-    "Restart R before performing further MPI-backed computation.",
-    fixed = TRUE
-  )
+  expect_identical(quit.state$tx$phase, "quiescent")
+  expect_length(quit.state$queue, 0L)
+  expect_false(exists("1", getFromNamespace(".npRmpi_fanout_state", "npRmpi"), inherits = FALSE))
   expect_identical(quit.state$calls, 0L)
 })

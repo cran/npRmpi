@@ -16,10 +16,17 @@ test_that("partially linear bootstrap bias centers are component-specific", {
     degree = 0L,
     nmulti = 1L
   )
+  expect_identical(
+    getFromNamespace(".np_plreg_fixed_component_owner", "npRmpi")(
+      model$bws,
+      as.integer(model$bws$xndim)
+    ),
+    "lp0"
+  )
 
   for (boot in c("wild", "inid", "fixed", "geom")) {
     set.seed(123)
-    out <- suppressWarnings(plot(
+    out <- suppressWarnings(capture_plot_provider(plot(
       model,
       center = "bias-corrected",
       errors = "bootstrap",
@@ -28,7 +35,7 @@ test_that("partially linear bootstrap bias centers are component-specific", {
       B = 19L,
       data_overlay = FALSE,
       output = "data"
-    ))
+    ))$provider)
 
     expect_length(out, 4L)
     bc.lengths <- vapply(out, function(x) length(x$bias.corrected), integer(1L))

@@ -1,6 +1,11 @@
 npudens <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npudens")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("tdat"),
+      call = sys.call(), caller = parent.frame())
 
     if (!missing(bws)){
       if (is.recursive(bws)){
@@ -22,7 +27,13 @@ npudens <-
 
 npudens.formula <-
   function(bws, data = NULL, newdata = NULL, ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
 
+
+    dots <- list(...)
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    dots$formula <- NULL
     tt <- terms(bws)
 
     m <- match(c("formula", "data", "subset", "na.action"),
@@ -32,22 +43,27 @@ npudens.formula <-
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
     if (!missing(data) && !is.null(data))
-      tmf[["data"]] <- substitute(data)
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    umf <- tmf <- if (is.null(frame.state))
+      .np_bws_formula_model_frame(bws, mf.args,
+        data.override = !missing(data) && !is.null(data), overrides = dots) else
+        .np_formula_frame_take(frame.state)
+    tt <- attr(tmf, "terms")
+    bws <- .np_bws_retain_fit_frame(bws, tmf)
     train.omit <- attr(tmf, "na.action")
 
-    tdat <- tmf[, attr(attr(tmf, "terms"),"term.labels"), drop = FALSE]
+    tdat <- tmf[, .np_formula_term_names(attr(attr(tmf, "terms"),"term.labels")), drop = FALSE]
 
-    has.eval <- !is.null(newdata)
+    has.eval <- !is.null(newdata) && !("edat" %in% names(dots))
     if (has.eval) {
       npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      umf <- do.call(.np_formula_model_frame, umf.args, envir = parent.frame())
       emf <- umf
       eval.omit <- attr(umf, "na.action")
 
-      edat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
+      edat <- emf[, .np_formula_term_names(attr(attr(emf, "terms"),"term.labels")), drop = FALSE]
     } else {
       eval.omit <- train.omit
     }
@@ -56,9 +72,10 @@ npudens.formula <-
     if (has.eval)
       ud.args$edat <- edat
     ud.args$bws <- bws
-    ev <- do.call(npudens, c(ud.args, list(...)))
+    ev <- do.call(npudens, c(ud.args, dots))
 
-    ev$omit <- attr(umf,"na.action")
+    ev$omit <- .np_formula_output_action(ev, umf, has.eval)
+    eval.omit <- if (isTRUE(ev$trainiseval)) train.omit else ev$omit
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
     ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
@@ -67,27 +84,51 @@ npudens.formula <-
     ev$neval.omit <- if (length(eval.omit)) length(eval.omit) else 0L
 
     ev$dens <- napredict(ev$omit, ev$dens)
-    ev$derr <- napredict(ev$omit, ev$derr)
+    if (isTRUE(ev[["se", exact = TRUE]]))
+      ev$derr <- napredict(ev$omit, ev$derr)
 
     return(ev)
   }
 
 npudens.call <-
   function(bws, ...) {
-    npudens(bws, tdat = .np_eval_bws_call_arg(bws, "dat"),
-            ...)
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    do.call(npudens, .np_retained_training_args(
+      bws, c(tdat = "dat"), list(...), npudens.bandwidth))
   }
 
 npudens.bandwidth <-
   function(bws,
            tdat = stop("invoked without training data 'tdat'"),
-           edat, ...){
+           edat, ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
 
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+
+  se <- npValidateScalarLogical(se, "se")
+  ann.se <- se && identical(bws[["type", exact = TRUE]], "adaptive_nn") &&
+    bws[["ncon", exact = TRUE]] > 0L
   dots <- list(...)
   fit.start <- proc.time()[3]
   fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
+  native.newdata <- dots[["newdata", exact = TRUE]]
+  if (missing(edat) && !is.null(native.newdata)) {
+    native.eval <- .np_native_newdata_parts(
+      native.newdata, list(edat = bws$xnames), "npudens")
+    edat <- native.eval$edat
+  }
+
   no.e = missing(edat)
   .npRmpi_require_active_slave_pool(where = "npudens()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   if (.npRmpi_autodispatch_active()) {
     tdat.preflight <- toFrame(tdat)
     if (anyNA(tdat.preflight) && !any(stats::complete.cases(tdat.preflight)))
@@ -97,10 +138,13 @@ npudens.bandwidth <-
       if (anyNA(edat.preflight) && !any(stats::complete.cases(edat.preflight)))
         stop("Evaluation data has no rows without NAs")
     }
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    result <- .npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npudens.bandwidth")
+    return(.npRmpi_restore_nomad_fit_bws_metadata(result, bws))
   }
 
-  tdat = toFrame(tdat)
+  tdat.was.vector <- is.atomic(tdat) && is.null(dim(tdat))
+    tdat = .np_native_vector_frame_names(toFrame(tdat), tdat.was.vector, bws)
+  bws <- .np_bws_retain_native_training(bws, dat = tdat)
 
   if (!no.e)
     edat = toFrame(edat)
@@ -110,6 +154,21 @@ npudens.bandwidth <-
 
   if (length(bws$bw) != length(tdat))
     stop("length of bandwidth vector does not match number of columns of 'tdat'")
+
+  beta.kernel <- identical(bws$ckertype, "beta")
+  npValidateBetaKernelSpecification(
+    ckertype = bws$ckertype,
+    ckerorder = bws$ckerorder,
+    bwtype = bws$type,
+    ckerbound = bws$ckerbound,
+    ckerlb = bws$ckerlb,
+    ckerub = bws$ckerub,
+    dati = bws$xdati,
+    bw = bws$bw,
+    bandwidth.compute = FALSE,
+    where = "beta density",
+    allow.categorical = TRUE
+  )
 
   if ((any(bws$icon) &&
        !all(vapply(as.data.frame(tdat[, bws$icon]), inherits, logical(1), c("integer", "numeric")))) ||
@@ -159,6 +218,7 @@ npudens.bandwidth <-
   ## put the unordered, ordered, and continuous data in their own objects
   ## data that is not a factor is continuous.
   
+  if (ann.se) ann.training <- tdat
   tdat = toMatrix(tdat)
 
   tuno = tdat[, bws$iuno, drop = FALSE]
@@ -178,13 +238,14 @@ npudens.bandwidth <-
     econ = data.frame()
   }
 
+  physical.bw <- .np_physical_bandwidth(bws)
   myopti = list(
     num_obs_train = tnrow,
     num_obs_eval = enrow,
     num_uno = bws$nuno,
     num_ord = bws$nord,
     num_con = bws$ncon,
-    int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
+    int_LARGE_SF = SF_ARB,
     BANDWIDTH_den_extern = switch(bws$type,
       fixed = BW_FIXED,
       generalized_nn = BW_GEN_NN,
@@ -194,7 +255,8 @@ npudens.bandwidth <-
       gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
       epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
       uniform = CKER_UNI,
-      "truncated gaussian" = CKER_TGAUSS),
+      beta = CKER_COORDINATE
+),
     ukerneval = switch(bws$ukertype,
       aitchisonaitken = UKER_AIT,
       liracine = UKER_LR),
@@ -205,11 +267,22 @@ npudens.bandwidth <-
     no.e = no.e,
     mcv.numRow = attr(bws$xmcv, "num.row"),
       densOrDist = NP_DO_DENS,
-      old.dens = FALSE,
-      int_do_tree = npDoTreeOrCategoricalCompress(ncon = bws$ncon, ncat = bws$nuno + bws$nord, bws = bws))
+      reserved.legacy = FALSE,
+      int_do_tree = if (beta.kernel) DO_TREE_NO else
+        npDoTreeOrCategoricalCompress(ncon = bws$ncon,
+                                      ncat = bws$nuno + bws$nord,
+                                      bws = bws))
+  myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
+  if (beta.kernel)
+    myopti <- c(
+      myopti,
+      categorical.compress = npStrictLogicalOption(
+        "np.categorical.compress", TRUE
+      )
+    )
   cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
 
-  myout <- .np_with_compiled_fit_progress(
+  myout <- .np_with_nn_radius_context(.np_with_compiled_fit_progress(
     label = "Fitting density",
     total = .np_densdist_fit_total(bws = bws, tnrow = tnrow, enrow = enrow),
     handoff = fit.progress.handoff,
@@ -217,28 +290,33 @@ npudens.bandwidth <-
     .Call("C_np_density",
           as.double(tuno), as.double(tord), as.double(tcon),
           as.double(euno), as.double(eord), as.double(econ),
-          as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+          as.double(c(physical.bw[bws$icon], physical.bw[bws$iuno], physical.bw[bws$iord])),
           as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
           as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
           as.integer(myopti),
           as.integer(enrow),
           as.double(cker.bounds.c$lb),
           as.double(cker.bounds.c$ub),
+          se && !ann.se,
           PACKAGE = "npRmpi")
-  )
+  ), continuous.names = bws[["xnames", exact = TRUE]][bws[["icon", exact = TRUE]]])
 
   ## For purely categorical density with zero bandwidths, the variance of
   ## the sample proportion is p(1-p)/n. The C routine returns p/n; fix here.
-  cat.mask <- rep(FALSE, length(bws$bw))
-  if (isTRUE(bws$nuno > 0L))
-    cat.mask <- cat.mask | bws$iuno
-  if (isTRUE(bws$nord > 0L))
-    cat.mask <- cat.mask | bws$iord
-  if (bws$ncon == 0 && any(cat.mask) && all(bws$bw[cat.mask] == 0)) {
-    p <- pmin(pmax(myout$dens, 0), 1)
-    myout$derr <- sqrt(p * (1 - p) / tnrow)
+  if (se) {
+    cat.mask <- rep(FALSE, length(bws$bw))
+    if (isTRUE(bws$nuno > 0L))
+      cat.mask <- cat.mask | bws$iuno
+    if (isTRUE(bws$nord > 0L))
+      cat.mask <- cat.mask | bws$iord
+    if (bws$ncon == 0 && any(cat.mask) && all(bws$bw[cat.mask] == 0)) {
+      p <- pmin(pmax(myout$dens, 0), 1)
+      myout$derr <- sqrt(p * (1 - p) / tnrow)
+    }
   }
 
+  if (ann.se)
+    myout$derr <- .np_ann_unconditional_se(bws, ann.training, teval, density = TRUE)
   fit.elapsed <- proc.time()[3] - fit.start
   optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
   total.time <- fit.elapsed + (if (is.na(optim.time)) 0.0 else optim.time)
@@ -250,20 +328,31 @@ npudens.bandwidth <-
                   train.rows.omit = train.rows.omit,
                   eval.rows.omit = if (no.e) integer(0) else eval.rows.omit,
                   timing = bws$timing, total.time = total.time,
-                  optim.time = optim.time, fit.time = fit.elapsed)
+                  optim.time = optim.time, fit.time = fit.elapsed, se = se)
   return(ev)
 }
 
-npudens.default <- function(bws, tdat, ...){
+npudens.default <- function(bws, tdat, ..., se = FALSE){
+  se <- npValidateScalarLogical(se, "se")
   .npRmpi_require_active_slave_pool(where = "npudens()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   bws.formula.early <- (!missing(bws)) && inherits(bws, "formula")
+  if (!missing(tdat) && "data" %in% names(substitute(list(...))))
+    .np_data_argument_preflight(substitute(tdat), "tdat", sys.call(), parent.frame(), value = tdat)
   tdat.formula.early <- (!missing(tdat)) && inherits(tdat, "formula")
+  formula.input <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())[["formula", exact = TRUE]]
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
   if (.npRmpi_autodispatch_active() &&
+      (missing(bws) || "bws" %in% names(sc)) &&
       !bws.formula.early &&
-      !tdat.formula.early)
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      !tdat.formula.early && !inherits(formula.input, "formula"))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npudens.default"))
 
-  sc <- sys.call()
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -293,8 +382,15 @@ npudens.default <- function(bws, tdat, ...){
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
-  if(tdat.named)
+  if(tdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(tdat), "tdat", sys.call(), parent.frame(), value = tdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(tdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(tdat), parent.frame())), collapse = "") else NULL
     tdat <- toFrame(tdat)
+    if (!is.null(original.name)) names(tdat) <- original.name
+  }
 
   if(bws.named){
     sc.bw$bandwidth.compute <- FALSE
@@ -308,18 +404,31 @@ npudens.default <- function(bws, tdat, ...){
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npudensbw")
+  frame.state <- if (!has.explicit.bws &&
+      ((!no.bws && inherits(bws, "formula")) || direct.formula.tdat ||
+       inherits(formula.input, "formula"))) new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+  }
     
   tbw <- if (!has.explicit.bws) {
     .np_progress_select_bandwidth_enhanced(
       "Selecting density bandwidth",
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", dat = "tdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, tdat, "dat"))
     )
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", dat = "tdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, tdat, "dat"))
   }
 
   ## convention: first argument is always dropped, second, if present, propagated
-  call.args <- list(bws = tbw)
+  call.args <- list(bws = tbw, se = se)
+  if (!is.null(frame.state)) call.args$.np.formula.state <- frame.state
   if (!no.tdat && !direct.formula.tdat) {
     if (tdat.named) {
       call.args$tdat <- tdat
@@ -329,5 +438,8 @@ npudens.default <- function(bws, tdat, ...){
   }
   if (!has.explicit.bws)
     call.args$.np_fit_progress_handoff <- TRUE
-  do.call(npudens, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  do.call(npudens, c(call.args, fit.dots))
 }

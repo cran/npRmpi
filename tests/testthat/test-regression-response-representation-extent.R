@@ -1,0 +1,113 @@
+test_that("response coding refuses missing factor metadata and preserves fitted codes", {
+  ns <- asNamespace("npRmpi")
+  adjust <- get(".np_regression_response_levels", ns)
+  numeric.response <- get(".np_plreg_numeric_response", ns)
+  hat.response <- get(".np_hat_response", ns)
+  ut <- get("untangle", ns)
+  numeric.dati <- ut(data.frame(y = c(10, 30, 50)))
+  for (ordered in c(FALSE, TRUE)) for (lev in list(c("10", "30", "50"), c("a", "b", "c"))) {
+    y <- factor(rep(lev, 8L), levels = lev, ordered = ordered)
+    dati <- ut(data.frame(y))
+    expected <- rep(if (ordered && lev[1L] == "10") c(10, 30, 50) else 1:3, 8L)
+    expect_equal(numeric.response(y, dati), expected, tolerance = 0)
+    expect_equal(hat.response(y, dati), expected, tolerance = 0)
+    expect_error(adjust(data.frame(y), numeric.dati), "factor response requires")
+    expect_error(numeric.response(y, numeric.dati), "factor response requires")
+    expect_error(hat.response(y, numeric.dati),
+                 "must have numeric (integer or double) storage", fixed = TRUE)
+  }
+  y <- ordered(c(10, 30, 50))
+  dati <- ut(data.frame(y))
+  expect_error(adjust(data.frame(y = ordered(c(10, 20))), dati), "unknown factors")
+  ev <- adjust(data.frame(y = ordered(c(10, 20))), dati, allowNewCells = TRUE)
+  expect_equal(as.vector(get("toMatrix", ns)(ev)), c(10, 20), tolerance = 0)
+  payload <- cbind(1:24, (1:24)^2)
+  expect_identical(hat.response(payload, numeric.dati), payload)
+})
+
+test_that("regression rejects incompatible coding while explicit hat payloads retain their contract", {
+  old <- options(np.messages = FALSE); on.exit(options(old), add = TRUE)
+  x <- data.frame(x = seq(.05, .95, length.out = 24L))
+  y <- rep(c(10, 30, 50), 8L)
+  f <- ordered(y)
+  b <- npregbw(xdat = x, ydat = y, bws = .25, bandwidth.compute = FALSE)
+  expect_error(npreg(b, txdat = x, tydat = f, se = FALSE), "must be a numeric")
+  expect_error(npreg(b, txdat = x, tydat = y, eydat = f, se = FALSE), "must be a numeric")
+  H <- npreghat(b, txdat = x)
+  # Numeric-fitted direct and cached hats share the numeric-storage ingress.
+  expect_error(npreghat(b, txdat = x, y = f, output = "apply"),
+               "must have numeric (integer or double) storage", fixed = TRUE)
+  expect_error(predict(H, y = f, output = "apply"),
+               "must have numeric (integer or double) storage", fixed = TRUE)
+  valid <- npreg(b, txdat = x, tydat = y, se = FALSE)
+  expect_equal(as.numeric(fitted(valid)), as.numeric(H %*% y), tolerance = 1e-11)
+  external <- npreg(b, txdat = x, tydat = y, exdat = x[c(3, 12, 20), , drop = FALSE], se = FALSE)
+  expect_length(fitted(external), 3L)
+  expect_true(all(is.finite(fitted(external))))
+})
+
+test_that("native regression response extents are checked independently of R coding", {
+  old <- options(np.messages = FALSE); on.exit(options(old), add = TRUE)
+  ns <- asNamespace("npRmpi")
+  x <- data.frame(x = seq(.05, .95, length.out = 24L))
+  y <- sin(x$x)
+  b <- npregbw(xdat = x, ydat = y, bws = .25, bandwidth.compute = FALSE)
+  # Intercept a valid argument builder before native entry. The MPI overrides
+  # are capture-only: no computational claim is made from this local seam.
+  fn <- get(".npreg_fit_impl", ns)
+  env <- new.env(parent = environment(fn))
+  environment(fn) <- env
+  captured <- NULL
+  env$.Call <- function(.NAME, ...) {
+    stopifnot(identical(.NAME, "C_np_regression"))
+    captured <<- c(list(.NAME), list(...))
+    stop(structure(list(message = "captured", call = NULL),
+                   class = c("response_capture", "error", "condition")))
+  }
+  if (identical("npRmpi", "npRmpi")) {
+    env$.npRmpi_require_active_slave_pool <- function(...) invisible(NULL)
+    env$.npRmpi_master_local_entry_needed <- function(...) FALSE
+    env$.npRmpi_autodispatch_active <- function(...) FALSE
+    env$.npRmpi_guard_no_auto_object_in_manual_bcast <- function(...) invisible(NULL)
+    env$.npRmpi_rank_local_regression_context <- function(...) FALSE
+    env$mpi.comm.size <- function(...) 1L
+  }
+  expect_error(fn(b, txdat = x, tydat = y, eydat = y, se = FALSE,
+                  .np.context = list(public = TRUE, dots = pairlist())), class = "response_capture")
+  expect_length(captured, 26L)
+  # Never pass a short buffer to a live communicator on the master alone.
+  # REG_CATCOMPI (C index 17) is an independent pre-computation fence after
+  # the two extent checks. If either extent guard regresses, this invalid
+  # flag raises the wrong *named* condition, without entering arithmetic.
+  # Prove the fence first with valid buffers, in an MPI-uninitialized child;
+  # a missing fence prevents either malformed-buffer probe from running.
+  captured[[16L]][[18L]] <- 2L
+  input <- tempfile("npRmpi-response-extents-", fileext = ".rds")
+  saveRDS(captured, input)
+  on.exit(unlink(input), add = TRUE)
+  result <- npRmpi_run_isolated_contract(
+    lines = c(
+      "suppressPackageStartupMessages(library(npRmpi))",
+      "stopifnot(!isTRUE(getOption('npRmpi.mpi.initialized', FALSE)))",
+      sprintf("args <- readRDS(%s)", deparse(input)),
+      "condition <- function(x) tryCatch({do.call(base::.Call, x); 'NO ERROR'}, error = conditionMessage)",
+      "fence <- 'C_np_regression: categorical compression must be TRUE or FALSE'",
+      "if (!identical(condition(args), fence)) stop('RM07: pre-computation fence unavailable')",
+      "train <- args; train[[5L]] <- double()",
+      "evaluation <- args; evaluation[[9L]] <- double()",
+      "expected <- c('C_np_regression: training-response buffer is too short', 'C_np_regression: evaluation-response buffer is too short')",
+      "observed <- c(condition(train), condition(evaluation))",
+      "if (!identical(observed, expected)) stop('RM07: response extent guard regression: ', paste(observed, collapse = '; '))",
+      "cat('RM07_NATIVE_EXTENTS_AND_FENCE_OK\\n')"
+    ),
+    marker = "RM07_NATIVE_EXTENTS_AND_FENCE_OK",
+    timeout = 20L,
+    extra.env = "NP_RMPI_SKIP_INIT=1"
+  )
+  expect_false(is.null(result))
+  if (is.null(result)) stop("RM07: isolated native proof unavailable")
+  expect_identical(result$status, 0L, info = paste(result$output, collapse = "\n"))
+  expect_true(result$witnessed)
+  # Public valid calls test native recovery and legitimate absent ey.
+  expect_true(all(is.finite(fitted(npreg(b, txdat = x, tydat = y, se = FALSE)))))
+})

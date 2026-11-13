@@ -1,0 +1,142 @@
+#ifndef NP_REGRESSION_CONTRACT_H
+#define NP_REGRESSION_CONTRACT_H
+
+#include "regression_residual.h"
+
+/*
+ * Standard-error algebra belongs to the regression response consumer, not to
+ * a continuous-kernel family.  Ordinary regression retains its local-
+ * residual covariance contract.  A scalar conditional density/distribution
+ * fit instead treats the dependent-side kernel row as the response and uses
+ * the established observation-influence variance.
+ */
+typedef enum {
+  NP_REGRESSION_STDERR_LOCAL_RESIDUAL = 0,
+  NP_REGRESSION_STDERR_CONDITIONAL_INFLUENCE = 1
+} NPRegressionStandardErrorMode;
+
+/*
+ * Private, invocation-owned ordinary-residual HC0 input.  Residuals are
+ * scaled once after the training-point fit and retained in the active donor
+ * order used by the kernel traversal.  donor_to_canonical makes that order
+ * explicit; the reducer must never infer it from pointer identity.
+ */
+typedef enum {
+  NP_REGRESSION_HC0_RESIDUAL_PREPARING = 0,
+  NP_REGRESSION_HC0_RESIDUAL_READY = 1,
+  NP_REGRESSION_HC0_RESIDUAL_ALL_ZERO = 2
+} NPRegressionHC0ResidualStatus;
+
+/* Private selected categorical output, in the unchanged native column order.
+ * NULL requests every column. Resolve ranges before entering donor loops. */
+typedef struct {
+  int coordinate;
+} NPRegressionGradientRequest;
+
+typedef struct {
+  int begin;
+  int end;
+} NPRegressionGradientRange;
+
+/* Preparation writes one normalized residual/information record per training
+ * donor in the active traversal order. Self identity is explicit, never
+ * inferred from coordinate equality (duplicate observations are distinct).
+ * Every training donor occurs once in evaluation_to_donor. */
+typedef struct {
+  const double *response;
+  const int *evaluation_to_donor;
+  int num_obs_train;
+  int num_obs_eval;
+  double *normalized_residual;
+  int *information;
+} NPRegressionResidualPreparation;
+
+static inline NPRegressionGradientRange np_regression_gradient_range(
+  const NPRegressionGradientRequest *request, const int begin, const int end)
+{
+  NPRegressionGradientRange range = {begin, end};
+  if(request != NULL) {
+    if(request->coordinate >= begin && request->coordinate < end) {
+      range.begin = request->coordinate;
+      range.end = request->coordinate + 1;
+    } else {
+      range.end = begin;
+    }
+  }
+  return range;
+}
+
+typedef struct {
+  const double *scaled_residual;
+  const int *donor_to_canonical;
+  int num_obs_train;
+  double residual_scale;
+  NPRegressionHC0ResidualStatus status;
+  int point_already_computed;
+  const NPRegressionGradientRequest *gradient_request;
+  NPRegressionResidualPreparation *preparation;
+  const int *residual_information;
+  int unknown_count;
+  int *mean_unavailable;
+  int **gradient_unavailable;
+  int **gradient_structural_zero;
+} NPRegressionHC0Context;
+
+/*
+ * Public regression fits select one explicit output contract at the native
+ * boundary.  The values are intentionally bit flags so all owners can derive
+ * the same request without route-specific boolean combinations or silent
+ * promotion to a more expensive mode.
+ */
+typedef enum {
+  NP_REGRESSION_OUTPUT_MEAN_ONLY = 0,
+  NP_REGRESSION_OUTPUT_MEAN_AND_SE = 1,
+  NP_REGRESSION_OUTPUT_MEAN_AND_GRADIENT = 2,
+  NP_REGRESSION_OUTPUT_FULL = 3,
+  /* Existing low bits retained; private bit 4 omits derivative uncertainty. */
+  NP_REGRESSION_OUTPUT_MEAN_SE_AND_GRADIENT = 7
+} NPRegressionOutputRequest;
+
+static inline int np_regression_output_request_valid(const int request)
+{
+  return (request >= NP_REGRESSION_OUTPUT_MEAN_ONLY &&
+          request <= NP_REGRESSION_OUTPUT_FULL) ||
+    request == NP_REGRESSION_OUTPUT_MEAN_SE_AND_GRADIENT;
+}
+
+static inline int np_regression_output_requests_errors(const int request)
+{
+  return (request & NP_REGRESSION_OUTPUT_MEAN_AND_SE) != 0;
+}
+
+static inline int np_regression_output_requests_gradients(const int request)
+{
+  return (request & NP_REGRESSION_OUTPUT_MEAN_AND_GRADIENT) != 0;
+}
+
+static inline int np_regression_output_requests_gradient_errors(const int request)
+{
+  return request == NP_REGRESSION_OUTPUT_FULL;
+}
+
+/*
+ * Read-only consumer view of a call-scoped realized continuous-bandwidth
+ * layout.  The owning conditional loop advances only evaluation_offset;
+ * bandwidth storage remains immutable after realization.
+ * Conditional response-row consumers can reuse one full X realization while
+ * invoking the common regression owner on successive response rows.  The
+ * owner copies only its current view into its existing bounded workspace; it
+ * never assumes ownership of these pointers.
+ */
+typedef struct {
+  int bandwidth_mode;
+  int num_train;
+  int num_eval_total;
+  int num_continuous;
+  int evaluation_offset;
+  int evaluation_count;
+  double **bandwidth_eval;
+  double **bandwidth_train;
+} NPContinuousPreparedBandwidthView;
+
+#endif

@@ -5,7 +5,7 @@ npdistribution <-
              train.rows.omit = rows.omit,
              eval.rows.omit = if (trainiseval) rows.omit else NA,
              timing = NA, total.time = NA,
-             optim.time = NA, fit.time = NA){
+             optim.time = NA, fit.time = NA, se = TRUE){
 
         if (missing(bws) || missing(eval) || missing(dist) || missing(ntrain))
             stop("improper invocation of distribution constructor")
@@ -34,6 +34,7 @@ npdistribution <-
             eval = eval,
             dist = dist,
             derr = derr,
+            se = se,
             ntrain = ntrain,
             trainiseval = trainiseval,
             rows.omit = rows.omit,
@@ -74,21 +75,37 @@ print.npdistribution <- function(x, digits=NULL, ...){
 fitted.npdistribution <- function(object, ...){
  object$dist 
 }
-se.npdistribution <- function(x){ x$derr }
+se.npdistribution <- function(x) {
+  .np_require_stored_se(
+    x, x[["derr", exact = TRUE]], "npudist", expr = substitute(x),
+    data.hint = if (is.null(x[["bws", exact = TRUE]][["call", exact = TRUE]]))
+      "tdat = training_data" else NULL)
+}
 
 predict.npdistribution <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
+  if ("se" %in% names(dots)) {
+    requested.se <- npValidateScalarLogical(dots[["se"]], "se")
+    if (!identical(requested.se, se.fit))
+      stop("conflicting 'se' and 'se.fit' requests; use se.fit to request prediction standard errors",
+           call. = FALSE)
+    dots[["se"]] <- NULL
+  }
   has.formula.route <- !is.null(object$bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npudist.dbandwidth,
+                                  c("tdat"))
 
   if (!is.null(dots$edat) && !is.null(dots$newdata)) {
     dots$newdata <- NULL
   } else if (!has.formula.route && is.null(dots$edat) && !is.null(dots$newdata)) {
-    dots$edat <- dots$newdata
+    dots$edat <- .np_native_newdata_parts(
+      dots$newdata, list(edat = object$bws$xnames), "predict")$edat
     dots$newdata <- NULL
   }
 
-  tr <- do.call(npudist, c(list(bws = object$bws), dots))
+  tr <- do.call(npudist, c(list(bws = object$bws, se = se.fit), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
                 df = tr$nobs))

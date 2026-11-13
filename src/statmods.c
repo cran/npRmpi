@@ -11,6 +11,7 @@
 #ifdef MPI2
 
 #include "mpi.h"
+#include "np_native_safety.h"
 
 extern  int my_rank;
 extern  int source;
@@ -401,360 +402,750 @@ int is_valid_unordered_bw(double lambda,
   return ((lambda >= 0.0) && (lambda <= max_unordered_bw(num_categories, kernel)));
 }
 
-static int build_sorted_unique_support(int n,
-                                       const double *vector_data,
-                                       double **support_out,
-                                       int **support_count_out,
-                                       int *support_n_out)
+static int build_sorted_observation_support(int n,
+                                            const double *vector_data,
+                                            double **sorted_out)
 {
-  int i, m;
-  double *support;
-  int *support_count;
+  double *sorted;
+  int i;
 
-  support = alloc_vecd(n);
-  support_count = NULL;
-
-  if (support_count_out != NULL)
-    support_count = alloc_vecu(n);
-
+  if (n <= 0 || vector_data == NULL || sorted_out == NULL)
+    return 1;
+  sorted = alloc_vecd(n);
   for (i = 0; i < n; i++)
-    support[i] = vector_data[i];
-
-  sort_safe(n, support);
-
-  m = 0;
-  for (i = 0; i < n; i++) {
-    if ((m == 0) || (support[i] != support[m - 1])) {
-      support[m] = support[i];
-      if (support_count != NULL)
-        support_count[m] = 1;
-      m++;
-    } else if (support_count != NULL) {
-      support_count[m - 1]++;
-    }
-  }
-
-  *support_out = support;
-  if (support_count_out != NULL)
-    *support_count_out = support_count;
-  *support_n_out = m;
-
+    sorted[i] = vector_data[i];
+  sort_safe(n, sorted);
+  *sorted_out = sorted;
   return 0;
 }
 
-static int find_support_index(int support_n,
-                              const double *support,
-                              double value)
+static int lower_bound_observation_support(int n,
+                                           const double *sorted,
+                                           double value)
 {
-  int lo, hi;
-
-  lo = 0;
-  hi = support_n - 1;
-
-  while (lo <= hi) {
-    const int mid = lo + (hi - lo) / 2;
-
-    if (support[mid] == value)
-      return mid;
-
-    if (support[mid] < value) {
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
-  }
-
-  return -1;
-}
-
-static int nearest_positive_radius_from_support(int support_n,
-                                                const double *support,
-                                                int center_idx,
-                                                double *radius_out)
-{
-  const double dleft =
-    (center_idx > 0) ? (support[center_idx] - support[center_idx - 1]) : DBL_MAX;
-  const double dright =
-    (center_idx + 1 < support_n) ? (support[center_idx + 1] - support[center_idx]) : DBL_MAX;
-  const double distance = (dleft < dright) ? dleft : dright;
-
-  if (distance <= DBL_MIN)
-    return 1;
-
-  *radius_out = distance;
-  return 0;
-}
-
-static int kth_observation_radius_from_support(int support_n,
-                                               const double *support,
-                                               const int *support_count,
-                                               int center_idx,
-                                               int int_k_nn,
-                                               double *radius_out)
-{
-  int left, right, count;
-
-  left = center_idx - 1;
-  right = center_idx + 1;
-  count = support_count[center_idx] - 1;
-
-  if (count >= int_k_nn)
-    return nearest_positive_radius_from_support(support_n, support, center_idx, radius_out);
-
-  while ((left >= 0) || (right < support_n)) {
-    double dleft = DBL_MAX;
-    double dright = DBL_MAX;
-    double distance;
-
-    if (left >= 0)
-      dleft = support[center_idx] - support[left];
-    if (right < support_n)
-      dright = support[right] - support[center_idx];
-
-    distance = (dleft < dright) ? dleft : dright;
-
-    if (distance <= DBL_MIN)
-      return 1;
-
-    if ((left >= 0) && ((support[center_idx] - support[left]) == distance)) {
-      count += support_count[left];
-      left--;
-    }
-
-    if ((right < support_n) && ((support[right] - support[center_idx]) == distance)) {
-      count += support_count[right];
-      right++;
-    }
-
-    if (count >= int_k_nn) {
-      *radius_out = distance;
-      return 0;
-    }
-  }
-
-  return 1;
-}
-
-static int compute_nn_distance_observation_support_subset(int num_obs,
-                                                          double *vector_data,
-                                                          int int_k_nn,
-                                                          int query_start,
-                                                          int query_end,
-                                                          double *nn_distance)
-{
-  int i, j, support_n;
-  double *support;
-  int *support_count;
-  double *support_radius;
-
-  support = NULL;
-  support_count = NULL;
-  support_radius = NULL;
-
-  if (query_start > query_end)
-    return 0;
-
-  if ((query_start < 0) || (query_end >= num_obs))
-    return 1;
-
-  if (build_sorted_unique_support(num_obs, vector_data, &support, &support_count, &support_n) != 0)
-    return 1;
-
-  if ((int_k_nn < 1) || (int_k_nn > num_obs - 1)) {
-    free(support);
-    if (support_count != NULL)
-      free(support_count);
-    return 1;
-  }
-
-  support_radius = alloc_vecd(support_n);
-
-  for (i = 0; i < support_n; i++) {
-    if (kth_observation_radius_from_support(
-          support_n,
-          support,
-          support_count,
-          i,
-          int_k_nn,
-          &support_radius[i]
-        ) != 0) {
-      free(support);
-      free(support_count);
-      free(support_radius);
-      return 1;
-    }
-  }
-
-  for (i = query_start, j = 0; i <= query_end; i++, j++) {
-    const int idx = find_support_index(support_n, support, vector_data[i]);
-
-    if (idx < 0) {
-      free(support);
-      free(support_count);
-      free(support_radius);
-      return 1;
-    }
-
-    nn_distance[j] = support_radius[idx];
-    if (nn_distance[j] <= DBL_MIN) {
-      free(support);
-      free(support_count);
-      free(support_radius);
-      return 1;
-    }
-  }
-
-  free(support);
-  free(support_count);
-  free(support_radius);
-
-  return 0;
-}
-
-static int lower_bound_support(int support_n,
-                               const double *support,
-                               double value)
-{
-  int lo, hi;
-
-  lo = 0;
-  hi = support_n;
-
+  int lo = 0;
+  int hi = n;
   while (lo < hi) {
     const int mid = lo + (hi - lo) / 2;
-
-    if (support[mid] < value) {
+    if (sorted[mid] < value)
       lo = mid + 1;
-    } else {
+    else
       hi = mid;
-    }
   }
-
   return lo;
 }
 
-static int kth_observation_radius_for_eval_from_support(int support_n,
-                                                        const double *support,
-                                                        const int *support_count,
-                                                        double eval_value,
-                                                        int int_k_nn,
-                                                        double *radius_out)
+static int upper_bound_observation_support(int n,
+                                           const double *sorted,
+                                           double value)
 {
-  int left, right, count;
-  int insert_idx;
-  int exact_match;
-
-  insert_idx = lower_bound_support(support_n, support, eval_value);
-  exact_match = ((insert_idx < support_n) && (support[insert_idx] == eval_value));
-
-  if (exact_match) {
-    left = insert_idx - 1;
-    right = insert_idx + 1;
-    count = support_count[insert_idx];
-  } else {
-    left = insert_idx - 1;
-    right = insert_idx;
-    count = 0;
+  int lo = 0;
+  int hi = n;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (!(value < sorted[mid]))
+      lo = mid + 1;
+    else
+      hi = mid;
   }
+  return lo;
+}
 
-  if (count >= int_k_nn) {
-    if (exact_match)
-      return nearest_positive_radius_from_support(support_n, support, insert_idx, radius_out);
-    return 1;
-  }
+static double adaptive_left_distance(const double *sorted,
+                                     int position,
+                                     int index)
+{
+  return sorted[position] - sorted[position - 1 - index];
+}
 
-  while ((left >= 0) || (right < support_n)) {
-    double dleft = DBL_MAX;
-    double dright = DBL_MAX;
-    double distance;
+static double adaptive_right_distance(const double *sorted,
+                                      int position,
+                                      int index)
+{
+  return sorted[position + 1 + index] - sorted[position];
+}
 
-    if (left >= 0)
-      dleft = eval_value - support[left];
-    if (right < support_n)
-      dright = support[right] - eval_value;
+static double generalized_left_distance(const double *sorted,
+                                        int split,
+                                        double eval_value,
+                                        int index)
+{
+  return eval_value - sorted[split - 1 - index];
+}
 
-    distance = (dleft < dright) ? dleft : dright;
+static double generalized_right_distance(const double *sorted,
+                                         int split,
+                                         double eval_value,
+                                         int index)
+{
+  return sorted[split + index] - eval_value;
+}
 
-    if (distance <= DBL_MIN)
-      return 1;
+/*
+ * Select the k-th member of two nondecreasing distance sequences without
+ * materializing their merge.  A valid partition takes k elements in total
+ * and leaves every selected boundary no larger than either unselected
+ * boundary.  The adaptive sequences omit exactly the focal observation;
+ * duplicate observations remain separate sequence members and therefore
+ * retain observation-count NN semantics.
+ */
+static int kth_observation_radius_sorted_adaptive(const double *sorted,
+                                                  int n,
+                                                  int position,
+                                                  int int_k_nn,
+                                                  double *radius_out)
+{
+  const int left_n = position;
+  const int right_n = n - position - 1;
+  int lo = (int_k_nn > right_n) ? int_k_nn - right_n : 0;
+  int hi = (int_k_nn < left_n) ? int_k_nn : left_n;
 
-    if ((left >= 0) && ((eval_value - support[left]) == distance)) {
-      count += support_count[left];
-      left--;
-    }
-    if ((right < support_n) && ((support[right] - eval_value) == distance)) {
-      count += support_count[right];
-      right++;
-    }
+  while (lo <= hi) {
+    const int take_left = lo + (hi - lo) / 2;
+    const int take_right = int_k_nn - take_left;
+    const double left_before = (take_left > 0) ?
+      adaptive_left_distance(sorted, position, take_left - 1) : -INFINITY;
+    const double left_after = (take_left < left_n) ?
+      adaptive_left_distance(sorted, position, take_left) : INFINITY;
+    const double right_before = (take_right > 0) ?
+      adaptive_right_distance(sorted, position, take_right - 1) : -INFINITY;
+    const double right_after = (take_right < right_n) ?
+      adaptive_right_distance(sorted, position, take_right) : INFINITY;
 
-    if (count >= int_k_nn) {
-      *radius_out = distance;
+    if (left_before > right_after) {
+      hi = take_left - 1;
+    } else if (right_before > left_after) {
+      lo = take_left + 1;
+    } else {
+      *radius_out = (left_before > right_before) ? left_before : right_before;
       return 0;
     }
   }
-
   return 1;
 }
 
-static int compute_nn_distance_train_eval_observation_support_subset(int num_obs_train,
-                                                                     int num_obs_eval,
-                                                                     double *vector_data_train,
-                                                                     double *vector_data_eval,
-                                                                     int int_k_nn,
-                                                                     int query_start,
-                                                                     int query_end,
-                                                                     double *nn_distance)
+static int kth_observation_radius_sorted_generalized(const double *sorted,
+                                                     int n,
+                                                     int split,
+                                                     double eval_value,
+                                                     int int_k_nn,
+                                                     double *radius_out)
 {
-  int i, j, support_n;
-  double *support;
-  int *support_count;
+  const int left_n = split;
+  const int right_n = n - split;
+  int lo = (int_k_nn > right_n) ? int_k_nn - right_n : 0;
+  int hi = (int_k_nn < left_n) ? int_k_nn : left_n;
 
-  support = NULL;
-  support_count = NULL;
+  while (lo <= hi) {
+    const int take_left = lo + (hi - lo) / 2;
+    const int take_right = int_k_nn - take_left;
+    const double left_before = (take_left > 0) ?
+      generalized_left_distance(sorted, split, eval_value, take_left - 1) : -INFINITY;
+    const double left_after = (take_left < left_n) ?
+      generalized_left_distance(sorted, split, eval_value, take_left) : INFINITY;
+    const double right_before = (take_right > 0) ?
+      generalized_right_distance(sorted, split, eval_value, take_right - 1) : -INFINITY;
+    const double right_after = (take_right < right_n) ?
+      generalized_right_distance(sorted, split, eval_value, take_right) : INFINITY;
 
+    if (left_before > right_after) {
+      hi = take_left - 1;
+    } else if (right_before > left_after) {
+      lo = take_left + 1;
+    } else {
+      *radius_out = (left_before > right_before) ? left_before : right_before;
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static NPNNGeometryStatus
+kth_observation_radius_for_eval_sorted(const double *sorted,
+                                       int n,
+                                       double eval_value,
+                                       int int_k_nn,
+                                       double *radius_out)
+{
+  const int split = lower_bound_observation_support(n, sorted, eval_value);
+  if (kth_observation_radius_sorted_generalized(
+        sorted, n, split, eval_value, int_k_nn, radius_out) != 0)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  if (!isfinite(*radius_out))
+    return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+  if (*radius_out == 0.0)
+    return NP_NN_GEOMETRY_ZERO_RADIUS;
+  if (*radius_out < 0.0)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  return NP_NN_GEOMETRY_OK;
+}
+
+static NPNNGeometryStatus
+compute_nn_distance_observation_support_subset(int num_obs,
+                                               double *vector_data,
+                                               int int_k_nn,
+                                               int query_start,
+                                               int query_end,
+                                               double *nn_distance)
+{
+  int i, j, start;
+  double *sorted = NULL;
+  double *sorted_radius = NULL;
+
+  if (num_obs <= 0 || vector_data == NULL || nn_distance == NULL ||
+      query_start < 0 || query_end >= num_obs)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
   if (query_start > query_end)
-    return 0;
+    return NP_NN_GEOMETRY_OK;
+  for (i = 0; i < num_obs; ++i)
+    if (!isfinite(vector_data[i]))
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
 
-  if ((query_start < 0) || (query_end >= num_obs_eval))
-    return 1;
+  if (build_sorted_observation_support(num_obs, vector_data, &sorted) != 0)
+    return NP_NN_GEOMETRY_ALLOCATION_FAILURE;
 
-  if (build_sorted_unique_support(num_obs_train, vector_data_train, &support, &support_count, &support_n) != 0)
-    return 1;
+  if ((int_k_nn < 1) || (int_k_nn > num_obs - 1)) {
+    free(sorted);
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  }
 
-  if ((int_k_nn < 1) || (int_k_nn > num_obs_train - 1)) {
-    free(support);
-    free(support_count);
-    return 1;
+  sorted_radius = alloc_vecd(num_obs);
+  start = 0;
+  while (start < num_obs) {
+    const int stop = upper_bound_observation_support(num_obs, sorted, sorted[start]);
+    double radius;
+
+    if (kth_observation_radius_sorted_adaptive(
+          sorted, num_obs, start, int_k_nn, &radius) != 0) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+    /* All observations in a duplicate block have the same self-excluded radius. */
+    if (!isfinite(radius)) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+    }
+    if (radius == 0.0) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_ZERO_RADIUS;
+    }
+    if (radius < 0.0) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+    for (i = start; i < stop; i++)
+      sorted_radius[i] = radius;
+    start = stop;
   }
 
   for (i = query_start, j = 0; i <= query_end; i++, j++) {
-    if (kth_observation_radius_for_eval_from_support(
-          support_n, support, support_count, vector_data_eval[i], int_k_nn, &nn_distance[j]
-        ) != 0) {
-      free(support);
-      free(support_count);
-      return 1;
+    const int idx = lower_bound_observation_support(num_obs, sorted, vector_data[i]);
+
+    if (idx >= num_obs || sorted[idx] != vector_data[i]) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+
+    nn_distance[j] = sorted_radius[idx];
+    if (nn_distance[j] == 0.0) {
+      free(sorted);
+      free(sorted_radius);
+      return NP_NN_GEOMETRY_ZERO_RADIUS;
+    }
+    if (nn_distance[j] < 0.0 || !isfinite(nn_distance[j])) {
+      const NPNNGeometryStatus status = !isfinite(nn_distance[j]) ?
+        NP_NN_GEOMETRY_NONFINITE_RADIUS : NP_NN_GEOMETRY_INVALID_ARGUMENT;
+      free(sorted);
+      free(sorted_radius);
+      return status;
     }
   }
 
-  free(support);
-  free(support_count);
+  free(sorted);
+  free(sorted_radius);
+
+  return NP_NN_GEOMETRY_OK;
+}
+
+/*
+ * Prepare the adjacent donor-self-excluded order statistics needed by exact
+ * adaptive delete-one geometry. One occurrence-safe value sort serves every
+ * donor; duplicate observations remain separate multiset members. Zero
+ * radii are retained for pair-local status handling rather than replaced by a
+ * nearest-positive distance.
+ */
+NPNNGeometryStatus compute_nn_adaptive_distance_pair(
+  const int num_obs,
+  const double *vector_data,
+  const int int_k_nn,
+  double *primary_distance,
+  double *successor_distance)
+{
+  double *sorted = NULL;
+  double *primary_sorted = NULL;
+  double *successor_sorted = NULL;
+  int start;
+  int observation;
+
+  if(num_obs < 3 || vector_data == NULL || primary_distance == NULL ||
+     successor_distance == NULL || int_k_nn < 1 ||
+     int_k_nn > num_obs - 2)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  for(observation = 0; observation < num_obs; ++observation)
+    if(!isfinite(vector_data[observation]))
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+
+  if(build_sorted_observation_support(
+       num_obs, vector_data, &sorted) != 0)
+    return NP_NN_GEOMETRY_ALLOCATION_FAILURE;
+  primary_sorted = alloc_vecd(num_obs);
+  successor_sorted = alloc_vecd(num_obs);
+  if(primary_sorted == NULL || successor_sorted == NULL){
+    free(sorted);
+    free(primary_sorted);
+    free(successor_sorted);
+    return NP_NN_GEOMETRY_ALLOCATION_FAILURE;
+  }
+
+  start = 0;
+  while(start < num_obs){
+    const int stop = upper_bound_observation_support(
+      num_obs, sorted, sorted[start]);
+    double primary;
+    double successor;
+
+    if(kth_observation_radius_sorted_adaptive(
+         sorted, num_obs, start, int_k_nn, &primary) != 0 ||
+       kth_observation_radius_sorted_adaptive(
+         sorted, num_obs, start, int_k_nn + 1, &successor) != 0 ||
+       !isfinite(primary) || !isfinite(successor) ||
+       primary < 0.0 || successor < primary){
+      free(sorted);
+      free(primary_sorted);
+      free(successor_sorted);
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+    }
+    for(observation = start; observation < stop; ++observation){
+      primary_sorted[observation] = primary;
+      successor_sorted[observation] = successor;
+    }
+    start = stop;
+  }
+
+  for(observation = 0; observation < num_obs; ++observation){
+    const int position = lower_bound_observation_support(
+      num_obs, sorted, vector_data[observation]);
+
+    if(position < 0 || position >= num_obs ||
+       sorted[position] != vector_data[observation]){
+      free(sorted);
+      free(primary_sorted);
+      free(successor_sorted);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+    primary_distance[observation] = primary_sorted[position];
+    successor_distance[observation] = successor_sorted[position];
+  }
+
+  free(sorted);
+  free(primary_sorted);
+  free(successor_sorted);
+  return NP_NN_GEOMETRY_OK;
+}
+
+/*
+ * Materialize one exact adaptive-fold bandwidth row without allocation. The
+ * held-out donor slot is never consumed by the delete-one estimator; give the
+ * generic row engine a finite positive placeholder so it cannot manufacture
+ * a division-by-zero before applying its structural omission.
+ */
+NPNNGeometryStatus np_nn_adaptive_fold_select_row(
+  const int num_obs,
+  const int num_cont,
+  double **matrix_train,
+  double **primary_bandwidth,
+  double **successor_bandwidth,
+  const double *fold_scale,
+  const int held_out,
+  double **selected_bandwidth)
+{
+  int coordinate;
+  int donor;
+
+  if(num_obs < 3 || num_cont <= 0 || held_out < 0 || held_out >= num_obs ||
+     matrix_train == NULL || primary_bandwidth == NULL ||
+     successor_bandwidth == NULL || fold_scale == NULL ||
+     selected_bandwidth == NULL)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+
+  for(coordinate = 0; coordinate < num_cont; ++coordinate){
+    if(matrix_train[coordinate] == NULL ||
+       primary_bandwidth[coordinate] == NULL ||
+       successor_bandwidth[coordinate] == NULL ||
+       selected_bandwidth[coordinate] == NULL ||
+       !isfinite(fold_scale[coordinate]) || fold_scale[coordinate] < 1.0)
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    selected_bandwidth[coordinate][held_out] = 1.0;
+    for(donor = 0; donor < num_obs; ++donor){
+      double selected;
+      double distance;
+
+      if(donor == held_out)
+        continue;
+      distance = fabs(matrix_train[coordinate][held_out] -
+                      matrix_train[coordinate][donor])*
+        fold_scale[coordinate];
+      if(np_nn_two_slot_radius_select(
+           primary_bandwidth[coordinate][donor],
+           successor_bandwidth[coordinate][donor],
+           distance, 1, &selected) != 0)
+        return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+      if(!isfinite(selected))
+        return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+      if(selected <= 0.0)
+        return NP_NN_GEOMETRY_ZERO_RADIUS;
+      selected_bandwidth[coordinate][donor] = selected;
+    }
+  }
+  return NP_NN_GEOMETRY_OK;
+}
+
+static NPNNGeometryStatus
+compute_nn_distance_train_eval_observation_support_subset(
+  int num_obs_train,
+  int num_obs_eval,
+  double *vector_data_train,
+  double *vector_data_eval,
+  int int_k_nn,
+  int query_start,
+  int query_end,
+  double *nn_distance)
+{
+  int i, j;
+  double *sorted = NULL;
+
+  if (num_obs_train <= 0 || num_obs_eval <= 0 ||
+      vector_data_train == NULL || vector_data_eval == NULL ||
+      nn_distance == NULL || query_start < 0 || query_end >= num_obs_eval)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  if (query_start > query_end)
+    return NP_NN_GEOMETRY_OK;
+  for (i = 0; i < num_obs_train; ++i)
+    if (!isfinite(vector_data_train[i]))
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+
+  if (build_sorted_observation_support(num_obs_train, vector_data_train, &sorted) != 0)
+    return NP_NN_GEOMETRY_ALLOCATION_FAILURE;
+
+  if ((int_k_nn < 1) || (int_k_nn > num_obs_train - 1)) {
+    free(sorted);
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+  }
+
+  for (i = query_start, j = 0; i <= query_end; i++, j++) {
+    NPNNGeometryStatus status;
+
+    if (!isfinite(vector_data_eval[i])) {
+      free(sorted);
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+    }
+    status = kth_observation_radius_for_eval_sorted(
+      sorted, num_obs_train, vector_data_eval[i], int_k_nn, &nn_distance[j]);
+    if (status != NP_NN_GEOMETRY_OK) {
+      free(sorted);
+      return status;
+    }
+  }
+
+  free(sorted);
+  return NP_NN_GEOMETRY_OK;
+}
+
+/*
+ * Canonical generalized-NN query primitive.  Occurrence identity is supplied
+ * by the caller; it is never inferred from pointer or value equality.  The
+ * selected radius is the literal order statistic after deleting at most one
+ * identified training occurrence.  In particular, a zero order statistic is
+ * reported as such rather than replaced by the nearest positive distance.
+ */
+int np_nn_two_slot_radius_select(const double primary_radius,
+                                 const double successor_radius,
+                                 const double base_distance,
+                                 const int distinct_base_exclusion,
+                                 double *radius)
+{
+  if(radius == NULL || !isfinite(primary_radius) || primary_radius < 0.0 ||
+     (distinct_base_exclusion &&
+      (!isfinite(successor_radius) || successor_radius < primary_radius ||
+       !isfinite(base_distance) || base_distance < 0.0)))
+    return 1;
+
+  *radius = distinct_base_exclusion && base_distance <= primary_radius ?
+    successor_radius : primary_radius;
   return 0;
+}
+
+typedef struct {
+  double value;
+  int occurrence;
+} NPNNTwoSlotOrderEntry;
+
+static int np_nn_two_slot_order_entry_compare(const void *left,
+                                              const void *right)
+{
+  const NPNNTwoSlotOrderEntry * const lhs =
+    (const NPNNTwoSlotOrderEntry *)left;
+  const NPNNTwoSlotOrderEntry * const rhs =
+    (const NPNNTwoSlotOrderEntry *)right;
+
+  if(lhs->value < rhs->value)
+    return -1;
+  if(lhs->value > rhs->value)
+    return 1;
+  if(lhs->occurrence < rhs->occurrence)
+    return -1;
+  if(lhs->occurrence > rhs->occurrence)
+    return 1;
+  return 0;
+}
+
+/* Prepare the occurrence-safe response order and, for every mapped query,
+ * the half-open interval of base occurrences whose deletion advances the
+ * prepared primary radius. Inclusive support-boundary ties are retained.
+ * Storage is linear and the single sort is shared by all fold queries. */
+int np_nn_two_slot_exclusion_intervals_scaled(
+  const double *primary_radius,
+  const double *successor_radius,
+  const double *training_values,
+  const int num_train,
+  const double distance_scale,
+  const int *occurrence_to_position,
+  int *sorted_occurrences,
+  int *interval_start,
+  int *interval_end)
+{
+  NPNNTwoSlotOrderEntry *order = NULL;
+  unsigned char *seen_position = NULL;
+  int occurrence;
+  int status = 1;
+
+  if(primary_radius == NULL || successor_radius == NULL ||
+     training_values == NULL || num_train <= 0 ||
+     !isfinite(distance_scale) || distance_scale <= 0.0 ||
+     sorted_occurrences == NULL || interval_start == NULL ||
+     interval_end == NULL)
+    return 1;
+
+  order = (NPNNTwoSlotOrderEntry *)malloc(
+    (size_t)num_train*sizeof(NPNNTwoSlotOrderEntry));
+  seen_position = (unsigned char *)calloc(
+    (size_t)num_train, sizeof(unsigned char));
+  if(order == NULL || seen_position == NULL)
+    goto cleanup_two_slot_intervals;
+
+  for(occurrence = 0; occurrence < num_train; ++occurrence){
+    const int position = occurrence_to_position != NULL ?
+      occurrence_to_position[occurrence] : occurrence;
+
+    if(position < 0 || position >= num_train || seen_position[position] ||
+       !isfinite(training_values[position]) ||
+       !isfinite(primary_radius[position]) || primary_radius[position] < 0.0 ||
+       !isfinite(successor_radius[position]) ||
+       successor_radius[position] < primary_radius[position])
+      goto cleanup_two_slot_intervals;
+    seen_position[position] = 1U;
+    order[occurrence].value = training_values[position];
+    order[occurrence].occurrence = occurrence;
+  }
+
+  qsort(order,
+        (size_t)num_train,
+        sizeof(NPNNTwoSlotOrderEntry),
+        np_nn_two_slot_order_entry_compare);
+
+  for(occurrence = 0; occurrence < num_train; ++occurrence)
+    sorted_occurrences[occurrence] = order[occurrence].occurrence;
+
+  for(int query_rank = 0; query_rank < num_train; ++query_rank){
+    const int query_occurrence = order[query_rank].occurrence;
+    const int query_position = occurrence_to_position != NULL ?
+      occurrence_to_position[query_occurrence] : query_occurrence;
+    const double query_value = order[query_rank].value;
+    const double radius = primary_radius[query_position];
+    int lo = 0;
+    int hi = query_rank;
+
+    while(lo < hi){
+      const int mid = lo + (hi - lo)/2;
+      if(fabs(order[mid].value - query_value)*distance_scale > radius)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    interval_start[query_rank] = lo;
+
+    lo = query_rank;
+    hi = num_train;
+    while(lo < hi){
+      const int mid = lo + (hi - lo)/2;
+      if(fabs(order[mid].value - query_value)*distance_scale <= radius)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    interval_end[query_rank] = lo;
+    if(interval_start[query_rank] > query_rank ||
+       interval_end[query_rank] <= query_rank)
+      goto cleanup_two_slot_intervals;
+  }
+
+  status = 0;
+
+cleanup_two_slot_intervals:
+  free(order);
+  free(seen_position);
+  return status;
+}
+
+/* Preserve the scale-one contract for incumbent conditional callers. */
+int np_nn_two_slot_exclusion_intervals(
+  const double *primary_radius, const double *successor_radius,
+  const double *training_values, const int num_train,
+  const int *occurrence_to_position, int *sorted_occurrences,
+  int *interval_start, int *interval_end)
+{
+  return np_nn_two_slot_exclusion_intervals_scaled(
+    primary_radius, successor_radius, training_values, num_train, 1.0,
+    occurrence_to_position, sorted_occurrences, interval_start, interval_end);
+}
+
+static NPNNGeometryStatus
+compute_nn_distance_train_eval_context_subset(
+  const int num_obs_train,
+  const int num_obs_eval,
+  const double *vector_data_train,
+  const double *vector_data_eval,
+  const int int_k_nn,
+  const NPNNGeometryContext *geometry_context,
+  const int query_start,
+  const int query_end,
+  double *nn_distance)
+{
+  double *sorted = NULL;
+  int i, j;
+
+  if(num_obs_train <= 0 || num_obs_eval <= 0 ||
+     vector_data_train == NULL || vector_data_eval == NULL ||
+     geometry_context == NULL || nn_distance == NULL ||
+     query_start < 0 || query_end >= num_obs_eval)
+    return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+
+  if(query_start > query_end)
+    return NP_NN_GEOMETRY_OK;
+
+  if(geometry_context->mode == NP_NN_QUERY_TRAINING_IDENTITY) {
+    if(num_obs_train != num_obs_eval || geometry_context->eval_to_train != NULL)
+      return NP_NN_GEOMETRY_INVALID_EXCLUSION;
+  } else if(geometry_context->mode == NP_NN_QUERY_TRAINING_MAP) {
+    if(geometry_context->eval_to_train == NULL)
+      return NP_NN_GEOMETRY_INVALID_EXCLUSION;
+  } else if(geometry_context->mode != NP_NN_QUERY_EXTERNAL ||
+            geometry_context->eval_to_train != NULL) {
+    return NP_NN_GEOMETRY_INVALID_EXCLUSION;
+  }
+
+  for(i = 0; i < num_obs_train; ++i)
+    if(!isfinite(vector_data_train[i]))
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+
+  if(build_sorted_observation_support(
+       num_obs_train, vector_data_train, &sorted) != 0)
+    return NP_NN_GEOMETRY_ALLOCATION_FAILURE;
+
+  for(i = query_start, j = 0; i <= query_end; ++i, ++j) {
+    const int exclude_training =
+      geometry_context->mode != NP_NN_QUERY_EXTERNAL;
+    const int excluded =
+      geometry_context->mode == NP_NN_QUERY_TRAINING_IDENTITY ? i :
+      (geometry_context->mode == NP_NN_QUERY_TRAINING_MAP ?
+       geometry_context->eval_to_train[i] : -1);
+    const int target_k = int_k_nn + exclude_training;
+    int split;
+    double radius = 0.0;
+
+    if(!isfinite(vector_data_eval[i])) {
+      free(sorted);
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+    }
+
+    if(exclude_training) {
+      if(excluded < 0 || excluded >= num_obs_train ||
+         vector_data_eval[i] != vector_data_train[excluded]) {
+        free(sorted);
+        return NP_NN_GEOMETRY_INVALID_EXCLUSION;
+      }
+    }
+
+    if(int_k_nn < 1 ||
+       int_k_nn > num_obs_train - exclude_training) {
+      free(sorted);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+
+    split = lower_bound_observation_support(
+      num_obs_train, sorted, vector_data_eval[i]);
+
+    /* Identity mode deletes the zero self distance, hence selects k + 1. */
+    if(kth_observation_radius_sorted_generalized(
+         sorted, num_obs_train, split, vector_data_eval[i],
+         target_k, &radius) != 0) {
+      free(sorted);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+    if(!isfinite(radius)) {
+      free(sorted);
+      return NP_NN_GEOMETRY_NONFINITE_RADIUS;
+    }
+    if(radius == 0.0) {
+      free(sorted);
+      return NP_NN_GEOMETRY_ZERO_RADIUS;
+    }
+    if(radius < 0.0) {
+      free(sorted);
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    }
+    nn_distance[j] = radius;
+  }
+
+  free(sorted);
+  return NP_NN_GEOMETRY_OK;
 }
 
 /* Population variance, double precision */
 /* Returns 0 upon success, 1 upon failure (constant most likely) */
 
 
-int compute_nn_distance(int num_obs, int suppress_parallel, double *vector_data,
-int int_k_nn, double *nn_distance)
+NPNNGeometryStatus compute_nn_distance_status(
+  int num_obs,
+  int suppress_parallel,
+  double *vector_data,
+  int int_k_nn,
+  double *nn_distance)
 {
 
 #ifdef MPI2
-    int stride = (int)ceil((double) num_obs / (double) iNum_Processors);
-		int return_flag = 0;
-		int return_flag_MPI = 0;
-    if(stride < 1) stride = 1;
+    int stride = 0;
+    int global_status = NP_NN_GEOMETRY_OK;
+    int local_status = NP_NN_GEOMETRY_OK;
+    if(!np_int_ceil_div_nonnegative(num_obs, iNum_Processors, &stride))
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    if(stride < 1)
+      stride = 1;
 
     int is, ie;
 #endif
@@ -767,10 +1158,11 @@ int int_k_nn, double *nn_distance)
         {
 					REprintf("\n** Error: Invalid Kth nearest neighbor (%d).", int_k_nn);
         }
-			return(1);
+			return NP_NN_GEOMETRY_INVALID_ARGUMENT;
     }
 
-    return(compute_nn_distance_observation_support_subset(num_obs, vector_data, int_k_nn, 0, num_obs - 1, nn_distance));
+    return compute_nn_distance_observation_support_subset(
+      num_obs, vector_data, int_k_nn, 0, num_obs - 1, nn_distance);
 
 #endif
 
@@ -785,7 +1177,7 @@ int int_k_nn, double *nn_distance)
                 REprintf("\n** Error: Invalid Kth nearest neighbor (%d).", int_k_nn);
             }
         }
-        return(1);
+        return NP_NN_GEOMETRY_INVALID_ARGUMENT;
     }
 
 
@@ -798,43 +1190,59 @@ int int_k_nn, double *nn_distance)
       ie = num_obs - 1;
     }
 
-    if (compute_nn_distance_observation_support_subset(num_obs, vector_data, int_k_nn, is, ie, nn_distance) != 0)
-        return_flag_MPI = 1;
+    local_status = (int)compute_nn_distance_observation_support_subset(
+      num_obs, vector_data, int_k_nn, is, ie, nn_distance);
 
-    if(!suppress_parallel){
-      MPI_Reduce(&return_flag_MPI, &return_flag, 1, MPI_INT, MPI_SUM, 0, comm[1]);
-      MPI_Bcast(&return_flag, 1, MPI_INT, 0, comm[1]);
+    if(suppress_parallel){
+      global_status = local_status;
+    } else {
+      MPI_Reduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, 0, comm[1]);
+      MPI_Bcast(&global_status, 1, MPI_INT, 0, comm[1]);
     }
 
-		if(return_flag > 0) {
-			return(1);
+		if(global_status != NP_NN_GEOMETRY_OK) {
+			return (NPNNGeometryStatus)global_status;
 		}
 
 	    if(!suppress_parallel){
 	      if (mpi_gatherv_nn_distance_exact(num_obs, stride, nn_distance) != 0)
-	        return(1);
+	        return NP_NN_GEOMETRY_INVALID_ARGUMENT;
 	      MPI_Bcast(nn_distance, num_obs, MPI_DOUBLE, 0, comm[1]);
 	    }
 #endif
 
-    return(0);
+    return NP_NN_GEOMETRY_OK;
 
 }
 
+int compute_nn_distance(int num_obs, int suppress_parallel, double *vector_data,
+                        int int_k_nn, double *nn_distance)
+{
+  return compute_nn_distance_status(
+    num_obs, suppress_parallel, vector_data, int_k_nn, nn_distance) ==
+    NP_NN_GEOMETRY_OK ? 0 : 1;
+}
 
-int compute_nn_distance_train_eval(int num_obs_train,
-                                   int num_obs_eval,
-                                   int suppress_parallel,
-                                   double *vector_data_train,
-                                   double *vector_data_eval,
-                                   int int_k_nn,
-                                   double *nn_distance){
+NPNNGeometryStatus compute_nn_distance_train_eval_status(
+  int num_obs_train,
+  int num_obs_eval,
+  int suppress_parallel,
+  double *vector_data_train,
+  double *vector_data_eval,
+  int int_k_nn,
+  double *nn_distance)
+{
 
 #ifdef MPI2
-    int stride = (int)ceil((double) num_obs_eval / (double) iNum_Processors);
-		int return_flag = 0;
-		int return_flag_MPI = 0;
-    if(stride < 1) stride = 1;
+    int stride = 0;
+    int global_status = NP_NN_GEOMETRY_OK;
+    int local_status = NP_NN_GEOMETRY_OK;
+    if(!np_int_ceil_div_nonnegative(num_obs_eval,
+                                    iNum_Processors,
+                                    &stride))
+      return NP_NN_GEOMETRY_INVALID_ARGUMENT;
+    if(stride < 1)
+      stride = 1;
     int is, ie;
 #endif
 
@@ -852,11 +1260,11 @@ int compute_nn_distance_train_eval(int num_obs_train,
 #endif
 
         }
-        return(1);
+        return NP_NN_GEOMETRY_INVALID_ARGUMENT;
     }
 
 #ifndef MPI2
-    return(compute_nn_distance_train_eval_observation_support_subset(
+    return compute_nn_distance_train_eval_observation_support_subset(
       num_obs_train,
       num_obs_eval,
       vector_data_train,
@@ -865,7 +1273,7 @@ int compute_nn_distance_train_eval(int num_obs_train,
       0,
       num_obs_eval - 1,
       nn_distance
-    ));
+    );
 
 #endif
 
@@ -879,7 +1287,7 @@ int compute_nn_distance_train_eval(int num_obs_train,
       ie = num_obs_eval - 1;
     }
 
-    if (compute_nn_distance_train_eval_observation_support_subset(
+    local_status = (int)compute_nn_distance_train_eval_observation_support_subset(
           num_obs_train,
           num_obs_eval,
           vector_data_train,
@@ -888,26 +1296,105 @@ int compute_nn_distance_train_eval(int num_obs_train,
           is,
           ie,
           nn_distance
-        ) != 0)
-      return_flag_MPI = 1;
+        );
 
-    if(!suppress_parallel){
-      MPI_Reduce(&return_flag_MPI, &return_flag, 1, MPI_INT, MPI_SUM, 0, comm[1]);
-      MPI_Bcast(&return_flag, 1, MPI_INT, 0, comm[1]);
+    if(suppress_parallel){
+      global_status = local_status;
+    } else {
+      MPI_Reduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, 0, comm[1]);
+      MPI_Bcast(&global_status, 1, MPI_INT, 0, comm[1]);
     }
-		if(return_flag > 0) {
-			return(1);
+		if(global_status != NP_NN_GEOMETRY_OK) {
+			return (NPNNGeometryStatus)global_status;
 		}
 
 	    if(!suppress_parallel){
 	      if (mpi_gatherv_nn_distance_exact(num_obs_eval, stride, nn_distance) != 0)
-	        return(1);
+	        return NP_NN_GEOMETRY_INVALID_ARGUMENT;
 	      MPI_Bcast(nn_distance, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
 	    }
 #endif
 
-    return(0);
+    return NP_NN_GEOMETRY_OK;
 
+}
+
+int compute_nn_distance_train_eval(int num_obs_train,
+                                   int num_obs_eval,
+                                   int suppress_parallel,
+                                   double *vector_data_train,
+                                   double *vector_data_eval,
+                                   int int_k_nn,
+                                   double *nn_distance)
+{
+  return compute_nn_distance_train_eval_status(
+    num_obs_train, num_obs_eval, suppress_parallel,
+    vector_data_train, vector_data_eval, int_k_nn, nn_distance) ==
+    NP_NN_GEOMETRY_OK ? 0 : 1;
+}
+
+NPNNGeometryStatus compute_nn_distance_train_eval_ctx(
+  const int num_obs_train,
+  const int num_obs_eval,
+  const int suppress_parallel,
+  const double *vector_data_train,
+  const double *vector_data_eval,
+  const int int_k_nn,
+  const NPNNGeometryContext *geometry_context,
+  double *nn_distance)
+{
+#ifdef MPI2
+  int stride = (int)ceil((double)num_obs_eval/(double)iNum_Processors);
+  int query_start;
+  int query_end;
+  int local_status;
+  int global_status = NP_NN_GEOMETRY_OK;
+
+  if(stride < 1)
+    stride = 1;
+  if(suppress_parallel) {
+    query_start = 0;
+    query_end = num_obs_eval - 1;
+  } else {
+    query_start = my_rank*stride;
+    query_end = MIN(num_obs_eval, (my_rank + 1)*stride) - 1;
+  }
+
+  local_status = (int)compute_nn_distance_train_eval_context_subset(
+    num_obs_train, num_obs_eval,
+    vector_data_train, vector_data_eval,
+    int_k_nn, geometry_context,
+    query_start, query_end, nn_distance);
+
+  if(!suppress_parallel) {
+    MPI_Reduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, 0, comm[1]);
+    MPI_Bcast(&global_status, 1, MPI_INT, 0, comm[1]);
+  } else {
+    global_status = local_status;
+  }
+
+  if(global_status != NP_NN_GEOMETRY_OK)
+    return (NPNNGeometryStatus)global_status;
+
+  if(!suppress_parallel) {
+    if(my_rank == 0) {
+      MPI_Gather(MPI_IN_PLACE, stride, MPI_DOUBLE,
+                 nn_distance, stride, MPI_DOUBLE, 0, comm[1]);
+    } else {
+      MPI_Gather(nn_distance, stride, MPI_DOUBLE,
+                 NULL, stride, MPI_DOUBLE, 0, comm[1]);
+    }
+    MPI_Bcast(nn_distance, num_obs_eval, MPI_DOUBLE, 0, comm[1]);
+  }
+  return NP_NN_GEOMETRY_OK;
+#else
+  (void)suppress_parallel;
+  return compute_nn_distance_train_eval_context_subset(
+    num_obs_train, num_obs_eval,
+    vector_data_train, vector_data_eval,
+    int_k_nn, geometry_context,
+    0, num_obs_eval - 1, nn_distance);
+#endif
 }
 
 
@@ -1009,6 +1496,17 @@ int initialize_nr_directions(int BANDWIDTH,
 
   return(0);
 
+}
+
+/* Supplied categorical starts use scale-factor units when int_large is zero.
+ * Validate their physical lambda without changing the supplied value.  Keep
+ * this conversion at initialization, not in the objective evaluation path. */
+static int np_categorical_start_is_valid(double value, double maximum,
+                                         int int_large, double ncatfac)
+{
+  if (!int_large)
+    value *= ncatfac;
+  return value >= 0.0 && value <= maximum;
 }
 
 void initialize_nr_vector_scale_factor(int BANDWIDTH,
@@ -1153,7 +1651,8 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
     if(!int_use_starting_values){
       vector_scale_factor[l+1] = bwi*(RANDOM ? (hbd_init-lbd_init)*ran3(&seed)+lbd_init : d_init);
     } else {
-      if(!is_valid_unordered_bw(vector_scale_factor[l+1], num_categories[l-ncon], kernel_yu)){
+      if(!np_categorical_start_is_valid(vector_scale_factor[l+1],
+             max_unordered_bw(num_categories[l-ncon], kernel_yu), int_large, ncatfac)){
         REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
         vector_scale_factor[l+1] = bwi;
       }
@@ -1166,7 +1665,7 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
     if(!int_use_starting_values){
       vector_scale_factor[l+1] = bwi*(RANDOM ? (hbd_init-lbd_init)*ran3(&seed)+lbd_init : d_init);
     } else {
-      if((vector_scale_factor[l+1] < 0.0) || (vector_scale_factor[l+1] > 1.0)){
+      if(!np_categorical_start_is_valid(vector_scale_factor[l+1], 1.0, int_large, ncatfac)){
         REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
         vector_scale_factor[l+1] = bwi;
       }
@@ -1179,7 +1678,8 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
     if(!int_use_starting_values){
       vector_scale_factor[l+1] = bwi*(RANDOM ? (hbd_init-lbd_init)*ran3(&seed)+lbd_init : d_init);
     } else {
-      if(!is_valid_unordered_bw(vector_scale_factor[l+1], num_categories[l-ncon], kernel_xu)){
+      if(!np_categorical_start_is_valid(vector_scale_factor[l+1],
+             max_unordered_bw(num_categories[l-ncon], kernel_xu), int_large, ncatfac)){
         REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
         vector_scale_factor[l+1] = bwi;
       }
@@ -1192,7 +1692,7 @@ void initialize_nr_vector_scale_factor(int BANDWIDTH,
     if(!int_use_starting_values){
       vector_scale_factor[l+1] = bwi*(RANDOM ? (hbd_init-lbd_init)*ran3(&seed)+lbd_init : d_init);
     } else {
-      if((vector_scale_factor[l+1] < 0.0) || (vector_scale_factor[l+1] > 1.0)){
+      if(!np_categorical_start_is_valid(vector_scale_factor[l+1], 1.0, int_large, ncatfac)){
         REprintf("\n** Warning: invalid sf in init_nr_sf() [%g]\n", vector_scale_factor[l+1]);
         vector_scale_factor[l+1] = bwi;
       }
@@ -1691,7 +2191,8 @@ double **matrix_categorical_vals)
 
 int check_valid_scale_factor_cv(
 int KERNEL,
-int KERNEL_unordered_liracine,
+int KERNEL_var_unordered_liracine,
+int KERNEL_reg_unordered_liracine,
 int BANDWIDTH,
 int BANDWIDTH_den_ml,
 int REGRESSION_ML,
@@ -1857,7 +2358,7 @@ double *vector_scale_factor)
     for(i = num_var_continuous+num_reg_continuous+1; i <= num_var_continuous+num_reg_continuous+num_var_unordered; i++)
     {
 /* Check for admissible value of lambda - in inadmissible, set to admissible */
-      if(KERNEL_unordered_liracine == 1) {
+      if(KERNEL_var_unordered_liracine == 1) {
         /* If using the unordered li_racine kernel use ordered bounds */
         if(int_LARGE_SF == 0)
         {
@@ -1919,7 +2420,7 @@ double *vector_scale_factor)
     for(i = num_var_continuous+num_reg_continuous+num_var_unordered+num_var_ordered+1; i <= num_var_continuous+num_reg_continuous+num_var_unordered+num_var_ordered+num_reg_unordered; i++)
     {
 /* Check for admissible value of lambda - in inadmissible, set to admissible */
-      if(KERNEL_unordered_liracine == 1) {
+      if(KERNEL_reg_unordered_liracine == 1) {
         /* If using the unordered li_racine kernel use ordered bounds */
         if(int_LARGE_SF == 0)
         {
@@ -2006,67 +2507,6 @@ double *vector_scale_factor)
 
 }
 
-
-int compute_continuous_stddev(
-int int_large,
-int num_obs,
-int num_var_continuous,
-int num_reg_continuous,
-double **matrix_Y_continuous,
-double **matrix_X_continuous,
-double *vector_continuous_stddev)
-{
-
-    int i;
-
-/* In vector_scale_factor, order is continuous reg, continuous var, */
-
-/* Only compute if not using standardized values */
-
-    if(int_large == 1)
-    {
-
-        for(i=0; i < num_reg_continuous; i++)
-        {
-
-            vector_continuous_stddev[i] = standerrd(num_obs, matrix_X_continuous[i]);
-
-            if(vector_continuous_stddev[i] <= DBL_MIN)
-            {
-              error("\r ** Fatal Error in routine kernel_bandwidth() ** variable %d appears to be constant!", i);
-            }
-
-        }
-
-        for(i=0; i < num_var_continuous; i++)
-        {
-
-            vector_continuous_stddev[i+num_reg_continuous] = standerrd(num_obs, matrix_Y_continuous[i]);
-
-            if(vector_continuous_stddev[i+num_reg_continuous] <= DBL_MIN)
-            {
-              error("\r ** Fatal Error in routine kernel_bandwidth() ** variable %d appears to be constant!", i+num_reg_continuous);
-            }
-            
-        }
-
-    }
-
-    return(0);
-
-}
-
-
-
-
-
-/* +++Date last modified: 05-Jul-1997 */
-
-/*
- **  IPOW.C - Raise a number to an integer power
- **
- **  public domain by Mark Stephen with suggestions by Keiichi Nakasato
- */
 
 double ipow(double x, int n)                      /* return x^n */
 {

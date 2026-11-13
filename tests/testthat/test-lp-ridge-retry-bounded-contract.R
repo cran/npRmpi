@@ -1,0 +1,191 @@
+locate_lp_retry_source <- function(file) {
+  candidates <- c(
+    test_path("..", "..", "src", file),
+    test_path("..", "..", "..", "src", file),
+    file.path(Sys.getenv("R_PACKAGE_DIR", ""), "src", file),
+    file.path(Sys.getenv("R_PACKAGE_SOURCE", ""), "src", file),
+    file.path(getwd(), "src", file),
+    file.path(getwd(), "..", "src", file)
+  )
+  candidates <- unique(candidates[nzchar(candidates)])
+  hits <- candidates[file.exists(candidates)]
+  if (!length(hits))
+    return(NULL)
+  hits[[1L]]
+}
+
+locate_lp_retry_r_source <- function(file) {
+  candidates <- c(
+    test_path("..", "..", "R", file),
+    test_path("..", "..", "..", "R", file),
+    file.path(Sys.getenv("R_PACKAGE_DIR", ""), "R", file),
+    file.path(Sys.getenv("R_PACKAGE_SOURCE", ""), "R", file),
+    file.path(getwd(), "R", file),
+    file.path(getwd(), "..", "R", file)
+  )
+  candidates <- unique(candidates[nzchar(candidates)])
+  hits <- candidates[file.exists(candidates)]
+  if (!length(hits))
+    return(NULL)
+  hits[[1L]]
+}
+
+test_that("all canonical LP solve retries are bounded", {
+  jksum.file <- locate_lp_retry_source("jksum.c")
+  solve.c.file <- locate_lp_retry_source("jksum_lp_solve.c")
+  solve.h.file <- locate_lp_retry_source("jksum_lp_solve.h")
+  reghat.c.file <- locate_lp_retry_source("reghat_fast.c")
+  reghat.r.file <- locate_lp_retry_r_source("np.reghat.R")
+  skip_if(any(vapply(
+    list(jksum.file, solve.c.file, solve.h.file, reghat.c.file, reghat.r.file),
+    is.null,
+    logical(1L)
+  )), "complete LP retry sources unavailable in this test context")
+
+  jksum <- paste(np_test_read_incumbent_c_source(jksum.file, warn = FALSE), collapse = "\n")
+  solve.c <- paste(np_test_read_incumbent_c_source(solve.c.file, warn = FALSE), collapse = "\n")
+  solve.h <- paste(np_test_read_incumbent_c_source(solve.h.file, warn = FALSE), collapse = "\n")
+  reghat.c <- paste(np_test_read_incumbent_c_source(reghat.c.file, warn = FALSE), collapse = "\n")
+  reghat.r <- paste(np_test_read_incumbent_c_source(reghat.r.file, warn = FALSE), collapse = "\n")
+
+  expect_true(grepl(
+    "execution->status = NP_REGRESSION_GENERAL_LP_FIT_ERR_SOLVE;",
+    jksum,
+    fixed = TRUE
+  ))
+  expect_false(grepl("cleanup_glp_fit:", jksum, fixed = TRUE))
+  expect_true(grepl(
+    "#define NP_LP_SOLVE_MAX_RIDGE_STEPS 128",
+    solve.h,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_response_ranked(",
+    solve.c,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    solve.c,
+    fixed = TRUE
+  ))
+  expect_true(grepl("NP_LP_COLD_PATH", solve.h, fixed = TRUE))
+  expect_true(grepl(
+    "for(i = 0; i < gram_elements; i++)",
+    solve.c,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "for(i = 0; i < rhs_elements; i++)",
+    solve.c,
+    fixed = TRUE
+  ))
+  step.guard.count <- lengths(regmatches(
+    solve.c,
+    gregexpr(
+      "ridge_steps >= NP_LP_SOLVE_MAX_RIDGE_STEPS",
+      solve.c,
+      fixed = TRUE
+    )
+  ))
+  expect_gte(step.guard.count, 2L)
+  expect_true(grepl(
+    "np_lp_solve_workspace_sources_finite(workspace, p, nrhs)",
+    solve.c,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    reghat.c,
+    fixed = TRUE
+  ))
+  expect_false(grepl(
+    "NP_LP_SOLVE_MAX_RIDGE_STEPS",
+    reghat.c
+  ))
+  expect_false(grepl(
+    "np_lp_solve_workspace_solve\\(",
+    jksum
+  ))
+
+  fallback.start <- regexpr(
+    "\\.npreghat_exact_lp_matrix_from_kernel_weights <- function",
+    reghat.r
+  )
+  fallback.stops <- c(
+    regexpr(
+      "\\.npreghat_exact_lp_apply_chunked_from_kernel_weights <- function",
+      reghat.r
+    ),
+    regexpr(
+      "\\.npreghat_exact_lp_apply_from_regression_core <- function",
+      reghat.r
+    )
+  )
+  fallback.stop <- min(fallback.stops[fallback.stops > fallback.start])
+  expect_gt(fallback.start, 0L)
+  expect_gt(fallback.stop, fallback.start)
+  fallback <- substr(reghat.r, fallback.start, fallback.stop - 1L)
+  # The R matrix route now borrows the canonical bounded native adjoint solve.
+  expect_true(grepl("C_np_lp_adjoint_prepared", fallback, fixed = TRUE))
+  expect_true(grepl("non-finite system", fallback, fixed = TRUE))
+  expect_false(grepl("repeat\\s*\\{", fallback))
+})
+
+test_that("compiled LP hat path rejects a non-finite system promptly", {
+  package <- if ("npRmpi" %in% loadedNamespaces()) "npRmpi" else "np"
+  kw <- matrix(1.0, nrow = 4L, ncol = 1L)
+  wtrain <- cbind(1.0, c(NaN, 0.0, 0.0, 0.0))
+  weval <- matrix(c(1.0, 0.0), nrow = 1L)
+
+  expect_error(
+    .Call(
+      "C_np_reghat_lp_matrix_fast",
+      kw,
+      wtrain,
+      weval,
+      PACKAGE = package
+    ),
+    "LP solve failed in compiled hat-matrix path: non-finite system"
+  )
+})
+
+test_that("MPI LP owner failures remain collective and fully owned", {
+  jksum.file <- locate_lp_retry_source("jksum.c")
+  skip_if(is.null(jksum.file), "source file src/jksum.c unavailable")
+  source <- paste(np_test_read_incumbent_c_source(jksum.file, warn = FALSE), collapse = "\n")
+
+  expect_true(grepl(
+    "owner->mpi_owner_chunk.sendbuf[owner_row_width_lp - 1] = -1.0;",
+    source,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_reg_mpi_owner_chunk_allgather(&owner->mpi_owner_chunk);",
+    source,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    paste0(
+      "constdouble*first=np_reg_mpi_owner_chunk_recv_ptr(&owner->mpi_owner_chunk,i,0);",
+      "constdoublestatus=first[owner_row_width_lp-1];",
+      "if(status<0.0||(!isfinite(first[0])&&",
+      "!(status==1.0&&ISNA(first[0]))))owner_solve_failed=1;"
+    ),
+    # Certified empty fits may be NA; real failure and other nonfinite
+    # results must still be rejected after the existing allgather.
+    gsub("[[:space:]]+", "", source),
+    fixed = TRUE
+  ))
+  free.pos <- regexpr(
+    "np_reg_mpi_owner_chunk_free(&owner->mpi_owner_chunk);",
+                      source, fixed = TRUE)
+  status.pos <- max(gregexpr(
+    "execution->status = NP_REGRESSION_GENERAL_LP_FIT_ERR_ROUTE;",
+    source,
+    fixed = TRUE
+  )[[1L]])
+  expect_gt(free.pos, 0L)
+  expect_gt(status.pos, free.pos)
+  expect_true(grepl("return R_NilValue;", source, fixed = TRUE))
+})

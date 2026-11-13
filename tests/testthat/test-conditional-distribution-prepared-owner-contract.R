@@ -1,0 +1,122 @@
+np_conditional_distribution_owner_source <- function() {
+  path <- npRmpi_test_source_path("src", "np.c")
+  paste(readLines(path, warn = FALSE), collapse = "\n")
+}
+
+np_conditional_distribution_owner_function <- function(source, name) {
+  start <- gregexpr(
+    paste0("static void\\s+", name, "\\s*\\([^;]*\\)\\s*\\{"),
+    source, perl = TRUE
+  )[[1L]]
+  if (length(start) != 1L || start[[1L]] < 1L)
+    stop("expected one C function definition for ", name, call. = FALSE)
+  expect_gt(start[[1L]], 0L)
+  tail <- substring(source, start[[1L]], nchar(source))
+  open <- regexpr("\\{", tail, perl = TRUE)[[1L]]
+  chars <- strsplit(tail, "", fixed = TRUE)[[1L]]
+  depth <- 0L
+  for (i in seq.int(open, length(chars))) {
+    if (chars[[i]] == "{") depth <- depth + 1L
+    if (chars[[i]] == "}") depth <- depth - 1L
+    if (depth == 0L)
+      return(paste0(chars[seq_len(i)], collapse = ""))
+  }
+  fail(sprintf("could not extract %s", name))
+}
+
+test_that("conditional-distribution bandwidth state has one typed owner", {
+  source <- np_conditional_distribution_owner_source()
+  destroy <- np_conditional_distribution_owner_function(
+    source, "np_conditional_distribution_prepared_context_destroy"
+  )
+
+  expect_match(source, "} NPConditionalDistributionPreparedCtx;", fixed = TRUE)
+  for (field in c(
+    "matrix_y_unordered_train", "matrix_y_ordered_train",
+    "matrix_y_continuous_train", "matrix_y_unordered_eval",
+    "matrix_y_ordered_eval", "matrix_y_continuous_eval",
+    "matrix_x_unordered_train", "matrix_x_ordered_train",
+    "matrix_x_continuous_train", "matrix_xy_unordered_train",
+    "matrix_xy_ordered_train", "matrix_xy_continuous_train",
+    "matrix_categorical_vals", "powell_directions", "scale_factor",
+    "scale_factor_startbest", "powell_step", "extendednn_upper",
+    "ipt_x", "ipt_y", "ipt_xy"
+  )) {
+    expect_match(destroy, paste0("context->", field), fixed = TRUE,
+                 info = field)
+  }
+  # State moved into the invocation-owned cleanup context. Verify both its
+  # owned storage and delivery to the unchanged computation owner.
+  expect_match(source, "NPConditionalDistributionPreparedCtx owned;", fixed = TRUE)
+  expect_match(source, "c->support,&c->owned);", fixed = TRUE)
+  expect_match(source,
+    "R_ExecWithCleanup(np_distribution_conditional_bw_mode_call_run,&c,np_distribution_conditional_bw_mode_call_cleanup,&c);",
+    fixed = TRUE)
+  expect_match(
+    source, "np_conditional_distribution_prepared_context_destroy(prepared_context);",
+    fixed = TRUE
+  )
+})
+
+test_that("prepared CDF cache identity includes response and predictor dimensions", {
+  source <- np_conditional_distribution_owner_source()
+  owner <- np_conditional_distribution_owner_function(
+    source, "np_distribution_conditional_bw_mode_owned")
+  call <- regmatches(owner, regexpr(
+    "bwm_nn_cache_configure_for_degree_search\\([^;]+;", owner, perl = TRUE))
+  expect_length(call, 1L)
+  expect_match(call, "degree_key_len", fixed = TRUE)
+  for (kind in c("continuous", "unordered", "ordered"))
+    expect_match(call, paste0("num_var_", kind, "_extern + num_reg_", kind,
+                             "_extern"), fixed = TRUE)
+})
+
+test_that("native conditional-distribution search retains one prepared owner", {
+  source <- np_conditional_distribution_owner_source()
+
+  expect_match(
+    source,
+    "NPConditionalDistributionPreparedCtx prepared;",
+    fixed = TRUE
+  )
+  expect_match(
+    source,
+    "np_conditional_distribution_prepared_context_eval(\n      &context->prepared",
+    fixed = TRUE
+  )
+  expect_match(
+    source,
+    "1, &context.prepared, 1, ndegree > 0, &support);",
+    fixed = TRUE
+  )
+  for (field in c(
+    "eval_bandwidth", "eval_degree", "glp_degree",
+    "matrix_y_continuous_tree", "matrix_xy_continuous_tree"
+  )) {
+    expect_match(source, paste0("context->", field), fixed = TRUE,
+                 info = field)
+  }
+})
+
+test_that("conditional-distribution native callbacks cannot restore constructor evaluation", {
+  source <- np_conditional_distribution_owner_source()
+
+  expect_false(grepl(
+    "np_distribution_conditional_nomad_native_eval_once",
+    source,
+    fixed = TRUE
+  ))
+
+  callback <- sub(
+    ".*static int np_cdist_native_search_callback",
+    "static int np_cdist_native_search_callback",
+    source
+  )
+  callback <- sub(
+    "SEXP C_np_distribution_conditional_nomad_native_search.*",
+    "",
+    callback
+  )
+  expect_false(grepl("NP_NOMAD_CALLBACK_CALLOC", callback, fixed = TRUE))
+  expect_false(grepl("np_distribution_conditional_bw(", callback, fixed = TRUE))
+})

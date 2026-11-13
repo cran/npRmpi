@@ -24,7 +24,8 @@ npqreg(bws, \dots)
 \method{npqreg}{formula}(bws, 
        data = NULL, 
        newdata = NULL, 
-       \dots)
+       \dots,
+       se = FALSE)
 
 \method{npqreg}{condbandwidth}(bws,
        txdat = stop("training data 'txdat' missing"),
@@ -35,13 +36,15 @@ npqreg(bws, \dots)
        tol = 1.490116e-04,
        small = 1.490116e-05,
        itmax = 10000,
-       \dots)
+       \dots,
+       se = FALSE)
 
 \method{npqreg}{default}(bws, 
        txdat, 
        tydat, 
        nomad = FALSE,
-       \dots)
+       \dots,
+       se = FALSE)
 
 \method{predict}{qregression}(object, se.fit = FALSE, \dots)
 
@@ -65,6 +68,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -148,6 +158,20 @@ These arguments control where the quantile regression is evaluated and which fit
     returns fitted conditional quantiles.
   }
 
+  \item{se}{
+    a scalar logical controlling asymptotic standard-error computation.
+    Defaults to \code{FALSE}. With \code{TRUE}, quantile standard errors
+    are computed, and available gradient standard errors are computed when
+    \code{gradients=TRUE}. Point quantiles and gradients do not depend on
+    this switch. \code{se(fit)} and \code{gradients(fit, se=TRUE)} only
+    extract stored results; they never initiate search or refitting. To add
+    omitted uncertainty, use \code{npqreg(bws=fit$bws, tau=fit$tau,
+    se=TRUE)} (also \code{gradients=TRUE} for gradient errors), with the
+    original training/evaluation data if needed. The bandwidth object avoids
+    repeating search. \code{predict(..., se.fit=TRUE)} explicitly requests
+    its required uncertainty during the existing prediction fit.
+  }
+
 
   \item{tau}{
     a numeric scalar or vector specifying the quantile probability or
@@ -167,14 +191,20 @@ These arguments control the one-dimensional numerical quantile extraction step.
 
 
   \item{small}{
-    minimum interval width used by the one-dimensional quantile
-    refinement. Defaults to \code{1.490116e-05}
+    absolute interval-width allowance, in response units, added to the
+    relative stopping tolerance in the one-dimensional quantile refinement.
+    Defaults to \code{1.490116e-05}
     (approximately \code{1000*sqrt(.Machine$double.eps)}).
   }
 
 
   \item{tol}{
-    tolerance on the one-dimensional quantile location refinement.
+    relative tolerance on the one-dimensional quantile location refinement.
+    Refinement stops when the bracket width is at most \code{tol} times
+    the initial observed response range plus \code{small}, or when no
+    distinct floating-point midpoint remains. The relative scale does not
+    depend on the response origin. When rescaling the response, rescale
+    \code{small} in the same units to retain the same accuracy contract.
     Defaults to \code{1.490116e-04}
     (approximately \code{10000*sqrt(.Machine$double.eps)}).
   }
@@ -212,6 +242,46 @@ prediction/evaluation route, or plot route as appropriate.
   }
 }
 \details{
+  Conditional fitting and replay use the literal categorical kernels for
+  both explanatory and response variables. Near-upper categorical bandwidths
+  are not replaced by approximate constant factors. The same target is used
+  for levels, gradients, standard errors, conditional hats, and reconstructed
+  plot uncertainty. This conditional-family policy does not change direct
+  regression or unconditional kernel-sum evaluation and does not modify the
+  caller's \code{np.largelambda} option.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} supplies \code{exdat};
+  explicitly supplied native evaluation arguments take precedence. This
+  evaluates at the requested rows without repeating bandwidth selection.
+
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
+  Local-polynomial calculations inherit numerical ridging from
+  \code{\link{npcdist}}. See that estimator's help for the solve
+  policy and its distinct conditional uncertainty formula.
+
   Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
 
@@ -249,6 +319,22 @@ prediction/evaluation route, or plot route as appropriate.
   \code{npqreg} supports \code{cykerorder = 2} for this route and rejects
   higher-order dependent-variable CDF kernels, which can be nonmonotone.
 
+  During this inversion, an external predictor row identified by the selected
+  CDF as having no kernel support returns \code{NA} for its quantiles and
+  requested standard errors and gradients. Supported rows retain their
+  original order, including repeated evaluation points and vector-\code{tau}
+  requests. An unavailable categorical counterfactual affects only the
+  corresponding contrast, not an otherwise supported base quantile. One
+  warning summarizes affected external rows after the public evaluation or
+  plot call completes. Other numerical failures, and required training or
+  bootstrap evaluations, retain their strict error behavior.
+
+  The existing point-only shortcut for an exactly constant response is
+  unchanged: it returns that response value without evaluating the conditional
+  CDF. External predictor support is not checked by this shortcut; requests
+  for standard errors or gradients still enter the conditional evaluation
+  machinery.
+
   Let \eqn{f(y|x) = \partial F(y|x)/\partial y} denote the conditional
   density. The asymptotic standard error of the conditional quantile is
   computed by the first-order delta method,
@@ -262,6 +348,75 @@ prediction/evaluation route, or plot route as appropriate.
   and the selected conditional density evaluated at the fitted quantile.
   This corresponds to the quantile variance expression in Li, Lin and
   Racine (2013).
+
+  Conditional-quantile plots support first derivatives only. The default
+  and explicit \code{gradient_order=1} retain that target; other derivative
+  orders are rejected before plot fitting or drawing. Higher polynomial
+  degrees in the fitted bandwidth object do not add higher-order quantile
+  derivatives. This restriction does not apply to \code{nplsqreg} or
+  conditional-distribution gradient plots.
+
+  A scalar quantile can be displayed as a surface by explicitly supplying
+  \code{perspective=TRUE} when there are two continuous or numeric-labelled
+  ordered conditioning variables. Omitting \code{perspective}, or supplying
+  \code{perspective=FALSE}, retains the usual slice layout. Vector quantiles
+  and gradient plots also retain their slice layout. Surface uncertainty is
+  calibrated over the complete displayed grid for that one \code{tau}.
+  Both the base renderer and \code{renderer="rgl", view="fixed"} support
+  level surfaces and their interval meshes. Returned evaluation rows retain
+  the trained predictor names and ordered-factor support; numeric axis
+  coordinates are used only for drawing. The data overlay can be disabled
+  with \code{data_overlay=FALSE}.
+
+  Local-polynomial conditional-response factors use local response moments
+  as a working covariance approximation conditional on the accepted design
+  and response map. At fixed nonshrinking bandwidths they need not equal the
+  full empirical-caseweight derivative, which also perturbs the design map.
+  Their leading interpretation requires smooth shrinking neighborhoods and
+  nondegenerate local response variation.
+
+  Asymptotic \code{plot(..., band="simultaneous")} calibrates a joint
+  Gaussian maximum over the retained grid within one panel and one
+  \code{tau}; calibration is not joint across quantiles or panels. Levels
+  use inverse-CDF influence rows at their own fitted quantiles. Continuous
+  gradients use the selected CDF-derivative influence and the existing
+  leading plug-in standard error. Positive-degree categorical effects use
+  paired own-quantile endpoint influences with shared observation columns.
+  Local-constant and degree-zero categorical effects retain their different
+  public target, the same-root CDF contrast divided by the selected density:
+  their joint bands include density and root-evaluation terms in a full local
+  delta calculation, with separately computed joint-band standard errors.
+  \code{band="all"} retains existing pointwise and Bonferroni widths even
+  when the simultaneous calculation uses this different scale.
+
+  Local-constant and local-polynomial routes retain the fitted kernel,
+  bandwidth type, degree and basis. Quantile inversion still requires a
+  second-order response kernel. A valid joint grid requires finite positive
+  slopes, interior unclamped quantiles, negligible inversion residuals,
+  identifiable local influence and regular kernel/support geometry. The
+  nearest-neighbor same-root calculation holds the realized neighbor counts
+  and geometry fixed in its empirical-mass approximation, while retaining
+  movement of a generalized-neighbor query radius when differentiating in
+  the response coordinate. It does not claim an unconditional law for
+  estimating the counts or radii.
+
+  These are selected-smoothing variability approximations, not smoothing-bias
+  corrections or continuum confidence bands. An asymptotic coverage
+  interpretation additionally requires independent observations, consistent
+  local covariance and marginal scales, negligible smoothing/ridge bias and
+  non-dominating influence rows. The continuous-gradient leading
+  approximation requires shrinking explanatory bandwidth \eqn{h_x}, with
+  \eqn{h_x^2/h_y\longrightarrow0}, and sufficient local derivative sample
+  size; fixed nonshrinking smoothing retains a working approximation.
+  A growing or data-dependent grid needs a corresponding uniform
+  linearization and Gaussian-maximum approximation. Unsupported or
+  nonregular grids receive a specific unavailable-band notice.
+  \code{gaussian_draws} controls simulation precision and
+  \code{random_seed} controls reproducible calibration. Its temporary seed
+  scope restores the visible \code{.Random.seed} binding (or its absence),
+  but not hidden generator state, including a pending Box--Muller normal or
+  custom state absent from that binding. Subsequent caller draws can therefore
+  differ; this is separate from replay within the current band calculation.
 
   If \code{gradients=TRUE}, \code{npqreg} also computes gradients of
   the conditional quantile with respect to the conditioning variables
@@ -286,6 +441,40 @@ prediction/evaluation route, or plot route as appropriate.
          {\hat f(\hat q_\tau(x)|x)} .
   }
 
+  This is a plug-in estimate of the population implicit-CDF identity, using
+  the selected density in the denominator. It is not in general the exact
+  derivative of the fitted finite-smoothing quantile curve. In particular,
+  bounded and beta response kernels use observation-centred CDFs and
+  target-centred densities, so numerical differentiation of the fitted
+  quantiles need not reproduce the reported plug-in gradients. The same
+  selected-density convention is used for the delta-method standard errors.
+
+  For categorical conditioning variables in positive-degree local-polynomial
+  fits (including local-linear fits), first-difference standard errors retain
+  the paired covariance between the two category endpoints. Each endpoint uses
+  its own fitted quantile and positive conditional-density slope in the
+  implicit-CDF calculation. The selected basis, smoothing parameters and
+  realized neighbour radii are held fixed. This requested-only calculation
+  supports fixed, generalized nearest-neighbour and adaptive nearest-neighbour
+  bandwidths; a nonpositive density slope or nonsmooth/nonfinite influence
+  produces \code{NA} uncertainty with a notice.
+
+  For continuous conditioning variables, these gradient standard errors are
+  componentwise leading asymptotic approximations. They propagate the
+  conditional CDF-gradient uncertainty but do not jointly propagate
+  fluctuations of the density denominator and estimated quantile location.
+  Their use requires appropriate smoothness, positive-density and relative
+  bandwidth-rate conditions. They are not a full finite-smoothing covariance
+  or a joint covariance across coordinates or \code{tau} values.
+
+  In a heterogeneous fitted local-polynomial degree vector, a degree-zero
+  coordinate has no available first-derivative estimate and is returned as
+  \code{NA}; the established all-degree-zero compatibility route is unchanged.
+  Its plot
+  panel remains present but empty when another derivative or categorical
+  first-difference effect is available; a request with no available component
+  is rejected.
+
   When \code{npqreg} is called without an explicit \code{bws} object, it
   first computes conditional distribution bandwidths using
   \code{\link{npcdistbw}} and stores them in the returned object's
@@ -307,7 +496,8 @@ prediction/evaluation route, or plot route as appropriate.
   non-formula fits, \code{newdata} is translated to the native
   evaluator argument \code{exdat} when \code{exdat} is not supplied.
   The native \code{exdat} argument remains available for advanced
-  workflows and takes precedence if both \code{newdata} and
+  workflows, contains already transformed predictor coordinates for formula
+  fits, and takes precedence if both \code{newdata} and
   \code{exdat} are supplied. If \code{tau} is omitted in
   \code{predict}, the fitted object's stored \code{tau} value is used.
 
@@ -318,9 +508,9 @@ prediction/evaluation route, or plot route as appropriate.
   \code{npqreg} returns a \code{qregression} object.  The generic
   functions \code{\link{fitted}} (or \code{\link{quantile}}),
   \code{\link{se}}, \code{\link{predict}}, and \code{\link{gradients}}
-  extract (or generate) estimated values, asymptotic standard errors on
-  estimates, predictions, and gradients, respectively, from the returned
-  object. \code{\link{predict}} uses the object's stored \code{tau}
+  extract stored estimated values, asymptotic standard errors, and
+  gradients, or compute predictions from the retained bandwidth object.
+  \code{\link{predict}} uses the object's stored \code{tau}
   value by default; supply \code{tau=} to override it. Furthermore, the functions
   \code{\link{summary}} and \code{\link{plot}} support objects of this
   type. The returned object has the following components:
@@ -333,15 +523,23 @@ prediction/evaluation route, or plot route as appropriate.
     regression estimates, obtained from the conditional distribution
     standard error and the estimated conditional density at the fitted
     quantile. If \code{tau} has length greater than one this is an
-    evaluation-by-\code{tau} matrix. }
+    evaluation-by-\code{tau} matrix. This component is \code{NULL}
+    when \code{se=FALSE}. }
   \item{quantgrad}{ gradients of the conditional quantile with respect
     to the conditioning variables at each evaluation point, when
     \code{gradients=TRUE}. If \code{tau} has length greater than one
     this is an evaluation-by-gradient-by-\code{tau} array. }
   \item{quantgerr}{ asymptotic standard errors for gradients, when
-    \code{gradients=TRUE}. If \code{tau} has length greater than one
-    this is an evaluation-by-gradient-by-\code{tau} array. }
+    \code{gradients=TRUE} and \code{se=TRUE}. If \code{tau} has length
+    greater than one this is an evaluation-by-gradient-by-\code{tau} array.
+    This component is \code{NULL} when \code{se=FALSE}. }
+  \item{se}{ whether asymptotic uncertainty was requested }
   \item{tau}{ the quantile probability or probabilities computed }
+  \item{fit.controls}{ resolved \code{tol}, \code{small}, and \code{itmax}
+    controls used for numerical quantile extraction. Prediction and quantile
+    plots (including bootstrap fits and centers) reuse these values unless the
+    corresponding argument is explicitly supplied. Older
+    objects without this component use the historical defaults. }
 
 
 }
@@ -407,13 +605,22 @@ prediction/evaluation route, or plot route as appropriate.
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
 }
 
 \seealso{

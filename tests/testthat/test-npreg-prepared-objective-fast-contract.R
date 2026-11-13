@@ -1,0 +1,34 @@
+test_that("npreg prepared NOMAD evaluation matches objective and reports a counter", {
+  skip_if_not_installed("crs")
+  skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+
+  old_opts <- options(np.messages = FALSE, np.tree = FALSE, npRmpi.autodispatch = TRUE)
+  on.exit(options(old_opts), add = TRUE)
+
+  set.seed(42)
+  n <- 240
+  x <- runif(n)
+  y <- sin(2 * pi * x) + rnorm(n, sd = 0.1)
+  xdat <- data.frame(x = x)
+
+  bw <- npregbw(y ~ x, nomad = TRUE, nmulti = 1L, degree.max = 1L)
+
+  prepared <- npRmpi:::.npregbw_prepared_begin(
+    xdat = xdat,
+    ydat = y,
+    bws = bw,
+    start.bw = bw$bw
+  )
+
+  out <- npRmpi:::.npregbw_prepared_eval(
+    prepared = prepared,
+    bw = bw$bw,
+    degree = bw$degree
+  )
+  npRmpi:::.npregbw_prepared_end(prepared)
+
+  expect_equal(out[1L], bw$fval, tolerance = 1e-10)
+  expect_true(is.finite(out[2L]))
+  expect_gte(out[2L], 0)
+})

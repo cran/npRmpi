@@ -1,3 +1,5 @@
+# Numerical-provider proof: public plot schema is checked by the interception
+# helper and dedicated schema/geometry tests; no provider fields are public.
 test_that("fixed ll gradient helper returns finite gradients without exact fallback", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   old.auto <- getOption("npRmpi.autodispatch", FALSE)
@@ -56,6 +58,66 @@ test_that("fixed ll gradient helper returns finite gradients without exact fallb
   expect_true(all(is.finite(fast.out$t)))
   expect_true(all(is.finite(fast.out$t0)))
   expect_identical(fast.calls, 0L)
+})
+
+test_that("public ll bootstrap-gradient plot consumes the validated LP1 engine spec", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  old.auto <- getOption("npRmpi.autodispatch", FALSE)
+  on.exit(options(npRmpi.autodispatch = old.auto), add = TRUE)
+  on.exit(close_mpi_slaves(), add = TRUE)
+  options(npRmpi.autodispatch = FALSE)
+
+  set.seed(20260819)
+  n <- 12L
+  x <- runif(n)
+  y <- 1 + 2 * x + rnorm(n, sd = 0.04)
+  tx <- data.frame(x = x)
+
+  bw.ll <- npregbw(
+    xdat = tx,
+    ydat = y,
+    regtype = "ll",
+    bws = 0.3,
+    bandwidth.compute = FALSE
+  )
+
+  set.seed(20260820)
+  out <- capture_plot_provider(plot(
+    bw.ll,
+    xdat = tx,
+    ydat = y,
+    perspective = FALSE,
+    errors = "bootstrap",
+    B = 2L,
+    output = "data",
+    gradients = TRUE,
+    neval = 4L
+  ))$provider
+
+  expect_type(out, "list")
+  expect_true(length(out) >= 1L)
+  expect_true(all(is.finite(as.numeric(gradients(out[[1L]])))))
+  expect_identical(bw.ll$regtype, "ll")
+  expect_null(bw.ll$degree)
+  expect_identical(bw.ll$regtype.engine, "lp")
+  expect_identical(bw.ll$degree.engine, 1L)
+
+  bw.bad <- bw.ll
+  bw.bad$degree.engine <- 2L
+  expect_error(
+    capture_plot_provider(plot(
+      bw.bad,
+      xdat = tx,
+      ydat = y,
+      perspective = FALSE,
+      errors = "bootstrap",
+      B = 2L,
+      output = "data",
+      gradients = TRUE,
+      neval = 4L
+    ))$provider,
+    "incoherent public and canonical engine metadata"
+  )
 })
 
 test_that("fixed lp gradient helper preserves derivative order and counts drawer semantics", {
@@ -152,14 +214,14 @@ test_that("fixed lp plot output records requested gradient order", {
 
   pdf(NULL)
   on.exit(dev.off(), add = TRUE)
-  out <- plot(
+  out <- capture_plot_provider(plot(
     fit,
     gradients = TRUE,
     gradient_order = 2L,
     errors = "none",
     output = "data",
     neval = 20
-  )
+  ))$provider
 
   expect_equal(as.vector(out[[1L]]$grad), rep(6, 20), tolerance = 1e-8)
   expect_identical(out[[1L]]$gradient.order, 2L)

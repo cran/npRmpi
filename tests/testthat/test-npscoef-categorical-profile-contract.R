@@ -69,7 +69,7 @@ npscoef_profile_oracle <- function(xdat, ydat, zdat, bws, exdat = NULL,
 
 test_that("npscoef all-categorical profile route preserves fitted values", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
-  options(npRmpi.autodispatch = FALSE)
+  withr::local_options(npRmpi.autodispatch = FALSE)
   on.exit(close_mpi_slaves(), add = TRUE)
   old <- options(np.messages = FALSE, np.tree = FALSE,
                  np.categorical.compress = TRUE)
@@ -94,7 +94,7 @@ test_that("npscoef all-categorical profile route preserves fitted values", {
     regtype = "lc"
   )
   fit <- npscoef(bws = bw, txdat = xdat, tydat = ydat, tzdat = zdat,
-                 errors = FALSE, iterate = FALSE, betas = TRUE)
+                 se = FALSE, iterate = FALSE, betas = TRUE)
   oracle <- npscoef_profile_oracle(xdat, ydat, zdat, bw)
   expect_equal(fit$mean, oracle$mean, tolerance = 1e-8)
   expect_equal(fit$beta, oracle$beta, tolerance = 1e-8)
@@ -102,7 +102,7 @@ test_that("npscoef all-categorical profile route preserves fitted values", {
 
 test_that("npscoef all-categorical profile route preserves evaluation values", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
-  options(npRmpi.autodispatch = FALSE)
+  withr::local_options(npRmpi.autodispatch = FALSE)
   on.exit(close_mpi_slaves(), add = TRUE)
   old <- options(np.messages = FALSE, np.tree = FALSE,
                  np.categorical.compress = TRUE)
@@ -126,7 +126,7 @@ test_that("npscoef all-categorical profile route preserves evaluation values", {
   ezdat <- zdat[seq_len(31L), , drop = FALSE]
   fit <- npscoef(bws = bw, txdat = xdat, tydat = ydat, tzdat = zdat,
                  exdat = exdat, ezdat = ezdat,
-                 errors = FALSE, iterate = FALSE, betas = TRUE)
+                 se = FALSE, iterate = FALSE, betas = TRUE)
   oracle <- npscoef_profile_oracle(xdat, ydat, zdat, bw,
                                    exdat = exdat, ezdat = ezdat)
   expect_equal(fit$mean, oracle$mean, tolerance = 1e-8)
@@ -135,7 +135,7 @@ test_that("npscoef all-categorical profile route preserves evaluation values", {
 
 test_that("npscoef all-categorical profile route preserves bandwidth CV", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
-  options(npRmpi.autodispatch = TRUE)
+  withr::local_options(npRmpi.autodispatch = TRUE)
   on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
   old <- options(np.messages = FALSE, np.tree = FALSE,
                  np.categorical.compress = FALSE)
@@ -168,7 +168,7 @@ test_that("npscoef all-categorical profile route preserves bandwidth CV", {
 
 test_that("npscoefhat apply uses categorical profile route", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
-  options(npRmpi.autodispatch = FALSE)
+  withr::local_options(npRmpi.autodispatch = FALSE)
   on.exit(close_mpi_slaves(), add = TRUE)
   old <- options(np.messages = FALSE, np.tree = FALSE,
                  np.categorical.compress = TRUE)
@@ -198,9 +198,66 @@ test_that("npscoefhat apply uses categorical profile route", {
   expect_equal(got[, 1L], oracle$mean, tolerance = 1e-8)
 })
 
+test_that("npscoefhat categorical profile ridge uses the canonical weight scale", {
+  skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  old <- options(np.messages = FALSE, np.tree = FALSE,
+                 np.categorical.compress = TRUE)
+  on.exit(options(old), add = TRUE)
+
+  set.seed(20260917L)
+  n <- 48L
+  xdat <- data.frame(a = runif(n, -1, 1), b = runif(n, -1, 1))
+  zdat <- data.frame(
+    u = factor(rep(letters[1:3], length.out = n)),
+    v = factor(rep(LETTERS[1:2], length.out = n))
+  )
+  y <- xdat$a - 0.35 * xdat$b + rnorm(n, sd = 0.1)
+  exdat <- xdat[1:7, , drop = FALSE]
+  ezdat <- zdat[1:7, , drop = FALSE]
+  for (ukertype in c("liracine", "aitchisonaitken")) {
+    bw <- npscoefbw(
+      xdat = xdat, ydat = y, zdat = zdat, bws = c(0.4, 0.3),
+      bandwidth.compute = FALSE, ukertype = ukertype
+    )
+    args <- list(bws = bw, txdat = xdat, tzdat = zdat,
+                 exdat = exdat, ezdat = ezdat, ridge = 0.25)
+
+    H <- do.call(npscoefhat, c(args, list(output = "matrix")))
+    applied.profile <- do.call(npscoefhat, c(args, list(y = y, output = "apply")))
+    options(np.categorical.compress = FALSE)
+    applied.direct <- do.call(npscoefhat, c(args, list(y = y, output = "apply")))
+    options(np.categorical.compress = TRUE)
+
+    W <- cbind(1, as.matrix(xdat))
+    E <- cbind(1, as.matrix(exdat))
+    oracle <- vapply(seq_len(nrow(exdat)), function(i) {
+      weights <- rep(1, n)
+      for (j in seq_along(zdat)) {
+        same <- zdat[[j]] == ezdat[[j]][i]
+        lambda <- c(0.4, 0.3)[j]
+        nc <- nlevels(zdat[[j]])
+        weights <- weights * if (ukertype == "liracine")
+          ifelse(same, 1, lambda) / (1 + (nc - 1) * lambda) else
+          ifelse(same, 1 - lambda, lambda / (nc - 1))
+      }
+      moment <- crossprod(W, W * weights)
+      rhs <- crossprod(W, y * weights)
+      rhs[1L] <- rhs[1L] + 0.25 * rhs[1L] / moment[1L, 1L]
+      drop(E[i, , drop = FALSE] %*%
+             solve(moment + diag(0.25, ncol(W)), rhs))
+    }, numeric(1L))
+    expect_equal(as.vector(H %*% y), oracle, tolerance = 1e-11, info = ukertype)
+    expect_equal(as.vector(applied.profile), oracle, tolerance = 1e-11,
+                 info = ukertype)
+    expect_equal(as.vector(applied.direct), as.vector(H %*% y), tolerance = 1e-11,
+                 info = ukertype)
+  }
+})
+
 test_that("npscoef plot-bootstrap inid helper uses categorical profiles exactly", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
-  options(npRmpi.autodispatch = FALSE)
+  withr::local_options(npRmpi.autodispatch = FALSE)
   on.exit(close_mpi_slaves(), add = TRUE)
   old <- options(np.messages = FALSE, np.tree = FALSE,
                  np.categorical.compress = FALSE)

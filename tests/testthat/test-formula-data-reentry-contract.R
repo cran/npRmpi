@@ -130,12 +130,12 @@ test_that("stored formula reentry honors explicit data override in executable ro
     bandwidth.compute = FALSE
   )
   .formula_reentry_expect(
-    npsigtest(bws = bw.sig, data = data_b, boot.num = 9L,
+    npsigtest(bws = bw.sig, data = data_b, B = 9L,
               random.seed = 20260703L)$In,
     npsigtest(bws = bw.sig, xdat = data_b[c("x", "z")], ydat = data_b$y,
-              boot.num = 9L, random.seed = 20260703L)$In,
-    npsigtest(bws = bw.sig, boot.num = 9L, random.seed = 20260703L)$In,
-    npsigtest(bws = bw.sig, data = NULL, boot.num = 9L,
+              B = 9L, random.seed = 20260703L)$In,
+    npsigtest(bws = bw.sig, B = 9L, random.seed = 20260703L)$In,
+    npsigtest(bws = bw.sig, data = NULL, B = 9L,
               random.seed = 20260703L)$In
   )
 })
@@ -172,7 +172,7 @@ test_that("stored formula reentry passes explicit data to stalled MPI fit routes
   )
   cap.sc <- .formula_reentry_capture_default(
     "npscoef.scbandwidth",
-    npscoef(bws = bw.sc, data = data_b, errors = FALSE)
+    npscoef(bws = bw.sc, data = data_b, se = FALSE)
   )
   expect_equal(as.numeric(cap.sc$txdat$x), data_b$x, tolerance = 0)
   expect_equal(as.numeric(cap.sc$tzdat$z), data_b$z, tolerance = 0)

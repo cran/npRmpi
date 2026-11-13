@@ -11,7 +11,7 @@ npunitest(data.x = NULL,
           data.y = NULL,
           method = c("integration","summation"),
           bootstrap = TRUE,
-          boot.num = 399,
+          B = 399,
           bw.x = NULL,
           bw.y = NULL,
           random.seed = 42,
@@ -47,7 +47,7 @@ These arguments identify the two samples, statistic variant, and any supplied ba
 These arguments control bootstrap execution and reproducibility settings.
 }
 
-  \item{boot.num}{
+  \item{B}{
     an integer value specifying the number of bootstrap
     replications to use. Defaults to \code{399}.
   }
@@ -61,6 +61,8 @@ These arguments control bootstrap execution and reproducibility settings.
 
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
@@ -79,6 +81,13 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
     \code{okertype}.}
 
 
+}
+\section{Bootstrap P-Values}{
+  The bootstrap upper-tail p-value is the proportion of bootstrap statistics
+  greater than or equal to the observed statistic. Ties count as at least as
+  extreme, giving the conservative tie convention for discrete statistics.
+  This is the ordinary bootstrap proportion, without an add-one correction;
+  a reported zero is possible with a finite number of replications.
 }
 \value{
   \code{npunitest} returns an object of type \code{unitest} with the
@@ -135,6 +144,20 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
    with replacement from the pooled \code{data.x} and \code{data.y}
    (\code{data.x} only for \code{summation}).
 
+   Missing observations are omitted independently from the two samples before
+   bandwidth selection and overlap checks. Each sample must retain at least
+   one observation; automatic bandwidth selection can require more.
+
+   For categorical data, the declared factor levels define the finite domain
+   of the probability comparison, including levels not observed in a sample.
+   The two samples share the union of their declared levels, retained in all
+   bootstrap samples. Plug-in bandwidths use that category count, and the
+   discrete statistic sums over the entire common domain, not only observed
+   categories. Existing kernel normalization is unchanged. Numeric ordered
+   levels retain their numeric scale. Qualitative ordered samples must specify
+   the same level order or an order-consistent subset; otherwise declare a
+   common ordered level set explicitly before calling the test.
+
    The summation version of this statistic can be numerically unstable
    when \code{data.x} and \code{data.y} lack common support or when the
    overlap is sparse (the summation version involves division of
@@ -143,13 +166,27 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
    messages are produced when this occurs (\sQuote{integration recommended})
    and should be heeded.
 
-   Numerical integration can occasionally fail when the \code{data.x}
-   and \code{data.y} distributions lack common support and/or lie an
-   extremely large distance from one another (the statistic in such
-   cases will be reported as exactly 0.5 or 0). However, in these
-   extreme cases, simple tests will reveal the obvious differences in
-   the distributions and entropy-based tests for equality will be
-   clearly unnecessary.
+   For numeric data using the fixed second-order Gaussian density
+   estimator, the integration
+   statistic uses deterministic corrected composite trapezoidal
+   quadrature. The integration domain extends eight bandwidths beyond
+   the pooled observed support and uses four evaluation points per
+   smallest bandwidth. During a default numeric iid bootstrap,
+   resampling counts are evaluated in bounded chunks on the same
+   quadrature grid for \code{integration} or on the original support for
+   \code{summation}. This avoids repeated adaptive integration and
+   repeated reconstruction of resampled data. The summation density
+   ratios are evaluated by a registered native routine without forming a
+   sample-by-sample kernel matrix.
+
+   The accelerated route is also used when \code{...} contains only
+   options explicitly equivalent to the defaults: \code{bwtype="fixed"},
+   \code{ckertype="gaussian"}, and \code{ckerorder=2}. Other density
+   options retain the corresponding general estimator and numerical
+   integration route. In particular, generalized and adaptive
+   nearest-neighbour bandwidths use duplicate-preserving resamples and
+   recompute their realized neighbour radii; bootstrap counts are not
+   treated as fixed-bandwidth observation weights.
 
 }
 
@@ -202,7 +239,7 @@ y <- rnorm(n)
 output <- npunitest(x,y,
                     method="summation",
                     bootstrap=TRUE,
-                    boot.num=29)
+                    B=29)
 
 summary(output)
 

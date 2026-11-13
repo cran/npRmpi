@@ -1,6 +1,6 @@
 local_npRmpi_fresh_subprocess_env <- function(extra = character()) {
   pkg.root <- tryCatch(
-    normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
+    npRmpi_namespace_hygiene_root(),
     error = function(e) ""
   )
   if (!nzchar(pkg.root))
@@ -9,7 +9,7 @@ local_npRmpi_fresh_subprocess_env <- function(extra = character()) {
   lib.path <- tempfile("npRmpi-northstar-lib-")
   dir.create(lib.path, recursive = TRUE, showWarnings = FALSE)
 
-  out <- suppressWarnings(system2(
+  out <- suppressWarnings(npRmpi_test_system2(
     file.path(R.home("bin"), "R"),
     c("CMD", "INSTALL", "--no-test-load", "-l", lib.path, pkg.root),
     stdout = TRUE,
@@ -78,10 +78,10 @@ test_that("npRmpi exact generalized-nn bootstrap bounds match np north star", {
     "    perspective = FALSE,",
     "    boot_control = np_boot_control(nonfixed = 'exact')",
     "  ))",
-    "  stopifnot(length(out_np) == length(out_mpi))",
-    "  for (nm in names(out_np)) {",
-    "    stopifnot(isTRUE(all.equal(out_mpi[[nm]]$condens, out_np[[nm]]$condens, tolerance = 1e-8)))",
-    "    stopifnot(isTRUE(all.equal(out_mpi[[nm]]$conderr, out_np[[nm]]$conderr, tolerance = 1e-8)))",
+    "  stopifnot(length(out_np$panels) == length(out_mpi$panels))",
+    "  for (nm in names(out_np$panels)) {",
+    "    stopifnot(isTRUE(all.equal(out_mpi$panels[[nm]]$values$estimate, out_np$panels[[nm]]$values$estimate, tolerance = 1e-8)))",
+    "    stopifnot(isTRUE(all.equal(as.matrix(out_mpi$panels[[nm]]$intervals[c('lower','upper')]), as.matrix(out_np$panels[[nm]]$intervals[c('lower','upper')]), tolerance = 1e-8)))",
     "  }",
     "}",
     "run_case()",

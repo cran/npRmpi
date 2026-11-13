@@ -92,6 +92,10 @@ mpi.spawn.Rslaves <-
 	sleep=0.1) {
     if (!is.loaded("mpi_comm_spawn"))
         stop("You cannot use MPI_Comm_spawn API")   
+    .npRmpi_lease_require_open()
+    runtime <- .npRmpi_session_runtime_state()
+    if (!isTRUE(runtime[["initialized"]]) || !identical(runtime[["finalized"]], FALSE))
+        stop("MPI runtime is inactive; restart R before spawning workers", call. = FALSE)
     if (mpi.comm.size(comm) > 1){
          if (isTRUE(getOption("npRmpi.reuse.slaves", FALSE))) {
              existing <- mpi.comm.size(comm) - 1L
@@ -106,6 +110,7 @@ mpi.spawn.Rslaves <-
                      ), call. = FALSE)
                  }
              }
+             .npRmpi_worker_identity_admit(comm)
              if (!quiet) mpi.hostinfo(comm)
              return(invisible(existing))
          }
@@ -159,6 +164,7 @@ mpi.spawn.Rslaves <-
 		mpi.bcast(nonblock,type=1, rank=0, comm=comm)
 		mpi.bcast(sleep,type=2, rank=0, comm=comm)
         .npRmpi_sync_runtime_options_to_slaves(comm=comm, force=TRUE)
+        .npRmpi_worker_identity_admit(comm)
         if (!quiet) mpi.hostinfo(comm)
     }
     else
@@ -168,9 +174,10 @@ mpi.spawn.Rslaves <-
 mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
     if (mpi.comm.size(comm) < 2)
     stop("It seems no slaves running.")
-    tag <- floor(runif(1,20000,30000))
     scmd <- substitute(cmd)
     arg <-list(...)
+    simplify <- npValidateScalarLogical(simplify, "simplify")
+    tag <- floor(runif(1,20000,30000))
     .npRmpi_transport_trace(
         role = "master",
         event = "remote.exec.start",
@@ -179,9 +186,10 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
     #if (length(arg) > 0) 
     #    deparse(arg)
     #tag.ret <- c(tag, ret, simplify)
+    prepared <- serialize(list(scmd = scmd, arg = arg), NULL)
     mpi.bcast.cmd(.mpi.worker.exec, tag=tag, ret=ret, simplify=simplify, comm = comm)
     #mpi.bcast(as.integer(tag.ret), type=1, comm=comm)
-    mpi.bcast.Robj(list(scmd=scmd, arg=arg), comm=comm)
+    .npRmpi_bcast_prepared(prepared, comm = comm)
 
     if (ret){
         size <- mpi.comm.size(comm) 
@@ -202,7 +210,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
         )
         if (eqlen && simplify){
             out <- mpi.gather(integer(len[1]),1,integer(size*len[1]),0,comm)
-            out <- out[(len[1]+1):(size*len[1])]
+            out <- out[seq.int(from = len[1] + 1L, length.out = (size - 1L) * len[1])]
         dim(out) <- c(len[1], size-1)
         out <- data.frame(out)
         }
@@ -213,7 +221,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
                 out <- as.list(integer(size-1))
                 names(out) <- paste("slave", seq_len(size - 1L), sep="")
                 for (i in seq_len(size - 1L))
-            out[[i]]<- out1[lowlen[i]:uplen[i]]
+            out[[i]]<- out1[seq.int(from = lowlen[i], length.out = len[i])]
         }
     }
     else if (all(type==2)){
@@ -224,7 +232,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
         )
         if (eqlen && simplify){
                 out <- mpi.gather(double(len[1]),2,double(size*len[1]),0,comm)
-                out <- out[(len[1]+1):(size*len[1])]
+                out <- out[seq.int(from = len[1] + 1L, length.out = (size - 1L) * len[1])]
                 dim(out) <- c(len[1], size-1)
                 out <- data.frame(out)
             }
@@ -235,7 +243,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
                 out <- as.list(integer(size-1))
                 names(out) <- paste("slave", seq_len(size - 1L), sep="")
                 for (i in seq_len(size - 1L))
-            out[[i]]<- out1[lowlen[i]:uplen[i]]
+            out[[i]]<- out1[seq.int(from = lowlen[i], length.out = len[i])]
         }
     }
  else if (all(type==4)){
@@ -246,7 +254,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
         )
         if (eqlen && simplify){
                 out <- mpi.gather(raw(len[1]),4,raw(size*len[1]),0,comm)
-                out <- out[(len[1]+1):(size*len[1])]
+                out <- out[seq.int(from = len[1] + 1L, length.out = (size - 1L) * len[1])]
                 dim(out) <- c(len[1], size-1)
                 out <- data.frame(out)
             }
@@ -257,7 +265,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
                 out <- as.list(integer(size-1))
                 names(out) <- paste("slave", seq_len(size - 1L), sep="")
                 for (i in seq_len(size - 1L))
-                    out[[i]]<- out1[lowlen[i]:uplen[i]]
+                    out[[i]]<- out1[seq.int(from = lowlen[i], length.out = len[i])]
         }
     }
 
@@ -272,7 +280,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
             for (i in seq_len(size - 1L)){
         tmp<- mpi.recv.Robj(mpi.any.source(),tag,comm)
         src <- mpi.get.sourcetag()[1] 
-        out[[src]]<- tmp 
+        out[src] <- list(tmp)
         }
         }
         .npRmpi_transport_trace(
@@ -375,7 +383,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
     if (isTRUE(out$ok))
         return(out$value)
     if (inherits(out$error, "error"))
-        stop(conditionMessage(out$error), call. = FALSE)
+        stop(out$error)
     stop("unable to evaluate MPI command expression", call. = FALSE)
 }
 
@@ -397,10 +405,11 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
     #ret <- as.logical(tag.ret[2])
     #simplify <- as.logical(tag.ret[3])
     scmd.arg <- mpi.bcast.Robj(comm=.comm)
+    worker.env <- parent.frame()
 
 	    if (ret){
 	    size <- mpi.comm.size(.comm)
-	    out <- tryCatch(.npRmpi_eval_scmd(scmd.arg$scmd, scmd.arg$arg, envir = sys.parent()),
+	    out <- tryCatch(.npRmpi_eval_scmd(scmd.arg$scmd, scmd.arg$arg, envir = worker.env),
 	                    error = function(e) e)
 
 	    type <- .typeindex(out)
@@ -444,7 +453,7 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
 	    }       
 	    }
     else {
-	        out <- tryCatch(.npRmpi_eval_scmd(scmd.arg$scmd, scmd.arg$arg, envir = parent.frame()),
+	        out <- tryCatch(.npRmpi_eval_scmd(scmd.arg$scmd, scmd.arg$arg, envir = worker.env),
 	                        error = function(e) e)
 	    }
     .npRmpi_transport_trace(
@@ -455,79 +464,65 @@ mpi.remote.exec <- function(cmd, ...,  simplify=TRUE, comm=1, ret=TRUE){
 }
 
 mpi.close.Rslaves <- function(dellog=TRUE, comm=1, force=FALSE){
-    if (mpi.comm.size(comm) < 2){
-    err <-paste("It seems no slaves running on comm", comm)
-    stop(err)
+    soft <- isTRUE(getOption("npRmpi.reuse.slaves", FALSE)) && !isTRUE(force)
+    if (soft) .npRmpi_lease_require_open()
+    runtime <- .npRmpi_session_runtime_state()
+    if (!isTRUE(runtime[["initialized"]]) || !identical(runtime[["finalized"]], FALSE))
+        stop("MPI runtime is inactive; no worker communicator can be closed", call. = FALSE)
+    .npRmpi_fanout_quiesce(comm, resume = isTRUE(force))
+    size <- .npRmpi_safe_int(mpi.comm.size(comm))
+    if (length(size) != 1L || is.na(size) || size < 0L) {
+        .npRmpi_lease_poison()
+        stop("npRmpi cannot confirm communicator state; session remains poisoned", call. = FALSE)
     }
-    if (isTRUE(getOption("npRmpi.reuse.slaves", FALSE)) && !isTRUE(force)) {
-        # Soft-close: keep the slave daemons alive for reuse in this session.
-        # This avoids repeated spawn/merge/teardown cycles that can hang/crash
-        # on some MPI stacks (notably MPICH on macOS).
+    if (size < 2L) stop(paste("It seems no slaves running on comm", comm))
+    if (soft) {
         reset.ok <- tryCatch({
           fn <- get(".npRmpi_session_reset_spmd_state_allranks",
-                    envir = asNamespace("npRmpi"),
-                    mode = "function",
-                    inherits = FALSE)
+                    envir = asNamespace("npRmpi"), mode = "function", inherits = FALSE)
           isTRUE(fn(comm = comm, strict = FALSE, where = "mpi.close.Rslaves() soft-close reset"))
         }, error = function(e) FALSE)
-        if (isTRUE(reset.ok))
-            return(invisible(0L))
-        .np_warning(
-            "soft-close SPMD reset failed; falling back to hard-close to avoid stale sequence state",
-            call. = FALSE
-        )
+        if (reset.ok) return(invisible(0L))
+        .npRmpi_shutdown_notice("soft-close SPMD reset failed; proceeding with hard-close to avoid stale sequence state")
     }
-    # Tell slaves to exit their daemon loop cleanly.
-    # The spawned slave daemon (`inst/slavedaemon.R`) treats the character
-    # token "kaerb" as a shutdown signal.
+    complete <- FALSE
+    on.exit(if (!complete) .npRmpi_lease_poison(), add = TRUE)
+    primary <- NULL
+    attempt <- function(expr) tryCatch(force(expr), error = function(e) {
+      if (is.null(primary)) primary <<- e
+      NULL
+    }, interrupt = function(e) {
+      if (is.null(primary)) primary <<- e
+      NULL
+    })
     recv.timeout <- tryCatch({
       fn <- get0(".npRmpi_session_recv_timeout", envir = asNamespace("npRmpi"), inherits = FALSE)
       if (is.function(fn)) as.numeric(fn()) else 0
     }, error = function(e) 0)
-    if (!is.finite(recv.timeout) || recv.timeout <= 0)
-      recv.timeout <- 0
-
-    if (recv.timeout > 0)
-      base::setTimeLimit(elapsed = recv.timeout, transient = TRUE)
-    shut <- try(mpi.bcast.cmd(cmd="kaerb", rank=0, comm=comm), silent=TRUE)
-    if (recv.timeout > 0)
-      base::setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
-    if (inherits(shut, "try-error")) {
-      msg <- as.character(shut)
-      .np_warning(
-        paste(
-          "timed out or failed while broadcasting slave shutdown token.",
-          "Proceeding with communicator teardown;",
-          "ensure stale mpiexec/slave daemons are cleaned if this recurs.",
-          paste(msg, collapse = " ")
-        ),
-        call. = FALSE
-      )
+    if (!is.finite(recv.timeout) || recv.timeout <= 0) recv.timeout <- 0
+    if (recv.timeout > 0) base::setTimeLimit(elapsed = recv.timeout, transient = TRUE)
+    attempt(mpi.bcast.cmd(cmd = "kaerb", rank = 0, comm = comm))
+    if (recv.timeout > 0) base::setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
+    # Reporting cannot bypass the existing terminal release attempt.
+    attempt({
+    if (.Platform$OS != "windows" && dellog && mpi.comm.size(0) < mpi.comm.size(comm)) {
+        tmp <- paste(Sys.getpid(), "+", comm, sep = "")
+        logfiles <- Sys.glob(paste("*.", tmp, ".*.log", sep = ""))
+        if (length(logfiles)) unlink(logfiles)
     }
-    if (.Platform$OS!="windows"){
-        if (dellog && mpi.comm.size(0) < mpi.comm.size(comm)){
-        tmp <- paste(Sys.getpid(),"+",comm,sep="")  
-        logfile <- paste("*.",tmp,".*.log", sep="")
-        logfiles <- Sys.glob(logfile)
-        if (length(logfiles) >= 1)
-            unlink(logfiles)
-        }
+    })
+    res <- NULL
+    if (comm > 0) {
+        # Retain the incumbent intracommunicator free/disconnect choice.
+        res <- attempt(if (is.loaded("mpi_comm_free")) mpi.comm.free(comm)
+                       else if (is.loaded("mpi_comm_disconnect")) mpi.comm.disconnect(comm)
+                       else mpi.comm.free(comm))
     }
-#     mpi.barrier(comm)
-    if (comm > 0){
-        # `comm` is an intracommunicator created via `MPI_Intercomm_merge()`.
-        # Using `MPI_Comm_disconnect()` here has been observed to destabilize
-        # subsequent spawn/merge cycles with MPICH; `MPI_Comm_free()` is the
-        # correct teardown for an intracommunicator.
-        if (is.loaded("mpi_comm_free")) {
-            res <- mpi.comm.free(comm)
-        } else if (is.loaded("mpi_comm_disconnect")) {
-            res <- mpi.comm.disconnect(comm)
-        } else {
-            res <- mpi.comm.free(comm)
-        }
-    }
-#   mpi.comm.set.errhandler(0)
+    null <- attempt(.Call("mpi_comm_is_null", as.integer(comm), PACKAGE = "npRmpi"))
+    if (!is.null(primary)) .npRmpi_fanout_rethrow(primary)
+    if (!identical(res, 1L) || !identical(null, 1L))
+        stop("npRmpi worker shutdown did not confirm local communicator release; session remains poisoned", call. = FALSE)
+    complete <- TRUE
     invisible(res)
 }
 
@@ -542,84 +537,20 @@ tailslave.log <- function(nlines=3,comm=1){
     system(paste("tail -",nlines," ", logfile,sep=""))
 }
 
-mpi.apply <- function(X, FUN, ...,  comm=1){
-    n <- length(X)
-    nslaves <- mpi.comm.size(comm)-1
-     if (nslaves < n)
-        stop("data length must be at most total slave size")
-    if (!is.function(FUN))
-        stop("FUN is not a function")
-    length(list(...)) #test for any non existing R objects
-    tag <- floor(runif(1,1,1000))    
-    mpi.bcast.cmd(.mpi.worker.apply, n=n, tag=tag, comm=comm)
-    #mpi.bcast(as.integer(c(tag,n)),type=1,comm=comm)
-    mpi.bcast.Robj(list(FUN=FUN,dot.arg=list(...)),rank=0,comm=comm)
-    if (n < nslaves)
-        X=c(X,as.list(integer( nslaves-n)))
-    mpi.scatter.Robj(c(list("master"),as.list(X)),root=0,comm=comm)
-
-    out <- as.list(integer(n))
-    for (i in seq_len(n)){
-       tmp<- mpi.recv.Robj(mpi.any.source(),tag,comm)
-       src <- mpi.get.sourcetag()[1]
-       out[[src]]<- tmp
-    }
-    out
+mpi.apply <- function(X, FUN, ..., comm=1) {
+    .npRmpi_fanout_apply(X, FUN, list(...), comm = comm)
 }
 
-.mpi.worker.apply <- function(n, tag){
-    #assign(".mpi.err", FALSE,  envir = .GlobalEnv)
-	.comm <- 1
-    #tag.n <- mpi.bcast(integer(2), type=1, comm=.comm)
-    #tag <- tag.n[1]
-    #n <- tag.n[2]
+.mpi.worker.apply <- function(n, tag) {
+    .comm <- 1
     tmpfunarg <- mpi.bcast.Robj(rank=0, comm=.comm)
-    .tmpfun <- tmpfunarg$FUN
-    dotarg <- tmpfunarg$dot.arg
-    tmpdata.arg <- list(mpi.scatter.Robj(root=0,comm=.comm))
-    if (mpi.comm.rank(.comm) <= n){
-        out <- tryCatch(do.call(.tmpfun, c(tmpdata.arg, dotarg)),
-                        error = function(e)
-                          structure(conditionMessage(e),
-                                    class = "try-error",
-                                    condition = e))
-        mpi.send.Robj(out,0,tag,.comm)
-    }
+    .npRmpi_fanout_worker_header(tmpfunarg, "scatter", .comm)
+    .npRmpi_fanout_worker_apply(tmpfunarg, n, tag, .comm)
 }
 
-mpi.iapply <- function(X, FUN, ...,  comm=1, sleep=0.01){
-    n <- length(X)
-    nslaves <- mpi.comm.size(comm)-1
-     if (nslaves < n)
-        stop("data length must be at most total slave size")
-    if (!is.function(FUN))
-        stop("FUN is not a function")
-    length(list(...)) #test for any non existing R objects
-    tag <- floor(runif(1,1,1000))    
-    mpi.bcast.cmd(.mpi.worker.apply, n=n, tag=tag,comm=comm)
-    #mpi.bcast(as.integer(c(tag,n)),type=1,comm=comm)
-    mpi.bcast.Robj(list(FUN=FUN,dot.arg=list(...)),rank=0,comm=comm)
-    if (n < nslaves)
-        X=c(X,as.list(integer( nslaves-n)))
-    mpi.scatter.Robj(c(list("master"),as.list(X)),root=0,comm=comm)
-
-    out <- as.list(integer(n))
-    done=0
-	anysource=mpi.any.source()
-    repeat {
-       if (mpi.iprobe(anysource,tag,comm)){ 
-       srctag <- mpi.get.sourcetag()
-       charlen <- mpi.get.count(type=4)
-           tmp <- unserialize(mpi.recv(x = raw(charlen), type = 4, srctag[1], 
-            srctag[2], comm))
-           out[[srctag[1]]]<- tmp
-       done=done+1
-       }
-       if (done < n)
-       Sys.sleep(sleep)
-       else break
-    }
-	gc()
+mpi.iapply <- function(X, FUN, ..., comm=1, sleep=0.01) {
+    out <- .npRmpi_fanout_apply(X, FUN, list(...), comm = comm, poll = TRUE, sleep = sleep)
+    gc()
     out
 }
 
@@ -647,9 +578,11 @@ mpi.parSim <- function(n=100,rand.gen=rnorm, rand.arg=NULL,
                 length(sim.seq)!=slave.num*run)
             stop("sim.seq is not in right order")
 
+    simplify <- npValidateScalarLogical(simplify, "simplify")
+    prepared <- serialize(list(rand.gen = rand.gen, rand.arg = rand.arg,
+                               stat = statistic, stat.arg = list(...)), NULL)
     mpi.bcast.cmd(.mpi.worker.sim, n=n, nsim=nsim, run=run, comm=comm)  
-    mpi.bcast.Robj(list(rand.gen=rand.gen, rand.arg=rand.arg,
-                        stat=statistic, stat.arg=list(...)), comm=comm)
+    .npRmpi_bcast_prepared(prepared, comm = comm)
 
     #nnr <- c(n,nsim,run)
     #mpi.bcast(as.integer(nnr),type=1, comm=comm)
@@ -753,209 +686,42 @@ mpi.iparMM <- function(A, B, comm=1, sleep=0.01){
         get("%*%"), B, comm=comm, sleep=sleep))
 }    
 
-mpi.applyLB <- function(X, FUN, ...,  apply.seq=NULL, comm=1){
-	apply.seq=NULL
+mpi.applyLB <- function(X, FUN, ..., apply.seq=NULL, comm=1) {
     n <- length(X)
-    slave.num <- mpi.comm.size(comm)-1
-    .npRmpi_transport_trace(
-        role = "master",
-        event = "applylb.start",
-        fields = list(n = n, slave_num = slave.num, comm = comm)
-    )
-    if (slave.num < 1)
-        stop("There are no slaves running")
-    if (n <= slave.num) {
+    workers <- mpi.comm.size(comm) - 1L
+    .npRmpi_transport_trace("master", "applylb.start", list(n = n, slave_num = workers, comm = comm))
+    if (workers < 1L) stop("There are no slaves running")
+    if (n <= workers) {
         .npRmpi_clear_applylb_cache()
-        return (mpi.apply(X,FUN,...,comm=comm))
-    }    
-    if (!is.function(FUN))
-        stop("FUN is not a function")
-    length(list(...))
-    if (!is.null(apply.seq))
-        if (!is.integer(apply.seq))
-            stop("apply.seq is not an integer vector")
-        else if (min(apply.seq)<1 && max(apply.seq)>slave.num && 
-                length(apply.seq)!=n)
-            stop("apply.seq is not in right order")
-            
-    mpi.bcast.cmd(.mpi.worker.applyLB, n=n, comm=comm)
-    #mpi.bcast(as.integer(n),type=1,comm=comm)
-    mpi.bcast.Robj(list(FUN=FUN,dot.arg=list(...)),rank=0,comm=comm)
-    out <- as.list(integer(n))
-    mpi.anysource <- mpi.any.source()
-    mpi.anytag <- mpi.any.tag()
-    for (i in seq_len(slave.num))
-        mpi.send.Robj(list(data.arg=list(X[[i]])), dest=i,tag=i, comm=comm)
-  
-    if (!is.null(apply.seq)){
-        for ( i in seq_len(n)){
-            tmp <- mpi.recv.Robj(source=apply.seq[i], tag=mpi.anytag, comm=comm)
-            tag <- mpi.get.sourcetag()[2]
-            out[[tag]]<- tmp
-            j <- i+slave.num
-            if (j <= n)
-                mpi.send.Robj(list(data.arg=list(X[[j]])), dest=apply.seq[i],tag=j, comm=comm)
-            else
-                mpi.send.Robj(as.integer(0),dest=apply.seq[i],tag=j,comm=comm)
-        }
-        .npRmpi_transport_trace(
-            role = "master",
-            event = "applylb.done",
-            fields = list(n = n, slave_num = slave.num, comm = comm, apply_seq = TRUE)
-        )
-        return(out)
+        return(mpi.apply(X, FUN, ..., comm = comm))
     }
-    # .mpi.applyLB <- integer(n)
-	mpi.seq.tmp <- integer(n)
-    for (i in seq_len(n)){
-       tmp<- mpi.recv.Robj(mpi.anysource,mpi.anytag,comm)
-       srctag <- mpi.get.sourcetag()
-       out[[srctag[2]]]<- tmp
-       mpi.seq.tmp[i] <- srctag[1]
-       j <- i+slave.num
-       if (j <= n)
-            mpi.send.Robj(list(data.arg=list(X[[j]])), dest=srctag[1],tag=j, comm=comm)
-       else
-            mpi.send.Robj(as.integer(0),dest=srctag[1],tag=j,comm=comm)
-    }
- 	#assign(".mpi.applyLB",mpi.seq.tmp, envir = .GlobalEnv)
-    .npRmpi_transport_trace(
-        role = "master",
-        event = "applylb.done",
-        fields = list(n = n, slave_num = slave.num, comm = comm, apply_seq = FALSE)
-    )
-	out
+    out <- .npRmpi_fanout_apply(X, FUN, list(...), comm, dynamic = TRUE)
+    .npRmpi_transport_trace("master", "applylb.done", list(n = n, slave_num = workers, comm = comm, apply_seq = FALSE))
+    out
 }
 
-.mpi.worker.applyLB <- function(n){
-    #assign(".mpi.err", FALSE,  envir = .GlobalEnv)
-	.comm <- 1
+.mpi.worker.applyLB <- function(n) {
+    .comm <- 1
     .npRmpi_transport_trace(
-        role = "worker",
-        event = "worker.applylb.start",
+        role = "worker", event = "worker.applylb.start",
         fields = list(n = n, comm = .comm)
     )
-    #n <- mpi.bcast(integer(1), type=1, comm=.comm)
     tmpfunarg <- mpi.bcast.Robj(rank=0, comm=.comm)
-    .tmpfun <- tmpfunarg$FUN
-    dotarg <- tmpfunarg$dot.arg
-    mpi.anytag <- mpi.any.tag()
-    repeat {
-        tmpmsg <- mpi.recv.Robj(source=0,tag=mpi.anytag, comm=.comm)
-        tag <- mpi.get.sourcetag()[2]
-        if (tag > n)
-            break
-        tmpdata.arg <- if (is.list(tmpmsg)) tmpmsg$data.arg else NULL
-        if (is.null(tmpdata.arg)) {
-            .npRmpi_transport_trace(
-                role = "worker",
-                event = "worker.applylb.malformed_task",
-                fields = list(tag = tag)
-            )
-            out <- structure(
-                "mpi.applyLB worker received malformed task payload",
-                class = "try-error"
-            )
-            mpi.send.Robj(out,0,tag,.comm)
-            next
-        }
-        out <- tryCatch(do.call(.tmpfun, c(tmpdata.arg, dotarg)),
-                        error = function(e)
-                          structure(conditionMessage(e),
-                                    class = "try-error",
-                                    condition = e))
-        #if (.mpi.err)
-        #    print(geterrmessage())
-        mpi.send.Robj(out,0,tag,.comm)
-    }
-    .npRmpi_transport_trace(
-        role = "worker",
-        event = "worker.applylb.done",
-        fields = list(n = n, comm = .comm)
-    )
+    .npRmpi_fanout_worker_header(tmpfunarg, "dynamic", .comm)
+    .npRmpi_fanout_worker_dynamic(tmpfunarg, n, .comm)
 }
 
-mpi.iapplyLB <- function(X, FUN, ...,  apply.seq=NULL, comm=1, sleep=0.01){
-	apply.seq=NULL
+mpi.iapplyLB <- function(X, FUN, ..., apply.seq=NULL, comm=1, sleep=0.01) {
     n <- length(X)
-    slave.num <- mpi.comm.size(comm)-1
-    if (slave.num < 1)
-        stop("There are no slaves running")
-    if (n <= slave.num) {
+    workers <- mpi.comm.size(comm) - 1L
+    if (workers < 1L) stop("There are no slaves running")
+    if (n <= workers) {
         .npRmpi_clear_applylb_cache()
-        return (mpi.iapply(X,FUN,...,comm=comm,sleep=sleep))
+        return(mpi.iapply(X, FUN, ..., comm = comm, sleep = sleep))
     }
-    if (!is.function(FUN))
-        stop("FUN is not a function")
-    if (slave.num > 2000)
-        stop("Total slaves are more than nonblock send/receive can handle")
-    length(list(...))
-    if (!is.null(apply.seq))
-        if (!is.integer(apply.seq))
-            stop("apply.seq is not an integer vector")
-        else if (min(apply.seq)<1 && max(apply.seq)>slave.num &&
-                length(apply.seq)!=n)
-            stop("apply.seq is not in right order")
-
-    mpi.bcast.cmd(.mpi.worker.applyLB, n=n, comm=comm)
-    #mpi.bcast(as.integer(n),type=1,comm=comm)
-    mpi.bcast.Robj(list(FUN=FUN,dot.arg=list(...)),rank=0,comm=comm)
-    out <- as.list(integer(n))
-    mpi.anysource <- mpi.any.source()
-    mpi.anytag <- mpi.any.tag()
-    for (i in seq_len(slave.num))
-        mpi.send.Robj(list(data.arg=list(X[[i]])), dest=i,tag=i,comm=comm)
-    #for (i in 1:slave.num)
-    #    mpi.waitany(slave.num)
-
-    if (!is.null(apply.seq)){
-       i=0
-       repeat {
-        if (mpi.iprobe(apply.seq[i+1],mpi.anytag,comm)){
-            i=i+1
-            j <- i+slave.num
-            if ( j <= n)
-                mpi.send.Robj(list(data.arg=list(X[[j]])), dest=apply.seq[i],tag=j, comm=comm) 
-            else
-                mpi.send.Robj(as.integer(0),dest=apply.seq[i],tag=j,comm=comm)  
-            charlen <- mpi.get.count(type=4)
-            tag <- mpi.get.sourcetag()[2]
-            tmp <- unserialize(mpi.recv(x = raw(charlen), type = 4, apply.seq[i], tag, comm))
-            out[[tag]]<- tmp
-            #mpi.wait(0)
-        }
-      if (i < n)
-         Sys.sleep(sleep)
-      else break
-      }
-      return(out)
-    }
-    mpi.seq.tmp <- integer(n)
-    i=0
-    repeat {
-        if (mpi.iprobe(mpi.anysource,mpi.anytag,comm)){
-            i=i+1
-            srctag <- mpi.get.sourcetag()
-            src <- srctag[1]
-            tag <- srctag[2]
-            j <- i+slave.num
-            if ( j <= n)
-                mpi.send.Robj(list(data.arg=list(X[[j]])), dest=src,tag=j, comm=comm)
-            else
-                mpi.send.Robj(as.integer(0),dest=src,tag=j,comm=comm)
-            charlen <- mpi.get.count(type=4)
-            tmp <- unserialize(mpi.recv(x = raw(charlen), type = 4, src, tag, comm))
-            out[[tag]]<- tmp
-            mpi.seq.tmp[i] <- src
-            #mpi.wait(src-1)
-        }
-        if (i < n)
-            Sys.sleep(sleep)
-        else
-            break
-    }
-  	#assign(".mpi.applyLB",mpi.seq.tmp, envir = .GlobalEnv)
-	gc()
+    if (workers > 2000L) stop("Total slaves are more than nonblock send/receive can handle")
+    out <- .npRmpi_fanout_apply(X, FUN, list(...), comm, dynamic = TRUE, poll = TRUE, sleep = sleep)
+    gc()
     out
 }
 
@@ -981,6 +747,7 @@ mpi.iapplyLB <- function(X, FUN, ...,  apply.seq=NULL, comm=1, sleep=0.01){
 #}
 
 .simplify <- function(n, answer, simplify, len=1, recursive=FALSE){
+    simplify <- npValidateScalarLogical(simplify, "simplify")
     if (simplify && length(answer)&&length(common.len <- unique(unlist(lapply(answer, 
         length)))) == 1 ) {
         if (common.len == len) 
@@ -1016,6 +783,7 @@ mpi.parSapply <- function (X, FUN, ..., job.num=mpi.comm.size(comm)-1, apply.seq
                 simplify = TRUE, USE.NAMES = TRUE, comm=1) 
 {
     FUN <- match.fun(FUN)
+    simplify <- npValidateScalarLogical(simplify, "simplify")
     answer <- mpi.parLapply(as.list(X),FUN,...,job.num=job.num,apply.seq=apply.seq,comm=comm)
     if (USE.NAMES && is.character(X) && is.null(names(answer))) 
         names(answer) <- X
@@ -1026,6 +794,7 @@ mpi.iparSapply <- function (X, FUN, ..., job.num=mpi.comm.size(comm)-1, apply.se
                 simplify = TRUE, USE.NAMES = TRUE, comm=1,sleep=0.01) 
 {
     FUN <- match.fun(FUN)
+    simplify <- npValidateScalarLogical(simplify, "simplify")
     answer <- mpi.iparLapply(as.list(X),FUN,...,job.num=job.num,apply.seq=apply.seq,comm=comm,sleep=sleep)
     if (USE.NAMES && is.character(X) && is.null(names(answer))) 
         names(answer) <- X

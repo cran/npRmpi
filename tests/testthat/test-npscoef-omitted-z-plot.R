@@ -1,0 +1,25 @@
+test_that("smooth-coefficient plots and hats use x metadata when z is omitted", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
+  old <- options(np.messages = FALSE)
+  on.exit(options(old), add = TRUE)
+  set.seed(2403)
+  x <- data.frame(x = runif(60))
+  y <- sin(3 * x$x) + rnorm(60, sd = 0.1)
+  fit <- npscoef(txdat = x, tydat = y, bws = 0.4, se = FALSE)
+  expect_null(fit$bws[["zdati", exact = TRUE]])
+  applied <- npscoefhat(bws = fit$bws, txdat = x, y = y, output = "apply")
+  expect_equal(as.vector(applied), fitted(fit), tolerance = 1e-8)
+  panel <- plot(fit, output = "data", neval = 9L)
+  eval <- plot_coordinates(panel, role = "X")
+  expect_equal(nrow(eval), 9L)
+  expected <- npscoef(bws = fit$bws, txdat = x, tydat = y,
+                      exdat = eval, se = FALSE)
+  expect_equal(plot_target(panel)$estimate, fitted(expected), tolerance = 1e-8)
+
+  formula.fit <- npscoef(y ~ x, data = data.frame(y = y, x = x$x), bws = 0.4)
+  formula.panel <- plot(formula.fit, output = "data", neval = 9L)
+  expect_equal(plot_target(formula.panel)$estimate,
+               as.vector(predict(formula.fit, newdata = plot_coordinates(formula.panel, role = "X"))),
+               tolerance = 1e-8)
+})

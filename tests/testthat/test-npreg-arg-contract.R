@@ -21,8 +21,8 @@ test_that("npreg rejects non-logical gradients and residuals under autodispatch"
                "'residuals' must be TRUE or FALSE")
 })
 
-test_that("npreg.rbandwidth validates gradient flags before autodispatch branch", {
-  npreg_rbandwidth <- getFromNamespace("npreg.rbandwidth", "npRmpi")
+test_that(".npreg_fit_impl validates gradient flags before autodispatch branch", {
+  npreg_rbandwidth <- getFromNamespace(".npreg_fit_impl", "npRmpi")
   fn.body <- paste(deparse(body(npreg_rbandwidth), width.cutoff = 500L), collapse = " ")
   pos.grad <- regexpr("gradients <- npValidateScalarLogical\\(gradients, \"gradients\"\\)", fn.body)[1]
   pos.resid <- regexpr("residuals <- npValidateScalarLogical\\(residuals, \"residuals\"\\)", fn.body)[1]
@@ -33,12 +33,18 @@ test_that("npreg.rbandwidth validates gradient flags before autodispatch branch"
   expect_true(pos.resid < pos.auto)
 })
 
-test_that("lp regtype remains lp internally for degree 0/1", {
+test_that("public lc and explicit lp degree 0 share the scalar LP0 engine", {
   npRegtypeToC <- getFromNamespace("npRegtypeToC", "npRmpi")
+  REGTYPE_LP0 <- getFromNamespace("REGTYPE_LP0", "npRmpi")
   REGTYPE_LP <- getFromNamespace("REGTYPE_LP", "npRmpi")
 
-  expect_identical(npRegtypeToC(regtype = "lp", degree = 0L, ncon = 1L)$code, REGTYPE_LP)
+  expect_identical(npRegtypeToC(regtype = "lc", degree = NULL, ncon = 2L),
+                   list(code = REGTYPE_LP0, degree = c(0L, 0L)))
+  expect_identical(npRegtypeToC(regtype = "lp", degree = 0L, ncon = 1L),
+                   list(code = REGTYPE_LP0, degree = 0L))
   expect_identical(npRegtypeToC(regtype = "lp", degree = 1L, ncon = 1L)$code, REGTYPE_LP)
+  expect_identical(npRegtypeToC(regtype = "ll", degree = NULL, ncon = 2L),
+                   list(code = REGTYPE_LP, degree = c(1L, 1L)))
 })
 
 test_that("lp degree-0 gradients allow first derivatives and reject higher orders under autodispatch", {
@@ -111,8 +117,8 @@ test_that("lc gradients reject higher-order derivative requests under autodispat
   )
 })
 
-test_that("npreg.rbandwidth no longer contains bernstein OOS direct fallback", {
-  npreg_rbandwidth <- getFromNamespace("npreg.rbandwidth", "npRmpi")
+test_that(".npreg_fit_impl contains no Bernstein OOS direct fallback", {
+  npreg_rbandwidth <- getFromNamespace(".npreg_fit_impl", "npRmpi")
   fn.body <- paste(deparse(body(npreg_rbandwidth), width.cutoff = 500L), collapse = " ")
   expect_no_match(fn.body, "bernstein\\.oos")
   expect_no_match(fn.body, "\\.np_kernel_weights_direct")
@@ -138,9 +144,23 @@ test_that("lp bernstein OOS warns but keeps canonical npreg path under autodispa
     bernstein.basis = TRUE
   )
   ex <- data.frame(x = c(-0.2, 1.2))
+  ns <- asNamespace("npRmpi")
+  witness <- new.env(parent = emptyenv()); witness$native <- 0L
+  withr::local_options(list(np.test.regression.owner = witness))
+  trace(".npreg_fit_impl", where = ns, print = FALSE, tracer = quote({
+    .Call <- function(.NAME, ...) {
+      if (identical(.NAME, "C_np_regression")) {
+        state <- getOption("np.test.regression.owner")
+        state$native <- state$native + 1L
+      }
+      base::.Call(.NAME, ...)
+    }
+  }))
+  withr::defer(untrace(".npreg_fit_impl", where = ns))
   expect_warning(
     fit <- npRmpi::npreg(bws = bw, txdat = dat["x"], tydat = dat$y, exdat = ex),
     "outside training support"
   )
   expect_identical(fit$bws$regtype, "lp")
+  expect_identical(witness$native, 1L)
 })

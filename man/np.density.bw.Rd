@@ -113,7 +113,8 @@ These arguments identify the data, formula interface, and whether bandwidths are
     a logical value which specifies whether to do a numerical search for
     bandwidths or not. If set to \code{FALSE}, a \code{bandwidth} object
     will be returned with bandwidths set to those specified
-    in \code{bws}. Defaults to \code{TRUE}.
+    in \code{bws}. Defaults to \code{TRUE}. Beta kernels support both
+    automatic cross-validation and explicit bandwidth objects.
   }
 
 
@@ -142,6 +143,13 @@ These arguments identify the data, formula interface, and whether bandwidths are
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -263,7 +271,8 @@ These controls choose and parameterize bounded support for continuous kernels.
   \item{ckerbound}{
     character string controlling continuous-kernel support handling.
     Can be set as \code{none} (default kernel on full support),
-    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{range} (use sample min/max, except that beta kernels use the
+    outer half-spacing rule in \code{\link{np.kernels}}), or \code{fixed} (use
     \code{ckerlb}/\code{ckerub}). The bounded-kernel route reuses the selected continuous kernel and renormalizes it on the chosen support; see \code{\link{np.kernels}}.
   }
 
@@ -331,8 +340,9 @@ These controls choose continuous, unordered, and ordered kernels.
 
   \item{ckertype}{
     character string used to specify the continuous kernel type.
-    Can be set as \code{gaussian}, \code{epanechnikov}, or
-    \code{uniform}. Defaults to \code{gaussian}.
+    Can be set as \code{gaussian}, \code{epanechnikov}, \code{uniform}, or
+    \code{beta}; see Details for the finite-support beta contract.
+    Defaults to \code{gaussian}.
   }
 
   \item{okertype}{
@@ -440,6 +450,19 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  Seeded temporary operations follow \link{np_rng_scope}.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -466,6 +489,27 @@ or standard-deviation factors.
   supplied for storage with \code{bandwidth.compute = FALSE} are not
   rewritten by the search floor.
 
+  For automatic fixed-bandwidth CVLS with a beta kernel,
+  repeated complete observations at a declared endpoint require an
+  explicitly positive resolved \code{scale.factor.search.lower}. The default
+  \code{0.1} already satisfies this requirement. Endpoint repetitions can
+  cause the criterion to prefer vanishing bandwidths; this is a conservative
+  search-admissibility policy, not a claim that every such sample has a
+  divergent criterion. Manual bandwidth evaluation and nearest-neighbor
+  searches remain available. No positive floor is silently substituted for
+  an explicitly requested zero.
+
+  A selected scale factor at this floor is a boundary solution of the
+  constrained search, not evidence of an interior optimum. In particular,
+  endpoint observations can make beta CVLS sensitive to the chosen floor.
+  For a returned fixed-bandwidth object \code{bw}, inspect
+  \code{bw$sfactor$x[bw$icon]} alongside
+  \code{bw$scale.factor.search.lower}; the physical bandwidth is on a
+  different scale and should not be compared directly with this dimensionless
+  bound. Near-bound solutions merit the same sensitivity consideration, but
+  proximity alone does not prove that the unconstrained criterion diverges.
+  Changing the floor changes the admissible search problem.
+
   Categorical search-start controls such as \code{dfac.init},
   \code{lbd.init}, and \code{hbd.init} have separate semantics and are
   not affected by \code{scale.factor.search.lower}.
@@ -474,15 +518,19 @@ or standard-deviation factors.
   \eqn{\log(\hat f_i)}{log(fhat_i)}. Compact-support kernels can yield
   zero leave-one-out density estimates, and higher-order kernels can
   yield negative estimates. In those cases the package optimizes a
-  guarded CVML criterion rather than the literal log likelihood. Let
-  \eqn{\epsilon}{epsilon} denote the positive machine floor used for the
-  guard. Positive fitted values use the ordinary branch
-  \eqn{-\log(\hat f_i)}{-log(fhat_i)}. Near-zero fitted values use
-  \eqn{-\log(\epsilon)}{-log(epsilon)}, and negative fitted values use
-  the smooth penalty
+  guarded CVML criterion rather than the literal log likelihood. Every
+  represented strictly positive fitted value, including a positive
+  subnormal value, uses the ordinary branch
+  \eqn{-\log(\hat f_i)}{-log(fhat_i)}. Let
+  \eqn{\epsilon}{epsilon} denote the positive machine floor used only to
+  encode an invalid nonpositive contribution. Exact zero and negative values
+  with magnitude no greater than \eqn{\epsilon}{epsilon} use
+  \eqn{-\log(\epsilon)}{-log(epsilon)}; negative values of larger magnitude
+  use the smooth penalty
   \eqn{\log(-\hat f_i)-2\log(\epsilon)}{log(-fhat_i)-2*log(epsilon)}.
   The \code{guarded} count reported in bandwidth summaries records
-  objective evaluations in which this guard was used. The
+  objective evaluations containing an invalid nonpositive contribution; a
+  positive value is not guarded merely because it is small. The
   \code{bwmethod="cv.ls"} criterion remains well defined for negative
   kernel density estimates and is not modified by this CVML guard.
 
@@ -555,6 +603,31 @@ or standard-deviation factors.
   with the point at which the density is estimated, \eqn{x}. Fixed bandwidths
   are constant over the support of \eqn{x}.
 
+  Exact ties can make the literal \eqn{k}th continuous nearest-neighbor
+  radius zero. Such a bandwidth is undefined and is rejected; see
+  \code{\link{np.kernels}} for the precise contract and remedies.
+
+  The Chen/Igarashi--Kakizawa beta family is available at orders 2, 4, 6,
+  and 8 for fixed, generalized-NN, and adaptive-NN estimation of continuous
+  variables on finite supports. Beta continuous coordinates may be combined
+  with unordered and ordered categorical coordinates, which retain their
+  selected categorical kernels. Set \code{ckertype = "beta"} and use either
+  \code{ckerbound = "fixed"} with finite \code{ckerlb}/\code{ckerub} or
+  \code{ckerbound = "range"}. Explicit bandwidth objects and automatic
+  \code{cv.ml}/\code{cv.ls} selection are supported for continuous and mixed
+  data; normal-reference selection is not. The bandwidth \eqn{h_j} is in
+  the units of coordinate \eqn{j}; internally the beta precision is
+  \eqn{\tau_j=((b_j-a_j)/h_j)^2}{tau[j]=((b[j]-a[j])/h[j])^2}.
+  Higher orders use the signed multiscale coefficients documented in
+  \code{\link{np.kernels}}. Bounded density \code{cv.ls} uses numerical
+  target-coordinate quadrature of the estimator rather than the public
+  observation-coordinate overlap. For univariate order-2 fixed-bandwidth beta
+  \code{ckerbound="range"} CVLS searches with Powell, the ordinary result is
+  also checked against the deterministic uniform-limit certificate documented
+  in \code{\link{np.kernels}}. This does not replace or reduce the user's
+  \code{nmulti} search, and the same check applies when automatic selection is
+  restarted from an eligible beta range bandwidth object.
+
   \code{npudensbw} may be invoked \emph{either} with a formula-like
   symbolic description of variables on which bandwidth selection is to
   be performed \emph{or} through a simpler interface whereby data is
@@ -609,6 +682,11 @@ or standard-deviation factors.
   \item{bw}{ bandwidth(s), scale factor(s) or nearest neighbours for the
     data, \code{dat} }
   \item{fval}{ objective function value at minimum }
+  \item{beta.range.certification}{for an eligible automatic beta range CVLS
+    search, a list recording the uniform-limit probe, trigger decision,
+    optional support-width refinement, and selected source; absent otherwise}
+  \item{num.feval.certified}{number of function evaluations attributable to
+    that certification and optional refinement; absent otherwise}
 
   if \code{bwtype} is set to \code{fixed}, an object containing
   bandwidths, of class \code{bandwidth}
@@ -621,8 +699,20 @@ or standard-deviation factors.
   element \eqn{i} corresponding to column \eqn{i} of input data
   \code{dat}.
 
-  The functions  \code{\link{predict}}, \code{\link{summary}} and \code{\link{plot}} support
-  objects of type \code{bandwidth}.
+  Prediction follows a two-stage contract. Calling \code{predict(bw)}
+  on the returned bandwidth object is a convenience forwarder for
+  \code{npudens(bws = bw)} and returns a fitted \code{npdensity}
+  object; it does not return a numeric vector of density estimates.
+  Call \code{fitted(fit)} or \code{predict(fit, newdata = ...)} on that
+  fitted object to obtain numeric results. The canonical workflow is
+  \preformatted{
+    bw <- npudensbw(~ x, data = mydata)
+    fit <- predict(bw)             # equivalent to npudens(bws = bw)
+    fitted(fit)
+    predict(fit, newdata = newdata)
+  }
+  The functions \code{\link{summary}} and \code{\link{plot}} also
+  support \code{bandwidth} objects.
 }
 \section{Book And Method Pointers}{
   \code{npudensbw} selects bandwidths for the unconditional density

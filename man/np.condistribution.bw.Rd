@@ -124,7 +124,7 @@ npcdistbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-            degree.min = NULL,
+          degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -170,6 +170,13 @@ These arguments identify the data, formula interface, optional distribution grid
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -288,8 +295,9 @@ These arguments choose the selection criterion and the way continuous bandwidths
     \eqn{1.587 \sigma_j n^{-1/(2P+l)}}{1.587*sigma[j]*n^(-1.0/(2.0*P+l))}
     for response variables, where \eqn{\sigma_j}{sigma[j]} is an adaptive
     measure of spread of the \eqn{j}th continuous variable defined as
-    min(standard deviation, mean absolute deviation/1.4826, interquartile
-    range/1.349), \eqn{n} the number of observations, \eqn{P} the order
+    min(standard deviation, normal-consistent median absolute deviation,
+    interquartile range divided by \eqn{2\Phi^{-1}(0.75)}),
+    \eqn{n} the number of observations, \eqn{P} the order
     of the kernel, and \eqn{l} the number of continuous variables. Note
     that when there exist factors and the normal-reference rule is used,
     there is zero smoothing of the factors. Defaults to \code{cv.ls}.  }
@@ -303,8 +311,9 @@ These arguments choose the selection criterion and the way continuous bandwidths
     related by the formula \eqn{h_j = c_j \sigma_j n^{-1/(2P+l)}}{h[j] =
     c[j]*sigma[j]*n^(-1/(2*P+l))}, where \eqn{\sigma_j}{sigma[j]} is an
     adaptive measure of spread of continuous variable \eqn{j} defined as
-    min(standard deviation, mean absolute deviation/1.4826, interquartile
-    range/1.349), \eqn{n} the number of observations, \eqn{P}{P} the
+    min(standard deviation, normal-consistent median absolute deviation,
+    interquartile range divided by \eqn{2\Phi^{-1}(0.75)}),
+    \eqn{n} the number of observations, \eqn{P}{P} the
     order of the kernel, and \eqn{l}{l} the number of continuous
     variables. For discrete data types, \eqn{c_j}{c[j]} and
     \eqn{h_j}{h[j]} are related by the formula \eqn{h_j =
@@ -369,7 +378,8 @@ These controls choose and parameterize bounded support for continuous kernels.
   \item{cxkerbound}{
     character string controlling continuous-kernel support handling for
     \code{xdat}. Can be set as \code{none} (default kernel on full support),
-    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{range} (use sample min/max, except that beta kernels use the
+    outer half-spacing rule in \code{\link{np.kernels}}), or \code{fixed} (use
     \code{cxkerlb}/\code{cxkerub}). The bounded-kernel route reuses the selected continuous kernel and renormalizes it on the chosen support; see \code{\link{np.kernels}}.
   }
 
@@ -390,7 +400,8 @@ These controls choose and parameterize bounded support for continuous kernels.
   \item{cykerbound}{
     character string controlling continuous-kernel support handling for
     \code{ydat}. Can be set as \code{none} (default kernel on full support),
-    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{range} (use sample min/max, except that beta kernels use the
+    outer half-spacing rule in \code{\link{np.kernels}}), or \code{fixed} (use
     \code{cykerlb}/\code{cykerub}). For the response-side distribution
     operator, the selected continuous kernel is integrated after
     observation-centered truncation and normalization on the chosen support;
@@ -492,7 +503,7 @@ These controls choose continuous, unordered, and ordered kernels for \code{xdat}
   \item{cxkertype}{
     character string used to specify the continuous kernel type for
     \code{xdat}.  Can be set as \code{gaussian},
-    \code{epanechnikov}, or \code{uniform}. Defaults to \code{gaussian}.
+    \code{epanechnikov}, \code{uniform}, or \code{beta}. Defaults to \code{gaussian}.
   }
 
   \item{cykerorder}{
@@ -506,8 +517,8 @@ These controls choose continuous, unordered, and ordered kernels for \code{xdat}
   \item{cykertype}{
     character string used to specify the continuous kernel type for
     \code{ydat}.
-    Can be set as \code{gaussian}, \code{epanechnikov}, or
-    \code{uniform}. Defaults to \code{gaussian}.
+    Can be set as \code{gaussian}, \code{epanechnikov}, \code{uniform}, or
+    \code{beta}. Defaults to \code{gaussian}.
   }
 
   \item{oxkertype}{
@@ -539,8 +550,11 @@ These arguments control the local-polynomial estimator, basis, and fixed degree 
   }
 
   \item{bernstein.basis}{
-    logical value controlling Bernstein basis evaluation for
-    \code{regtype="lp"}. When automatic degree search is requested and
+    logical value controlling the stabilized representation for
+    \code{regtype="lp"}. For \code{basis="glp"}, \code{TRUE} selects the
+    complete degree-graded, orthonormal shifted-Legendre definition given in
+    \code{\link{npreg}}; additive and
+    tensor bases retain their fixed-coordinate-degree representation. When automatic degree search is requested and
     \code{bernstein.basis} is not explicitly supplied, the search route
     defaults to \code{TRUE} for numerical stability. Explicit
     \code{bernstein.basis=FALSE} is honored, but raw-polynomial search
@@ -736,6 +750,36 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  Seeded temporary operations follow \link{np_rng_scope}.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
+
+  Beta associated kernels may be selected independently with
+  \code{cxkertype="beta"} and \code{cykertype="beta"}. Orders 2, 4, 6,
+  and 8, fixed/generalized-NN/adaptive-NN bandwidths,
+  \code{cxkerbound}/\code{cykerbound} equal to \code{"fixed"} or
+  \code{"range"}, explicit bandwidth objects, and automatic \code{cv.ls}
+  search are supported. Normal-reference selection is not. Beta kernels act on continuous
+  coordinates alongside the kernels for categorical coordinates.
+  Local-constant, local-linear and local-polynomial fits are supported. Local-constant gradients with respect to X are
+  available: a beta X coordinate uses its analytic evaluation-coordinate PDF
+  derivative, while the beta or legacy Y CDF factor is held fixed. Exact
+  matching beta-X endpoints use structural cancellation in the normalized
+  ratio and can yield signed infinity or \code{NA} when a finite derivative
+  does not exist. Order-2 CDF factors
+  use the observation-centered incomplete-beta construction, while orders 4,
+  6, and 8 use its signed multiscale extension. See \code{\link{np.kernels}}
+  for the orientation, warnings, and references.
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -811,6 +855,10 @@ or standard-deviation factors.
   bandwidths change with the point at which the cumulative distribution is estimated,
   \eqn{x}. Fixed bandwidths are constant over the support of \eqn{x}.
 
+  Exact ties can make the literal \eqn{k}th continuous nearest-neighbor
+  radius zero. Such a bandwidth is undefined and is rejected; see
+  \code{\link{np.kernels}} for the precise contract and remedies.
+
   \code{npcdistbw} may be invoked \emph{either} with a formula-like
   symbolic
   description of variables on which bandwidth selection is to be
@@ -837,6 +885,15 @@ or standard-deviation factors.
   specifies that the bandwidths for the joint distribution of variables
   \code{y1} and \code{y2} conditioned on \code{x1} and \code{x2} are to
   be estimated. See below for further examples.
+
+  Response expressions such as \code{log(y)} or \code{I(y^2)} are not
+  supported on the left-hand side and are rejected. Instead create, for
+  example, \code{data$log_y <- log(data$y)} and use \code{log_y ~ x}, or
+  supply the transformed response through \code{ydat}. Right-hand-side
+  \code{offset()} special terms are also unsupported and are rejected rather
+  than omitted. These checks do not evaluate response expressions, alter
+  stored/dynamically constructed formulas, or change supported explanatory
+  transformations.
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
@@ -925,11 +982,27 @@ or standard-deviation factors.
   continuous variables while the discrete kernel bandwidths are returned
   for the discrete variables.
 
-  The functions \code{\link{predict}}, \code{\link{summary}} and \code{\link{plot}} support
-  objects of type \code{condbandwidth}.
+  Prediction follows a two-stage contract. Calling \code{predict(bw)}
+  on the returned bandwidth object is a convenience forwarder for
+  \code{npcdist(bws = bw)} and returns a fitted \code{condistribution}
+  object; it does not return a numeric vector of conditional-distribution
+  estimates. Call \code{fitted(fit)} or
+  \code{predict(fit, newdata = ...)} on that fitted object to obtain
+  numeric results. The canonical workflow is
+  \preformatted{
+    bw <- npcdistbw(y ~ x, data = mydata)
+    fit <- predict(bw)             # equivalent to npcdist(bws = bw)
+    fitted(fit)
+    predict(fit, newdata = newdata)
+  }
+  The functions \code{\link{summary}} and \code{\link{plot}} also
+  support \code{condbandwidth} objects.
 }
 
 \section{Book And Method Pointers}{
+  Local-polynomial search uses the numerical-ridging policies described in
+  \code{\link{npreg}}; see Seifert and Gasser (2000) there.
+
   \code{npcdistbw} selects response and conditioning bandwidths, and
   when requested local-polynomial degree/search metadata, for the
   conditional distribution target

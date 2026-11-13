@@ -14,7 +14,7 @@ npdeptest(data.x = NULL,
           data.y = NULL,
           method = c("integration","summation"),
           bootstrap = TRUE,
-          boot.num = 399,
+          B = 399,
           random.seed = 42)
   
 }
@@ -45,7 +45,7 @@ These arguments identify the paired samples being tested.
 These arguments control bootstrap execution and reproducibility settings.
 }
 
-  \item{boot.num}{
+  \item{B}{
     an integer value specifying the number of bootstrap
     replications to use. Defaults to \code{399}.
   }
@@ -59,10 +59,19 @@ These arguments control bootstrap execution and reproducibility settings.
 
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
 
+}
+\section{Bootstrap P-Values}{
+  The bootstrap upper-tail p-value is the proportion of bootstrap statistics
+  greater than or equal to the observed statistic. Ties count as at least as
+  extreme, giving the conservative tie convention for discrete statistics.
+  This is the ordinary bootstrap proportion, without an add-one correction;
+  a reported zero is possible with a finite number of replications.
 }
 \value{
   \code{npdeptest} returns an object of type \code{deptest} with the
@@ -145,12 +154,30 @@ These arguments control bootstrap execution and reproducibility settings.
 
 \section{Usage Issues}{
 
-  The \code{integration} version of the statistic uses multidimensional
-  numerical methods from the \pkg{cubature} package. See
-  \pkg{adaptIntegrate} for details. The \code{integration}
-  version of the statistic will be substantially slower than the
-  \code{summation} version, however, it will likely be both more
-  accurate and powerful.
+  The \code{integration} version uses deterministic tensor-product,
+  corrected composite trapezoidal quadrature. Along each axis the domain
+  extends eight relevant bandwidths beyond the observed support and uses
+  two evaluation points per smallest relevant bandwidth. A registered
+  native callback evaluates the Gaussian marginal and joint densities in
+  bounded tiles, so package-owned working memory does not grow as a dense
+  sample-by-quadrature array. The integration version is generally more
+  computationally demanding than \code{summation}, but avoids the density
+  division that can make the summation statistic unstable.
+
+  Observed bivariate statistics share evaluation rows or quadrature points
+  across active MPI ranks, with the complete training sample on each rank.
+  Results are assembled in their original order using storage linear in the
+  number of evaluation points, not a sample-by-sample kernel matrix.
+
+  The \code{summation} version fuses both marginal density sums and the
+  joint density sum in one registered native pass with constant auxiliary
+  storage. During bootstrapping, each MPI rank processes bounded groups of
+  its sampled \code{data.x} indices and shares the invariant \code{data.y}
+  marginal work while retaining every draw's positionwise pairing, reduction
+  order, and global output order. Rank-local workspace grows only with the
+  sample size times the bounded group size; no dense sample-by-sample kernel
+  matrix is retained. Counts alone are not used because they would discard
+  the required pairing with \code{data.y}.
 
 }
 
@@ -197,7 +224,7 @@ y.fit <- fitted(model)
 
 output <- npdeptest(y,
                     y.fit,
-                    boot.num=29,
+                    B=29,
                     method="summation")
 
 summary(output)

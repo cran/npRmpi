@@ -50,19 +50,50 @@ MPI startup, shutdown, worker-count, and worker-status controls.
     synchronized options across ranks on each dispatch sync event.}
   \item{autodispatch.option.sync}{Option synchronization policy for
     auto-dispatch: \code{"onchange"} (default), \code{"always"}, or
-    \code{"never"}.}
+    \code{"never"}. The synchronized options include \code{warn}, so
+    warning-to-error conversion follows the same policy on participating ranks.
+    Synchronized values remain worker options until a subsequent update; they
+    are not restored at the end of an individual call. With \code{"never"},
+    automatic numerical calls are refused before dispatch because the existing
+    boundary cannot certify agreement of computational options across ranks.
+    This includes automatic plot tasks and regression-hat broadcasts;
+    genuinely local calculations do not acquire a new MPI admission requirement.
+    This also refuses manually synchronized automatic calls. Explicit manual
+    MPI workflows remain available; their caller must maintain agreement of
+    computational options on every rank, including after worker-side changes.
+    Prepared-search commands still broadcast their required search-option
+    snapshot, but this does not certify the enclosing automatic call. \code{autodispatch.verify.options}
+    verifies only an actual synchronization event. Use \code{"onchange"} or \code{"always"}
+    for package-managed synchronization.}
   \item{np.messages}{Logical; if non-\code{NULL}, sets
     \code{options(np.messages=...)} inside \code{npRmpi.init()}.}
-  \item{nonblock}{Logical passed to the internal attach-mode worker loop
-    receive path.}
-  \item{sleep}{Polling sleep interval (seconds) for nonblocking attach-mode
-    worker-loop receives.}
+  \item{nonblock}{Logical passed to the worker-loop receive path in both spawn
+    and attach modes.}
+  \item{sleep}{Polling sleep interval (seconds) for nonblocking worker-loop
+    receives in both spawn and attach modes. The default is 0.1 seconds.
+    For repeated small jobs, a smaller explicit value (for example,
+    \code{sleep = 0.001}) reduces command latency at the cost of more frequent
+    polling. This setting does not change numerical work or its rank ownership.}
   \item{quiet}{Logical; suppress host-info printing when \code{FALSE}.}
-  \item{force}{Logical; when \code{TRUE}, force a hard shutdown of slave daemons.}
+  \item{force}{Logical; when \code{TRUE}, close slave daemons instead of keeping
+    them for reuse, resuming pending cooperative cleanup if necessary. This is
+    not a process kill or an MPI abort; see Details.}
   \item{dellog}{Logical; when \code{TRUE}, remove slave log files (if applicable).}
   \item{\dots}{Additional arguments passed to \code{mpi.spawn.Rslaves()}.}
 }
 \details{
+The package-owned startup routes compare the loaded R and native source
+identities on participating ranks. A mismatch or a worker from an older build
+without an identity record refuses admission. Close the pool and restart all
+ranks with matching package sources; changing files underneath a running R
+session does not update its loaded code. Different library paths and supported
+platform builds of the same sources are allowed. Identity checking runs at
+startup/reuse, not for every numerical call. It is an accidental source-mismatch
+check, not authentication of modified binaries or subsequent namespace changes.
+Low-level MPI worlds that bypass these startup helpers and the shipped profile
+remain caller-managed and are not certified by this check.
+
+
   Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup.
 
 \code{npRmpi.init()} and \code{npRmpi.quit()} are the ordinary entry
@@ -74,13 +105,55 @@ points for two workflows:
   MPI world and runs worker-loop coordination internally.
 }
 
-\strong{Profile/manual-broadcast mode is a separate advanced route.} It
-does not call \code{npRmpi.init()}. Instead, ranks are started under
+Calling \code{npRmpi.init()} again on the coordinator reuses an open
+package-managed pool. Reuse reapplies the requested automatic-dispatch
+options and resets rank sequencing together, but does not change worker
+count or shutdown ownership. In particular, an attached pool retains its
+session identity even when reused with \code{mode="spawn"}; close it using
+its original attach workflow. Repeated \code{mode="attach"} or
+\code{mode="auto"} does not repeat attach startup collectives.
+An explicit attach request in an ordinary single-process world is rejected
+before changing the existing pool or its options.
+
+A profile-managed pool can be explicitly reused with \code{mode="spawn"},
+but it retains its profile/manual shutdown workflow. Trying to convert it
+with \code{mode="attach"} (including \code{"auto"} in that MPI world)
+is rejected before changing state. Ordinary profile scripts should continue
+to use the separate workflow below.
+
+\strong{Profile/manual-broadcast mode is a separate advanced route.} For
+pure explicit collective use, it does not call \code{npRmpi.init()}.
+Instead, ranks are started under
 \code{mpiexec} with \code{inst/Rprofile} (or an explicit
 \code{R_PROFILE_USER} path), and the script then uses
 \code{mpi.bcast.cmd(np.mpi.initialize(), caller.execute=TRUE)} plus
 explicit \code{mpi.bcast.*} calls. See \code{\link{np.mpi.initialize}},
 \code{inst/Rprofile}, and the demo run guide for that route.
+
+\strong{Master plotting from a profile-started job.} Profile startup alone
+does not register an active coordinator pool. To use a master-coordinated
+plot, explicitly adopt the existing workers at the start of a fresh job,
+before constructing models. On rank zero, after the initialization broadcast:
+\preformatted{
+stopifnot(mpi.comm.rank(1L) == 0L, mpi.comm.size(1L) >= 2L)
+npRmpi.init(mode = "spawn", nslaves = mpi.comm.size(1L) - 1L,
+           quiet = TRUE)
+}
+With this existing communicator, the \code{"spawn"} mode reuses its workers;
+it does not create additional ranks. Use that explicit mode: the default
+\code{"auto"} selects attach startup in a multi-rank world, whereas these
+profile workers are already in their command loops. Do not set internal pool
+options manually or use this recipe to migrate an in-progress leased session.
+
+Then call \code{plot(model, ...)} on the master. A direct
+\code{mpi.bcast.cmd(plot(...))} is rejected; wrapping or hiding the plot call
+inside another expression is not a supported substitute. This adopted-pool
+workflow remains distinct from raw SPMD plotting. Each method's ordinary
+kernel, band and RNG restrictions still apply. For this standalone
+profile-started job, terminate with the explicit broadcast
+\code{mpi.bcast.cmd(mpi.quit(), caller.execute = TRUE)} after the work has
+completed. Ordinary session/attach workflows retain their existing shutdown
+rules.
 
 Workflow quick-start guidance:
 \enumerate{
@@ -101,6 +174,40 @@ Workflow quick-start guidance:
   \code{mpi.bcast.*} calls. Use \code{R CMD BATCH --no-save} (not
   \code{--vanilla}) and provide exactly one startup profile source.
 }
+
+\strong{Random-number generators and distributed replay.} Some bootstrap
+and calibration routes generate random-number states on the coordinator and
+replay them on workers. The current admission guard rejects user-supplied
+uniform generators on these routes, including generators preloaded on every
+worker. This is a limitation of distributed state replay, not a change to the
+requested resampling law. The package does not automatically choose another
+generator. To use a guarded route, explicitly select a built-in uniform
+generator before the call, for example
+\code{RNGkind(kind="Mersenne-Twister")}, and then set the desired seed.
+The plotting argument \code{random_seed} sets a seed; it does not select a
+different RNG implementation.
+
+Loading a generator library is distinct from initializing it for R, and a seed
+vector need not contain all of a custom generator's state. The separate
+\code{\link{npsigtest}} bootstrap planner is not qualified for distributed
+user-supplied uniform replay and refuses such saved bootstrap plans inside
+its existing task failure boundary. Use a built-in uniform generator for that
+distributed bootstrap. Temporary seed scopes separately refuse Box--Muller
+and uncertifiable custom caller states before a seed reset or state swap;
+admitted built-in states preserve caller continuation and seed-binding absence.
+Uniform-only task transport does not by itself certify a seed reset. The shared
+bootstrap task-state transport also
+refuses user-supplied normal generators when its tasks draw normal variates,
+before advancing or publishing those tasks. Loading the implementation on
+every rank does not certify its hidden state. An unused custom normal generator
+is not refused for normal-free tasks. These guards also cover local seed-only
+task replay; deterministic tasks and retained innovations do not enter this
+transport owner.
+
+These limitations do not redefine unrelated local computations or RNGs that
+do not enter the affected replay routes. In particular,
+\code{options(npRmpi.autodispatch=FALSE)} controls estimator dispatch; it does
+not force bootstrap or plot coordinators to stop using workers.
 
 \strong{Performance note.} Wall-clock can differ across workflows even for
 identical statistical output. The main drivers are MPI message passing and
@@ -124,6 +231,11 @@ startup/teardown behavior:
   can be slower due to command marshalling/serialization overhead. A practical
   pattern is: keep auto-dispatch enabled for bandwidth selection, then set
   \code{options(npRmpi.autodispatch=FALSE)} for post-\code{bw} fit/predict.
+  With this option, numerical estimator, bandwidth and kernel-sum calls made
+  only on the master enter a scoped local native computation before preparing
+  their inputs. Explicit manual broadcasts remain collective; bootstrap and
+  plot coordinators retain their own worker dispatch. The active pool remains
+  available for subsequent calls, including after an ordinary local error.
   Manual-broadcast/profile mode often behaves closer to this low-overhead
   pattern.
 }
@@ -138,6 +250,27 @@ disables reading startup profiles and the manual-broadcast worker loop will not
 be initialized from \code{.Rprofile}. Also avoid setting both \code{R_PROFILE}
 and \code{R_PROFILE_USER} to the same file; this is treated as a startup
 misconfiguration and fails fast.
+
+A standalone multi-rank profile job owns its terminal error policy. An error
+escaping the worker command loop or reaching the master's top-level error
+handler terminates the MPI job with a nonzero status, after reporting the
+error. This avoids cooperative shutdown waiting for ranks that have already
+left the command protocol. The profile installs its own \code{options(error=)}
+handler; replacing that handler removes the master's fail-fast protection.
+To recover from an anticipated command error, catch it inside the broadcast
+expression on every affected rank. Catching only the master-side error does
+not recover a failed worker. In session and attach mode, an error escaping a
+manual broadcast expression can also end a worker's command loop. Catching only
+the master-side error does not make that pool reusable: later commands or
+shutdown can block waiting for the failed worker. This can include
+\code{npRmpi.quit()}, \code{npRmpi.quit(force=TRUE)} and ordinary \code{q()}:
+force does not repair a lost worker. If the affected R/MPI job is already stuck
+in this state, it must be ended externally using the operating system's process
+manager or job launcher. Anticipated errors must be handled inside the broadcast
+expression on every affected rank. This is a
+limitation of manual-command error recovery, not a promise of recovery from
+arbitrary collective failures. One-rank profile use does not install the
+multi-rank profile policy.
 
 Minimal comparison script (three patterns) follows:
 \preformatted{
@@ -195,9 +328,50 @@ on the master process. In profile/manual-broadcast mode, termination is
 handled explicitly in the script via broadcasted \code{mpi.quit()} calls
 rather than via \code{npRmpi.quit()}.
 
-If an MPI-fanned bootstrap dispatch fails or times out, the current MPI
-session may no longer be usable. Restart R before performing further
-MPI-backed computations.
+During an active MPI-backed computation, a master interrupt is deferred until
+the current rank-lockstep operation reaches its existing common completion
+boundary. The master then signals an ordinary R \code{interrupt} condition.
+This prevents a rank-local unwind from stranding workers; if the condition is
+caught, the existing pool remains available for subsequent MPI-backed work.
+Consequently, interrupt delivery may not be immediate during a long objective
+evaluation or solve. This coordination adds no MPI commands or payloads.
+
+Bootstrap fan-out and MPI apply collectors use a separate cooperative
+cancellation protocol. After a master-side error, interrupt or dispatch
+timeout, workers stop at their existing task or bootstrap-chunk boundaries;
+the current task may finish first. Outstanding replies are drained, no partial
+result is returned, and the original condition is signalled. Once cleanup
+completes, the existing pool can be reused.
+
+A second interrupt during cleanup returns control with the pool explicitly
+quarantined. The \code{npRmpi.fanout.cleanup.timeout} R option limits each
+cleanup attempt (default 30 seconds, a finite positive value). This replaces
+the former use of \code{npRmpi.session.recv.timeout} for fan-out cleanup.
+The separate \code{npRmpi.fanout.terminal.timeout} option (also default 30
+seconds, finite and positive) bounds each outstanding worker handshake stage
+only after all numerical result payloads, including the master's work, are
+accounted for. Sending a stop command or retirement acknowledgement starts the
+newly enabled stage for that worker. Its budget starts at the first wait for
+an unavailable receipt, without extending other workers' already armed budgets.
+Queued replies are consumed before an idle wait is declared expired.
+Final native request retirement has a separate budget of the same length.
+Neither limit sets a deadline for ongoing numerical computation. These are
+maximum waits, not mandatory delays, and do not arm the worker watchdog.
+The cleanup clock starts afresh for each explicit attempt and is not reset by
+incoming replies. An exhausted terminal deadline quarantines the pool without
+adding another cleanup grace to that same failed call. A missing numerical
+result still requires an interrupt or an explicitly configured dispatch timeout.
+
+A quarantined pool rejects new work. An explicit
+\code{npRmpi.quit(force=TRUE)} can resume cooperative cleanup and close the pool
+only after pending communication is retired. An active call cannot close its
+own pool, and exit/unload finalizers do not silently resume quarantined work.
+Cancellation and quarantine notices are shown even when \code{np.messages=FALSE}.
+No automatic MPI abort or process termination is performed. These safeguards
+do not recover a lost rank, a failed native MPI primitive or an unmatched
+collective inside a user task; an actual native transport failure makes the
+session unusable. Interrupts and cleanup budgets are serviced between native
+calls, not inside an MPI call that does not return.
 
 Advanced diagnostic option: setting environment variable
 \code{NP_RMPI_SKIP_INIT} to a non-empty value before loading \pkg{npRmpi}

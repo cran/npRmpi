@@ -144,6 +144,13 @@ These arguments identify the data, formula interface, optional integration grid,
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object coercible to
     a data frame by \code{\link{as.data.frame}}) containing the
     variables in the model. If not found in data, the variables are
@@ -276,7 +283,8 @@ These controls choose and parameterize bounded support for continuous kernels.
   \item{ckerbound}{
     character string controlling continuous-kernel support handling.
     Can be set as \code{none} (default kernel on full support),
-    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{range} (use sample min/max, except that beta kernels use the
+    outer half-spacing rule in \code{\link{np.kernels}}), or \code{fixed} (use
     \code{ckerlb}/\code{ckerub}). For distribution estimation the selected
     continuous kernel is integrated after observation-centered truncation and
     normalization on the chosen support; see \code{\link{np.kernels}}.
@@ -381,7 +389,9 @@ These controls choose continuous, unordered, and ordered kernels.
   \item{ckertype}{
     character string used to specify the continuous kernel type.
     Can be set as \code{gaussian}, \code{epanechnikov}, or
-    \code{uniform}. Defaults to \code{gaussian}.
+    \code{uniform}, or \code{beta}. See Details for the finite-support beta
+    contract. Defaults to
+    \code{gaussian}.
   }
 
   \item{okertype}{
@@ -484,6 +494,19 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  Seeded temporary operations follow \link{np_rng_scope}.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -585,6 +608,16 @@ or standard-deviation factors.
   with the point at which the cumulative distribution is estimated, \eqn{x}. Fixed bandwidths
   are constant over the support of \eqn{x}.
 
+  Nearest-neighbor cross-validation excludes the held-out observation from
+  both the kernel sum and the sample defining the neighborhood. An empirical
+  evaluation-grid row retains its training-query identity in that deleted
+  sample. An explicitly supplied grid is an external evaluation grid, even
+  when its coordinates equal observed values.
+
+  Exact ties can make the literal \eqn{k}th continuous nearest-neighbor
+  radius zero. Such a bandwidth is undefined and is rejected; see
+  \code{\link{np.kernels}} for the precise contract and remedies.
+
   \code{npudistbw} may be invoked \emph{either} with a formula-like
   symbolic description of variables on which bandwidth selection is to
   be performed \emph{or} through a simpler interface whereby data is
@@ -609,6 +642,23 @@ or standard-deviation factors.
   eighth-order Gaussian and Epanechnikov kernels, and the uniform
   kernel. Ordered data types use a variation of the Wang and van Ryzin
   (1981) kernel.
+
+  The beta associated CDF supports orders 2, 4, 6, and 8, explicit bandwidth
+  objects and automatic \code{cv.cdf} selection, and fixed, generalized-NN,
+  and adaptive-NN bandwidths. Set \code{ckertype="beta"} and use
+  \code{ckerbound="fixed"} with finite \code{ckerlb}/\code{ckerub}, or
+  \code{ckerbound="range"}. Data must be continuous and lie within those
+  supports. Normal-reference selection and categorical products are not
+  supported. Unsupported specifications fail explicitly. The bandwidth
+  \eqn{h} remains in the coordinate's original units and maps to beta
+  precision \eqn{((b-a)/h)^2}. See \code{\link{np.kernels}} and
+  \code{\link{npudist}} for the exact observation-centered CDF contribution.
+  For univariate order-2 fixed-bandwidth beta \code{ckerbound="range"} CDF
+  searches with Powell, the ordinary result is also checked against the
+  deterministic uniform-limit certificate documented in
+  \code{\link{np.kernels}}. This does not replace or reduce the user's
+  \code{nmulti} search, and the same check applies when automatic selection is
+  restarted from an eligible beta range bandwidth object.
 
   The optimizer invoked for search is Powell's conjugate direction
   method which requires the setting of (non-random) initial values and
@@ -637,6 +687,11 @@ or standard-deviation factors.
   \item{bw}{ bandwidth(s), scale factor(s) or nearest neighbours for the
     data, \code{dat} }
   \item{fval}{ objective function value at minimum }
+  \item{beta.range.certification}{for an eligible automatic beta range CDF
+    search, a list recording the uniform-limit probe, trigger decision,
+    optional support-width refinement, and selected source; absent otherwise}
+  \item{num.feval.certified}{number of function evaluations attributable to
+    that certification and optional refinement; absent otherwise}
 
   if \code{bwtype} is set to \code{fixed}, an object containing
   bandwidths, of class \code{bandwidth}
@@ -649,8 +704,20 @@ or standard-deviation factors.
   element \eqn{i} corresponding to column \eqn{i} of input data
   \code{dat}.
 
-  The functions  \code{\link{predict}}, \code{\link{summary}} and \code{\link{plot}} support
-  objects of type \code{bandwidth}.
+  Prediction follows a two-stage contract. Calling \code{predict(bw)}
+  on the returned bandwidth object is a convenience forwarder for
+  \code{npudist(bws = bw)} and returns a fitted \code{npdistribution}
+  object; it does not return a numeric vector of distribution estimates.
+  Call \code{fitted(fit)} or \code{predict(fit, newdata = ...)} on that
+  fitted object to obtain numeric results. The canonical workflow is
+  \preformatted{
+    bw <- npudistbw(~ x, data = mydata)
+    fit <- predict(bw)             # equivalent to npudist(bws = bw)
+    fitted(fit)
+    predict(fit, newdata = newdata)
+  }
+  The functions \code{\link{summary}} and \code{\link{plot}} also
+  support \code{dbandwidth} objects.
 }
 \section{Book And Method Pointers}{
   \code{npudistbw} selects bandwidths for the unconditional distribution
@@ -670,7 +737,11 @@ or standard-deviation factors.
 
   Higher-order continuous CDF kernels can yield estimates that are not
   globally monotone and may fall outside \eqn{[0,1]} at some evaluation
-  points. Returned values are not silently clamped.
+  points. Returned values are not silently clamped. Fixed and adaptive
+  order-2 beta CDFs remain monotone and in \eqn{[0,1]}; generalized-NN
+  order-2 curves can be locally nonmonotone because the bandwidth changes with
+  the target. Signed beta orders 4, 6, and 8 may additionally leave
+  \eqn{[0,1]} or be locally nonmonotone in any bandwidth mode.
 
   For book-length derivations, see Li and Racine (2007), Chapter 1
   \emph{Density Estimation}, especially Sections 1.4 and 1.5, and Chapter

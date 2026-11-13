@@ -127,9 +127,12 @@
   env$bandwidth_depth <- 0L
   env$bandwidth_label <- NULL
   env$bandwidth_state <- NULL
+  env$bandwidth_forward_active <- FALSE
+  env$bandwidth_forward_state <- NULL
   env$bandwidth_old_messages <- NULL
   env$bandwidth_context_label <- NULL
   env$fit_state <- NULL
+  env$fit_forward <- NULL
   env$iv_depth <- 0L
   env$iv_label <- NULL
   env$iv_state <- NULL
@@ -152,6 +155,138 @@
 
   .np_progress_runtime$bandwidth_context_label <- label
   invisible(NULL)
+}
+
+.np_progress_bandwidth_notice <- function(labels) {
+  forwarding <- isTRUE(.np_progress_runtime$bandwidth_forward_active)
+  slot <- if (forwarding) "bandwidth_forward_state" else "bandwidth_state"
+  state <- .np_progress_runtime[[slot]]
+  if (!isTRUE(state$enabled) || !isTRUE(state$visible) ||
+      .np_progress_bandwidth_worker_silent())
+    return(invisible(NULL))
+  # Only the next ordinary update consumes this event. Do not advance the
+  # owner's counters, force its throttle, or create another display owner.
+  state$bandwidth_notice <- labels
+  .np_progress_runtime[[slot]] <- state
+  invisible(NULL)
+}
+
+.np_progress_bandwidth_notice_line <- function(line, prefix, labels, width,
+                                                fallback = "restored") {
+  candidates <- c(paste0(line, "; ", labels[1L]),
+                  paste0(prefix, " Bandwidth selection (", labels, ")"),
+                  paste0(prefix, " BW search (", utils::tail(labels, 1L), ")"),
+                  paste(prefix, fallback))
+  fits <- nchar(candidates, type = "width") <= width
+  candidates[which(fits)[1L]]
+}
+
+.np_progress_bandwidth_nn_recovery <- function() {
+  forwarding <- isTRUE(.np_progress_runtime$bandwidth_forward_active)
+  slot <- if (forwarding) "bandwidth_forward_state" else "bandwidth_state"
+  state <- .np_progress_runtime[[slot]]
+  if (!isTRUE(state$enabled) || !isTRUE(state$visible) ||
+      !identical(.np_progress_registry$active_id, state$id) ||
+      .np_progress_bandwidth_worker_silent())
+    return(invisible(NULL))
+
+  # A one-time stage notice, not a new search mode or a successful recovery.
+  # Preserve an unrelated pending notice and all objective/start counters.
+  pending <- state$bandwidth_notice
+  state$bandwidth_notice <- NULL
+  now <- .np_progress_now()
+  line <- .np_progress_bandwidth_notice_line(
+    .np_progress_format_line(state, done = state$last_done, now = now),
+    state$pkg_prefix,
+    c("NN bandwidth infeasible; attempting recovery", "NN recovery"),
+    if (identical(state$renderer, "single_line")) .np_progress_output_width() else Inf,
+    fallback = "recovering")
+  state$start_note_pending <- FALSE
+  state <- .np_progress_render(state, line, event = "update", now = now,
+                               done = state$last_done)
+  state$bandwidth_notice <- pending
+  state$last_emit <- now
+  .np_progress_runtime[[slot]] <- state
+  invisible(NULL)
+}
+
+.np_progress_bandwidth_enter_provider_stage <- function(state,
+                                                        provider,
+                                                        label,
+                                                        fields,
+                                                        degree = NULL,
+                                                        best_record = NULL) {
+  if (is.null(state)) {
+    return(state)
+  }
+
+  provider <- as.character(provider)[1L]
+  if (is.na(provider) || !nzchar(provider)) {
+    stop("progress provider must be a non-empty string", call. = FALSE)
+  }
+  if (!is.function(fields)) {
+    stop("progress stage fields must be a function", call. = FALSE)
+  }
+
+  now <- .np_progress_now()
+  state$progress_provider <- provider
+  state$nomad_native_progress <- identical(provider, "nomad_native")
+  state$bandwidth_progress_common <- FALSE
+  state$label <- as.character(label)[1L]
+  state$unknown_total_fields <- fields
+  state$nomad_nmulti <- 1L
+  state$nomad_current_degree <- if (is.null(degree)) NULL else as.integer(degree)
+  state$nomad_best_record <- best_record
+  state$started <- now
+  state$last_done <- NULL
+  state$last_emitted_done <- NULL
+  state$last_emitted_detail <- NULL
+  state$start_note_pending <- FALSE
+  state$last_emit <- now - state$throttle_sec
+
+  .np_progress_step_at(
+    state = state,
+    now = now,
+    done = NULL,
+    force = TRUE
+  )
+}
+
+.np_progress_bandwidth_worker_silent <- function() {
+  if (!isTRUE(getOption("npRmpi.mpi.initialized", FALSE))) {
+    return(FALSE)
+  }
+
+  attach.size <- tryCatch(as.integer(mpi.comm.size(1L)), error = function(e) NA_integer_)
+  attach.rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) NA_integer_)
+
+  !is.na(attach.size) && attach.size > 1L &&
+    !is.na(attach.rank) && attach.rank != 0L
+}
+
+.np_progress_with_nested_bandwidth_heartbeat <- function(expr) {
+  old.state <- .np_progress_runtime$bandwidth_state
+  old.forward.active <- isTRUE(.np_progress_runtime$bandwidth_forward_active)
+  old.forward.state <- .np_progress_runtime$bandwidth_forward_state
+  parent.state <- if (old.forward.active) old.forward.state else old.state
+
+  .np_progress_runtime$bandwidth_forward_active <- TRUE
+  .np_progress_runtime$bandwidth_forward_state <- parent.state
+  .np_progress_runtime$bandwidth_state <- NULL
+
+  on.exit({
+    evolved.parent <- .np_progress_runtime$bandwidth_forward_state
+    .np_progress_runtime$bandwidth_state <- old.state
+    .np_progress_runtime$bandwidth_forward_active <- old.forward.active
+    if (old.forward.active) {
+      .np_progress_runtime$bandwidth_forward_state <- evolved.parent
+    } else {
+      .np_progress_runtime$bandwidth_forward_state <- old.forward.state
+      .np_progress_runtime$bandwidth_state <- evolved.parent
+    }
+  }, add = TRUE)
+
+  force(expr)
 }
 
 .np_progress_make_registry <- function() {
@@ -194,7 +329,7 @@
 
 .np_progress_single_line_surfaces <- function() {
   c("bandwidth", "plot_activity", "plot_bounded", "bootstrap", "lag", "iv_solve",
-    "copula")
+    "copula", "fit")
 }
 
 .np_progress_renderer_for_surface <- function(surface, capability) {
@@ -356,11 +491,14 @@
 
   keep_right <- max(1L, floor((max_width - 3L) / 2L))
   keep_left <- max_width - 3L - keep_right
-  paste0(
-    substr(text, 1L, keep_left),
-    "...",
-    substr(text, nchar(text, type = "chars") - keep_right + 1L, nchar(text, type = "chars"))
-  )
+  left <- substr(text, 1L, keep_left)
+  right <- substr(text, nchar(text) - keep_right + 1L, nchar(text))
+  # Character counts differ from console columns for wide Unicode labels.
+  while (nchar(left, type = "width") > keep_left)
+    left <- substr(left, 1L, nchar(left) - 1L)
+  while (nchar(right, type = "width") > keep_right)
+    right <- substr(right, 2L, nchar(right))
+  paste0(left, "...", right)
 }
 
 .np_progress_compact_single_line <- function(line, max_width) {
@@ -402,150 +540,78 @@
   compacted
 }
 
-.np_progress_compact_bandwidth_line <- function(line, max_width) {
-  if (!is.character(line) || length(line) != 1L || is.na(line)) {
-    return(line)
+# Pure presentation policy: abbreviate labels, then omit optional whole fields.
+# Counters are atomic; this helper never reads or mutates progress state.
+.np_progress_fit_fields <- function(prefix, fields, max_width,
+                                     short_prefix = prefix, counter = NULL) {
+  render <- function(label, parts) {
+    head <- paste(c(if (nzchar(label)) label, counter), collapse = " ")
+    if (length(parts)) paste0(head, " (", paste(parts, collapse = ", "), ")") else head
+  }
+  fits <- function(line) nchar(line, type = "width") <= max_width
+  line <- render(prefix, fields)
+  if (fits(line)) return(line)
+
+  fields <- fields[!grepl("^detail ", fields)]
+  line <- render(prefix, fields)
+  if (fits(line)) return(line)
+
+  fields <- sub("^multistart ", "ms ", fields)
+  fields <- sub("^iteration ", "iter ", fields)
+  fields <- sub("^elapsed ", "elap ", fields)
+  line <- render(prefix, fields)
+  if (fits(line)) return(line)
+  short_prefix <- sub("Bandwidth selection", "BW search", short_prefix, fixed = TRUE)
+  short_prefix <- sub("Plot bootstrap", "Plot boot", short_prefix, fixed = TRUE)
+  short_prefix <- sub("Bootstrap replications", "Bootstrap", short_prefix, fixed = TRUE)
+  short_prefix <- sub("Bootstrap all bands", "Boot bands", short_prefix, fixed = TRUE)
+  short_prefix <- sub("Bootstrap pmzsd", "Boot pmzsd", short_prefix, fixed = TRUE)
+  line <- render(short_prefix, fields)
+  if (fits(line)) return(line)
+
+  fields <- sub("^target ", "tgt ", fields)
+  short_prefix <- sub("Plot boot", "Boot", short_prefix, fixed = TRUE)
+  line <- render(short_prefix, fields)
+  if (fits(line)) return(line)
+
+  # Verbose context and redundant diagnostics yield before work and time.
+  for (pattern in c("^detail ", "^best ", "^deg ", "^[0-9.]+%$",
+                    "^eta ", "^elap ")) {
+    fields <- fields[!grepl(pattern, fields)]
+    line <- render(short_prefix, fields)
+    if (fits(line)) return(line)
   }
 
-  max_width <- suppressWarnings(as.integer(max_width)[1L])
-  if (is.na(max_width) || max_width < 1L) {
-    return(line)
-  }
-
-  if (nchar(line, type = "width") <= max_width) {
-    return(line)
-  }
-
-  matches <- regexec("^(.+Bandwidth selection) \\((.+)\\)$", line)
-  capture <- regmatches(line, matches)[[1L]]
-  if (length(capture) != 3L) {
-    return(line)
-  }
-
-  prefix <- capture[[2L]]
-  fields <- strsplit(capture[[3L]], ", ", fixed = TRUE)[[1L]]
-  if (!length(fields)) {
-    return(line)
-  }
-
-  render <- function(parts) {
-    sprintf("%s (%s)", prefix, paste(parts, collapse = ", "))
-  }
-
-  abbreviate_fields <- function(parts) {
-    compacted <- parts
-    compacted <- sub("^multistart ([0-9]+/[0-9]+)$", "\\1", compacted)
-    compacted <- sub("^iteration ", "iter ", compacted)
-    compacted
-  }
-
-  drop_last_field <- function(parts) {
-    if (length(parts) <= 1L) {
-      parts
-    } else {
-      parts[seq_len(length(parts) - 1L)]
-    }
-  }
-
-  fields_abbrev <- abbreviate_fields(fields)
-
-  candidates <- list(
-    render(fields),
-    render(fields_abbrev)
-  )
-
-  for (candidate in candidates) {
-    if (nchar(candidate, type = "width") <= max_width) {
-      return(candidate)
-    }
-  }
-
+  # At a very narrow console shorten only the activity, never half a counter.
+  if (nchar(render("", fields), type = "width") > max_width - 8L)
+    fields <- fields[!grepl("^rep |^iter ", fields)]
+  suffix <- render("", fields)
+  if (!is.null(counter)) suffix <- paste0(" ", suffix)
+  room <- max_width - nchar(suffix, type = "width")
+  if (room >= 8L)
+    return(paste0(.np_progress_ellipsize_middle(short_prefix, room), suffix))
   line
 }
 
+.np_progress_compact_bandwidth_line <- function(line, max_width) {
+  match <- regexec("^(.+(?:Bandwidth selection|Plot bootstrap|Testing .+)) \\((.+)\\)$", line)
+  parts <- regmatches(line, match)[[1L]]
+  if (length(parts) != 3L) return(line)
+  fields <- strsplit(parts[[3L]], ", ", fixed = TRUE)[[1L]]
+  .np_progress_fit_fields(parts[[2L]], fields, max_width)
+}
+
 .np_progress_compact_plot_bootstrap_line <- function(line, max_width) {
-  if (!is.character(line) || length(line) != 1L || is.na(line)) {
-    return(line)
-  }
-
-  max_width <- suppressWarnings(as.integer(max_width)[1L])
-  if (is.na(max_width) || max_width < 1L) {
-    return(line)
-  }
-
-  if (nchar(line, type = "width") <= max_width) {
-    return(line)
-  }
-
-  matches <- regexec(
-    "^(.+(?:Plot bootstrap(?: \\([^)]+\\))?|Bootstrap (?:all bands|pmzsd)(?: \\([^)]+\\))?)) ([0-9]+/[0-9]+) \\((.+)\\)$",
-    line
-  )
-  capture <- regmatches(line, matches)[[1L]]
-  if (length(capture) != 4L) {
-    return(line)
-  }
-
-  prefix <- capture[[2L]]
-  counter <- capture[[3L]]
-  fields <- strsplit(capture[[4L]], ", ", fixed = TRUE)[[1L]]
-  if (!length(fields)) {
-    return(line)
-  }
-
-  render <- function(prefix_text, parts) {
-    sprintf("%s %s (%s)", prefix_text, counter, paste(parts, collapse = ", "))
-  }
-
-  compact_prefix <- prefix
-  compact_prefix <- sub("\\(grad index ", "(grad idx ", compact_prefix)
-  compact_prefix <- sub("\\(index ", "(idx ", compact_prefix)
-  short_prefix <- compact_prefix
-  short_prefix <- sub("Plot bootstrap", "Plot boot", short_prefix, fixed = TRUE)
-  short_prefix <- sub("Bootstrap all bands", "Boot all bands", short_prefix, fixed = TRUE)
-  short_prefix <- sub("Bootstrap pmzsd", "Boot pmzsd", short_prefix, fixed = TRUE)
-  short_prefix <- sub("\\(surf ", "(s ", short_prefix)
-  very_short_prefix <- short_prefix
-  very_short_prefix <- sub("Boot all bands", "Bands", very_short_prefix, fixed = TRUE)
-  very_short_prefix <- sub("Boot pmzsd", "Pmzsd", very_short_prefix, fixed = TRUE)
-
-  compact_fields <- function(parts) {
-    compacted <- parts
-    compacted <- sub("^elapsed ", "elap ", compacted)
-    compacted
-  }
-
-  drop_last_field <- function(parts) {
-    if (length(parts) <= 1L) {
-      parts
-    } else {
-      parts[seq_len(length(parts) - 1L)]
-    }
-  }
-
-  fields_compact <- compact_fields(fields)
-  fields_drop_eta <- drop_last_field(fields_compact)
-  fields_drop_eta_pct <- drop_last_field(fields_drop_eta)
-
-  candidates <- list(
-    render(prefix, fields),
-    render(compact_prefix, fields),
-    render(compact_prefix, fields_compact),
-    render(short_prefix, fields_compact),
-    render(short_prefix, fields_drop_eta),
-    render(short_prefix, fields_drop_eta_pct),
-    render(very_short_prefix, fields_drop_eta),
-    render(very_short_prefix, fields_drop_eta_pct),
-    sprintf("%s %s", very_short_prefix, counter)
-  )
-
-  for (candidate in candidates) {
-    if (nchar(candidate, type = "width") <= max_width) {
-      return(candidate)
-    }
-  }
-
-  line
+  # Known-total package output, including standalone fit/bootstrap owners.
+  match <- regexec("^(.+) ([0-9]+/[0-9]+) \\((.+)\\)$", line)
+  parts <- regmatches(line, match)[[1L]]
+  if (length(parts) != 4L) return(line)
+  fields <- strsplit(parts[[4L]], ", ", fixed = TRUE)[[1L]]
+  if (!all(grepl("^[0-9.]+%$|^elapsed |^eta ", fields))) return(line)
+  prefix <- sub("\\(grad index ", "(grad idx ", parts[[2L]])
+  prefix <- sub("\\(index ", "(idx ", prefix)
+  .np_progress_fit_fields(parts[[2L]], fields, max_width,
+                          short_prefix = prefix, counter = parts[[3L]])
 }
 
 .np_progress_compact_degree_line <- function(line, max_width) {
@@ -566,7 +632,8 @@
       !grepl("Exhaustive degree/bw", line, fixed = TRUE) &&
       !grepl("Auto:NOMAD degree/bw", line, fixed = TRUE) &&
       !grepl("Auto:exhaustive degree/bw", line, fixed = TRUE) &&
-      !grepl("Refining bandwidth", line, fixed = TRUE)) {
+      !grepl("Refining bandwidth", line, fixed = TRUE) &&
+      !grepl("Refining bw", line, fixed = TRUE)) {
     return(line)
   }
 
@@ -619,7 +686,6 @@
 
     out <- character(0L)
     drop_sets <- list(
-      grep("^ms ", parts),
       grep("^best ", parts),
       grep("^deg ", parts)
     )
@@ -651,6 +717,13 @@
     }
   }
 
+  open <- regexpr(" (", compacted_fields, fixed = TRUE)[1L]
+  if (open > 0L && endsWith(compacted_fields, ")")) {
+    prefix <- substr(compacted_fields, 1L, open - 1L)
+    fields <- substr(compacted_fields, open + 2L, nchar(compacted_fields) - 1L)
+    return(.np_progress_fit_fields(prefix,
+      strsplit(fields, ", ", fixed = TRUE)[[1L]], max_width))
+  }
   line
 }
 
@@ -756,10 +829,18 @@
     return(state)
   }
 
-  render_line <- if (identical(state$renderer, "single_line")) {
-    .np_progress_fit_single_line(line)
+  if (identical(event, "update") && !is.null(state$bandwidth_notice)) {
+    line <- .np_progress_bandwidth_notice_line(
+      line, state$pkg_prefix, state$bandwidth_notice,
+      if (identical(state$renderer, "single_line")) .np_progress_output_width() else Inf)
+    state$bandwidth_notice <- NULL
+    render_line <- line
   } else {
-    line
+    render_line <- if (identical(state$renderer, "single_line")) {
+      .np_progress_fit_single_line(line)
+    } else {
+      line
+    }
   }
 
   snapshot <- .np_progress_make_snapshot(
@@ -808,6 +889,27 @@
   }
 
   val <- suppressWarnings(as.numeric(getOption(option_name, default))[1L])
+  if (!is.finite(val) || is.na(val) || val < 0) {
+    val <- default
+  }
+
+  val
+}
+
+.np_progress_interval_sec <- function(known_total = FALSE, domain = "general") {
+  default <- 2.0
+
+  option_name <- if (identical(domain, "plot")) {
+    "np.plot.progress.interval.sec"
+  } else if (isTRUE(known_total)) {
+    "np.progress.interval.known.sec"
+  } else {
+    "np.progress.interval.unknown.sec"
+  }
+
+  common <- getOption("np.progress.interval.sec", NULL)
+  configured <- if (is.null(common)) getOption(option_name, default) else common
+  val <- suppressWarnings(as.numeric(configured)[1L])
   if (!is.finite(val) || is.na(val) || val < 0) {
     val <- default
   }
@@ -1034,6 +1136,14 @@
   mean(durations) * total
 }
 
+.np_progress_bandwidth_starts_complete <- function(state) {
+  total <- state$bandwidth_nmulti_total
+  if (.np_progress_bandwidth_coordinator_active(state)) {
+    total <- state$bandwidth_coordinator_offset + state$bandwidth_coordinator_local_total
+  }
+  isTRUE(total > 1L && state$bandwidth_multistart_completed >= total)
+}
+
 .np_progress_bandwidth_format_iteration <- function(state, done = NULL, now = .np_progress_now()) {
   elapsed <- max(0, now - state$started)
   total <- suppressWarnings(as.integer(state$bandwidth_nmulti_total)[1L])
@@ -1054,6 +1164,10 @@
     fields <- c(fields, sprintf("multistart %s/%s", format(current), format(total)))
   }
 
+  if (.np_progress_bandwidth_starts_complete(state)) {
+    fields <- c(fields, "starts complete; continuing search")
+  }
+
   if (!is.null(done)) {
     fields <- c(fields, sprintf("iteration %s", format(done)))
   }
@@ -1068,26 +1182,30 @@
   )
 }
 
-.np_progress_bandwidth_format_estimate <- function(state, now = .np_progress_now()) {
+.np_progress_bandwidth_format_estimate <- function(state, now = .np_progress_now(), finished = FALSE) {
   elapsed <- max(0, now - state$started)
   total <- suppressWarnings(as.integer(state$bandwidth_nmulti_total)[1L])
   completed <- suppressWarnings(as.integer(state$bandwidth_multistart_completed)[1L])
   current <- suppressWarnings(as.integer(state$bandwidth_multistart_current)[1L])
-  if (is.na(total) || total < 1L || completed < 1L) {
+  ## Native NN searches can still validate/recover/refine after their final
+  ## requested start. Only the enclosing successful return means 100% done.
+  if (is.na(total) || total < 1L || completed < 1L ||
+      (!isTRUE(finished) && .np_progress_bandwidth_starts_complete(state))) {
     return(.np_progress_bandwidth_format_iteration(state = state, done = state$last_done, now = now))
   }
 
   est.total <- .np_progress_bandwidth_estimated_total_time(state)
   base.share <- 100 * completed / total
   pct <- base.share
-  eta <- 0
+  eta <- if (isTRUE(finished)) "0.0s" else "estimating"
 
   if (is.finite(est.total) && !is.na(est.total) && est.total > 0) {
     pct.calc <- 100 * elapsed / est.total
     pct.upper <- if (completed < total) 99.9 else 100.0
     pct <- max(base.share, min(pct.upper, pct.calc))
     if (completed < total) {
-      eta <- max(0, est.total - elapsed)
+      remaining <- .np_progress_fmt_num(max(0, est.total - elapsed))
+      if (!identical(remaining, "0.0")) eta <- paste0(remaining, "s")
     }
   }
 
@@ -1113,9 +1231,9 @@
 
   fields <- c(
     fields,
-    sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)),
     sprintf("%s%%", .np_progress_fmt_num(pct)),
-    sprintf("eta %ss", .np_progress_fmt_num(eta))
+    sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)),
+    sprintf("eta %s", eta)
   )
 
   sprintf(
@@ -1143,7 +1261,8 @@
   total <- state$total
   pct <- if (isTRUE(total > 0)) 100 * done / total else 0
   elapsed <- max(0, now - state$started)
-  eta <- if (isTRUE(done > 0) && isTRUE(total >= done)) elapsed * (total - done) / done else 0
+  eta <- if (isTRUE(done > 0) && isTRUE(total >= done))
+    paste0(.np_progress_fmt_num(elapsed * (total - done) / done), "s") else "estimating"
 
   progress_token <- if (isTRUE(state$bandwidth_multistart)) {
     sprintf("multistart %s/%s", format(done), format(total))
@@ -1152,13 +1271,13 @@
   }
 
   line <- sprintf(
-    "%s %s %s (%s%%, elapsed %ss, eta %ss)",
+    "%s %s %s (%s%%, elapsed %ss, eta %s)",
     state$pkg_prefix,
     state$label,
     progress_token,
     .np_progress_fmt_num(pct),
     .np_progress_fmt_num(elapsed),
-    .np_progress_fmt_num(eta)
+    eta
   )
 
   if (!is.null(detail)) {
@@ -1237,7 +1356,7 @@
 
 .np_progress_begin <- function(label, total = NULL, domain = "general", surface = domain) {
   known_total <- !is.null(total)
-  throttle_sec <- if (known_total) 0.5 else 2.0
+  throttle_sec <- .np_progress_interval_sec(known_total = known_total, domain = domain)
   started <- .np_progress_now()
   capability <- .np_progress_capability(domain = domain)
   session_id <- .np_progress_next_id()
@@ -1448,7 +1567,7 @@
         state$bandwidth_multistart_current <- total
       }
       state$bandwidth_mode <- "complete_estimate"
-      line <- .np_progress_bandwidth_format_estimate(state = state, now = now)
+      line <- .np_progress_bandwidth_format_estimate(state = state, now = now, finished = TRUE)
       if (isTRUE(must_clear) || !identical(line, state$last_line)) {
         state <- .np_progress_render(
           state = state,
@@ -1792,8 +1911,20 @@
   invisible(NULL)
 }
 
-.np_progress_bandwidth_activity_step <- function(done = NULL) {
-  state <- .np_progress_runtime$bandwidth_state
+.np_progress_bandwidth_activity_step <- function(done = NULL, force = FALSE) {
+  forwarding <- isTRUE(.np_progress_runtime$bandwidth_forward_active)
+  state <- if (forwarding) {
+    .np_progress_runtime$bandwidth_forward_state
+  } else {
+    .np_progress_runtime$bandwidth_state
+  }
+
+  ## A nested bandwidth leaf reports activity, not ownership of the outer
+  ## objective counter.  Retain the parent's evolving heartbeat state while
+  ## preventing child-local counters from replacing the displayed outer count.
+  if (forwarding) {
+    done <- NULL
+  }
 
   if (isTRUE(state$nomad_native_progress)) {
     return(invisible(NULL))
@@ -1806,10 +1937,17 @@
         done <- NULL
       }
     }
-    .np_progress_runtime$bandwidth_state <- .np_progress_step(
+    updated <- .np_progress_step_at(
       state = state,
-      done = done
+      now = .np_progress_now(),
+      done = done,
+      force = isTRUE(force)
     )
+    if (forwarding) {
+      .np_progress_runtime$bandwidth_forward_state <- updated
+    } else {
+      .np_progress_runtime$bandwidth_state <- updated
+    }
     return(invisible(NULL))
   }
 
@@ -1824,15 +1962,105 @@
     }
   }
 
-  .np_progress_runtime$bandwidth_state <- .np_progress_step(
+  updated <- .np_progress_step_at(
     state = state,
-    done = done
+    now = .np_progress_now(),
+    done = done,
+    force = isTRUE(force)
   )
+  if (forwarding) {
+    .np_progress_runtime$bandwidth_forward_state <- updated
+  } else {
+    .np_progress_runtime$bandwidth_state <- updated
+  }
 
   invisible(NULL)
 }
 
+.np_bootstrap_progress_begin <- function(total, label) {
+  .np_progress_activity_begin(total, label, "preparing resamples")
+}
+
+.np_progress_activity_begin <- function(total = NULL, label, detail) {
+  if (!isTRUE(.np_progress_enabled(domain = "bandwidth")))
+    return(NULL)
+  context <- new.env(parent = emptyenv())
+  context$state <- .np_progress_begin(label, total, domain = "bandwidth",
+                                     surface = "bandwidth")
+  # Retain the silent owner's reservation while row-local fits temporarily
+  # suspend MPI state, so those children cannot acquire a worker display.
+  if (.np_progress_bandwidth_worker_silent())
+    context$state$visible <- FALSE
+  context$done <- if (is.null(total)) NULL else 0L
+  context$detail <- detail
+  context$closed <- FALSE
+  context$previous <- .np_progress_runtime$fit_forward
+  context$state <- .np_progress_show_now(context$state, done = context$done,
+                                        detail = context$detail)
+  .np_progress_runtime$fit_forward <- function() {
+    .np_progress_activity_step(context, context$done, context$detail)
+  }
+  context
+}
+
+# Scope a one-off phase with the same owner and native-fit forwarding as
+# existing bootstrap preparation. The promise keeps the caller's evaluation
+# environment, and quiet calls take the existing no-context fast path.
+.np_progress_activity_run <- function(label, expr) {
+  context <- .np_progress_activity_begin(label = label, detail = NULL)
+  if (is.null(context)) return(force(expr))
+  if (!isTRUE(context$state$visible)) {
+    .np_progress_activity_end(context)
+    return(force(expr))
+  }
+  completed <- FALSE
+  on.exit(.np_progress_activity_end(context, completed), add = TRUE)
+  value <- withVisible(force(expr))
+  completed <- TRUE
+  if (value$visible) value$value else invisible(value$value)
+}
+
+.np_progress_activity_step <- function(context, done = NULL, detail = NULL) {
+  if (is.null(context) || isTRUE(context$closed))
+    return(invisible(NULL))
+  context$done <- done
+  context$detail <- detail
+  context$state <- .np_progress_step(context$state, done = done, detail = detail)
+  invisible(NULL)
+}
+
+.np_progress_activity_end <- function(context, completed = FALSE) {
+  if (is.null(context) || isTRUE(context$closed))
+    return(invisible(NULL))
+  .np_progress_runtime$fit_forward <- context$previous
+  context$closed <- TRUE
+  if (isTRUE(completed))
+    .np_progress_end(context$state)
+  else
+    .np_progress_abort(context$state)
+  invisible(NULL)
+}
+
+.np_bootstrap_progress_statistic <- function(context, statistic) {
+  if (is.null(context))
+    return(statistic)
+  counter <- new.env(parent = emptyenv())
+  counter$replicate <- -1L
+  function(data, indices) {
+    counter$replicate <- counter$replicate + 1L
+    replicate <- counter$replicate
+    detail <- if (replicate == 0L) "initial statistic" else
+      sprintf("replication %d of %d", replicate, context$state$total)
+    .np_progress_activity_step(context, max(0L, replicate - 1L), detail)
+    value <- statistic(data, indices)
+    .np_progress_activity_step(context, replicate)
+    value
+  }
+}
+
 .np_fit_progress_begin <- function(label, total, handoff = FALSE, detail = NULL) {
+  if (!is.null(.np_progress_runtime$fit_forward))
+    return(invisible(NULL))
   total <- suppressWarnings(as.integer(total)[1L])
   if (is.na(total) || total < 1L) {
     .np_progress_runtime$fit_state <- NULL
@@ -1870,6 +2098,8 @@
 }
 
 .np_fit_progress_step <- function(done = NULL, detail = NULL) {
+  if (!is.null(.np_progress_runtime$fit_forward))
+    return(.np_progress_runtime$fit_forward())
   state <- .np_progress_runtime$fit_state
 
   if (is.null(state)) {
@@ -1893,6 +2123,8 @@
 }
 
 .np_fit_progress_finish <- function(detail = NULL) {
+  if (!is.null(.np_progress_runtime$fit_forward))
+    return(invisible(NULL))
   state <- .np_progress_runtime$fit_state
 
   if (is.null(state)) {
@@ -1905,6 +2137,8 @@
 }
 
 .np_fit_progress_abort <- function(detail = NULL) {
+  if (!is.null(.np_progress_runtime$fit_forward))
+    return(invisible(NULL))
   state <- .np_progress_runtime$fit_state
 
   if (is.null(state)) {
@@ -1970,13 +2204,12 @@
 }
 
 .np_condensdist_fit_total <- function(bws, tnrow, enrow) {
-  reg.engine <- if (is.null(bws$regtype.engine)) {
-    if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
-  } else {
-    as.character(bws$regtype.engine)
-  }
+  reg.spec <- npConditionalRegEngineSpec(
+    bws,
+    where = "conditional fit progress"
+  )
   base.total <- .np_densdist_fit_total(bws = bws, tnrow = tnrow, enrow = enrow)
-  lp.route <- identical(reg.engine, "lp") && isTRUE(bws$xncon > 0L)
+  lp.route <- identical(reg.spec$reg.engine, "lp")
 
   if (isTRUE(lp.route)) {
     as.integer(enrow)
@@ -1991,6 +2224,11 @@
 
   if (is.na(event) || is.na(surface)) {
     return(invisible(FALSE))
+  }
+
+  if (identical(event, "bandwidth_nn_recovery") && identical(surface, "bandwidth")) {
+    .np_progress_bandwidth_nn_recovery()
+    return(invisible(TRUE))
   }
 
   if (identical(event, "bandwidth_multistart_step") && identical(surface, "bandwidth")) {
@@ -2035,6 +2273,8 @@
   .np_progress_runtime$bandwidth_depth <- 0L
   .np_progress_runtime$bandwidth_label <- NULL
   .np_progress_runtime$bandwidth_state <- NULL
+  .np_progress_runtime$bandwidth_forward_active <- FALSE
+  .np_progress_runtime$bandwidth_forward_state <- NULL
   .np_progress_runtime$bandwidth_old_messages <- NULL
   .np_progress_runtime$bandwidth_context_label <- NULL
   .np_progress_runtime$force_enabled <- FALSE
@@ -2050,6 +2290,7 @@
 
 .np_progress_select_bandwidth <- function(label, expr) {
   starting <- !.np_progress_bandwidth_active()
+  succeeded <- FALSE
   worker_silent <- FALSE
   if (starting) {
     .np_progress_runtime$bandwidth_old_messages <- getOption("np.messages", TRUE)
@@ -2096,13 +2337,19 @@
       as.integer(.np_progress_runtime$bandwidth_depth) - 1L
     )
     if (starting) {
-      .np_progress_bandwidth_finish()
+      if (succeeded) {
+        .np_progress_bandwidth_finish()
+      } else {
+        .np_progress_abort(.np_progress_runtime$bandwidth_state)
+      }
       options(np.messages = .np_progress_runtime$bandwidth_old_messages)
       .np_progress_bandwidth_clear()
     }
   }, add = TRUE)
 
-  force(expr)
+  value <- withVisible(force(expr))
+  succeeded <- TRUE
+  if (value$visible) value$value else invisible(value$value)
 }
 
 .np_progress_select_bandwidth_enhanced <- function(label, expr) {

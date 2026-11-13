@@ -89,6 +89,7 @@ test_that("npconmode direct route pads omitted training rows", {
     bws = bw,
     txdat = tx,
     tydat = d["y"],
+    se = TRUE,
     probabilities = TRUE,
     gradients = TRUE,
     level = "b"
@@ -115,14 +116,17 @@ test_that("npconmode direct route pads omitted evaluation rows separately", {
     txdat = d["x"],
     tydat = d["y"],
     exdat = ex,
+    se = TRUE,
     probabilities = TRUE,
     gradients = TRUE,
     level = "b"
   )
 
   .npconmode_expect_missing_row(fit, row = 2L, n = nrow(ex))
-  expect_identical(fit$rows.omit, NA_integer_)
-  expect_identical(fit$nobs.omit, 0L)
+  expect_identical(fit$rows.omit, 2L)
+  expect_identical(fit$nobs.omit, 1L)
+  expect_identical(fit$train.rows.omit, NA_integer_)
+  expect_identical(fit$train.nobs.omit, 0L)
   expect_identical(fit$eval.rows.omit, 2L)
   expect_identical(fit$eval.nobs.omit, 1L)
   expect_equal(nrow(predict(fit, type = "prob")), nrow(ex))
@@ -140,6 +144,7 @@ test_that("npconmode formula route separates training and evaluation omissions",
   fit.train <- npconmode(
     y ~ x,
     data = d.train,
+    se = TRUE,
     bws = c(0.45, 0.45),
     bandwidth.compute = FALSE,
     regtype = "ll",
@@ -157,6 +162,7 @@ test_that("npconmode formula route separates training and evaluation omissions",
     y ~ x,
     data = d,
     newdata = nd,
+    se = TRUE,
     bws = c(0.45, 0.45),
     bandwidth.compute = FALSE,
     regtype = "ll",
@@ -166,8 +172,10 @@ test_that("npconmode formula route separates training and evaluation omissions",
   )
 
   .npconmode_expect_missing_row(fit.eval, row = 2L, n = nrow(nd))
-  expect_identical(fit.eval$rows.omit, NA_integer_)
-  expect_identical(fit.eval$nobs.omit, 0L)
+  expect_identical(fit.eval$rows.omit, 2L)
+  expect_identical(fit.eval$nobs.omit, 1L)
+  expect_identical(fit.eval$train.rows.omit, NA_integer_)
+  expect_identical(fit.eval$train.nobs.omit, 0L)
   expect_identical(as.integer(fit.eval$eval.rows.omit), 2L)
   expect_identical(fit.eval$eval.nobs.omit, 1L)
 })

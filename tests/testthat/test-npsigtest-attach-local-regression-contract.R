@@ -1,5 +1,5 @@
 run_attach_npsigtest_cmd <- function(cmd, args = character(), timeout = 60L, env = character()) {
-  out <- suppressWarnings(system2(cmd,
+  out <- suppressWarnings(npRmpi_test_system2(cmd,
                                   args,
                                   stdout = TRUE,
                                   stderr = TRUE,
@@ -19,7 +19,7 @@ ensure_attach_npsigtest_lib <- local({
       return(lib.path.cache)
 
     pkg.root <- tryCatch(
-      normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
+      npRmpi_namespace_hygiene_root(),
       error = function(e) ""
     )
     if (!nzchar(pkg.root))
@@ -29,7 +29,7 @@ ensure_attach_npsigtest_lib <- local({
     dir.create(lib.path.cache, recursive = TRUE, showWarnings = FALSE)
 
     cmd <- file.path(R.home("bin"), "R")
-    out <- suppressWarnings(system2(
+    out <- suppressWarnings(npRmpi_test_system2(
       cmd,
       c("CMD", "INSTALL", "--no-test-load", "-l", lib.path.cache, pkg.root),
       stdout = TRUE,
@@ -94,7 +94,7 @@ test_that("attach npsigtest npregression route remains valid under local regress
     "  mydat <- data.frame(z, x1, x2, y)",
     "  rm(z, x1, x2, y)",
     "  model <- npreg(y ~ z + x1 + x2, regtype='ll', bwmethod='cv.aic', data=mydat)",
-    "  out <- npsigtest(model, boot.num=9)",
+    "  out <- npsigtest(model, B=9)",
     "  stopifnot(inherits(out, 'sigtest'))",
     "  stopifnot(length(out$P) >= 1L)",
     "  cat('ATTACH_NPSIGTEST_OK\\n')",

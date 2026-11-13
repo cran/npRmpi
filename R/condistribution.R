@@ -12,7 +12,7 @@ condistribution <-
              train.rows.omit = NULL,
              eval.rows.omit = NULL,
              timing = NA, total.time = NA,
-             optim.time = NA, fit.time = NA){
+             optim.time = NA, fit.time = NA, se = TRUE){
 
         if (missing(bws) || missing(xeval) || missing(yeval) || missing(condist) || missing(ntrain))
             stop("improper invocation of condistribution constructor")
@@ -56,6 +56,7 @@ condistribution <-
             ntrain = ntrain,
             trainiseval = trainiseval,
             gradients = gradients,
+            se = se,
             gradient.order = gradient.order,
             proper.requested = proper.requested,
             proper.applied = proper.applied,
@@ -120,16 +121,25 @@ se.condistribution <- function(x){
   if (isTRUE(x$proper.applied)) {
     stop("standard errors are unavailable for repaired conditional distributions in tranche 1")
   }
-  x$conderr
+  .np_require_stored_se(x, x[["conderr", exact = TRUE]], "npcdist",
+                        expr = substitute(x))
 }
-gradients.condistribution <- function(x, errors = FALSE, gradient.order = NULL, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  gout <- if (!errors) x$congrad else x$congerr
+gradients.condistribution <- function(x, se = FALSE, gradient.order = NULL, ...) {
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.condistribution", suggest = TRUE)
+  npRejectLegacyBooleanErrors(list(...), "gradients.condistribution")
+  se <- npValidateScalarLogical(se, "se")
+  gout <- if (!se) x$congrad else .np_require_stored_se(
+    x, if (identical(x[["congerr", exact = TRUE]], NA)) NULL else
+      x[["congerr", exact = TRUE]], "npcdist",
+    what = "gradient standard errors", expr = substitute(x),
+    switches = "gradients = TRUE, se = TRUE")
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop(if (!errors)
-      "gradients are not available: fit the model with gradients=TRUE"
-    else
-      "gradient standard errors are not available: fit the model with gradients=TRUE")
+    .np_stop_missing_output(
+      substitute(x), "npcdist",
+      message = if (!se) "gradients are not available." else
+        "gradient standard errors were not computed.",
+      switches = if (!se) "gradients = TRUE" else "gradients = TRUE, se = TRUE")
 
   reg.spec <- npConditionalRegEngineSpec(x$bws, where = "gradients.condistribution")
   if (isTRUE(x$bws$xncon == 0L)) {
@@ -141,6 +151,9 @@ gradients.condistribution <- function(x, errors = FALSE, gradient.order = NULL, 
     }
     return(gout)
   }
+  if (!identical(reg.spec$reg.engine, "lp") && !is.null(gradient.order))
+    npConditionalGradientOrder(x$bws, reg.spec$reg.engine, gradient.order,
+                               where = "gradients.condistribution")
   if (!identical(reg.spec$reg.engine, "lp") || is.null(gradient.order))
     return(gout)
 
@@ -163,9 +176,15 @@ gradients.condistribution <- function(x, errors = FALSE, gradient.order = NULL, 
     ncon = x$bws$xncon,
     where = "gradients.condistribution"
   )
-  if (!any(available)) {
-    stop("gradients.condistribution has no available derivative components for the requested gradient.order and fitted polynomial degree",
-         call. = FALSE)
+  if (!any(available) && (x$bws$xnuno + x$bws$xnord == 0L)) {
+    npStopGlpGradientNoneAvailable(
+      where = "gradients.condistribution",
+      action = "return",
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = gorder,
+      available = available,
+      con.names = x$xnames[x$bws$ixcon]
+    )
   }
   if (any(!available)) {
     npWarnGlpGradientPartialAvailability(
@@ -185,14 +204,11 @@ gradients.condistribution <- function(x, errors = FALSE, gradient.order = NULL, 
   }
 
   gout.masked <- gout
-  gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$ixcon)
   if (length(cont.idx)) {
-    keep.cont <- available
-    if (any(keep.cont)) {
-      keep.idx <- cont.idx[keep.cont]
-      gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]
-    }
+    drop.idx <- cont.idx[!available]
+    if (length(drop.idx))
+      gout.masked[, drop.idx] <- NA_real_
   }
   gout.masked
 }
@@ -200,8 +216,17 @@ gradients.condistribution <- function(x, errors = FALSE, gradient.order = NULL, 
 predict.condistribution <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
+  if ("se" %in% names(dots)) {
+    supplied.se <- npValidateScalarLogical(dots[["se", exact = TRUE]], "se")
+    if (!identical(supplied.se, se.fit))
+      stop("conflicting 'se' and 'se.fit' requests; use se.fit to request prediction standard errors",
+           call. = FALSE)
+  }
+  dots[["se"]] <- se.fit
   has.formula.route <- !is.null(object$bws$formula)
-  proper_arg <- dots[["proper", exact = TRUE]]
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npcdist.condbandwidth,
+                                  c("txdat", "tydat"))
 
   if ((!is.null(dots$exdat) || !is.null(dots$eydat)) && !is.null(dots$newdata))
     dots$newdata <- NULL
@@ -210,31 +235,17 @@ predict.condistribution <- function(object, se.fit = FALSE, ...) {
       is.null(dots$exdat) &&
       is.null(dots$eydat) &&
       !is.null(dots$newdata)) {
-    nd <- toFrame(dots$newdata)
-    req <- c(object$ynames, object$xnames)
-    miss <- setdiff(req, names(nd))
-    if (length(miss) > 0L) {
-      stop(sprintf("'newdata' must include columns %s, or supply both 'exdat' and 'eydat'.",
-                   paste(shQuote(req), collapse = ", ")))
-    }
-    dots$eydat <- nd[, object$ynames, drop = FALSE]
-    dots$exdat <- nd[, object$xnames, drop = FALSE]
+    parts <- .np_native_newdata_parts(dots$newdata,
+      list(exdat = object$xnames, eydat = object$ynames), "predict")
+    dots$eydat <- parts$eydat
+    dots$exdat <- parts$exdat
     dots$newdata <- NULL
   }
 
-  if (is.null(proper_arg) && isTRUE(object$proper.requested)) {
-    dots$proper <- TRUE
-    proper_arg <- TRUE
-  }
-  if (isTRUE(proper_arg)) {
-    proper.control <- dots[["proper.control", exact = TRUE]]
-    if (is.null(proper.control))
-      proper.control <- list()
-    if (is.null(proper.control$fail.on.unsupported))
-      proper.control$fail.on.unsupported <- TRUE
-    dots$proper.control <- proper.control
-  }
+  dots <- .np_conditional_replay_proper(object, dots, prediction = TRUE)
 
+  dots[[".np_lp_first_se_demand"]] <- FALSE
+  dots[[".np_conditional_cat_se_demand"]] <- FALSE
   tr <- do.call(npcdist, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 

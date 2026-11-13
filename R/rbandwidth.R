@@ -7,7 +7,7 @@ rbandwidth <-
            bwmethod = c("cv.ls","cv.aic"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"),
+           ckertype = c("gaussian","epanechnikov","uniform","beta"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -48,16 +48,11 @@ rbandwidth <-
 
   if(missing(ckerorder))
     ckerorder = 2
-  else if (ckertype == "uniform")
-    .np_warning("ignoring kernel order specified with uniform kernel type")
-  else {
+  else if (ckertype != "uniform") {
     kord = c(2,4,6,8) 
     if (!any(kord == ckerorder))
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
-
-  if (ckertype == "truncated gaussian" && ckerorder != 2)
-    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   ukertype = match.arg(ukertype)
   okertype = match.arg(okertype)
@@ -67,7 +62,24 @@ rbandwidth <-
     kerbound = ckerbound,
     kerlb = ckerlb,
     kerub = ckerub,
-    argprefix = "cker")
+    argprefix = "cker",
+    range.policy = if (identical(ckertype, "beta"))
+      "beta_half_spacing" else "exact")
+  npValidateBetaKernelSpecification(
+    ckertype = ckertype,
+    ckerorder = ckerorder,
+    bwtype = bwtype,
+    ckerbound = cbounds$bound,
+    ckerlb = cbounds$lb,
+    ckerub = cbounds$ub,
+    dati = xdati,
+    bw = bw,
+    bandwidth.compute = bandwidth.compute,
+    where = "beta regression",
+    regtype = regtype,
+    allow.categorical = TRUE,
+    allow.general.lp = TRUE
+  )
   bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
   if (bwtype != "fixed" &&
       cbounds$bound != "none" &&
@@ -88,16 +100,13 @@ rbandwidth <-
     ncon = ncon,
     where = "rbandwidth"
   )
-  if (identical(regtype, "lp") && ncon > 0L && is.finite(nobs)) {
-    lp.dim <- dim_basis(basis = basis,
-                        kernel = TRUE,
-                        degree = degree,
-                        segments = rep.int(1L, ncon))
-    if (is.finite(lp.dim) && lp.dim > (nobs - 1.0))
-      stop(sprintf("LP basis dimension (%s) exceeds nobs - 1 (%s); reduce degree",
-                   format(lp.dim, trim = TRUE, scientific = FALSE),
-                   format(nobs - 1.0, trim = TRUE, scientific = FALSE)))
-  }
+  if (identical(reg.spec$regtype.engine, "lp") && ncon > 0L && is.finite(nobs))
+    npValidateLpBasisAdmission(
+      basis = reg.spec$basis.engine,
+      degree = reg.spec$degree.engine,
+      nobs = nobs,
+      where = "rbandwidth"
+    )
 
   porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
   ## calculate some info to be pretty-printed
@@ -200,6 +209,7 @@ rbandwidth <-
     mybw$pmethod <- "Manual"
 
   class(mybw) = "rbandwidth"
+  mybw <- .np_ordered_bandwidth_contract(mybw)
   if(!any(is.na(mybw$bandwidth)))
     validateBandwidth(mybw)
   mybw
@@ -220,7 +230,7 @@ npInsertGlpSummary <- function(txt, basis, degree, bernstein){
     basis <- "glp"
 
   basis.family <- npLpBasisFamilyLabel(basis)
-  basis.rep <- npLpBasisRepresentationLabel(bernstein)
+  basis.rep <- npLpBasisRepresentationLabel(bernstein, basis)
   basis.dim <- npLpBasisNcol(basis = basis, degree = degree)
 
   glp.lines <- c(

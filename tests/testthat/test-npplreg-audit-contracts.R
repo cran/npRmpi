@@ -53,7 +53,8 @@ test_that("npplreg direct default route preserves vector response and explicit-b
     txdat = dat$xdat,
     tydat = dat$ydat,
     tzdat = dat$zdat,
-    bandwidth.compute = FALSE
+    bandwidth.compute = FALSE,
+    se = TRUE
   )
   bw <- npplregbw(
     xdat = dat$xdat,
@@ -62,7 +63,7 @@ test_that("npplreg direct default route preserves vector response and explicit-b
     bws = bw.mat,
     bandwidth.compute = FALSE
   )
-  explicit <- npplreg(bws = bw)
+  explicit <- npplreg(bws = bw, se = TRUE)
   auto <- npplreg(
     txdat = dat$xdat,
     tydat = dat$ydat,
@@ -152,16 +153,13 @@ test_that("npplreg evaluation rows retain alignment and external GOF is explicit
   expect_true(is.finite(fit.ey$MSE))
 })
 
-test_that("npplreg factor response and factor linear regressor routes remain usable", {
+test_that("npplreg rejects factor outcomes and preserves factor linear regressors", {
   if (!npplreg_audit_ready()) skip("Could not initialize npplreg audit context")
 
   dat <- npplreg_audit_fixture()
   factor.y <- dat
   factor.y$ydat <- factor(ifelse(dat$ydat > median(dat$ydat), "hi", "lo"))
-  fit.y <- npplreg(bws = npplreg_audit_bw(factor.y))
-  expect_s3_class(fit.y, "plregression")
-  expect_true(all(is.finite(fit.y$mean)))
-  expect_true(all(is.finite(coef(fit.y))))
+  expect_error(npplreg_audit_bw(factor.y), "must be a numeric")
 
   factor.x <- dat
   factor.x$xdat <- data.frame(x = factor(ifelse(dat$xdat$x > median(dat$xdat$x), "high", "low")))
@@ -184,7 +182,7 @@ test_that("npplreg plot-center local fit stays parity-clean across bandwidth typ
   for (bwtype in c("fixed", "adaptive_nn", "generalized_nn")) {
     bw.value <- if (identical(bwtype, "fixed")) 0.55 else 5
     bw <- npplreg_audit_bw(dat, bw = bw.value, bwtype = bwtype)
-    fit <- npplreg(bws = bw, exdat = ex, ezdat = ez)
+    fit <- npplreg(bws = bw, exdat = ex, ezdat = ez, se = TRUE)
     plotfit <- local_fit(
       bws = bw,
       xdat = dat$xdat,

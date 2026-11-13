@@ -19,31 +19,34 @@
 }
 
 \usage{
-npindex(bws, \dots)
+npindex(bws, \dots, B = 399)
 
 \method{npindex}{formula}(bws,
         data = NULL,
         newdata = NULL,
-        y.eval = FALSE,
-        \dots)
+        y.eval = NULL,
+        se = TRUE,
+        \dots, se.type = c("asymptotic", "bootstrap"))
 
 
 \method{npindex}{default}(bws,
         txdat,
         tydat,
         nomad = FALSE,
-        \dots) 
+        se = TRUE,
+        \dots, se.type = c("asymptotic", "bootstrap"))
 
 \method{npindex}{sibandwidth}(bws,
         txdat = stop("training data 'txdat' missing"),
         tydat = stop("training data 'tydat' missing"),
         exdat,
         eydat,
-        boot.num = 399,
-        errors = FALSE,
+        B = 399,
+        se = TRUE,
         gradients = FALSE,
         residuals = FALSE,
-        \dots)
+        \dots, se.type = c("asymptotic", "bootstrap"),
+        y.eval = NULL)
 }
 
 \arguments{
@@ -63,6 +66,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -85,6 +95,10 @@ These arguments identify the bandwidth specification, formula/data interface, an
     \code{txdat}. Defaults to the corresponding
     training data recoverable from the bandwidth object in the current
     session.
+    For \code{method="kleinspady"}, response values must be numeric 0 or 1.
+    Factor responses are rejected rather than converted to internal category
+    codes; explanatory variables may still be factors. The same response
+    restriction applies to supplied evaluation outcomes.
   }
 
 
@@ -117,6 +131,13 @@ These arguments control where the single-index fit is evaluated and which evalua
     a \eqn{p}-variate data frame of points on which the regression will be
     estimated (evaluation data). By default,
     evaluation takes place on the data provided by \code{txdat}.
+    If all computed kernel weights are zero at an external evaluation row,
+    the undefined fitted quantities are returned as \code{NA}, with one
+    notice per call. This policy is independent of the \code{se} and
+    \code{gradients} switches; required training computations remain strict.
+    If a bootstrap resample has no support at a requested row, its bootstrap
+    standard error is \code{NA}; a supported original point estimate is
+    retained. Replications are not dropped or redrawn.
   }
 
 
@@ -134,36 +155,51 @@ These arguments control where the single-index fit is evaluated and which evalua
 
 
   \item{y.eval}{
-    If \code{newdata} contains dependent data and \code{y.eval = TRUE},
-    \code{\link{npRmpi}} will compute goodness of fit statistics on these
-    data and return them. Defaults to \code{FALSE}.
+    Selects the outcomes used for goodness-of-fit diagnostics. The default
+    \code{NULL} uses evaluation outcomes when supplied in \code{newdata} or
+    \code{eydat}. With evaluation predictors only, predictions are returned
+    normally and diagnostics are \code{NA}. Explicit \code{TRUE} requires
+    evaluation outcomes when evaluating new predictors. Explicit \code{FALSE}
+    ignores outcomes in \code{newdata} and preserves historical training
+    diagnostics, identified as such in the summary. Explicit \code{eydat}
+    takes precedence. With no evaluation inputs, diagnostics describe training
+    data.
   }
 
 
 \subsection{Fitted Quantities And Inference}{
-These arguments control residuals, gradients, and bootstrap standard errors.
+These arguments control residuals, gradients, and asymptotic or bootstrap inference.
 }
 
-  \item{boot.num}{
+  \item{B}{
     an integer specifying the number of bootstrap replications to use
-    when performing standard error calculations. Defaults to
+    when \code{se=TRUE, se.type="bootstrap"}. Defaults to
     \code{399}.
   }
 
 
-  \item{errors}{
-    a logical value indicating that you want (bootstrapped)
-    standard errors for the conditional mean, gradients (when
-    \code{gradients=TRUE} is set), and average gradients (when
-    \code{gradients=TRUE} is set), computed and returned in the
-    resulting \code{singleindex} object. Defaults to \code{FALSE}.
+  \item{se}{
+    a logical value requesting asymptotic coefficient covariance and standard
+    errors for the conditional mean and, when \code{gradients=TRUE}, gradients.
+    Defaults to \code{TRUE} for this estimator. Set \code{FALSE} to omit all
+    covariance and standard-error calculations, independently of whether
+    gradient estimates are requested.
   }
 
+  \item{se.type}{
+    the standard-error method for the conditional mean and gradients:
+    \code{"asymptotic"} (the default) or \code{"bootstrap"}. The latter also
+    supplies bootstrap standard errors for average gradients and uses \code{B}
+    replications. Coefficient covariance is asymptotic in both modes: the
+    fitted-value/gradient bootstrap holds beta and the selected bandwidth fixed
+    while resampling observations. No bootstrap is run when \code{se=FALSE}
+    or \code{se.type="asymptotic"}.
+  }
 
   \item{gradients}{
-    a logical value indicating that you want gradients and the
-    asymptotic covariance matrix for beta computed and returned in the
-    resulting \code{singleindex} object. Defaults to \code{FALSE}.
+    a logical value indicating that you want gradients computed and returned.
+    Defaults to \code{FALSE}. Their standard errors additionally require
+    \code{se=TRUE}. Coefficient covariance does not require this flag.
   }
 
 
@@ -184,6 +220,91 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   }
 }
 \details{
+  The primary response must be a one-dimensional numeric (integer or double)
+  vector. Factors and ordered factors are not accepted as primary responses,
+  including retained responses used in a new fit or bandwidth search.
+  The same requirement applies to explicitly selected evaluation responses.
+  Prediction without selected evaluation outcomes does not require a response
+  column. An explicit formula transformation that returns numeric values is
+  accepted; numerical scores are a modeling choice made by the user.
+  Categorical predictors retain their existing support. Internal auxiliary
+  responses used to represent predictors retain their established encoding.
+  Klein--Spady retains its stricter numeric 0/1 response requirement.
+
+  \subsection{Factor Predictors and Coefficient Inference}{
+    New bandwidth objects expand factors into the retained R contrast design
+    described in \code{\link{npindexbw}}. Training refits, prediction and plots
+    reuse the same columns, levels and contrasts. Numeric scores and older saved
+    bandwidth objects retain their existing interpretation. Supply raw predictor
+    data to the public fitting and prediction interfaces; expansion is automatic.
+
+    Coefficients, covariance and gradients use expanded design-column names.
+    Gradients for factor contrast columns are derivatives of the numerical
+    design extension, \eqn{g'(X^\prime\beta)\beta_j}; they are not the effect of
+    switching between observed categories. Such effects require comparing
+    predictions at the desired categories. No coefficient is estimated for the
+    intercept, which is absorbed into the unknown link.
+
+    Klein--Spady coefficient covariance uses the link derivative multiplied by
+    covariates centered on their conditional means given the index. This corrects
+    a legacy raw-covariate information calculation, including for numeric-only
+    inputs. Ichimura retains its conditional-centered sandwich calculation.
+    Coefficient inference requires additional conditional-moment computation;
+    \code{se=FALSE} skips this work. This correction does not change the search
+    objective or the conditional fitted-value uncertainty calculation.
+  }
+
+  Fixed kernel endpoints retained in the bandwidth object are also used by
+  fitting, prediction, inference and bootstrap resamples. They are not
+  recomputed from the evaluation grid or from a resampled training set.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} supplies \code{exdat}
+  and, in automatic mode, a named response column supplies evaluation outcomes.
+  Explicit native evaluation arguments take precedence. This evaluates at the
+  requested rows without repeating bandwidth selection or re-estimating index
+  coefficients. For held-out assessment, estimate the coefficients and any
+  data-selected bandwidths using the training sample.
+
+  Ichimura evaluation outcomes must be numeric when explicitly requested.
+  An unsuitable automatically discovered outcome, including a factor, leaves
+  diagnostics unavailable while predictions remain available.
+
+  Evaluation outcomes affect diagnostics only. In automatic mode, outcomes that
+  cannot be evaluated, aligned, or validated are treated as unavailable for
+  diagnostics; predictions remain available. Explicit \code{y.eval=TRUE} and
+  explicitly supplied \code{eydat} retain strict validation. Missing outcomes do not remove
+  predictor-complete prediction rows. Time-series outcomes are matched to the
+  predictor time coordinates; predictions outside the supplied outcome time
+  support remain available but are not scored. Scores use observed outcome/prediction
+  pairs, and are \code{NA} when none are available. Formula responses, including
+  transformations, are evaluated only when their variables are present in
+  \code{newdata}; an ambient response is never substituted. Predictor omission
+  and row-restoration conventions are unchanged.
+
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
   Documentation guide: see \code{\link{np.kernels}} for kernels, \code{\link{np.options}} for global options, \code{\link{plot}}, \code{\link{plot.np}} for plotting options, and \code{\link{npRmpi.init}} for interactive/cluster MPI startup. See \code{\link{npRmpi.init}} details for performance tradeoffs (message passing/startup mode) and the \code{inst/Rprofile} manual-broadcast template.
 
   For S3 plotting help, see \code{\link{plot.np}}. You can list
@@ -237,12 +358,12 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
 
 \value{
 
-  \code{npindex} returns a \code{npsingleindex} object.  The generic
+  \code{npindex} returns a \code{singleindex} object.  The generic
   functions \code{\link{fitted}}, \code{\link{residuals}},
   \code{\link{coef}}, \code{\link{vcov}}, \code{\link{se}},
   \code{\link{predict}}, and \code{\link{gradients}}, extract (or
   generate) estimated values, residuals, coefficients,
-  variance-covariance matrix, bootstrapped standard errors on estimates,
+  variance-covariance matrix, asymptotic or bootstrap standard errors on estimates,
   predictions, and gradients, respectively, from the returned
   object. Furthermore, the functions \code{\link{summary}} and
   \code{\link{plot}} support objects of this type. The returned object
@@ -266,6 +387,14 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   \item{CORR}{if \code{method="ichimura"}, absolute value of Pearson's correlation coefficient }
   \item{SIGN}{if \code{method="ichimura"}, fraction of observations where fitted and observed values
     agree in sign }
+  \item{diagnostics.sample}{\code{"training"}, \code{"evaluation"}, or
+    \code{"unavailable"}, identifying the sample used for goodness-of-fit statistics.}
+  \item{diagnostics.nobs}{Number of observed outcome/prediction pairs scored.}
+  \item{training.MSE}{For Ichimura fits, the training mean squared error when
+    training fitted values were computed, otherwise \code{NA}. Prediction's
+    \code{residual.scale} retains this training quantity in its historical MSE
+    units, independently of evaluation outcomes. No additional training fit is
+    performed solely to populate this field.}
   \item{confusion.matrix}{if \code{method="kleinspady"}, the confusion matrix or \code{NA} if outcomes
     are not available }
   \item{CCR.overall}{if \code{method="kleinspady"},  the overall correct
@@ -336,15 +465,87 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   intended on mixed data types and will coerce the data to the same
   type.
 
-  When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. For formula evaluation with \code{newdata}, an
+  explicit \code{na.action} also applies to the evaluation predictors:
+  \code{na.omit} drops incomplete predictor rows, \code{na.exclude}
+  restores their positions with \code{NA} in predictions, standard errors
+  and requested gradients, and \code{na.fail} rejects them. When omitted,
+  evaluation uses the current model-frame missing-data policy. Evaluation
+  outcomes are scored separately and do not remove prediction rows.
+  With both replacement training data and evaluation data, the policy is
+  applied separately to each frame. An evaluation-only request does not
+  refilter retained training data. Explicit native evaluation arguments
+  retain precedence and their existing complete-row handling.
+  Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
 
-  \code{\link{vcov}} requires that \code{gradients=TRUE} be set.
+  When reusing a bandwidth object without explicit training or evaluation
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
+
+  \code{\link{vcov}} extracts the asymptotic coefficient covariance computed
+  when \code{se=TRUE}, independently of \code{gradients} and \code{se.type}.
+  Its first row and column are zero because the first coefficient is normalized
+  to one. A singular free-coefficient information matrix raises an informative
+  error; the calculation does not substitute a generalized inverse or bootstrap.
+  In particular, the local-constant uniform kernel has zero first derivative
+  away from its support boundaries and cannot supply this covariance for free
+  coefficients. Use \code{se=FALSE} for point estimates in that case.
+  Selecting \code{se.type="bootstrap"} does not replace the coefficient
+  covariance calculation, which remains asymptotic.
+  The default inference requires additional training derivatives and moments;
+  it can cost appreciably more than a point-estimate-only fit, especially when
+  bandwidths have already been selected. Use \code{se=FALSE} to omit that work.
+  Asymptotic fitted-value and gradient standard errors use the same scalar-index
+  regression calculation as the asymptotic plot intervals, treating the fitted
+  index coefficients as fixed. They inherit the residual normalization of
+  Ruppert et al. (1997) described under Standard Errors in
+  \code{\link{npreg}}. This is not the separate coefficient covariance
+  returned by \code{vcov()}. Missing training residual information can
+  therefore make individual fitted-value or gradient errors unavailable
+  without removing their point estimates.
+  Local-polynomial index fits also inherit the numerical-ridging policy
+  described in \code{\link{npreg}}.
+  Asymptotic standard errors of average gradients
+  are not supplied; \code{mean.gerr} is available only in bootstrap mode.
+
+  Missing quantities can be computed without repeating bandwidth search.
+  After \code{model <- npindex(...)}, use
+  \code{model <- npindex(bws=model$bws, gradients=TRUE, se=TRUE)} to add gradients
+  and asymptotic inference, or \code{se=FALSE} for gradients alone. This reuses
+  both the fitted beta and bandwidth, just as fitting an object returned by
+  \code{npindexbw()} does. The training data must remain recoverable from the
+  retained state/call, or be supplied explicitly. \code{predict(..., se.fit=TRUE)}
+  uses the fitted object's stored \code{se.type} for new evaluation data unless
+  an explicit \code{se.type} is supplied.
+}
+
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{

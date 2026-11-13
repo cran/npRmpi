@@ -33,6 +33,15 @@ npuniden.boundary <- function(X=NULL,
     if(nmulti < 1) stop("number of multistarts nmulti must be positive")
     if(!is.logical(proper)) stop("proper must be either TRUE or FALSE")
     if(kertype=="gaussian2" && (!is.finite(a) || !is.finite(b))) stop("finite bounds are required for kertype gaussian2")
+    beta.kernel <- kertype %in% c("beta1", "beta2")
+    if(beta.kernel && (!is.finite(a) || !is.finite(b)))
+        stop("finite bounds are required for beta kernels")
+    if(kertype=="beta2") {
+        if(!is.null(h) && (!is.finite(h) || h > 1/4))
+            stop("beta2 bandwidth h must satisfy 0 < h <= 1/4 on normalized support")
+        if(!is.null(grid) && any(!is.finite(grid) | grid > 1/4))
+            stop("beta2 grid values must satisfy 0 < h <= 1/4 on normalized support")
+    }
     h.opt <- NULL
     if(kertype=="gaussian1") {
         ## Gaussian reweighted boundary kernel function (bias of O(h))
@@ -41,24 +50,47 @@ npuniden.boundary <- function(X=NULL,
         }
     } else if(kertype=="gaussian2") {
         ## Gaussian reweighted second-order boundary kernel function
-        ## (bias of O(h^2)). Instability surfaces for extremely large
-        ## bandwidths relative to range of the data, so we shrink to
-        ## the uniform when h exceeds 10,000 times the range (b-a)
+        ## (bias of O(h^2)), including its nonuniform large-h limit.
         kernel <- function(x,X,h,a=0,b=1) {
             z <- (x-X)/h
             z.a <- (a-x)/h
             z.b <- (b-x)/h
-            pnorm.zb.m.pnorm.za <- (pnorm(z.b)-pnorm(z.a))
-            mu.1 <- (dnorm(z.a)-dnorm(z.b))/(pnorm.zb.m.pnorm.za)
-            mu.2 <- 1+(z.a*dnorm(z.a)-z.b*dnorm(z.b))/(pnorm.zb.m.pnorm.za)
-            mu.3 <- ((z.a**2+2)*dnorm(z.a)-(z.b**2+2)*dnorm(z.b))/(pnorm.zb.m.pnorm.za)
-            aa <- mu.3/(mu.3-mu.1*mu.2)
-            bb <- -mu.1/(mu.3-mu.1*mu.2)
-            if((b-a)/h > 1e-04) {
-                (aa+bb*z**2)*dnorm(z)/(h*pnorm.zb.m.pnorm.za)
-            } else {
-                rep(1/(b-a),length(X))
+            if(max(abs(z.a),abs(z.b)) < .1) {
+                # Cancel common powers of support-width/h before taking moment
+                # ratios. Unit-support moments stay finite even as h grows.
+                width <- b-a
+                epsilon <- width/h
+                lower <- (a-x)/width
+                upper <- (b-x)/width
+                k <- 0:6
+                coefficient <- (-.5*epsilon^2)^k/factorial(k)
+                moment.0 <- sum(coefficient*(upper^(2*k+1)-lower^(2*k+1))/(2*k+1))
+                moment.2 <- sum(coefficient*(upper^(2*k+3)-lower^(2*k+3))/(2*k+3))
+                r <- (x-(a+width/2))/width
+                t2 <- (r*epsilon^2/2)^2
+                ratio <- .25+r^2-
+                    (r^2*epsilon^2/2)*(1/3-t2*(1/45-2*t2/945))
+                w <- (x-X)/width
+                return((ratio-w^2)/(ratio-moment.2/moment.0) *
+                    exp(-.5*z^2)/(width*moment.0))
             }
+            pnorm.zb.m.pnorm.za <- (pnorm(z.b)-pnorm(z.a))
+            mu.2 <- 1+(z.a*dnorm(z.a)-z.b*dnorm(z.b))/(pnorm.zb.m.pnorm.za)
+            # mu.3/mu.1 has a removable 0/0 at the support midpoint;
+            # the ordinates can also both underflow for narrow kernels.
+            half.width <- (b-a)/(2*h)
+            delta <- (x-(a+(b-a)/2))/h
+            t <- abs(half.width*delta)
+            if(t < 1e-3) {
+                t2 <- t*t
+                ratio <- half.width^2+delta^2-
+                    2*t2*(1/3-t2*(1/45-2*t2/945))
+            } else {
+                ratio <- 2+min(abs(z.a),abs(z.b))^2-4*t/expm1(2*t)
+            }
+            aa <- ratio/(ratio-mu.2)
+            bb <- -1/(ratio-mu.2)
+            (aa+bb*z**2)*dnorm(z)/(h*pnorm.zb.m.pnorm.za)
         }
     } else if(kertype=="beta1") {
         ## Chen (1999), Beta 1 kernel function (bias of O(h), function
@@ -77,11 +109,11 @@ npuniden.boundary <- function(X=NULL,
         kernel <- function(x,X,h,a=0,b=1) {
             X <- (X-a)/(b-a)
             x <- (x-a)/(b-a)
-            if(x < 2*h && h < (b-a)) {
+            if(x < 2*h) {
                 dbeta(X,rho(x,h),(1-x)/h)/(b-a)
-            } else if((2*h <= x && x <= 1-2*h) || h >= (b-a)) {
+            } else if(2*h <= x && x <= 1-2*h) {
                 dbeta(X,x/h,(1-x)/h)/(b-a)
-            } else if(x > 1-2*h && h < (b-a)) {
+            } else if(x > 1-2*h) {
                 dbeta(X,x/h,rho(1-x,h))/(b-a)
             }
         }
@@ -201,41 +233,46 @@ npuniden.boundary <- function(X=NULL,
         if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
         if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
         if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-        sapply(seq_along(X), function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b)**2)[length(X.seq)]})
+        geometry <- .np_quadrature_prepare(X.seq)
+        sapply(seq_along(X), function(i){.np_quadrature_total(X.seq,
+            h*kernel(X[i],X.seq,h,a,b)**2, geometry)})
     }
-    fhat <- function(X,Y,h,a=0,b=1,proper=FALSE) {
-        f <- sapply(seq_along(Y), function(i){mean(kernel(Y[i],X,h,a,b))})
-        if(proper) {
-            if(is.finite(a) && is.finite(b)) X.seq <- seq(a,b,length=1000)
-            if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
-            if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
-            if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-            f.seq <- sapply(seq_along(X.seq), function(i){mean(kernel(X.seq[i],X,h,a,b))})
-            if(any(f.seq<0)) {
-                f <- f - min(f.seq)
-                f.seq <- f.seq - min(f.seq)
-            }
-            int.f.seq <- integrate.trapezoidal(X.seq,f.seq)[length(X.seq)]
-            f <- f/int.f.seq
-        }
-        return(f)
+    fhat <- function(X,Y,h,a=0,b=1) {
+        sapply(seq_along(Y), function(i){mean(kernel(Y[i],X,h,a,b))})
     }
-    Fhat <- function(Y,f,a,b,proper=FALSE) {
-        ## Numerical integration of f, check for aberrant values, if
-        ## on range of data ensure F\in[0,1], if not make sure value
-        ## is proper (negative boundary kernel functions can cause
-        ## unwanted artifacts)
-        f[is.na(f)] <- 0
-        F <- integrate.trapezoidal(Y,f)
-        if(proper) {
-            if(min(Y)==a && max(Y)==b) {
-                F <- (F-min(F))/(max(F)-min(F))
-            } else {
-                if(min(F)<0) F <- F+min(F)
-                if(max(F)>1) F <- F/max(F)
-            }
+    final.fit <- function(h) {
+        density <- function(y) fhat(X,y,h,a,b)
+        f <- density(Y)
+        # Only the ordinary, unbounded Gaussian kernel has this analytic CDF.
+        if(kertype=="gaussian1" && !is.finite(a) && !is.finite(b)) {
+            F <- vapply(Y,function(y) mean(pnorm((y-X)/h)),0.0)
+            return(list(f=f,F=F))
         }
-        F
+        branch.points <- switch(kertype,
+            beta2=c(a+2*h*(b-a),b-2*h*(b-a)),
+            fb=c(a+h,b-h),fbl=a+h,fbu=b-h,numeric())
+        integration.scale <- if(beta.kernel) h*(b-a) else h
+        integration.widths <- rep(integration.scale,length(X))
+        if(beta.kernel) {
+            normalized.X <- (X-a)/(b-a)
+            integration.widths <- (b-a)*sqrt(h*(normalized.X*(1-normalized.X)+h))
+        } else if(kertype=="gamma") {
+            integration.widths <- sqrt(h*(X-a)+h*h)
+        } else if(kertype=="rigaussian") {
+            integration.widths[X>a] <- sqrt(h*(X[X>a]-a))
+            integration.scale <- min(integration.widths)
+        }
+        integrand <- if(proper) function(y) pmax(density(y),0) else density
+        integral <- .np_density_integral(integrand,Y,a,b,
+            X,integration.scale,branch.points,positive=proper,widths=integration.widths)
+        F <- integral$F
+        if(proper) {
+            if(!is.finite(integral$total) || integral$total<=0)
+                stop("proper density requires finite positive whole-support mass")
+            f <- pmax(f,0)/integral$total
+            F <- F/integral$total
+        }
+        list(f=f,F=F)
     }
     fhat.loo <- function(X,h,a=0,b=1) {
         n <- length(X)
@@ -258,8 +295,9 @@ npuniden.boundary <- function(X=NULL,
     } else {
         ## Least-squares cross-validation function (minimizing)
         fnscale <- list(fnscale = 1) 
+        cv.geometry <- if(is.null(h)) .np_quadrature_prepare(X) else NULL
         cv.function <- function(h,X,a=0,b=1) {
-            cv.ls <- (integrate.trapezoidal(X,fhat(X,X,h,a,b)**2)[order(X)])[length(X)]-2*mean(fhat.loo(X,h,a,b))
+            cv.ls <- .np_quadrature_total(X,fhat(X,X,h,a,b)**2,cv.geometry)-2*mean(fhat.loo(X,h,a,b))
             if (is.finite(cv.ls)) cv.ls else sqrt(sqrt(.Machine$double.xmax))
         }
     }
@@ -280,13 +318,18 @@ npuniden.boundary <- function(X=NULL,
         ## First establish a sound starting value using grid search,
         ## then use that starting value for numeric search
         if(is.null(grid)) {
-            rob.spread <- c(sd(X),IQR(X)/1.349)
+            # Beta h is dimensionless, as are the kernel's shape parameters.
+            search.X <- if(beta.kernel) (X-a)/(b-a) else X
+            rob.spread <- c(sd(search.X),IQR(search.X)/1.349)
             rob.spread <- min(rob.spread[rob.spread>0])
             constant <- rob.spread*length(X)**(-0.2)
             h.vec <- c(seq(0.25,1.75,length=10),2^(1:25))*constant
+            if(kertype=="beta2")
+                h.vec <- unique(c(h.vec[is.finite(h.vec) &
+                    h.vec >= sqrt(.Machine$double.eps) & h.vec <= 1/4], 1/4))
             cv.vec <- sapply(seq_along(h.vec), function(i){cv.function(h.vec[i],X,a,b)})
             start.idx <- if (bwmethod=="cv.ml") which.max(cv.vec) else which.min(cv.vec)
-            upper.bound <- if (kertype=="beta2") (b-a)/4 else Inf
+            upper.bound <- if (kertype=="beta2") 1/4 else Inf
             foo <- optim(h.vec[start.idx],
                          cv.function,
                          method="L-BFGS-B",
@@ -301,7 +344,7 @@ npuniden.boundary <- function(X=NULL,
         } else {
             cv.vec <- sapply(seq_along(grid), function(i){cv.function(grid[i],X,a,b)})
             start.idx <- if (bwmethod=="cv.ml") which.max(cv.vec) else which.min(cv.vec)
-            upper.bound <- if (kertype=="beta2") (b-a)/4 else Inf
+            upper.bound <- if (kertype=="beta2") 1/4 else Inf
             foo <- optim(grid[start.idx],
                          cv.function,
                          method="L-BFGS-B",
@@ -317,23 +360,23 @@ npuniden.boundary <- function(X=NULL,
     }
     if(is.null(h.opt)) {
         ## Manual inputted bandwidth
-        f <- fhat(X,Y,h,a,b,proper=proper)
-        ## Numerical integration via the trapezoidal rule
-        F <- Fhat(Y,f,a,b,proper=proper)
+        fit <- final.fit(h)
+        f <- fit$f
+        F <- fit$F
         return(list(f=f,
                     F=F,
-                    sd.f=sqrt(abs(f*int.kernel.squared(Y,h,a,b)/(h*length(f)))),
-                    sd.F=sqrt(abs(F*(1-F)/length(F))),
+                    sd.f=sqrt(abs(f*int.kernel.squared(Y,h,a,b)/(h*length(X)))),
+                    sd.F=sqrt(abs(F*(1-F)/length(X))),
                     h=h))
     } else {
         ## Search bandwidth
-        f <- fhat(X,Y,h.opt,a,b,proper=proper)
-        ## Numerical integration via the trapezoidal rule
-        F <- Fhat(Y,f,a,b,proper=proper)
+        fit <- final.fit(h.opt)
+        f <- fit$f
+        F <- fit$F
         return(list(f=f,
                     F=F,
-                    sd.f=sqrt(abs(f*int.kernel.squared(Y,h.opt,a,b)/(h.opt*length(f)))),
-                    sd.F=sqrt(abs(F*(1-F)/length(F))),
+                    sd.f=sqrt(abs(f*int.kernel.squared(Y,h.opt,a,b)/(h.opt*length(X)))),
+                    sd.F=sqrt(abs(F*(1-F)/length(X))),
                     h=h.opt,
                     nmulti=nmulti,
                     cv.opt=cv.opt))

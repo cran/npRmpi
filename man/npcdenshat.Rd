@@ -53,6 +53,14 @@ These arguments control whether the operator is returned as a matrix or applied 
 
 }
 \details{
+For the adaptive-nearest-neighbour local-constant (including degree-zero
+local-polynomial) ratio, every finite nonzero conditioning-weight sum is used
+without an epsilon floor. If all computed conditioning weights at an external
+evaluation row are zero, that row is returned as \code{NA} with a warning.
+This describes computed weights, not necessarily absence of geometric support.
+Zero response weights still give a valid zero numerator when the conditioning
+denominator is defined. Required internal and bootstrap ratios remain strict.
+
 For \code{output = "matrix"}, the return value is a matrix with class
 \code{c("npcdenshat", "matrix")} and attributes storing the bandwidth object,
 training data, evaluation data, and call metadata.
@@ -68,6 +76,12 @@ continuous-\eqn{x} problem or \code{s = c(x2 = 1L)} in a multivariate problem,
 returns the hat operator for that component of the conditional-density
 gradient. This derivative route is intended to match
 \code{npcdens(..., gradients = TRUE)$congrad}.
+
+For local-constant beta X kernels, first derivatives use the analytic beta
+PDF derivative. Exact support-endpoint rows whose raw weights jump are
+returned as \code{NA}, because a response-free hat matrix cannot perform the
+response-specific numerator/denominator cancellation available to the fitted
+conditional-density estimator.
 
 This helper is intended for object-fed repeated evaluation once a bandwidth
 object has already been constructed. It does not perform bandwidth selection.

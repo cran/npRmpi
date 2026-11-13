@@ -1,7 +1,7 @@
 test_that("npudist all-ordered profile route preserves fitted distribution", {
   options(np.messages = FALSE)
-  npRmpi.init(nslaves = 1)
-  on.exit(try(npRmpi.quit(), silent = TRUE), add = TRUE)
+  skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
+  on.exit(close_mpi_slaves(), add = TRUE)
 
   for (okertype in c("liracine", "racineliyan")) {
     set.seed(20260537)
@@ -20,7 +20,7 @@ test_that("npudist all-ordered profile route preserves fitted distribution", {
       bandwidth.compute = FALSE,
       okertype = okertype
     )
-    dense <- npudist(bws = dense_bw)
+    dense <- npudist(bws = dense_bw, se = TRUE)
     options(old)
 
     old <- options(np.tree = FALSE, np.categorical.compress = TRUE)
@@ -31,7 +31,7 @@ test_that("npudist all-ordered profile route preserves fitted distribution", {
       bandwidth.compute = FALSE,
       okertype = okertype
     )
-    profile <- npudist(bws = profile_bw)
+    profile <- npudist(bws = profile_bw, se = TRUE)
     options(old)
 
     expect_equal(fitted(profile), fitted(dense), tolerance = 1e-12)

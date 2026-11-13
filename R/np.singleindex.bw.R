@@ -3,23 +3,34 @@ npindexbw <-
   function(...){
     mc <- match.call(expand.dots = FALSE)
     npRejectRenamedScaleFactorSearchArgs(names(mc$...), where = "npindexbw")
+    .np_validate_public_dots(mc[["..."]], "npindexbw")
     target <- .np_bw_dispatch_target(dots = mc$...,
                                      data_arg_names = c("xdat", "ydat"),
-                                     eval_env = parent.frame())
+                                     eval_env = parent.frame(),
+                                     promise.frame = environment())
     UseMethod("npindexbw", target)
   }
 
+# Validate the response before factor/numeric coercion or objective evaluation.
+# Bandwidth construction retains its existing both-class requirement; held fits
+# and evaluation samples may contain one class and retain their NA omission.
+.npindex_check_binary_response <- function(y, where, require.both = FALSE) {
+  valid <- is.numeric(y) && !is.complex(y) && is.null(dim(y)) &&
+    all(y == 0 | y == 1, na.rm = TRUE)
+  if (!valid)
+    stop(paste0(where, ": Klein and Spady's estimator requires a numeric ",
+                "(integer or double) response coded 0/1; factors and other ",
+                "response values are not accepted.",
+                if (require.both) " Bandwidth selection requires both 0 and 1." else ""),
+         call. = FALSE)
+  if (require.both && !setequal(y, c(0, 1)))
+    stop(paste0(where, ": Bandwidth selection requires both 0 and 1 in the complete training sample after removing incomplete rows."),
+         call. = FALSE)
+  invisible(NULL)
+}
+
 npindexbw.formula <-
   function(formula, data, subset, na.action, call, ...){
-    formula.terms <- terms(formula)
-    orig.ts <- if (missing(data))
-      .np_terms_ts_mask(terms_obj = formula.terms,
-                        data = environment(formula),
-                        eval_env = environment(formula))
-    else .np_terms_ts_mask(terms_obj = formula.terms,
-                           data = data,
-                           eval_env = environment(formula))
-
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
@@ -27,56 +38,42 @@ npindexbw.formula <-
 
     mf[[1]] <- as.name("model.frame")
 
-    if(all(orig.ts)){
-      args <- (as.list(attr(formula.terms, "variables"))[-1])
-      formula <- formula.terms
-      attr(formula, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
-      mf[["formula"]] <- formula
-    }else if(any(orig.ts)){
-      arguments <- (as.list(attr(formula.terms, "variables"))[-1])
-      arguments.normal <- arguments[which(!orig.ts)]
-      arguments.timeseries <- arguments[which(orig.ts)]
-
-      ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-      formula <- formula.terms
-      attr(formula, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
-      mf[["formula"]] <- formula
-    }
-
     mf.args <- as.list(mf[-1L])
-    mf <- do.call(stats::model.frame, mf.args, envir = parent.frame())
+    mf.args[["formula"]] <- substitute(quote(VALUE), list(VALUE = formula))
+    capture <- new.env(parent = emptyenv())
+    mf.args$.np.capture <- capture
+    mf <- do.call(.np_formula_model_frame, mf.args, envir = parent.frame())
 
     ydat <- model.response(mf)
-    xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
+    xdat <- .np_index_formula_xdat(mf)
 
-    tbw <- do.call(npindexbw, c(list(xdat = xdat, ydat = ydat), list(...)))
+    .npRmpi.bw.metadata <- .npRmpi_bw_formula_plan(
+      "npindexbw", match.call(expand.dots = FALSE), parent.frame(),
+      formula, mf, capture$na.action)
+    tbw <- do.call(npindexbw, c(list(xdat = xdat, ydat = quote(ydat)), list(...)))
 
-    ## clean up (possible) inconsistencies due to recursion ...
-    tbw$call <- match.call(expand.dots = FALSE)
-    environment(tbw$call) <- parent.frame()
-    tbw$formula <- formula
-    tbw$rows.omit <- as.vector(attr(mf,"na.action"))
-    tbw$nobs.omit <- length(tbw$rows.omit)
-    tbw$terms <- attr(mf,"terms")
-
-    tbw <-
-      updateBwNameMetadata(nameList =
-                           list(ynames =
-                                attr(mf, "names")[attr(tbw$terms, "response")]),
-                           bws = tbw)
-
-    tbw
+    .npRmpi_bw_formula_finish(tbw, .npRmpi.bw.metadata)
   }
 
 npindexbw.NULL <-
   function(xdat = stop("training data xdat missing"),
            ydat = stop("training data ydat missing"),
            bws, ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     .npRmpi_require_active_slave_pool(where = "npindexbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     mc <- match.call(expand.dots = FALSE)
     dots <- list(...)
     dot.names <- names(dots)
-    nomad.requested <- "nomad" %in% dot.names &&
+    only.beta <- "only.optimize.beta" %in% dot.names &&
+      npValidateScalarLogical(dots[["only.optimize.beta", exact = TRUE]], "only.optimize.beta")
+    nomad.requested <- !only.beta && "nomad" %in% dot.names &&
       (npValidateNomadControl(dots$nomad, "nomad") %in% c("true", "auto"))
     degree.select.value <- if ("degree.select" %in% dot.names) {
       match.arg(as.character(dots$degree.select[[1L]]),
@@ -84,8 +81,8 @@ npindexbw.NULL <-
     } else {
       "manual"
     }
-    automatic.degree.search <- isTRUE(nomad.requested) ||
-      !identical(degree.select.value, "manual")
+    automatic.degree.search <- !only.beta && (isTRUE(nomad.requested) ||
+      !identical(degree.select.value, "manual"))
     method.value <- if ("method" %in% dot.names) {
       match.arg(as.character(dots$method[[1L]]), c("ichimura", "kleinspady"))
     } else {
@@ -111,7 +108,7 @@ npindexbw.NULL <-
       identical(method.value, "ichimura") &&
       identical(regtype.value, "lp") &&
       search.engine.value %in% c("nomad", "nomad+powell")
-    .np_nomad_validate_inner_multistart(
+    if (!only.beta) .np_nomad_validate_inner_multistart(
       call_names = names(mc),
       dot.args = dots,
       regtype = regtype.value,
@@ -123,15 +120,12 @@ npindexbw.NULL <-
            isTRUE(collective.degree.search) ||
            isTRUE(ichimura.lp.nomad.degree.search) ||
            .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
-      return(.npRmpi_autodispatch_call(mc, parent.frame()))
+      return(.np_index_dispatch(mc, xdat, ydat, parent.frame(),
+                               owner.name = "npindexbw.NULL"))
 
     xdat <- toFrame(xdat)
 
-    bws <- double(ncol(xdat)+1)
-
-    tbw <- npindexbw.default(xdat = xdat,
-                             ydat = ydat,
-                             bws = bws, ...)
+    tbw <- npindexbw.default(xdat = xdat, ydat = ydat, ...)
 
     ## clean up (possible) inconsistencies due to recursion ...
     environment(mc) <- parent.frame()
@@ -145,26 +139,11 @@ npindexbw.NULL <-
   }
 
 .npindex_resolve_spec <- function(source, where = "npindex") {
-  if (!is.null(source$regtype.engine)) {
-    return(list(
-      regtype = if (is.null(source$regtype)) "lc" else as.character(source$regtype),
-      basis = if (is.null(source$basis)) "glp" else as.character(source$basis),
-      degree = if (is.null(source$degree)) integer(0) else as.integer(source$degree),
-      bernstein.basis = isTRUE(source$bernstein.basis),
-      regtype.engine = as.character(source$regtype.engine),
-      basis.engine = if (is.null(source$basis.engine)) "glp" else as.character(source$basis.engine),
-      degree.engine = if (is.null(source$degree.engine)) integer(0) else as.integer(source$degree.engine),
-      bernstein.basis.engine = isTRUE(source$bernstein.basis.engine)
-    ))
-  }
-
-  npCanonicalConditionalRegSpec(
-    regtype = if (is.null(source$regtype)) "lc" else as.character(source$regtype),
-    basis = if (is.null(source$basis)) "glp" else as.character(source$basis),
-    degree = source$degree,
-    bernstein.basis = isTRUE(source$bernstein.basis),
+  npValidatedConditionalRegSpec(
+    source,
+    where = where,
     ncon = 1L,
-    where = where
+    ncon.field = NULL
   )
 }
 
@@ -185,13 +164,7 @@ npindexbw.NULL <-
     paste0("lp", paste(as.integer(spec$degree), collapse = ","))
   }
 
-  canonical.degree <- if (identical(public.regtype, "lc")) {
-    0L
-  } else if (identical(public.regtype, "ll")) {
-    1L
-  } else {
-    as.integer(spec$degree.engine)
-  }
+  canonical.degree <- as.integer(spec$degree.engine)
 
   canonical.degree0 <- length(canonical.degree) > 0L && all(canonical.degree == 0L)
   if (!(identical(method, "ichimura") || identical(method, "kleinspady"))) {
@@ -216,7 +189,7 @@ npindexbw.NULL <-
     public.regtype = public.regtype,
     public.degree = as.integer(spec$degree),
     route = route,
-    canonical.regtype = if (identical(public.regtype, "lc") || identical(public.regtype, "ll")) "lp" else engine.regtype,
+    canonical.regtype = engine.regtype,
     canonical.degree = canonical.degree,
     executor = executor,
     objective.spec = objective.spec,
@@ -279,14 +252,179 @@ npindexbw.NULL <-
 .npindex_random_start_bandwidth <- function(fit,
                                             bwtype,
                                             nobs,
-                                            start.controls = .npindexbw_h_start_controls()) {
+                                            start.controls = .npindexbw_h_start_controls(),
+                                            retain.scale = FALSE) {
   if (identical(bwtype, "fixed")) {
-    return(runif(1, min = start.controls$scale.factor.init.lower, max = start.controls$scale.factor.init.upper) *
-             .npindex_start_bandwidth_scale(fit = fit, nobs = nobs))
+    u <- runif(1, min = start.controls$scale.factor.init.lower, max = start.controls$scale.factor.init.upper)
+    scale <- .npindex_start_bandwidth_scale(fit = fit, nobs = nobs)
+    h <- u * scale
+    if (isTRUE(retain.scale))
+      return(list(h = h, scale = scale))
+    return(h)
   }
 
   upper <- max(1L, as.integer(nobs) - 1L)
   runif(1, min = 2, max = max(2L, upper))
+}
+
+.npindex_bound_automatic_start <- function(h, lower, upper = Inf) {
+  # Bound generated starts only; invalid arithmetic still reaches validation.
+  if (is.finite(h)) min(upper, max(lower, h)) else h
+}
+
+.npindex_random_restart_bandwidth <- function(xmat, beta, fit, bwtype, nobs,
+                                               start.controls, fixed.h.lower,
+                                               retain.scale = FALSE) {
+  if (identical(bwtype, "fixed") && length(beta))
+    fit <- .npindex_index_from_beta_tail(xmat, beta)
+  h <- .npindex_random_start_bandwidth(
+    fit = fit, bwtype = bwtype, nobs = nobs, start.controls = start.controls,
+    retain.scale = retain.scale
+  )
+  if (!identical(bwtype, "fixed"))
+    return(h)
+  details <- if (isTRUE(retain.scale)) h else NULL
+  if (!is.null(details))
+    h <- details$h
+  h <- .npindex_finalize_bandwidth(
+    h = .npindex_bound_automatic_start(h, fixed.h.lower),
+    bwtype = bwtype, nobs = nobs, lower = fixed.h.lower,
+    where = "npindexbw automatic restart"
+  )
+  if (!is.null(details)) {
+    details$h <- h
+    return(details)
+  }
+  h
+}
+
+.npindexbw_restore_start_eligible <- function(bws, owner) {
+  # Kernel/degree validity is resolved before search. First-start feasibility
+  # is independent of those choices and of final endpoint certification.
+  isTRUE(owner) && identical(bws$type, "fixed")
+}
+
+.npindexbw_first_scalar_guard <- function(objective.method, to.public = identity) {
+  guard <- new.env(parent = emptyenv())
+  token <- new.env(parent = emptyenv())
+  logical.id <- 0L
+  current <- NULL
+  guard$active <- FALSE
+  guard$observe <- function(raw, point) {
+    if (!isTRUE(guard$active))
+      return(invisible(NULL))
+    point <- as.double(point)
+    if (is.null(current) || isTRUE(current$seen) ||
+        length(point) != current$dimension || any(!is.finite(point)) ||
+        !identical(point, current$expected.point))
+      stop("internal error: npindexbw first scalar has a stale or mismatched raw witness",
+           call. = FALSE)
+    if (!is.numeric(raw) || length(raw) != 1L || !is.finite(raw))
+      stop("internal error: npindexbw first scalar lacks a normal finite raw objective",
+           call. = FALSE)
+    current$seen <- TRUE
+    current$point <- point
+    current$invalid <- identical(as.double(raw), .Machine$double.xmax)
+    guard$active <- FALSE
+    if (isTRUE(current$invalid)) {
+      stop(structure(list(message = "npindexbw private invalid first scalar",
+        call = NULL, token = token, logical.id = logical.id,
+        start = current$start, retry = current$retry, attempt = current$attempt,
+        point = point), class = c("np_index_first_scalar_invalid", "error", "condition")))
+    }
+    if (!is.null(current$restoration.note))
+      .np_progress_bandwidth_notice(c(
+        sprintf("start %d retry %d: valid start restored", current$start, current$retry),
+        sprintf("start %d restored", current$start), "start restored"))
+    invisible(NULL)
+  }
+  guard$run <- function(args, automatic, held, scale, lower, h, start, retry,
+                        upper = Inf) {
+    logical.id <<- logical.id + 1L
+    original.h <- as.double(h)
+    h <- original.h
+    expansion <- 0L
+    beta.search <- if (isTRUE(held)) args$par else args$par[-length(args$par)]
+    expected.beta <- as.double(to.public(beta.search))
+    on.exit({ guard$active <- FALSE; current <<- NULL }, add = TRUE)
+    description <- function(attempts) sprintf(
+      "npindexbw %s/%s start %d retry %d: %d starting scalar(s), h %s to %s",
+      objective.method, args$method, start, retry, attempts,
+      format(original.h, digits = 17L, scientific = TRUE),
+      format(h, digits = 17L, scientific = TRUE))
+    fail <- function(reason) stop(paste0(description(expansion + 1L), "; ", reason,
+      ". The starting h may be too small; review scale.factor.init, random-start controls or explicit h."),
+      call. = FALSE)
+    repeat {
+      state <- new.env(parent = emptyenv())
+      state$seen <- FALSE
+      state$invalid <- FALSE
+      state$dimension <- length(args$par) + as.integer(held)
+      state$h <- h
+      state$expected.point <- c(expected.beta, h)
+      state$start <- start
+      state$retry <- retry
+      state$attempt <- expansion + 1L
+      state$restoration.note <- if (expansion > 0L)
+        paste0(description(expansion + 1L), "; restored a raw-valid start") else NULL
+      current <<- state
+      # The objective already reports its raw first result. Leave optim's
+      # function untouched; observe() disarms this hook before later trials.
+      guard$active <- TRUE
+      result <- tryCatch(do.call(optim, args), np_index_first_scalar_invalid = function(e) {
+        if (!identical(e$token, token) || !identical(e$logical.id, logical.id) ||
+            !identical(e$start, start) || !identical(e$retry, retry) ||
+            !identical(e$attempt, expansion + 1L) || !isTRUE(state$invalid) ||
+            !identical(e$point, state$point))
+          stop(e)
+        e
+      })
+      if (!inherits(result, "np_index_first_scalar_invalid")) {
+        if (!isTRUE(state$seen))
+          stop("internal error: npindexbw first scalar returned without its current ordinary raw objective",
+               call. = FALSE)
+        return(result)
+      }
+      if (isTRUE(held))
+        fail("raw-invalid held bandwidth; restoration is disabled")
+      if (!isTRUE(automatic))
+        fail("raw-invalid explicit initial bandwidth; restoration is disabled")
+      if (length(scale) != 1L || !is.finite(scale) || scale <= 0 ||
+          length(h) != 1L || !is.finite(h) || h <= 0)
+        fail("restoration requires a positive finite index scale and h")
+      if (expansion >= 8L)
+        fail("raw-invalid start exhausted the eight-doubling restoration budget")
+      next.h <- h * 2
+      if (!is.finite(next.h) || next.h <= h)
+        fail("restoration cannot produce a finite strictly larger h")
+      if ((!is.null(lower) && next.h < lower) || next.h > upper)
+        fail("restoration would violate the existing search bounds")
+      h <- next.h
+      args$par[length(args$par)] <- h
+      expansion <- expansion + 1L
+    }
+  }
+  guard
+}
+
+.npindexbw_prepare_fixed_starts <- function(starts, xmat, beta.coord, h.scale,
+                                           h.lower, h.upper) {
+  h.col <- ncol(xmat)
+  if (nrow(starts) <= 1L || h.col == 1L)
+    return(starts)
+  for (j in 2:nrow(starts)) {
+    beta <- beta.coord$to_public(starts[j, seq_len(h.col - 1L)])
+    fit <- .npindex_index_from_beta_tail(xmat, beta)
+    scale <- .npindex_start_bandwidth_scale(fit = fit, nobs = nrow(xmat))
+    if (!is.finite(scale) || scale <= 0)
+      stop("npindexbw automatic NOMAD restart has a nonpositive or nonfinite index scale",
+           call. = FALSE)
+    if (scale != h.scale)
+      starts[j, h.col] <- (starts[j, h.col] * scale) / h.scale
+    starts[j, h.col] <- .npindex_bound_automatic_start(
+      starts[j, h.col], h.lower, h.upper)
+  }
+  starts
 }
 
 .npindex_ols_beta_tail <- function(ols.fit) {
@@ -308,8 +446,21 @@ npindexbw.NULL <-
   out
 }
 
+.npindex_internal_numeric_matrix <- function(xmat, where) {
+  if (!is.matrix(xmat) || !is.numeric(xmat)) {
+    stop(
+      sprintf("internal error: %s requires a numeric matrix", where),
+      call. = FALSE
+    )
+  }
+  xmat
+}
+
 .npindex_index_from_beta_tail <- function(xmat, beta.tail) {
-  xmat <- toMatrix(xmat)
+  xmat <- .npindex_internal_numeric_matrix(
+    xmat,
+    where = ".npindex_index_from_beta_tail()"
+  )
   beta.tail <- as.double(beta.tail)
   beta <- c(1, beta.tail)
   if (length(beta) != ncol(xmat))
@@ -320,7 +471,10 @@ npindexbw.NULL <-
 }
 
 .npindex_beta_coordinate_setup <- function(xmat) {
-  xmat <- toMatrix(xmat)
+  xmat <- .npindex_internal_numeric_matrix(
+    xmat,
+    where = ".npindex_beta_coordinate_setup()"
+  )
   p <- ncol(xmat)
   if (p <= 1L) {
     factor <- numeric(0)
@@ -355,9 +509,12 @@ npindexbw.NULL <-
                                         bwtype,
                                         nobs,
                                         lower = NULL,
-                                        where = "npindexbw") {
+                                        where = "npindexbw",
+                                        strict = TRUE) {
   candidate <- .npindex_nn_candidate_bandwidth(h = h, bwtype = bwtype, nobs = nobs)
   if (!candidate$ok) {
+    if (!strict)
+      return(NULL)
     if (identical(bwtype, "fixed")) {
       stop(sprintf("%s: bandwidth must be positive and finite", where), call. = FALSE)
     }
@@ -383,6 +540,8 @@ npindexbw.NULL <-
   }
 
   if (identical(bwtype, "fixed") && !is.null(lower) && candidate$value < lower) {
+    if (!strict)
+      return(NULL)
     stop(sprintf("%s: bandwidth is below the continuous scale-factor lower bound", where),
          call. = FALSE)
   }
@@ -437,7 +596,7 @@ npindexbw.NULL <-
     beta.start.raw[!is.finite(beta.start.raw)] <- 0
   fit.proxy <- .npindex_index_from_beta_tail(xmat, beta.start.raw)
 
-  if (isTRUE(all.equal(as.double(baseline.bws$bw[1L]), 0))) {
+  if (identical(as.double(baseline.bws$bw[1L]), 0)) {
     h.start.raw <- .npindex_default_start_bandwidth(
       fit = fit.proxy,
       bwtype = "fixed",
@@ -447,20 +606,12 @@ npindexbw.NULL <-
   } else {
     h.lower.raw <- h.start.controls$scale.factor.search.lower *
       .npindex_start_bandwidth_scale(fit = fit.proxy, nobs = nobs)
-    h.start.raw <- tryCatch(
-      .npindex_finalize_bandwidth(
-        h = baseline.bws$bw[1L],
-        bwtype = "fixed",
-        nobs = nobs,
-        lower = h.lower.raw,
-        where = "npindexbw"
-      ),
-      error = function(e) .npindex_default_start_bandwidth(
-        fit = fit.proxy,
-        bwtype = "fixed",
-        nobs = nobs,
-        start.controls = h.start.controls
-      )
+    h.start.raw <- .npindex_finalize_bandwidth(
+      h = baseline.bws$bw[1L],
+      bwtype = "fixed",
+      nobs = nobs,
+      lower = h.lower.raw,
+      where = "npindexbw"
     )
   }
   if (!is.finite(h.start.raw) || h.start.raw <= 0)
@@ -490,8 +641,9 @@ npindexbw.NULL <-
   start_matrix.raw[, degree.col] <- as.integer(degree.starts[, 1L])
 
   if (nmulti > 1L) {
-    seed.state <- .np_seed_enter(random.seed)
-    on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
+    seed.state <- .np_rng_scope_capture(collective = .npRmpi_rng_scope_collective())
+    on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+    .np_rng_scope_seed(seed.state, random.seed)
 
     for (j in 2:nmulti) {
       if (length(beta.free)) {
@@ -543,8 +695,6 @@ npindexbw.NULL <-
 
   ckertype <- as.character(bws$ckertype)[1L]
   ckerorder <- as.integer(bws$ckerorder)[1L]
-  if (identical(ckertype, "truncated gaussian"))
-    return(FALSE)
   if (!identical(ckertype, "uniform") &&
       (!is.finite(ckerorder) || ckerorder != 2L))
     return(FALSE)
@@ -572,11 +722,6 @@ npindexbw.NULL <-
   h >= (diff(range(vals)) / cont_utol)
 }
 
-.npindexbw_is_degree0_policy <- function(policy) {
-  degree <- as.integer(policy$canonical.degree)
-  length(degree) > 0L && all(degree == 0L)
-}
-
 .npindexbw_check_index_bound_contract <- function(bws,
                                                   policy,
                                                   where = "npindexbw") {
@@ -602,20 +747,10 @@ npindexbw.NULL <-
   invisible(TRUE)
 }
 
-.npindexbw_build_lp_regression_leaf <- function(index,
-                                                ydat,
-                                                h,
-                                                bws,
-                                                spec) {
-  index.df <- data.frame(index = as.double(index))
-  engine.regtype <- if (is.null(spec$regtype.engine) ||
-                        !length(spec$regtype.engine)) {
-    "lc"
-  } else {
-    as.character(spec$regtype.engine[1L])
-  }
+.npindexbw_lp_regression_leaf_spec <- function(spec) {
+  engine.regtype <- as.character(spec$regtype.engine)[1L]
   engine.basis <- if (identical(engine.regtype, "lp")) {
-    as.character(spec$basis.engine)
+    as.character(spec$basis.engine)[1L]
   } else {
     "glp"
   }
@@ -626,11 +761,37 @@ npindexbw.NULL <-
   }
   engine.bernstein <- identical(engine.regtype, "lp") &&
     isTRUE(spec$bernstein.basis.engine)
-  reg.args <- list(
+
+  list(
     regtype = engine.regtype,
+    pregtype = switch(
+      engine.regtype,
+      lc = "Local-Constant",
+      lp = "Local-Polynomial",
+      stop("internal error: unsupported npindex regression-leaf type", call. = FALSE)
+    ),
     basis = engine.basis,
     degree = engine.degree,
     bernstein.basis = engine.bernstein,
+    regtype.engine = engine.regtype,
+    basis.engine = engine.basis,
+    degree.engine = if (identical(engine.regtype, "lp")) engine.degree else 0L,
+    bernstein.basis.engine = engine.bernstein
+  )
+}
+
+.npindexbw_prepare_lp_regression_leaf_descriptor <- function(index,
+                                                             ydat,
+                                                             h,
+                                                             bws,
+                                                             spec) {
+  index.df <- data.frame(index = as.double(index))
+  leaf.spec <- .npindexbw_lp_regression_leaf_spec(spec)
+  reg.args <- list(
+    regtype = leaf.spec$regtype,
+    basis = leaf.spec$basis,
+    degree = leaf.spec$degree,
+    bernstein.basis = leaf.spec$bernstein.basis,
     bwmethod = "cv.ls",
     bwtype = bws$type,
     ckertype = bws$ckertype,
@@ -642,24 +803,211 @@ npindexbw.NULL <-
     okertype = if (is.null(bws$okertype)) "liracine" else bws$okertype
   )
 
-  list(
-    xdat = index.df,
-    bws = .npregbw_build_rbandwidth(
-      xdat = index.df,
-      ydat = ydat,
-      bws = c(h),
-      bandwidth.compute = FALSE,
-      reg.args = reg.args,
-      yname = if (is.null(bws$ynames)) "y" else as.character(bws$ynames[1L])
-    )
+  structure(
+    list(
+      bws = .npregbw_build_rbandwidth(
+        xdat = index.df,
+        ydat = ydat,
+        bws = c(h),
+        bandwidth.compute = FALSE,
+        reg.args = reg.args,
+        yname = if (is.null(bws$ynames)) "y" else as.character(bws$ynames[1L])
+      )
+    ),
+    class = "npindex_lp_regression_leaf_descriptor"
   )
 }
 
-.npindexbw_with_inner_bandwidth_progress_suppressed <- function(expr) {
-  old.state <- .np_progress_runtime$bandwidth_state
-  .np_progress_runtime$bandwidth_state <- NULL
-  on.exit(.np_progress_runtime$bandwidth_state <- old.state, add = TRUE)
-  force(expr)
+.npindexbw_refresh_lp_regression_leaf <- function(descriptor,
+                                                  index,
+                                                  h,
+                                                  spec) {
+  if (!inherits(descriptor, "npindex_lp_regression_leaf_descriptor") ||
+      !is.list(descriptor$bws)) {
+    stop("internal error: invalid npindex regression-leaf descriptor", call. = FALSE)
+  }
+
+  index.df <- data.frame(index = as.double(index))
+  leaf.bws <- descriptor$bws
+  leaf.spec <- .npindexbw_lp_regression_leaf_spec(spec)
+  leaf.bws$bw <- c(as.double(h))
+  for (field in names(leaf.spec))
+    leaf.bws[[field]] <- leaf.spec[[field]]
+
+  ## The scalar index changes with every beta candidate. Keep no stale
+  ## index-derived metadata in the otherwise immutable descriptor.
+  leaf.bws$xdati <- untangle(index.df)
+  leaf.bws$dati$x <- leaf.bws$xdati
+  bounds <- npKernelBoundsResolve(
+    dati = leaf.bws$xdati,
+    varnames = names(index.df),
+    kerbound = leaf.bws$ckerbound,
+    kerlb = leaf.bws$ckerlb,
+    kerub = leaf.bws$ckerub,
+    argprefix = "cker",
+    range.policy = if (identical(leaf.bws$ckertype, "beta"))
+      "beta_half_spacing" else "exact"
+  )
+  leaf.bws$ckerbound <- bounds$bound
+  leaf.bws$ckerlb <- bounds$lb
+  leaf.bws$ckerub <- bounds$ub
+
+  list(xdat = index.df, bws = leaf.bws)
+}
+
+.npindexbw_lp_regression_leaf <- function(descriptor,
+                                          index,
+                                          ydat,
+                                          h,
+                                          bws,
+                                          spec) {
+  if (is.null(descriptor)) {
+    descriptor <- .npindexbw_prepare_lp_regression_leaf_descriptor(
+      index = index,
+      ydat = ydat,
+      h = h,
+      bws = bws,
+      spec = spec
+    )
+  }
+  .npindexbw_refresh_lp_regression_leaf(
+    descriptor = descriptor,
+    index = index,
+    h = h,
+    spec = spec
+  )
+}
+
+.npindexbw_prepare_lp_regression_leaf_owner <- function(xmat,
+                                                        ydat,
+                                                        bws,
+                                                        spec) {
+  beta <- as.double(bws$beta)
+  if (length(beta) != ncol(xmat) || any(!is.finite(beta)))
+    stop("internal error: invalid npindex regression-leaf beta state", call. = FALSE)
+  h <- as.double(bws$bw)[1L]
+  if (!is.finite(h))
+    stop("internal error: invalid npindex regression-leaf bandwidth state", call. = FALSE)
+
+  .npindexbw_prepare_lp_regression_leaf_descriptor(
+    ## The single-index identification contract fixes beta[1] at one.  A
+    ## bandwidth object's pre-search placeholder can still contain zero in
+    ## that slot, so do not let the prepared descriptor see a spurious
+    ## constant index (which is invalid for ckerbound = "range").
+    index = .npindex_index_from_beta_tail(xmat, beta[-1L]),
+    ydat = ydat,
+    h = h,
+    bws = bws,
+    spec = spec
+  )
+}
+
+.npindexbw_raw_objective_valid <- function(value) {
+  value <- as.numeric(value)
+  length(value) == 1L && !is.na(value) && is.finite(value) &&
+    !identical(value, .Machine$double.xmax)
+}
+
+.npindexbw_ichimura_outer_penalty <- function(ydat) {
+  ydat <- as.double(ydat)
+  nobs <- length(ydat)
+  if (nobs <= 1L || anyNA(ydat) || any(!is.finite(ydat)))
+    return(.Machine$double.xmax)
+
+  center <- mean(ydat)
+  mse0 <- mean((ydat - center)^2)
+  loo.scale <- nobs / (nobs - 1)
+  reference <- loo.scale * loo.scale * mse0
+  if (!is.finite(reference) || reference < 0)
+    return(.Machine$double.xmax)
+
+  penalty <- 10 * reference
+  if (identical(penalty, reference)) {
+    if (identical(reference, 0))
+      penalty <- .Machine$double.xmin * .Machine$double.eps
+    else
+      return(.Machine$double.xmax)
+  }
+  if (!is.finite(penalty) || penalty <= reference ||
+      identical(penalty, .Machine$double.xmax))
+    return(.Machine$double.xmax)
+  as.double(penalty)
+}
+
+.npindexbw_kleinspady_outer_penalty <- function(ydat) {
+  ydat <- as.double(ydat)
+  nobs <- length(ydat)
+  if (nobs <= 1L || anyNA(ydat) || any(!is.finite(ydat)) ||
+      any(ydat != 0 & ydat != 1))
+    return(.Machine$double.xmax)
+
+  ones <- sum(ydat == 1)
+  zeros <- nobs - ones
+  probability.floor <- sqrt(.Machine$double.eps)
+  clip <- function(probability) {
+    min(1 - probability.floor, max(probability.floor, probability))
+  }
+
+  loss.sum <- 0
+  if (zeros > 0) {
+    probability <- clip(ones / (nobs - 1))
+    loss.sum <- zeros * -log1p(-probability)
+  }
+  if (ones > 0) {
+    probability <- clip((ones - 1) / (nobs - 1))
+    loss.sum <- loss.sum + ones * -log(probability)
+  }
+  reference <- loss.sum / nobs
+  if (!is.finite(reference) || reference < 0)
+    return(.Machine$double.xmax)
+
+  penalty <- 10 * reference
+  if (!is.finite(penalty) || penalty <= reference ||
+      identical(penalty, .Machine$double.xmax))
+    return(.Machine$double.xmax)
+  as.double(penalty)
+}
+
+.npindexbw_map_ichimura_outer_result <- function(result, invalid.penalty) {
+  if (!is.list(result) || length(result$objective) != 1L)
+    stop("internal error: malformed npindex Ichimura objective result", call. = FALSE)
+  objective <- as.numeric(result$objective[1L])
+  if (.npindexbw_raw_objective_valid(objective))
+    return(result)
+  if (!identical(objective, .Machine$double.xmax))
+    stop("internal error: npindex Ichimura leaf returned a non-terminal invalid objective", call. = FALSE)
+  if (length(invalid.penalty) != 1L || is.na(invalid.penalty) ||
+      !is.finite(invalid.penalty))
+    stop("internal error: invalid npindex Ichimura outer guidance", call. = FALSE)
+  result$objective <- as.numeric(invalid.penalty)
+  result
+}
+
+.npindexbw_map_kleinspady_outer_result <- function(result, invalid.penalty) {
+  if (!is.list(result) || length(result$objective) != 1L)
+    stop("internal error: malformed npindex Klein-Spady objective result", call. = FALSE)
+  objective <- as.numeric(result$objective[1L])
+  if (.npindexbw_raw_objective_valid(objective))
+    return(result)
+  if (!identical(objective, .Machine$double.xmax))
+    stop("internal error: npindex Klein-Spady leaf returned a non-terminal invalid objective", call. = FALSE)
+  if (length(invalid.penalty) != 1L || is.na(invalid.penalty) ||
+      !is.finite(invalid.penalty))
+    stop("internal error: invalid npindex Klein-Spady outer guidance", call. = FALSE)
+  result$objective <- as.numeric(invalid.penalty)
+  result
+}
+
+.npindexbw_objective_result <- function(objective,
+                                        num.feval.fast,
+                                        certify = FALSE) {
+  result <- list(
+    objective = as.numeric(objective),
+    num.feval.fast = as.numeric(num.feval.fast)
+  )
+  if (isTRUE(certify))
+    result$raw.valid <- .npindexbw_raw_objective_valid(result$objective)
+  result
 }
 
 .npindexbw_eval_ichimura_lp_via_npreg <- function(index,
@@ -667,9 +1015,11 @@ npindexbw.NULL <-
                                                   h,
                                                   bws,
                                                   spec,
-                                                  invalid.penalty,
-                                                  localize = TRUE) {
-  leaf <- .npindexbw_build_lp_regression_leaf(
+                                                  localize = TRUE,
+                                                  leaf.descriptor = NULL,
+                                                  .entry.guard = NULL) {
+  leaf <- .npindexbw_lp_regression_leaf(
+    descriptor = leaf.descriptor,
     index = index,
     ydat = ydat,
     h = h,
@@ -677,22 +1027,22 @@ npindexbw.NULL <-
     spec = spec
   )
 
-  out <- tryCatch(
-    .npindexbw_with_inner_bandwidth_progress_suppressed(
-      .npregbw_eval_only(
-        xdat = leaf$xdat,
-        ydat = ydat,
-        bws = leaf$bws,
-        invalid.penalty = "baseline",
-        penalty.multiplier = 10,
-        localize = localize
-      )
-    ),
-    error = function(e) NULL
+  out <- .np_progress_with_nested_bandwidth_heartbeat(
+    .npregbw_eval_only(
+      xdat = leaf$xdat,
+      ydat = ydat,
+      bws = leaf$bws,
+      invalid.penalty = "dbmax",
+      penalty.multiplier = 10,
+      localize = localize,
+      .entry.guard = .entry.guard
+    )
   )
 
-  if (is.null(out) || !is.finite(out$objective[1L]))
-    return(list(objective = as.numeric(invalid.penalty), num.feval.fast = 0L))
+  if (!is.list(out) || length(out$objective) != 1L ||
+      length(out$num.feval.fast) < 1L || is.na(out$objective[1L]) ||
+      !is.finite(out$objective[1L]))
+    stop("internal error: malformed npreg result in npindex Ichimura leaf", call. = FALSE)
 
   list(
     objective = as.numeric(out$objective[1L]),
@@ -705,9 +1055,11 @@ npindexbw.NULL <-
                                                      h,
                                                      bws,
                                                      spec,
-                                                     invalid.penalty,
-                                                     localize = TRUE) {
-  leaf <- .npindexbw_build_lp_regression_leaf(
+                                                     localize = TRUE,
+                                                     leaf.descriptor = NULL,
+                                                     .entry.guard = NULL) {
+  leaf <- .npindexbw_lp_regression_leaf(
+    descriptor = leaf.descriptor,
     index = index,
     ydat = ydat,
     h = h,
@@ -715,27 +1067,72 @@ npindexbw.NULL <-
     spec = spec
   )
 
-  out <- tryCatch(
-    .npindexbw_with_inner_bandwidth_progress_suppressed(
-      .npregbw_eval_only(
-        xdat = leaf$xdat,
-        ydat = ydat,
-        bws = leaf$bws,
-        invalid.penalty = "dbmax",
-        penalty.multiplier = 10,
-        localize = localize,
-        objective = "ks"
-      )
-    ),
-    error = function(e) NULL
+  out <- .np_progress_with_nested_bandwidth_heartbeat(
+    .npregbw_eval_only(
+      xdat = leaf$xdat,
+      ydat = ydat,
+      bws = leaf$bws,
+      invalid.penalty = "dbmax",
+      penalty.multiplier = 10,
+      localize = localize,
+      objective = "ks",
+      .entry.guard = .entry.guard
+    )
   )
 
-  if (is.null(out) || !is.finite(out$objective[1L]))
-    return(list(objective = as.numeric(invalid.penalty), num.feval.fast = 0L))
+  if (!is.list(out) || length(out$objective) != 1L ||
+      length(out$num.feval.fast) < 1L || is.na(out$objective[1L]) ||
+      !is.finite(out$objective[1L]))
+    stop("internal error: malformed npreg result in npindex Klein-Spady leaf", call. = FALSE)
 
   list(
     objective = as.numeric(out$objective[1L]),
     num.feval.fast = as.numeric(out$num.feval.fast[1L])
+  )
+}
+
+.npindexbw_eval_raw_via_npreg <- function(index,
+                                          ydat,
+                                          h,
+                                          bws,
+                                          spec,
+                                          localize = TRUE,
+                                          leaf.descriptor = NULL,
+                                          objective = NULL,
+                                          .entry.guard = NULL) {
+  leaf <- .npindexbw_lp_regression_leaf(
+    descriptor = leaf.descriptor,
+    index = index,
+    ydat = ydat,
+    h = h,
+    bws = bws,
+    spec = spec
+  )
+  eval.args <- list(
+    xdat = leaf$xdat,
+    ydat = ydat,
+    bws = leaf$bws,
+    invalid.penalty = "dbmax",
+    penalty.multiplier = 10,
+    localize = localize,
+    .entry.guard = .entry.guard
+  )
+  if (!is.null(objective)) eval.args$objective <- objective
+  out <- tryCatch(
+    .np_progress_with_nested_bandwidth_heartbeat(
+      do.call(.npregbw_eval_only, eval.args)
+    ),
+    error = function(e) {
+      if (!is.null(.entry.guard)) stop(e)
+      NULL
+    }
+  )
+  if (is.null(out) || !is.finite(out$objective[1L]))
+    return(.npindexbw_objective_result(.Machine$double.xmax, 0L, TRUE))
+  .npindexbw_objective_result(
+    objective = out$objective[1L],
+    num.feval.fast = out$num.feval.fast[1L],
+    certify = TRUE
   )
 }
 
@@ -776,16 +1173,6 @@ npindexbw.NULL <-
   )
 }
 
-.npindexbw_service_eval_preflight <- function(ok,
-                                              comm = 1L) {
-  local.invalid <- if (isTRUE(ok)) 0.0 else 1.0
-  total.invalid <- mpi.allreduce(as.double(local.invalid),
-                                 type = 2,
-                                 op = "sum",
-                                 comm = comm)
-  as.numeric(total.invalid[1L]) > 0.0
-}
-
 .npindexbw_service_param_ok <- function(param, expected.length) {
   param <- as.numeric(param)
   expected.length <- as.integer(expected.length)[1L]
@@ -822,13 +1209,74 @@ npindexbw.NULL <-
   invisible(err)
 }
 
+# These phases cover R preparation and R result handling after native return.
+# An unwind inside collective native work is not a completed transaction and
+# must not be followed by a mismatched R recovery collective.
+.npindexbw_service_transaction <- function(ctx, evaluate) {
+  guard <- new.env(parent = emptyenv())
+  guard$phase <- "preparing"
+  guard$error <- NULL
+  shared.error <- function(error) {
+    source <- mpi.allreduce(if (is.null(error)) ctx$size else ctx$rank,
+                            type = 1L, op = "min", comm = ctx$comm)
+    received <- mpi.bcast.Robj(if (ctx$rank == source) error else NULL,
+                               rank = source, comm = ctx$comm)
+    if (ctx$rank == source) error else received
+  }
+  guard$enter <- function(native, error = NULL) {
+    guard$phase <- "agreement"
+    counts <- mpi.allreduce(c(as.integer(!is.null(error)), as.integer(native)),
+                            type = 1L, op = "sum", comm = ctx$comm)
+    if (counts[1L] > 0L) {
+      guard$error <- shared.error(error)
+      guard$phase <- "agreed.error"
+      stop(guard$error)
+    }
+    if (!(counts[2L] %in% c(0L, ctx$size))) {
+      guard$error <- simpleError("npindex service ranks disagree on native entry")
+      guard$phase <- "agreed.error"
+      stop(guard$error)
+    }
+    guard$phase <- if (native) "native" else "skipped"
+    invisible(NULL)
+  }
+  capture <- function(expr) tryCatch(list(value = force(expr)),
+    error = function(e) list(error = e), interrupt = function(e) list(error = e))
+  result <- capture(evaluate(guard))
+  if (identical(guard$phase, "preparing")) {
+    ready <- capture(guard$enter(native = FALSE, error = result$error))
+    if (!is.null(ready$error)) result <- ready
+  }
+  if (identical(guard$phase, "returned")) {
+    failed <- mpi.allreduce(as.integer(!is.null(result$error)),
+                             type = 1L, op = "sum", comm = ctx$comm)
+    if (failed > 0L) {
+      guard$error <- shared.error(result$error)
+      guard$phase <- "agreed.error"
+    }
+  }
+  if (identical(guard$phase, "agreed.error")) {
+    if (isTRUE(ctx$root)) stop(guard$error)
+    # Workers stay in this service until its existing terminal command arrives.
+    return(invisible(list(service.error = guard$error)))
+  }
+  if (!is.null(result$error)) stop(result$error)
+  result$value
+}
+
 .npindexbw_eval_objective_service_traced <- function(param,
                                                      xmat,
                                                      ydat,
                                                      bws,
                                                      spec,
                                                      ctx,
-                                                     eval_id = NA_integer_) {
+                                                     eval_id = NA_integer_,
+                                                     retain.raw = FALSE,
+                                                     .entry.guard = NULL) {
+  if (is.null(.entry.guard))
+    return(.npindexbw_service_transaction(ctx, function(guard)
+      .npindexbw_eval_objective_service_traced(param, xmat, ydat, bws, spec,
+        ctx, eval_id, retain.raw, .entry.guard = guard)))
   assignments <- .splitIndices(nrow(xmat), ctx$size)
   local.idx <- if (length(assignments) >= (ctx$rank + 1L)) {
     assignments[[ctx$rank + 1L]]
@@ -858,13 +1306,17 @@ npindexbw.NULL <-
       ydat = ydat,
       bws = bws,
       spec = spec,
-      localize = FALSE
+      leaf.descriptor = ctx$leaf.descriptor,
+      localize = FALSE,
+      invalid.penalty = ctx$invalid.penalty,
+      retain.raw = retain.raw,
+      .entry.guard = .entry.guard
     ),
     error = function(e) {
       list(
         objective = NA_real_,
         num.feval.fast = 0L,
-        error = conditionMessage(e)
+        error = e
       )
     }
   )
@@ -883,11 +1335,89 @@ npindexbw.NULL <-
       elapsed = proc.time()[3L] - started,
       objective = if (is.null(out$objective)) NA_real_ else as.numeric(out$objective[1L]),
       ok = is.null(out$error),
-      error = if (is.null(out$error)) "" else out$error
+      error = if (is.null(out$error)) "" else conditionMessage(out$error)
     )
   )
   if (!is.null(out$error))
-    stop(out$error, call. = FALSE)
+    stop(out$error)
+  out
+}
+
+.npindexbw_eval_objective_raw_service_traced <- function(param,
+                                                         xmat,
+                                                         ydat,
+                                                         bws,
+                                                         spec,
+                                                         ctx,
+                                                         eval_id = NA_integer_,
+                                                         .entry.guard = NULL) {
+  if (is.null(.entry.guard))
+    return(.npindexbw_service_transaction(ctx, function(guard)
+      .npindexbw_eval_objective_raw_service_traced(param, xmat, ydat, bws, spec,
+        ctx, eval_id, .entry.guard = guard)))
+  assignments <- .splitIndices(nrow(xmat), ctx$size)
+  local.idx <- if (length(assignments) >= (ctx$rank + 1L)) {
+    assignments[[ctx$rank + 1L]]
+  } else {
+    integer(0L)
+  }
+  started <- proc.time()[3L]
+  .npRmpi_transport_trace(
+    role = "npindex.npreg_loo.service",
+    event = "eval.enter",
+    fields = list(
+      service_id = ctx$service_id,
+      executor = if (is.null(ctx$executor)) "npreg_loo" else ctx$executor,
+      eval_id = eval_id,
+      rank = ctx$rank,
+      size = ctx$size,
+      nominal_partition_rows = length(local.idx),
+      objective_rows = nrow(xmat),
+      localize = FALSE,
+      certify = TRUE,
+      n = nrow(xmat)
+    )
+  )
+  out <- tryCatch(
+    .npindexbw_eval_objective_raw(
+      param = param,
+      xmat = xmat,
+      ydat = ydat,
+      bws = bws,
+      spec = spec,
+      leaf.descriptor = ctx$leaf.descriptor,
+      localize = FALSE,
+      .entry.guard = .entry.guard
+    ),
+    error = function(e) {
+      list(
+        objective = NA_real_,
+        num.feval.fast = 0L,
+        error = e
+      )
+    }
+  )
+  .npRmpi_transport_trace(
+    role = "npindex.npreg_loo.service",
+    event = "eval.exit",
+    fields = list(
+      service_id = ctx$service_id,
+      executor = if (is.null(ctx$executor)) "npreg_loo" else ctx$executor,
+      eval_id = eval_id,
+      rank = ctx$rank,
+      size = ctx$size,
+      nominal_partition_rows = length(local.idx),
+      objective_rows = nrow(xmat),
+      localize = FALSE,
+      certify = TRUE,
+      elapsed = proc.time()[3L] - started,
+      objective = if (is.null(out$objective)) NA_real_ else as.numeric(out$objective[1L]),
+      ok = is.null(out$error),
+      error = if (is.null(out$error)) "" else conditionMessage(out$error)
+    )
+  )
+  if (!is.null(out$error))
+    stop(out$error)
   out
 }
 
@@ -936,21 +1466,24 @@ npindexbw.NULL <-
       task.ctx$service_id <- task.service
 
     if (identical(task$kind, "eval")) {
-      param <- if (is.null(task$param)) numeric(0L) else as.numeric(task$param)
-      invalid.eval <- .npindexbw_service_eval_preflight(
-        ok = .npindexbw_service_param_ok(param, ncol(xmat)),
-        comm = task.ctx$comm
-      )
-      if (isTRUE(invalid.eval)) {
-        .npindexbw_ichimura_lp_service_task_error(
-          "malformed npindex Ichimura LP eval task",
-          task = task,
-          ctx = task.ctx
-        )
-        next
-      }
+      param <- task$param
       task.spec <- if (is.null(task$spec)) spec else task$spec
       .npindexbw_eval_objective_service_traced(
+        param = param,
+        xmat = xmat,
+        ydat = ydat,
+        bws = bws,
+        spec = task.spec,
+        ctx = task.ctx,
+        eval_id = if (is.null(task$eval_id)) NA_integer_ else as.integer(task$eval_id[1L])
+      )
+      next
+    }
+
+    if (identical(task$kind, "certify")) {
+      param <- task$param
+      task.spec <- if (is.null(task$spec)) spec else task$spec
+      .npindexbw_eval_objective_raw_service_traced(
         param = param,
         xmat = xmat,
         ydat = ydat,
@@ -992,7 +1525,8 @@ npindexbw.NULL <-
                                                 bws,
                                                 spec,
                                                 ctx,
-                                                eval_id = NA_integer_) {
+                                                eval_id = NA_integer_,
+                                                  retain.raw = FALSE) {
   mpi.bcast.Robj(
     list(
       kind = "eval",
@@ -1005,17 +1539,38 @@ npindexbw.NULL <-
     comm = ctx$comm
   )
 
-  invalid.eval <- .npindexbw_service_eval_preflight(
-    ok = .npindexbw_service_param_ok(param, ncol(xmat)),
-    comm = ctx$comm
-  )
-  if (isTRUE(invalid.eval))
-    return(list(
-      objective = 10 * mean(ydat^2),
-      num.feval.fast = 0L
-    ))
 
   .npindexbw_eval_objective_service_traced(
+    param = as.numeric(param),
+    xmat = xmat,
+    ydat = ydat,
+    bws = bws,
+    spec = spec,
+    ctx = ctx,
+    eval_id = eval_id,
+    retain.raw = retain.raw
+  )
+}
+
+.npindexbw_ichimura_lp_service_certify <- function(param,
+                                                   xmat,
+                                                   ydat,
+                                                   bws,
+                                                   spec,
+                                                   ctx,
+                                                   eval_id = NA_integer_) {
+  mpi.bcast.Robj(
+    list(
+      kind = "certify",
+      service_id = ctx$service_id,
+      eval_id = eval_id,
+      param = as.numeric(param),
+      spec = spec
+    ),
+    rank = 0L,
+    comm = ctx$comm
+  )
+  .npindexbw_eval_objective_raw_service_traced(
     param = as.numeric(param),
     xmat = xmat,
     ydat = ydat,
@@ -1125,22 +1680,26 @@ npindexbw.NULL <-
     }
 
     if (identical(task$kind, "eval")) {
-      beta <- if (is.null(task$beta)) numeric(0L) else as.double(task$beta)
-      h <- if (is.null(task$h)) NA_real_ else as.double(task$h[1L])
-      invalid.eval <- .npindexbw_service_eval_preflight(
-        ok = .npindexbw_service_param_ok(c(beta, h), ncol(xmat)),
-        comm = ctx$comm
-      )
-      if (isTRUE(invalid.eval)) {
-        .npindexbw_kleinspady_lp_service_task_error(
-          "malformed npindex Klein-Spady LP eval task",
-          task = task,
-          ctx = ctx
-        )
-        next
-      }
+      beta <- task$beta
+      h <- task$h
       task.spec <- if (is.null(task$spec)) spec else task$spec
       .npindexbw_eval_objective_service_traced(
+        param = c(beta, h),
+        xmat = xmat,
+        ydat = ydat,
+        bws = bws,
+        spec = task.spec,
+        ctx = ctx,
+        eval_id = if (is.null(task$eval_id)) NA_integer_ else as.integer(task$eval_id[1L])
+      )
+      next
+    }
+
+    if (identical(task$kind, "certify")) {
+      beta <- task$beta
+      h <- task$h
+      task.spec <- if (is.null(task$spec)) spec else task$spec
+      .npindexbw_eval_objective_raw_service_traced(
         param = c(beta, h),
         xmat = xmat,
         ydat = ydat,
@@ -1174,7 +1733,8 @@ npindexbw.NULL <-
                                                   bws,
                                                   spec,
                                                   ctx,
-                                                  eval_id = NA_integer_) {
+                                                  eval_id = NA_integer_,
+                                                  retain.raw = FALSE) {
   mpi.bcast.Robj(
     list(
       kind = "eval",
@@ -1188,15 +1748,6 @@ npindexbw.NULL <-
     comm = ctx$comm
   )
 
-  invalid.eval <- .npindexbw_service_eval_preflight(
-    ok = .npindexbw_service_param_ok(c(beta, h), ncol(xmat)),
-    comm = ctx$comm
-  )
-  if (isTRUE(invalid.eval))
-    return(list(
-      objective = sqrt(.Machine$double.xmax),
-      invalid = TRUE
-    ))
 
   objective <- .npindexbw_eval_objective_service_traced(
     param = c(as.numeric(beta), as.numeric(h)[1L]),
@@ -1205,11 +1756,46 @@ npindexbw.NULL <-
     bws = bws,
     spec = spec,
     ctx = ctx,
-    eval_id = eval_id
+    eval_id = eval_id,
+    retain.raw = retain.raw
   )
-  list(
+  result <- list(
     objective = as.numeric(objective$objective[1L]),
     invalid = !is.finite(as.numeric(objective$objective[1L]))
+  )
+  if (isTRUE(retain.raw))
+    result$raw.objective <- objective[["raw.objective"]]
+  result
+}
+
+.npindexbw_kleinspady_lp_service_certify <- function(beta,
+                                                     h,
+                                                     xmat,
+                                                     ydat,
+                                                     bws,
+                                                     spec,
+                                                     ctx,
+                                                     eval_id = NA_integer_) {
+  mpi.bcast.Robj(
+    list(
+      kind = "certify",
+      service_id = ctx$service_id,
+      eval_id = eval_id,
+      beta = as.numeric(beta),
+      h = as.numeric(h)[1L],
+      spec = spec
+    ),
+    rank = 0L,
+    comm = ctx$comm
+  )
+  .npindexbw_eval_objective_raw_service_traced(
+    param = c(as.numeric(beta), as.numeric(h)[1L]),
+    xmat = xmat,
+    ydat = ydat,
+    bws = bws,
+    spec = spec,
+    ctx = ctx,
+    eval_id = eval_id
   )
 }
 
@@ -1272,7 +1858,10 @@ npindexbw.NULL <-
   out
 }
 
-.npindexbw_run_fixed_degree <- function(xdat, ydat, bws, template, reg.args, opt.args) {
+.npindexbw_run_fixed_degree <- function(xdat, ydat, bws, template, reg.args,
+                                        opt.args, .certify.selected = TRUE,
+                                        .fixed.h.lower = NULL,
+                                        .rng.collective = .npRmpi_rng_scope_collective()) {
   tbw <- .npindexbw_build_sibandwidth(
     xdat = xdat,
     ydat = ydat,
@@ -1282,7 +1871,20 @@ npindexbw.NULL <-
     reg.args = reg.args
   )
 
-  do.call(npindexbw.sibandwidth, c(list(xdat = xdat, ydat = ydat, bws = tbw), opt.args))
+  do.call(
+    npindexbw.sibandwidth,
+    c(
+      list(
+        xdat = xdat,
+        ydat = ydat,
+        bws = tbw,
+        .certify.selected = .certify.selected,
+        .fixed.h.lower = .fixed.h.lower,
+        .rng.collective = .rng.collective
+      ),
+      opt.args
+    )
+  )
 }
 
 .npindexbw_eval_objective <- function(param,
@@ -1290,7 +1892,11 @@ npindexbw.NULL <-
                                       ydat,
                                       bws,
                                       spec,
-                                      localize = TRUE) {
+                                      leaf.descriptor = NULL,
+                                      localize = TRUE,
+                                      invalid.penalty = NULL,
+                                      retain.raw = FALSE,
+                                      .entry.guard = NULL) {
   p <- ncol(xmat)
   beta.idx <- if (p > 1L) seq_len(p - 1L) else integer(0)
   beta <- if (length(beta.idx)) as.double(param[beta.idx]) else numeric(0)
@@ -1310,11 +1916,17 @@ npindexbw.NULL <-
   spec <- policy$objective.spec
 
   if (identical(bws$method, "ichimura")) {
-    invalid.penalty <- 10 * mean(ydat^2)
+    if (is.null(invalid.penalty))
+      invalid.penalty <- .npindexbw_ichimura_outer_penalty(ydat)
+  } else if (identical(bws$method, "kleinspady")) {
+    if (is.null(invalid.penalty))
+      invalid.penalty <- .npindexbw_kleinspady_outer_penalty(ydat)
   } else {
-    invalid.penalty <- sqrt(.Machine$double.xmax)
+    stop("unsupported npindex method", call. = FALSE)
   }
 
+  if (!is.null(.entry.guard) && !.npindexbw_service_param_ok(param, p))
+    return(list(objective = invalid.penalty, num.feval.fast = 0L))
   h.candidate <- .npindex_nn_candidate_bandwidth(h = h, bwtype = bws$type, nobs = nobs)
   if (!h.candidate$ok)
     return(list(objective = invalid.penalty, num.feval.fast = 0L))
@@ -1323,30 +1935,142 @@ npindexbw.NULL <-
   index <- xmat %*% c(1, beta)
 
   if (identical(bws$method, "ichimura")) {
-    return(.npindexbw_eval_ichimura_lp_via_npreg(
+    result <- .npindexbw_eval_ichimura_lp_via_npreg(
       index = index,
       ydat = ydat,
       h = h,
       bws = bws,
       spec = spec,
-      invalid.penalty = invalid.penalty,
-      localize = localize
-    ))
+      localize = localize,
+      leaf.descriptor = leaf.descriptor,
+      .entry.guard = .entry.guard
+    )
+    if (isTRUE(retain.raw))
+      result$raw.objective <- result$objective
+    return(.npindexbw_map_ichimura_outer_result(result, invalid.penalty))
   }
 
   if (identical(bws$method, "kleinspady")) {
-    return(.npindexbw_eval_kleinspady_lp_via_npreg(
+    result <- .npindexbw_eval_kleinspady_lp_via_npreg(
       index = index,
       ydat = ydat,
       h = h,
       bws = bws,
       spec = spec,
-      invalid.penalty = invalid.penalty,
-      localize = localize
-    ))
+      localize = localize,
+      leaf.descriptor = leaf.descriptor,
+      .entry.guard = .entry.guard
+    )
+    if (isTRUE(retain.raw))
+      result$raw.objective <- result$objective
+    return(.npindexbw_map_kleinspady_outer_result(result, invalid.penalty))
   }
 
   stop("unsupported npindex method", call. = FALSE)
+}
+
+.npindexbw_eval_objective_raw <- function(param,
+                                          xmat,
+                                          ydat,
+                                          bws,
+                                          spec,
+                                          leaf.descriptor = NULL,
+                                          localize = TRUE,
+                                          .entry.guard = NULL) {
+  if (!is.null(.entry.guard) && !.npindexbw_service_param_ok(param, ncol(xmat)))
+    return(.npindexbw_objective_result(.Machine$double.xmax, 0L, TRUE))
+  p <- ncol(xmat)
+  beta.idx <- if (p > 1L) seq_len(p - 1L) else integer(0)
+  beta <- if (length(beta.idx)) as.double(param[beta.idx]) else numeric(0)
+  h <- as.double(param[p])
+  policy <- .npindex_objective_policy(
+    bws = bws,
+    spec = spec,
+    bandwidth.compute = TRUE,
+    where = "npindexbw objective"
+  )
+  .npindexbw_check_index_bound_contract(
+    bws = bws,
+    policy = policy,
+    where = "npindexbw objective"
+  )
+  spec <- policy$objective.spec
+  h.candidate <- .npindex_nn_candidate_bandwidth(
+    h = h,
+    bwtype = bws$type,
+    nobs = nrow(xmat)
+  )
+  if (!h.candidate$ok)
+    return(.npindexbw_objective_result(.Machine$double.xmax, 0L, TRUE))
+  index <- xmat %*% c(1, beta)
+  if (identical(bws$method, "ichimura")) {
+    return(.npindexbw_eval_raw_via_npreg(
+      index = index, ydat = ydat, h = h.candidate$value, bws = bws,
+      spec = spec, localize = localize, leaf.descriptor = leaf.descriptor,
+      .entry.guard = .entry.guard
+    ))
+  }
+  if (identical(bws$method, "kleinspady")) {
+    return(.npindexbw_eval_raw_via_npreg(
+      index = index, ydat = ydat, h = h.candidate$value, bws = bws,
+      spec = spec, localize = localize, leaf.descriptor = leaf.descriptor,
+      objective = "ks", .entry.guard = .entry.guard
+    ))
+  }
+  stop("unsupported npindex method", call. = FALSE)
+}
+
+.npindexbw_certify_selected_candidate <- function(param,
+                                                   xmat,
+                                                   ydat,
+                                                   bws,
+                                                   spec,
+                                                   leaf.descriptor = NULL,
+                                                   service.ctx = NULL,
+                                                   ks.service.ctx = NULL,
+                                                   eval_id = NA_integer_) {
+  result <- if (identical(bws$method, "ichimura") &&
+                is.list(service.ctx) && isTRUE(service.ctx$active) &&
+                isTRUE(service.ctx$root)) {
+    .npindexbw_ichimura_lp_service_certify(
+      param = param,
+      xmat = xmat,
+      ydat = ydat,
+      bws = bws,
+      spec = spec,
+      ctx = service.ctx,
+      eval_id = eval_id
+    )
+  } else if (identical(bws$method, "kleinspady") &&
+             is.list(ks.service.ctx) && isTRUE(ks.service.ctx$active) &&
+             isTRUE(ks.service.ctx$root)) {
+    .npindexbw_kleinspady_lp_service_certify(
+      beta = as.double(param[-length(param)]),
+      h = as.double(param[length(param)]),
+      xmat = xmat,
+      ydat = ydat,
+      bws = bws,
+      spec = spec,
+      ctx = ks.service.ctx,
+      eval_id = eval_id
+    )
+  } else {
+    .npindexbw_eval_objective_raw(
+      param = param,
+      xmat = xmat,
+      ydat = ydat,
+      bws = bws,
+      spec = spec,
+      leaf.descriptor = leaf.descriptor
+    )
+  }
+  if (!isTRUE(result$raw.valid)) {
+    stop(
+      "npindexbw search did not return a raw-valid selected candidate",
+      call. = FALSE
+    )
+  }
+  result
 }
 
 .npindexbw_nomad_search <- function(xdat,
@@ -1393,7 +2117,28 @@ npindexbw.NULL <-
   else
     y.clean <- as.double(y.clean)
 
+  ichimura.invalid.penalty <- if (identical(baseline.bws$method, "ichimura"))
+    .npindexbw_ichimura_outer_penalty(y.clean)
+  else
+    NULL
+  kleinspady.invalid.penalty <- if (identical(baseline.bws$method, "kleinspady"))
+    .npindexbw_kleinspady_outer_penalty(y.clean)
+  else
+    NULL
+
   p <- ncol(x.clean)
+  leaf.spec <- .npindex_objective_policy(
+    bws = baseline.bws,
+    spec = template.reg.args,
+    bandwidth.compute = TRUE,
+    where = "npindexbw objective descriptor"
+  )$objective.spec
+  leaf.descriptor <- .npindexbw_prepare_lp_regression_leaf_owner(
+    xmat = x.clean,
+    ydat = y.clean,
+    bws = baseline.bws,
+    spec = leaf.spec
+  )
   beta.coord <- .npindex_beta_coordinate_setup(x.clean)
   nomad.nmulti <- if (is.null(opt.args$nmulti)) npDefaultNmulti(ncol(xdat)) else npValidateNmulti(opt.args$nmulti[1L])
   scale.factor.search.lower <- npResolveScaleFactorLowerBound(opt.args$scale.factor.search.lower)
@@ -1510,6 +2255,19 @@ npindexbw.NULL <-
       character(0L)
     }
   )
+  # All ranks certify and activate temporary RNG ownership before workers
+  # enter the objective service. Subsequent coordinator-only scopes remain
+  # locally guarded; they must not initiate an unmatched collective.
+  service.rng.collective <- .npRmpi_rng_scope_collective()
+  if (isTRUE(service.ctx$active)) {
+    service.seed.state <- .np_rng_scope_capture(collective = TRUE)
+    on.exit(.np_rng_scope_restore(service.seed.state), add = TRUE)
+    .np_rng_scope_seed(service.seed.state,
+      if (!is.null(opt.args$random.seed)) opt.args$random.seed else 42L)
+    service.rng.collective <- FALSE
+  }
+  service.ctx$leaf.descriptor <- leaf.descriptor
+  service.ctx$invalid.penalty <- ichimura.invalid.penalty
   if (isTRUE(service.ctx$active) && !isTRUE(service.ctx$root))
     return(.npindexbw_ichimura_lp_service_worker_loop(
       xmat = x.clean,
@@ -1520,13 +2278,19 @@ npindexbw.NULL <-
     ))
   service.eval.counter <- 0L
   service.done <- FALSE
+  service.failure <- NULL
   if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
     on.exit({
       if (!isTRUE(service.done))
-        .npindexbw_ichimura_lp_service_error("npindex Ichimura LP NOMAD service stopped before returning a result", service.ctx)
+        .npindexbw_ichimura_lp_service_error(
+          if (is.null(service.failure)) "npindex Ichimura LP NOMAD service stopped before returning a result" else service.failure,
+          service.ctx)
     }, add = TRUE)
   }
 
+  # Keep the original error message for the existing worker cleanup broadcast.
+  # The calling handler observes errors without catching or replacing them.
+  withCallingHandlers({
   .np_nomad_baseline_note(degree.search$start.degree)
 
   point_h_to_raw <- function(h.point) {
@@ -1552,7 +2316,7 @@ npindexbw.NULL <-
     point
   }
 
-  point_to_param <- function(point) {
+  point_to_param <- function(point, strict = TRUE) {
     beta.tail <- if (length(beta.free)) beta.coord$to_public(point[seq_along(beta.free)]) else numeric(0)
     h <- point_h_to_raw(point[length(beta.free) + 1L])
     h <- .npindex_finalize_bandwidth(
@@ -1560,8 +2324,11 @@ npindexbw.NULL <-
       bwtype = baseline.bws$type,
       nobs = nrow(x.clean),
       lower = if (fixed.nomad) h.start.controls$scale.factor.search.lower * fixed.setup$h.scale else NULL,
-      where = "npindexbw"
+      where = "npindexbw",
+      strict = strict
     )
+    if (is.null(h))
+      return(NULL)
     c(beta.tail, h)
   }
 
@@ -1583,10 +2350,15 @@ npindexbw.NULL <-
     eval.spec$degree.engine <- degree
     eval.spec$bernstein.basis.engine <- degree.search$bernstein.basis
     eval.spec$basis.engine <- reg.args$basis.engine
+    # Reject only a mathematical trial-domain failure, not callback errors.
+    param <- point_to_param(point, strict = !fixed.nomad)
+    if (is.null(param))
+      return(list(objective = Inf, degree = as.integer(degree),
+                  admissible = FALSE, num.feval = 0, num.feval.fast = 0))
     service.eval.counter <<- service.eval.counter + 1L
     objective <- if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
       .npindexbw_ichimura_lp_service_eval(
-        param = point_to_param(point),
+        param = param,
         xmat = x.clean,
         ydat = y.clean,
         bws = baseline.bws,
@@ -1596,11 +2368,16 @@ npindexbw.NULL <-
       )
     } else {
       .npindexbw_eval_objective(
-        param = point_to_param(point),
+        param = param,
         xmat = x.clean,
         ydat = y.clean,
         bws = baseline.bws,
-        spec = eval.spec
+        spec = eval.spec,
+        leaf.descriptor = leaf.descriptor,
+        invalid.penalty = if (identical(baseline.bws$method, "ichimura"))
+          ichimura.invalid.penalty
+        else
+          kleinspady.invalid.penalty
       )
     }
     nomad.num.feval.total <<- nomad.num.feval.total + 1L
@@ -1644,7 +2421,8 @@ npindexbw.NULL <-
         xdat = xdat,
         ydat = ydat,
         bws = tbw,
-        bandwidth.compute = FALSE
+        bandwidth.compute = FALSE,
+        .rng.collective = service.rng.collective
       )
       if (!is.null(payload$method) && length(payload$method))
         payload$pmethod <- bwmToPrint(as.character(payload$method[1L]))
@@ -1678,7 +2456,12 @@ npindexbw.NULL <-
           bws = bw.vec,
           template = template,
           reg.args = hot.reg.args,
-          opt.args = hot.opt.args
+          opt.args = hot.opt.args,
+          .certify.selected = FALSE,
+          .fixed.h.lower = if (fixed.nomad)
+            h.start.controls$scale.factor.search.lower * fixed.setup$h.scale
+          else NULL,
+          .rng.collective = service.rng.collective
         )
       )
       powell.elapsed <- proc.time()[3L] - powell.start
@@ -1691,11 +2474,42 @@ npindexbw.NULL <-
       hot.objective <- as.numeric(hot.payload$fval[1L])
       if (is.finite(hot.objective) &&
           .np_degree_better(hot.objective, direct.objective, direction = "min")) {
-        return(list(payload = hot.payload, objective = hot.objective, powell.time = powell.elapsed))
+        selected.payload <- hot.payload
+      } else {
+        selected.payload <- direct.payload
       }
+    } else {
+      selected.payload <- direct.payload
     }
 
-    list(payload = direct.payload, objective = direct.objective, powell.time = powell.elapsed)
+    certificate.spec <- reg.args
+    certificate.spec$regtype.engine <- "lp"
+    certificate.spec$degree.engine <- degree
+    certificate.spec$bernstein.basis.engine <- degree.search$bernstein.basis
+    certificate.spec$basis.engine <- reg.args$basis.engine
+    service.eval.counter <<- service.eval.counter + 1L
+    certificate <- .npindexbw_certify_selected_candidate(
+      param = c(as.double(selected.payload$beta[-1L]),
+                as.double(selected.payload$bw[1L])),
+      xmat = x.clean,
+      ydat = y.clean,
+      bws = baseline.bws,
+      spec = certificate.spec,
+      leaf.descriptor = leaf.descriptor,
+      service.ctx = service.ctx,
+      eval_id = service.eval.counter
+    )
+    selected.payload$fval <- as.numeric(certificate$objective[1L])
+    selected.payload$num.feval <- as.numeric(selected.payload$num.feval[1L]) + 1
+    selected.payload$num.feval.fast <-
+      as.numeric(selected.payload$num.feval.fast[1L]) +
+      as.numeric(certificate$num.feval.fast[1L])
+
+    list(
+      payload = selected.payload,
+      objective = as.numeric(certificate$objective[1L]),
+      powell.time = powell.elapsed
+    )
   }
 
   search.result <- .np_nomad_search(
@@ -1718,8 +2532,13 @@ npindexbw.NULL <-
     reason = reason,
     progress_label = progress_label,
     handoff_before_build = isTRUE(handoff_before_build),
+    prepare_starts = if (fixed.nomad && !isTRUE(opt.args$only.optimize.beta)) function(starts)
+      .npindexbw_prepare_fixed_starts(starts, x.clean, beta.coord,
+                                    fixed.setup$h.scale, h.lower, h.upper) else NULL,
     nomad.opts = if (is.null(opt.args$nomad.opts)) list() else opt.args$nomad.opts,
     native.r.bridge = TRUE,
+    preserve.eval.error = TRUE,
+    .rng.collective = service.rng.collective,
     start.lower = start.lb,
     start.upper = start.ub,
     coordinate.roles = coordinate.roles,
@@ -1758,7 +2577,8 @@ npindexbw.NULL <-
           bws = bws,
           template = template,
           reg.args = verify.reg.args,
-          opt.args = opt.args
+          opt.args = opt.args,
+          .rng.collective = service.rng.collective
         ),
         error = function(e) e
       )
@@ -1836,6 +2656,9 @@ npindexbw.NULL <-
   }
 
   search.result
+  }, error = function(e) {
+    if (is.null(service.failure)) service.failure <<- conditionMessage(e)
+  })
 }
 
 .npindexbw_degree_search_controls <- function(regtype,
@@ -1980,8 +2803,18 @@ npindexbw.default <-
            scale.factor.search.lower = NULL,
            ...,
            nomad.opts = list()){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
+    only.beta <- !missing(only.optimize.beta) &&
+      npValidateScalarLogical(only.optimize.beta, "only.optimize.beta")
     nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npindexbw")
     .npRmpi_require_active_slave_pool(where = "npindexbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     mc <- match.call(expand.dots = FALSE)
     search.mc.names <- names(mc)
     dots <- list(...)
@@ -1990,7 +2823,9 @@ npindexbw.default <-
     npRejectUnsupportedBwsolver(dots, "npindexbw")
     dot.names <- names(dots)
     nomad.mode <- npValidateNomadControl(nomad, "nomad")
-    degree.select.value <- if (nomad.mode %in% c("true", "auto")) {
+    degree.select.value <- if (only.beta) {
+      "manual"
+    } else if (nomad.mode %in% c("true", "auto")) {
       "coordinate"
     } else if ("degree.select" %in% search.mc.names) {
       degree.select
@@ -2005,7 +2840,7 @@ npindexbw.default <-
     }
     collective.degree.search <- isTRUE(automatic.degree.search) &&
       identical(method.value, "kleinspady")
-    nomad.requested <- nomad.mode %in% c("true", "auto")
+    nomad.requested <- !only.beta && nomad.mode %in% c("true", "auto")
     regtype.value <- if ("regtype" %in% search.mc.names) {
       match.arg(regtype, c("lc", "ll", "lp"))
     } else if (isTRUE(nomad.requested)) {
@@ -2027,7 +2862,8 @@ npindexbw.default <-
            isTRUE(collective.degree.search) ||
            isTRUE(ichimura.lp.nomad.degree.search) ||
            .npRmpi_safe_int(mpi.comm.size(1L)) > 2L))
-      return(.npRmpi_autodispatch_call(mc, parent.frame()))
+      return(.np_index_dispatch(mc, xdat, ydat, parent.frame(),
+                               owner.name = "npindexbw.default"))
 
     xdat <- toFrame(xdat)
 
@@ -2042,14 +2878,27 @@ npindexbw.default <-
                     "dimensionality is unnecessary."))
     }
 
+    raw.xdat <- xdat
+    prepared <- attr(xdat, ".np.index.prepared", exact = TRUE)
+    attr(raw.xdat, ".np.index.prepared") <- NULL
+    if (is.null(prepared)) prepared <- .np_index_design_train(xdat, ydat)
+    if (!is.null(prepared)) xdat <- prepared$data
+    if (missing(bws)) bws <- double(ncol(xdat) + 1L)
+    if (!is.null(prepared) && length(bws) != ncol(xdat) + 1L)
+      stop(paste0("npindexbw: 'bws' requires coefficients for ",
+                  paste(names(xdat), collapse = ", "), " followed by the bandwidth. ",
+                  "Supply numeric predictors explicitly if category scores are intended."),
+           call. = FALSE)
+
     if (coarseclass(bws) != "numeric" || length(bws) != ncol(xdat)+1)
       stop(paste("manually specified 'bws' must be a numeric vector of length ncol(xdat)+1.",
                  "See documentation for details."))
 
     p <- ncol(xdat)
     mc.names <- names(mc)
+    # Beta-only refits retain the fixed model specification, not a search preset.
     nomad.shortcut <- .np_prepare_nomad_shortcut(
-      nomad = nomad,
+      nomad = if (only.beta) FALSE else nomad,
       call_names = unique(c(mc.names, dot.names)),
       preset = list(
         regtype = "lp",
@@ -2100,7 +2949,7 @@ npindexbw.default <-
     } else {
       42L
     }
-    degree.select.value <- if (!is.null(nomad.shortcut$values$degree.select)) nomad.shortcut$values$degree.select else degree.select.value
+    degree.select.value <- if (only.beta) "manual" else if (!is.null(nomad.shortcut$values$degree.select)) nomad.shortcut$values$degree.select else degree.select.value
     degree.search <- .npindexbw_degree_search_controls(
       regtype = if (!is.null(nomad.shortcut$values$regtype)) nomad.shortcut$values$regtype else regtype,
       regtype.named = isTRUE(nomad.shortcut$enabled) || ("regtype" %in% mc.names),
@@ -2120,7 +2969,10 @@ npindexbw.default <-
       nomad.source = nomad.shortcut$metadata$source,
       nomad.auto.filled = nomad.shortcut$metadata$auto.filled
     )
-    nomad.inner <- .np_nomad_validate_inner_multistart(
+    nomad.inner <- if (only.beta) {
+      list(named = "nomad.nmulti" %in% mc.names,
+           nmulti = npValidateNonNegativeInteger(nomad.nmulti, "nomad.nmulti"))
+    } else .np_nomad_validate_inner_multistart(
       call_names = mc.names,
       dot.args = dots,
       nomad.nmulti = nomad.nmulti,
@@ -2164,20 +3016,45 @@ npindexbw.default <-
     if (isTRUE(bandwidth.compute) &&
         !is.null(degree.search) &&
         initial.bwtype %in% c("generalized_nn", "adaptive_nn")) {
-      h.candidate <- .npindex_nn_candidate_bandwidth(
-        h = bws[p + 1L],
-        bwtype = initial.bwtype,
-        nobs = nrow(xdat)
-      )
-      bws[p + 1L] <- if (isTRUE(h.candidate$ok)) {
-        h.candidate$value
-      } else {
+      bws[p + 1L] <- if (identical(as.double(bws[p + 1L]), 0)) {
         .npindex_default_start_bandwidth(
           fit = NULL,
           bwtype = initial.bwtype,
           nobs = nrow(xdat)
         )
+      } else {
+        .npindex_finalize_bandwidth(
+          h = bws[p + 1L],
+          bwtype = initial.bwtype,
+          nobs = nrow(xdat),
+          where = "npindexbw"
+        )
       }
+    }
+    kleinspady <- !is.null(dots[["method", exact = TRUE]]) &&
+      match.arg(dots[["method", exact = TRUE]], c("ichimura", "kleinspady")) == "kleinspady"
+    if (kleinspady)
+      .npindex_check_binary_response(ydat, "npindexbw()")
+    else
+      .np_require_numeric_response(ydat, "npindexbw", "ydat")
+    if (kleinspady && bandwidth.compute && !is.null(degree.search)) {
+      # NOMAD bounds need a valid response before the first objective callback.
+      # Use the same joint complete sample as the ordinary bandwidth owner.
+      .np_require_paired_rows(xdat, ydat, "xdat", "ydat")
+      .npindex_check_binary_response(ydat[complete.cases(xdat, ydat)],
+                                    "npindexbw()", require.both = TRUE)
+    }
+
+    stored.rows <- if (!bandwidth.compute) {
+      .np_require_paired_rows(xdat, ydat, "xdat", "ydat")
+      which(!complete.cases(xdat, ydat))
+    } else integer(0)
+    if (!bandwidth.compute && length(stored.rows) == nrow(xdat))
+      stop("Data has no rows without NAs")
+    if (kleinspady && !bandwidth.compute) {
+      # Class membership belongs to the same complete sample as stored nobs.
+      complete.ydat <- if (length(stored.rows)) ydat[-stored.rows] else ydat
+      .npindex_check_binary_response(complete.ydat, "npindexbw()", require.both = TRUE)
     }
     tbw <- sibandwidth(beta = bws[seq_len(p)],
                        h = bws[p+1L], ...,
@@ -2185,7 +3062,8 @@ npindexbw.default <-
                        basis = spec$basis,
                        degree = spec$degree,
                        bernstein.basis = spec$bernstein.basis,
-                       nobs = dim(xdat)[1],
+                       nobs = nrow(xdat) - length(stored.rows),
+                       rows.omit = stored.rows,
                        xdati = untangle(xdat),
                        ydati = untangle(data.frame(ydat)),
                        xnames = names(xdat),
@@ -2193,9 +3071,6 @@ npindexbw.default <-
                        bandwidth = bws[p+1L],
                        bandwidth.compute = bandwidth.compute)
     tbw <- npSetScaleFactorSearchLower(tbw, scale.factor.search.lower)
-
-    if (tbw$method == "kleinspady" && !setequal(ydat,c(0,1)))
-      stop("Klein and Spady's estimator requires binary ydat with 0/1 values only")
 
     margs <- c("nmulti", "nomad.remin", "powell.remin", "random.seed", "optim.method", "optim.maxattempts",
                "nomad.opts",
@@ -2311,7 +3186,8 @@ npindexbw.default <-
     tbw$call <- mc
     tbw <- .np_attach_nomad_shortcut(tbw, nomad.shortcut$metadata)
 
-    return(tbw)
+    if (!is.null(prepared)) tbw[["index.design"]] <- prepared$schema
+    return(.np_bws_retain_native_training(tbw, xdat = raw.xdat, ydat = ydat))
   }
 
 npindexbw.sibandwidth <-
@@ -2319,6 +3195,7 @@ npindexbw.sibandwidth <-
            ydat = stop("training data ydat missing"),
            bws,
            bandwidth.compute = TRUE,
+           .certify.selected = TRUE,
            nmulti,
            only.optimize.beta = FALSE,
            optim.abstol = .Machine$double.eps,
@@ -2331,23 +3208,42 @@ npindexbw.sibandwidth <-
            scale.factor.init.upper = 2.0,
            scale.factor.init = 0.5,
            scale.factor.search.lower = NULL,
-           ...){
+           .restore.first.start = TRUE,
+           ...,
+           .fixed.h.lower = NULL,
+           .rng.collective = .npRmpi_rng_scope_collective()){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
 
     dots <- list(...)
     npRejectUnsupportedBwsolver(dots, "npindexbw")
 
     ## Save seed prior to setting
 
-    seed.state <- .np_seed_enter(random.seed)
-    on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
+    seed.state <- .np_rng_scope_capture(collective = .rng.collective)
+    on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+    .np_rng_scope_seed(seed.state, random.seed)
 
 
     xdat = toFrame(xdat)
+    index.design <- bws[["index.design", exact = TRUE]]
 
     if (missing(nmulti)){
-      nmulti <- npDefaultNmulti(ncol(xdat))
+      nmulti <- npDefaultNmulti(if (is.null(index.design)) ncol(xdat) else length(bws$beta))
     }
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute, "bandwidth.compute")
+    .certify.selected <- npValidateScalarLogical(
+      .certify.selected,
+      ".certify.selected"
+    )
+    .restore.first.start <- npValidateScalarLogical(.restore.first.start, ".restore.first.start")
+    if (!is.null(.fixed.h.lower) &&
+        (!identical(bws$type, "fixed") || !is.numeric(.fixed.h.lower) ||
+         length(.fixed.h.lower) != 1L || !is.finite(.fixed.h.lower) ||
+         .fixed.h.lower < 0))
+      stop("npindexbw: internal fixed-bandwidth floor must be finite and nonnegative",
+           call. = FALSE)
     only.optimize.beta <- npValidateScalarLogical(only.optimize.beta, "only.optimize.beta")
     nmulti <- npValidateNmulti(nmulti)
     .np_progress_bandwidth_set_total(nmulti)
@@ -2366,11 +3262,22 @@ npindexbw.sibandwidth <-
       where = "npindexbw"
     )
     .npRmpi_require_active_slave_pool(where = "npindexbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_autodispatch_active())
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npindexbw.sibandwidth"))
 
-    if (bws$method == "kleinspady" && !setequal(ydat,c(0,1)))
-      stop("Klein and Spady's estimator requires binary ydat with 0/1 values only")
+    # Preserve the same native representation the estimator consumes. The
+    # reconstructed bandwidth is published before outer wrappers can add it.
+    native.training <- list(xdat = xdat, ydat = ydat)
+
+    if (bws$method == "kleinspady")
+      .npindex_check_binary_response(ydat, "npindexbw()")
+    else
+      .np_require_numeric_response(ydat, "npindexbw", "ydat")
 
     if (ncol(xdat) < 2) {
       if (coarseclass(xdat[,1]) != "numeric")
@@ -2393,6 +3300,8 @@ npindexbw.sibandwidth <-
 
     xdat <- xdat[keep.rows,,drop = FALSE]
     ydat <- ydat[keep.rows]
+    if (bws$method == "kleinspady")
+      .npindex_check_binary_response(ydat, "npindexbw()", require.both = TRUE)
 
     ## convert to numeric
     if (is.factor(ydat))
@@ -2400,6 +3309,8 @@ npindexbw.sibandwidth <-
     else
       ydat <- as.double(ydat)
 
+    if (!is.null(index.design))
+      xdat <- .np_index_design_apply(index.design, xdat)
     xdat = toMatrix(xdat)
     p <- ncol(xdat)
     beta.idx <- if (p > 1L) seq_len(p - 1L) else integer(0)
@@ -2417,6 +3328,24 @@ npindexbw.sibandwidth <-
       where = "npindexbw"
     )
     objective.spec <- objective.policy$objective.spec
+    ichimuraMaxPenalty <- if (identical(bws$method, "ichimura"))
+      .npindexbw_ichimura_outer_penalty(ydat)
+    else
+      NULL
+    kleinspadyMaxPenalty <- if (identical(bws$method, "kleinspady"))
+      .npindexbw_kleinspady_outer_penalty(ydat)
+    else
+      NULL
+    leaf.descriptor <- if (isTRUE(bandwidth.compute)) {
+      .npindexbw_prepare_lp_regression_leaf_owner(
+        xmat = xdat,
+        ydat = ydat,
+        bws = bws,
+        spec = objective.spec
+      )
+    } else {
+      NULL
+    }
     service.ctx <- .npindexbw_ichimura_lp_service_context(
       bws = bws,
       spec = objective.spec,
@@ -2424,6 +3353,8 @@ npindexbw.sibandwidth <-
       comm = 1L,
       service_id = "npindex_ichimura_lp_fixed"
     )
+    service.ctx$leaf.descriptor <- leaf.descriptor
+    service.ctx$invalid.penalty <- ichimuraMaxPenalty
     if (isTRUE(service.ctx$active) && !isTRUE(service.ctx$root))
       return(.npindexbw_ichimura_lp_service_worker_loop(
         xmat = xdat,
@@ -2440,6 +3371,8 @@ npindexbw.sibandwidth <-
       comm = 1L,
       service_id = "npindex_kleinspady_lp_fixed"
     )
+    ks.service.ctx$leaf.descriptor <- leaf.descriptor
+    ks.service.ctx$invalid.penalty <- kleinspadyMaxPenalty
     if (isTRUE(ks.service.ctx$active) && !isTRUE(ks.service.ctx$root))
       return(.npindexbw_kleinspady_lp_service_worker_loop(
         xmat = xdat,
@@ -2450,20 +3383,27 @@ npindexbw.sibandwidth <-
       ))
     service.eval.counter <- 0L
     service.done <- FALSE
+    service.failure <- NULL
     if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
       on.exit({
         if (!isTRUE(service.done))
-          .npindexbw_ichimura_lp_service_error("npindex Ichimura LP fixed-degree service stopped before returning a result", service.ctx)
+          .npindexbw_ichimura_lp_service_error(
+            if (is.null(service.failure)) "npindex Ichimura LP fixed-degree service stopped before returning a result" else service.failure,
+            service.ctx)
       }, add = TRUE)
     }
     ks.service.done <- FALSE
     if (isTRUE(ks.service.ctx$active) && isTRUE(ks.service.ctx$root)) {
       on.exit({
         if (!isTRUE(ks.service.done))
-          .npindexbw_kleinspady_lp_service_error("npindex Klein-Spady LP fixed-degree service stopped before returning a result", ks.service.ctx)
+          .npindexbw_kleinspady_lp_service_error(
+            if (is.null(service.failure)) "npindex Klein-Spady LP fixed-degree service stopped before returning a result" else service.failure,
+            ks.service.ctx)
       }, add = TRUE)
     }
 
+    # Share only the error text with cleanup; leave propagation and MPI ordering intact.
+    withCallingHandlers({
     total.time <-
       system.time({
 
@@ -2501,6 +3441,10 @@ npindexbw.sibandwidth <-
             invisible(NULL)
           }
           fixed.h.lower <- NULL
+          start.scale <- NULL
+          start.guard <- if (.npindexbw_restore_start_eligible(
+            bws, isTRUE(.restore.first.start)
+          )) .npindexbw_first_scalar_guard(bws$method, beta.coord$to_public) else NULL
 
           ## Note - there are two methods currently implemented, Ichimura's
           ## least squares approach and Klein and Spady's likelihood approach.
@@ -2510,8 +3454,6 @@ npindexbw.sibandwidth <-
           ##function for these internals, and when computing the leave-one-out
           ##objective function use c(1,beta). However, we do indeed return
           ##c(1,beta) which can be used in the index.model function above.
-
-          ichimuraMaxPenalty <- 10*mean(ydat^2)
 
           ichimura <- function(param) {
             bandwidth_progress_step()
@@ -2546,7 +3488,8 @@ npindexbw.sibandwidth <-
                   bws = bws,
                   spec = objective.spec,
                   ctx = service.ctx,
-                  eval_id = service.eval.counter
+                  eval_id = service.eval.counter,
+                  retain.raw = !is.null(start.guard) && isTRUE(start.guard$active)
                 )
               } else {
                 .npindexbw_eval_ichimura_lp_via_npreg(
@@ -2555,12 +3498,25 @@ npindexbw.sibandwidth <-
                   h = h,
                   bws = bws,
                   spec = objective.spec,
-                  invalid.penalty = ichimuraMaxPenalty
+                  leaf.descriptor = leaf.descriptor
                 )
               }
               num.feval.fast.overall <<- num.feval.fast.overall +
                 as.numeric(objective$num.feval.fast[1L])
-              as.numeric(objective$objective[1L])
+              if (!is.null(start.guard) && isTRUE(start.guard$active))
+                start.guard$observe(
+                  if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root))
+                    objective[["raw.objective"]] else objective$objective,
+                  c(beta, h))
+              as.numeric(if (isTRUE(service.ctx$active) &&
+                             isTRUE(service.ctx$root)) {
+                objective$objective[1L]
+              } else {
+                .npindexbw_map_ichimura_outer_result(
+                  objective,
+                  ichimuraMaxPenalty
+                )$objective[1L]
+              })
             }
 
             ## For the objective function, we require a positive bandwidth, so
@@ -2594,10 +3550,10 @@ npindexbw.sibandwidth <-
             h <- param[p]
             h.candidate <- .npindex_nn_candidate_bandwidth(h = h, bwtype = bws$type, nobs = nobs)
             if (!h.candidate$ok)
-              return(sqrt(.Machine$double.xmax))
+              return(kleinspadyMaxPenalty)
             h <- h.candidate$value
             if (!is.null(fixed.h.lower) && h < fixed.h.lower)
-              return(sqrt(.Machine$double.xmax))
+              return(kleinspadyMaxPenalty)
             cache.hit <- r_nn_cache_lookup(beta, h)
             if (isTRUE(cache.hit$hit)) {
               num.feval.fast.overall <<- num.feval.fast.overall + 1L
@@ -2618,15 +3574,19 @@ npindexbw.sibandwidth <-
                   bws = bws,
                   spec = objective.spec,
                   ctx = ks.service.ctx,
-                  eval_id = service.eval.counter
+                  eval_id = service.eval.counter,
+                  retain.raw = !is.null(start.guard) && isTRUE(start.guard$active)
                 )
-                list(
+                result <- list(
                   objective = if (isTRUE(collective$invalid))
-                    sqrt(.Machine$double.xmax)
+                    kleinspadyMaxPenalty
                   else
                     as.numeric(collective$objective[1L]),
                   num.feval.fast = if (.npindexbw_fast_eligible(h = h, bws = bws, eval.index = index)) 1L else 0L
                 )
+                if (!is.null(start.guard) && isTRUE(start.guard$active))
+                  result$raw.objective <- collective[["raw.objective"]]
+                result
               } else {
                 .npindexbw_eval_kleinspady_lp_via_npreg(
                   index = index,
@@ -2634,12 +3594,25 @@ npindexbw.sibandwidth <-
                   h = h,
                   bws = bws,
                   spec = objective.spec,
-                  invalid.penalty = sqrt(.Machine$double.xmax)
+                  leaf.descriptor = leaf.descriptor
                 )
               }
               num.feval.fast.overall <<- num.feval.fast.overall +
                 as.numeric(objective$num.feval.fast[1L])
-              as.numeric(objective$objective[1L])
+              if (!is.null(start.guard) && isTRUE(start.guard$active))
+                start.guard$observe(
+                  if (isTRUE(ks.service.ctx$active) && isTRUE(ks.service.ctx$root))
+                    objective[["raw.objective"]] else objective$objective,
+                  c(beta, h))
+              as.numeric(if (isTRUE(ks.service.ctx$active) &&
+                             isTRUE(ks.service.ctx$root)) {
+                objective$objective[1L]
+              } else {
+                .npindexbw_map_kleinspady_outer_result(
+                  objective,
+                  kleinspadyMaxPenalty
+                )$objective[1L]
+              })
             }
 
             ## For the objective function, we require a positive bandwidth, so
@@ -2647,11 +3620,10 @@ npindexbw.sibandwidth <-
 
             if(h > 0) {
               fv <- sum.log.leave.one.out(beta,h)
-              r_nn_cache_store(cache.hit$token, fv, sqrt(.Machine$double.xmax))
+              r_nn_cache_store(cache.hit$token, fv, kleinspadyMaxPenalty)
               return(fv)
             } else {
-              ## No natural counterpart to var of y here, unlike Ichimura above...
-              return(sqrt(.Machine$double.xmax))
+              return(kleinspadyMaxPenalty)
             }
 
           }
@@ -2691,19 +3663,31 @@ npindexbw.sibandwidth <-
 
             if(i == 1) {
 
-              ## Initial values taken from OLS fit with a constant used for
-              ## multistart 1
-              ols.fit <- lm(ydat~xdat,x=TRUE)
+              # A normalized supplied beta may have zero free coefficients.
+              beta.auto <- if (only.optimize.beta) all(bws$beta == 0) else
+                setequal(bws$beta[-1L], c(0))
+              ols.fit <- if (!only.optimize.beta || beta.auto || nmulti > 1L)
+                lm(ydat~xdat,x=TRUE) else NULL
 
               if (p != 1L){
-                if (setequal(bws$beta[2:p], c(0)))
+                if (beta.auto)
                   beta <- .npindex_ols_beta_tail(ols.fit)
                 else
                   beta = bws$beta[2:p]
               } else { beta = numeric(0) }
               fit <- .npindex_index_from_beta_tail(xmat, beta)
               fixed.h.lower <- if (identical(bws$type, "fixed")) {
-                h.start.controls$scale.factor.search.lower * .npindex_start_bandwidth_scale(fit = fit, nobs = nobs)
+                start.scale <- .npindex_start_bandwidth_scale(fit = fit, nobs = nobs)
+                # Refinement inherits the physical domain of its NOMAD owner.
+                if (!is.null(.fixed.h.lower)) {
+                  .fixed.h.lower
+                } else if (only.optimize.beta && is.finite(bws$bw) && bws$bw > 0) {
+                  # A supplied h is held, not searched. Keep its stored search
+                  # control for later joint searches without re-anchoring it.
+                  NULL
+                } else {
+                  h.start.controls$scale.factor.search.lower * start.scale
+                }
               } else {
                 NULL
               }
@@ -2716,20 +3700,12 @@ npindexbw.sibandwidth <-
                   start.controls = h.start.controls
                 )
               else
-                h <- tryCatch(
-                  .npindex_finalize_bandwidth(
-                    h = bws$bw,
-                    bwtype = bws$type,
-                    nobs = nobs,
-                    lower = fixed.h.lower,
-                    where = "npindexbw"
-                  ),
-                  error = function(e) .npindex_default_start_bandwidth(
-                    fit = fit,
-                    bwtype = bws$type,
-                    nobs = nobs,
-                    start.controls = h.start.controls
-                  )
+                h <- .npindex_finalize_bandwidth(
+                  h = bws$bw,
+                  bwtype = bws$type,
+                  nobs = nobs,
+                  lower = fixed.h.lower,
+                  where = "npindexbw"
                 )
             } else {
               ## Random initialization used for remaining multistarts
@@ -2737,13 +3713,22 @@ npindexbw.sibandwidth <-
               ols.beta <- .npindex_ols_beta_tail(ols.fit)
               beta.length <- length(ols.beta)
               beta <- runif(beta.length,min=0.5,max=1.5)*ols.beta
-              if (!only.optimize.beta)
-                h <- .npindex_random_start_bandwidth(
+              if (!only.optimize.beta) {
+                h <- .npindex_random_restart_bandwidth(
+                  xmat = xmat,
+                  beta = beta,
                   fit = fit,
                   bwtype = bws$type,
                   nobs = nobs,
-                  start.controls = h.start.controls
+                  start.controls = h.start.controls,
+                  fixed.h.lower = fixed.h.lower,
+                  retain.scale = !is.null(start.guard)
                 )
+                if (!is.null(start.guard)) {
+                  start.scale <- h$scale
+                  h <- h$h
+                }
+              }
             }
 
             beta.search <- beta.coord$to_search(beta)
@@ -2759,20 +3744,37 @@ npindexbw.sibandwidth <-
             if (only.optimize.beta) {
               optim.base.args$h <- h
             }
-            suppressWarnings(optim.return <- do.call(optim, optim.base.args))
+            suppressWarnings(optim.return <- if (is.null(start.guard)) {
+              do.call(optim, optim.base.args)
+            } else {
+              start.guard$run(optim.base.args,
+                automatic = i > 1L || bws$bw == 0, held = only.optimize.beta,
+                scale = start.scale, lower = fixed.h.lower, h = h,
+                start = i, retry = 0L)
+            })
             attempts <- 0
             while((optim.return$convergence != 0) && (attempts <= optim.maxattempts)) {
               attempts <- attempts + 1
+              if (is.null(ols.fit)) ols.fit <- lm(ydat~xdat,x=TRUE)
               ols.beta <- .npindex_ols_beta_tail(ols.fit)
               beta.length <- length(ols.beta)
               beta <- runif(beta.length,min=0.5,max=1.5)*ols.beta
-              if(!only.optimize.beta)
-                h <- .npindex_random_start_bandwidth(
+              if(!only.optimize.beta) {
+                h <- .npindex_random_restart_bandwidth(
+                  xmat = xmat,
+                  beta = beta,
                   fit = fit,
                   bwtype = bws$type,
                   nobs = nobs,
-                  start.controls = h.start.controls
+                  start.controls = h.start.controls,
+                  fixed.h.lower = fixed.h.lower,
+                  retain.scale = !is.null(start.guard)
                 )
+                if (!is.null(start.guard)) {
+                  start.scale <- h$scale
+                  h <- h$h
+                }
+              }
 
               if(optim.return$convergence == 1){
                 if(optim.control$maxit < (2^32/10))
@@ -2797,14 +3799,21 @@ npindexbw.sibandwidth <-
               if (only.optimize.beta) {
                 optim.base.args$h <- h
               }
-              suppressWarnings(optim.return <- do.call(optim, optim.base.args))
+              suppressWarnings(optim.return <- if (is.null(start.guard)) {
+                do.call(optim, optim.base.args)
+              } else {
+                start.guard$run(optim.base.args,
+                  automatic = !only.optimize.beta, held = only.optimize.beta,
+                  scale = start.scale, lower = fixed.h.lower, h = h,
+                  start = i, retry = attempts)
+              })
             }
 
             if(optim.return$convergence != 0)
               stop(paste("optim failed to converge after optim.maxattempts = ", optim.maxattempts, " iterations."))
 
             fval.value[i] <- optim.return$value
-            if(optim.return$value < fval.min) {
+            if(i == 1L || optim.return$value < fval.min) {
               param <- if(only.optimize.beta) {
                 c(beta.coord$to_public(optim.return$par), h)
               } else {
@@ -2820,6 +3829,25 @@ npindexbw.sibandwidth <-
 
             .np_progress_bandwidth_multistart_step(done = i, total = nmulti)
 
+          }
+
+          if (isTRUE(.certify.selected)) {
+            bandwidth_progress_step()
+            service.eval.counter <- service.eval.counter + 1L
+            certificate <- .npindexbw_certify_selected_candidate(
+              param = param,
+              xmat = xmat,
+              ydat = ydat,
+              bws = bws,
+              spec = objective.spec,
+              leaf.descriptor = leaf.descriptor,
+              service.ctx = service.ctx,
+              ks.service.ctx = ks.service.ctx,
+              eval_id = service.eval.counter
+            )
+            fval.min <- as.numeric(certificate$objective[1L])
+            num.feval.fast.overall <- num.feval.fast.overall +
+              as.numeric(certificate$num.feval.fast[1L])
           }
 
           bws$beta <- c(1.0, param[beta.idx])
@@ -2847,7 +3875,7 @@ npindexbw.sibandwidth <-
 
     ## Restore seed
 
-    .np_seed_exit(seed.state, remove_if_absent = TRUE)
+    .np_rng_scope_restore(seed.state)
     nn.cache <- bws$nn.cache
 
     bws <- sibandwidth(beta = bws$beta,
@@ -2869,7 +3897,7 @@ npindexbw.sibandwidth <-
                        num.feval.fast = bws$num.feval.fast,
                        numimp = bws$numimp,
                        fval.vector = bws$fval.vector,
-                       nobs = bws$nobs,
+                       nobs = nobs,
                        xdati = bws$xdati,
                        ydati = bws$ydati,
                        xnames = bws$xnames,
@@ -2881,7 +3909,10 @@ npindexbw.sibandwidth <-
                        only.optimize.beta = only.optimize.beta,
                        total.time = total.time)
     bws$nn.cache <- nn.cache
+    if (!is.null(index.design)) bws[["index.design"]] <- index.design
     bws <- npSetScaleFactorSearchLower(bws, scale.factor.search.lower)
+    bws <- .np_bws_retain_native_training(
+      bws, xdat = native.training$xdat, ydat = native.training$ydat)
 
     if (isTRUE(service.ctx$active) && isTRUE(service.ctx$root)) {
       service.done <- TRUE
@@ -2893,5 +3924,8 @@ npindexbw.sibandwidth <-
     }
 
     bws
+    }, error = function(e) {
+      if (is.null(service.failure)) service.failure <<- conditionMessage(e)
+    })
 
   }

@@ -1,3 +1,198 @@
+.np_nn_raw_objective_valid <- function(value) {
+  is.numeric(value) && length(value) == 1L && !is.na(value) &&
+    is.finite(value) && abs(value) < .Machine$double.xmax
+}
+
+# A single native eval records invalidity before replacing it by a finite
+# exploration penalty. Aggregate search histories cannot certify an endpoint.
+.np_nn_single_eval_admissible <- function(out) {
+  if (!is.list(out))
+    stop("raw admission requires a native evaluation result", call. = FALSE)
+  evaluations <- out[["eval.history"]]
+  invalid <- out[["invalid.history"]]
+  value <- out[["fval"]]
+  if (!is.numeric(evaluations) || length(evaluations) != 1L ||
+      is.na(evaluations) || evaluations != 1 ||
+      !is.numeric(invalid) || length(invalid) != 1L || is.na(invalid) ||
+      !(invalid %in% c(0, 1)) || !is.numeric(value) || !length(value))
+    stop("raw admission requires a single native evaluation with valid status history",
+         call. = FALSE)
+  invalid == 0 && .np_nn_raw_objective_valid(value[1L])
+}
+
+# Only for a package-owned prepared search whose terminal failure is already
+# agreed on all ranks. Workers must unwind cleanup and return to their daemon;
+# throwing there would kill the daemon after the master reports the same error.
+.npRmpi_nomad_collective_failure <- function(message, rank) {
+  if (isTRUE(rank == 0L)) stop(message, call. = FALSE)
+  invisible(NULL)
+}
+
+# Prepared search owns a manual command rather than the SPMD option envelope.
+# Send the same search snapshot before every master-owned prepared command;
+# native collective eligibility must not depend on stale worker options.
+.npRmpi_sync_prepared_search_options <- function(comm = 1L) {
+  npObjectiveCacheEnabled()
+  snapshot <- .npRmpi_autodispatch_option_snapshot()
+  command <- substitute(do.call("options", OPTS), list(OPTS = snapshot))
+  .npRmpi_option_agreement$snapshot <- NULL
+  .npRmpi_bcast_cmd_expr(command, comm = comm, caller.execute = FALSE)
+  .npRmpi_option_agreement$snapshot <- snapshot
+  invisible(NULL)
+}
+
+.np_nn_candidate_invalid_condition <- function(message,
+                                                owner = NULL,
+                                                point = NULL,
+                                                raw.objective = NULL) {
+  if (!is.character(message) || length(message) != 1L || is.na(message) ||
+      !nzchar(message)) {
+    stop("internal NN candidate-invalid condition requires one message",
+         call. = FALSE)
+  }
+  structure(
+    list(
+      message = message,
+      call = NULL,
+      owner = owner,
+      point = point,
+      raw.objective = raw.objective
+    ),
+    class = c("np_nn_candidate_invalid", "error", "condition")
+  )
+}
+
+.np_nn_abort_candidate_invalid <- function(message,
+                                           owner = NULL,
+                                           point = NULL,
+                                           raw.objective = NULL) {
+  stop(.np_nn_candidate_invalid_condition(
+    message = message,
+    owner = owner,
+    point = point,
+    raw.objective = raw.objective
+  ))
+}
+
+.np_nn_certify_raw_point <- function(point, raw.eval, owner) {
+  if (!is.function(raw.eval))
+    stop("internal NN endpoint certification requires a raw evaluator",
+         call. = FALSE)
+  value <- raw.eval(point)
+  .np_nn_certify_raw_value(value, point = point, owner = owner)
+}
+
+# Validate an existing raw evaluation without changing its coordinate identity.
+# Final bandwidth payloads need not round-trip through optimizer coordinates.
+.np_nn_certify_raw_value <- function(value, point, owner) {
+  if (!.np_nn_raw_objective_valid(value)) {
+    .np_nn_abort_candidate_invalid(
+      sprintf("%s returned a candidate with invalid raw objective", owner),
+      owner = owner,
+      point = point,
+      raw.objective = value
+    )
+  }
+  as.double(value)
+}
+
+.np_nn_ordinary_schedule <- function(point, nn.indices, caps,
+                                     incumbent.caps = caps) {
+  point <- as.double(point)
+  nn.indices <- as.integer(nn.indices)
+  caps <- as.double(caps)
+
+  if (!length(nn.indices)) return(list())
+  if (length(caps) == 1L) caps <- rep.int(caps, length(nn.indices))
+  if (length(caps) != length(nn.indices) || anyNA(nn.indices) ||
+      anyDuplicated(nn.indices) || any(nn.indices < 1L) ||
+      any(nn.indices > length(point))) {
+    stop("internal NN recovery adapter has invalid coordinate indices",
+         call. = FALSE)
+  }
+  if (anyNA(caps) || any(!is.finite(caps)) || any(caps < 1) ||
+      any(caps > .Machine$integer.max) || any(caps != floor(caps))) {
+    stop("internal NN recovery adapter has invalid ordinary caps",
+         call. = FALSE)
+  }
+  incumbent.caps <- as.double(incumbent.caps)
+  if (length(incumbent.caps) == 1L)
+    incumbent.caps <- rep.int(incumbent.caps, length(nn.indices))
+  if (length(incumbent.caps) != length(caps) || anyNA(incumbent.caps) ||
+      any(!is.finite(incumbent.caps)) || any(incumbent.caps < caps) ||
+      any(incumbent.caps > .Machine$integer.max) ||
+      any(incumbent.caps != floor(incumbent.caps)))
+    stop("internal NN recovery adapter has invalid incumbent caps", call. = FALSE)
+
+  current <- point[nn.indices]
+  if (anyNA(current) || any(!is.finite(current)) ||
+      any(current > .Machine$integer.max)) {
+    stop("internal NN recovery incumbent has invalid NN coordinates",
+         call. = FALSE)
+  }
+  current <- round(current)
+  if (any(current < 1)) {
+    stop("internal NN recovery incumbent lies outside the ordinary NN domain",
+         call. = FALSE)
+  }
+  if (any(current > incumbent.caps))
+    return(list())
+
+  out <- list()
+  if (any(current > caps)) {
+    # An automatic public-domain point can exceed a deleted fit's domain.
+    # Probe its fold boundary once; genuinely extended incumbents stay out.
+    current <- pmin(current, caps)
+    point[nn.indices] <- current
+    out[[1L]] <- point
+  }
+  point[nn.indices] <- current
+  repeat {
+    incremented <- pmin(caps, current + 1)
+    doubled <- ifelse(current <= floor(caps / 2), 2 * current, caps)
+    next.value <- pmin(caps, pmax(incremented, doubled))
+    if (identical(next.value, current)) break
+    current <- next.value
+    point[nn.indices] <- current
+    if (!length(out) || !identical(out[[length(out)]], point))
+      out[[length(out) + 1L]] <- point
+  }
+  out
+}
+
+.np_nn_find_raw_valid_start <- function(point, nn.indices, caps, raw.eval,
+                                       incumbent.caps = caps) {
+  if (!is.function(raw.eval))
+    stop("internal NN recovery adapter requires a raw evaluator", call. = FALSE)
+
+  schedule <- .np_nn_ordinary_schedule(point, nn.indices, caps, incumbent.caps)
+  if (length(schedule))
+    .np_progress_bandwidth_nn_recovery()
+  for (i in seq_along(schedule)) {
+    candidate <- schedule[[i]]
+    value <- tryCatch(
+      raw.eval(candidate),
+      np_nn_candidate_invalid = function(e) e
+    )
+    if (inherits(value, "np_nn_candidate_invalid")) next
+    if (.np_nn_raw_objective_valid(value)) {
+      return(list(
+        found = TRUE,
+        point = candidate,
+        objective = as.double(value),
+        evaluations = i
+      ))
+    }
+  }
+
+  list(
+    found = FALSE,
+    point = NULL,
+    objective = NA_real_,
+    evaluations = length(schedule)
+  )
+}
+
 .np_degree_eval_key <- function(degree) {
   paste(as.integer(degree), collapse = ",")
 }
@@ -301,6 +496,16 @@
   degree_value <- function(value) {
     if (is.null(value) || !length(value))
       return(integer(0L))
+    if (is.list(value)) {
+      out <- lapply(value, degree_value)
+      names(out) <- names(value)
+      return(out)
+    }
+    if (is.matrix(value)) {
+      out <- matrix(as.integer(value), nrow = nrow(value), ncol = ncol(value))
+      dimnames(out) <- dimnames(value)
+      return(out)
+    }
     as.integer(value)
   }
 
@@ -347,32 +552,6 @@
   sprintf("(%s)", paste(as.integer(degree), collapse = ","))
 }
 
-.np_degree_format_objective <- function(value) {
-  value <- as.numeric(value)[1L]
-  if (!is.finite(value))
-    return("NA")
-
-  formatC(value, digits = 6L, format = "fg", flag = "#")
-}
-
-.np_degree_format_candidate_set <- function(cand) {
-  cand <- as.integer(cand)
-  if (!length(cand))
-    return("c()")
-
-  if (length(cand) >= 2L && all(diff(cand) == 1L))
-    return(sprintf("%s:%s", cand[1L], cand[length(cand)]))
-
-  sprintf("c(%s)", paste(cand, collapse = ","))
-}
-
-.np_degree_format_search_space <- function(candidates) {
-  paste(
-    vapply(candidates, .np_degree_format_candidate_set, character(1L)),
-    collapse = " x "
-  )
-}
-
 .np_degree_coordinate_visit_cap <- function(candidates,
                                             max_cycles,
                                             restart_total) {
@@ -412,20 +591,22 @@
 
 .np_degree_progress_best_detail <- function(best_record,
                                             objective_name = "objective") {
+  # Objective values remain in search records and returned objects. Dynamic
+  # progress reports only the incumbent degree so every search provider uses
+  # the same presentation-neutral contract.
+  invisible(objective_name)
   if (is.null(best_record))
     return("best pending")
 
-  sprintf(
-    "best %s, %s=%s",
-    .np_degree_format_degree(best_record$degree),
-    objective_name,
-    .np_degree_format_objective(best_record$objective)
-  )
+  sprintf("best %s", .np_degree_format_degree(best_record$degree))
 }
 
 .np_degree_progress_best_degree_detail <- function(best_record) {
   if (is.null(best_record))
     return("best pending")
+
+  if (is.null(best_record$degree) || !length(best_record$degree))
+    return(NULL)
 
   sprintf("best %s", .np_degree_format_degree(best_record$degree))
 }
@@ -885,6 +1066,14 @@
   state$baseline_record <- NULL
   state$interrupted <- FALSE
   state$progress_state <- NULL
+  state$first_error <- NULL
+  state$error_count <- 0L
+  on.exit({
+    if (!is.null(state$progress_state))
+      try(.np_progress_abort(state$progress_state,
+                             detail = "Polynomial degree search failed"),
+          silent = TRUE)
+  }, add = TRUE)
 
   state$record_trace <- function(rec) {
     if (!isTRUE(state$trace_enabled))
@@ -938,6 +1127,14 @@
     num.feval <- NA_real_
     num.feval.fast <- NA_real_
     nn.cache <- NULL
+    reject_candidate <- function(e) {
+      if (is.null(state$first_error))
+        state$first_error <- e
+      state$error_count <- state$error_count + 1L
+      status <<- "error"
+      msg <<- conditionMessage(e)
+      NULL
+    }
 
     result <- tryCatch(
       {
@@ -951,11 +1148,8 @@
         state$interrupted <- TRUE
         NULL
       },
-      error = function(e) {
-        status <<- "error"
-        msg <<- conditionMessage(e)
-        NULL
-      }
+      np_degree_candidate_invalid = reject_candidate,
+      np_nn_candidate_invalid = reject_candidate
     )
 
     if (isTRUE(state$interrupted)) {
@@ -1096,9 +1290,17 @@
     ),
     interrupted = state$interrupted
   )
+  state$progress_state <- NULL
 
-  if (is.null(state$best_payload))
+  if (is.null(state$best_payload)) {
+    if (!isTRUE(state$interrupted) &&
+        state$error_count > 0L &&
+        identical(state$error_count, state$eval_id) &&
+        !is.null(state$first_error)) {
+      stop(state$first_error)
+    }
     stop("automatic degree search failed to obtain any admissible fitted model")
+  }
 
   search_elapsed <- as.numeric(proc.time()[3] - search_started)
 
@@ -1127,7 +1329,7 @@
 
 .np_nomad_require_crs <- function(version_fn = utils::packageVersion,
                                   load_namespace = loadNamespace,
-                                  minimum_version = "0.15-41") {
+                                  minimum_version = "0.15-46") {
   minimum_version_label <- as.character(minimum_version)[1L]
   minimum_version <- package_version(minimum_version_label)
 
@@ -1285,7 +1487,8 @@
                                              nmulti = 1L,
                                              random.seed = 42L,
                                              max.tries = 256L,
-                                             user_supplied = FALSE) {
+                                             user_supplied = FALSE,
+                                             .rng.collective = .npRmpi_rng_scope_collective()) {
   basis <- match.arg(basis)
   lower <- as.integer(lower)
   upper <- as.integer(upper)
@@ -1350,8 +1553,9 @@
 
   initial <- as.integer(pmax(lower, pmin(upper, initial)))
 
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
+  seed.state <- .np_rng_scope_capture(collective = .rng.collective)
+  on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+  .np_rng_scope_seed(seed.state, random.seed)
 
   if (isTRUE(user_supplied)) {
     starts[1L, ] <- initial
@@ -1398,7 +1602,8 @@
                                    random.seed = 42L,
                                    degree_spec = NULL,
                                    start.lower = NULL,
-                                   start.upper = NULL) {
+                                   start.upper = NULL,
+                                   .rng.collective = .npRmpi_rng_scope_collective()) {
   n <- length(lb)
   if (length(ub) != n || length(bbin) != n)
     stop("NOMAD start construction requires matching lengths for x0/bbin/lb/ub")
@@ -1419,8 +1624,9 @@
   start.lower <- normalize.start.bound(start.lower, lb, "start.lower")
   start.upper <- normalize.start.bound(start.upper, ub, "start.upper")
 
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
+  seed.state <- .np_rng_scope_capture(collective = .rng.collective)
+  on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+  .np_rng_scope_seed(seed.state, random.seed)
 
   for (j in seq_len(nstart)) {
     for (i in seq_len(n)) {
@@ -1452,7 +1658,8 @@
         nobs = degree_spec$nobs,
         nmulti = nstart,
         random.seed = random.seed,
-        user_supplied = isTRUE(degree_spec$user_supplied)
+        user_supplied = isTRUE(degree_spec$user_supplied),
+        .rng.collective = .rng.collective
       )
       starts[, degree.idx] <- degree.starts
     }
@@ -1480,7 +1687,8 @@
           nobs = degree_spec$nobs,
           nmulti = 1L,
           random.seed = random.seed,
-          user_supplied = isTRUE(degree_spec$user_supplied)
+          user_supplied = isTRUE(degree_spec$user_supplied),
+          .rng.collective = .rng.collective
         )[1L, ]
       }
     }
@@ -1556,6 +1764,13 @@
   token %in% c("false", "f", "no", "n", "0")
 }
 
+.np_nomad_native_parallel_eval_gt_one <- function(value) {
+  if (!length(value))
+    return(FALSE)
+  parsed <- suppressWarnings(as.numeric(as.character(value[1L])))
+  length(parsed) == 1L && is.finite(parsed) && parsed > 1
+}
+
 .np_nomad_native_reject_unsupported_options <- function(opts, route) {
   if (is.null(opts) || !length(opts))
     return(invisible(TRUE))
@@ -1566,6 +1781,15 @@
   if (length(idx) && any(vapply(opts[idx], .np_nomad_native_false_option, logical(1)))) {
     stop(sprintf(
       "%s requires EVAL_USE_CACHE = TRUE; cache-off native solves are not supported",
+      route
+    ), call. = FALSE)
+  }
+  idx <- which(toupper(trimws(option.names)) == "NB_THREADS_PARALLEL_EVAL")
+  if (length(idx) && any(vapply(
+    opts[idx], .np_nomad_native_parallel_eval_gt_one, logical(1)
+  ))) {
+    stop(sprintf(
+      "%s requires NB_THREADS_PARALLEL_EVAL = 1; package objective state is not re-entrant",
       route
     ), call. = FALSE)
   }
@@ -1665,28 +1889,12 @@
   if (is.finite(elapsed) && !is.na(elapsed) && elapsed >= 0)
     fields <- c(fields, sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)))
 
-  if (!is.null(current_degree))
+  if (!is.null(current_degree) && length(current_degree))
     fields <- c(fields, sprintf("deg %s", .np_degree_format_degree(current_degree)))
 
   fields <- c(fields, .np_degree_progress_best_degree_detail(best_record = best_record))
 
   paste(fields, collapse = ", ")
-}
-
-.np_nomad_progress_start_detail <- function(baseline_degree,
-                                            restart_index = 1L,
-                                            nmulti,
-                                            best_record,
-                                            restart_durations = numeric(),
-                                            elapsed = NULL) {
-  .np_nomad_progress_detail(
-    current_degree = baseline_degree,
-    best_record = best_record,
-    restart_index = restart_index,
-    nmulti = nmulti,
-    restart_durations = restart_durations,
-    elapsed = elapsed
-  )
 }
 
 .np_nomad_progress_fields <- function(state,
@@ -1770,10 +1978,6 @@
   invisible(NULL)
 }
 
-.np_nomad_powell_note <- function(degree) {
-  invisible(NULL)
-}
-
 .np_nomad_powell_progress_label <- function() {
   "Refining bandwidth"
 }
@@ -1797,29 +2001,22 @@
   out
 }
 
-.np_nomad_powell_context_label <- function(degree) {
-  sprintf(
-    "Refining NOMAD solution with one Powell hot start at degree %s",
-    .np_degree_format_degree(degree)
-  )
-}
-
 .np_nomad_powell_progress_detail <- function(current_degree,
                                              best_record,
                                              iteration = NULL,
                                              elapsed = NULL) {
   fields <- .np_degree_progress_context_fields()
 
-  if (is.finite(elapsed) && !is.na(elapsed) && elapsed >= 0)
-    fields <- c(fields, sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)))
-
   if (!is.null(iteration)) {
     iteration <- suppressWarnings(as.integer(iteration)[1L])
     if (!is.na(iteration) && iteration >= 1L)
-      fields <- c(fields, sprintf("iter %s", format(iteration)))
+      fields <- c(fields, sprintf("iteration %s", format(iteration)))
   }
 
-  if (!is.null(current_degree))
+  if (is.finite(elapsed) && !is.na(elapsed) && elapsed >= 0)
+    fields <- c(fields, sprintf("elapsed %ss", .np_progress_fmt_num(elapsed)))
+
+  if (!is.null(current_degree) && length(current_degree))
     fields <- c(fields, sprintf("deg %s", .np_degree_format_degree(current_degree)))
 
   fields <- c(fields, .np_degree_progress_best_degree_detail(best_record = best_record))
@@ -1842,41 +2039,25 @@
 .np_nomad_progress_enter_powell <- function(state,
                                             degree,
                                             best_record) {
-  if (is.null(state))
-    return(state)
-
-  now <- .np_progress_now()
-  state$label <- .np_nomad_powell_progress_label()
-  state$unknown_total_fields <- .np_nomad_powell_progress_fields
-  state$nomad_current_degree <- as.integer(degree)
-  state$nomad_best_record <- best_record
-  state$started <- now
-  state$last_done <- NULL
-  state$last_emitted_done <- NULL
-  state$last_emitted_detail <- NULL
-  state$last_emit <- now - state$throttle_sec
-  .np_progress_step_at(
+  .np_progress_bandwidth_enter_provider_stage(
     state = state,
-    now = now,
-    done = NULL,
-    force = TRUE
+    provider = "powell",
+    label = .np_nomad_powell_progress_label(),
+    fields = .np_nomad_powell_progress_fields,
+    degree = degree,
+    best_record = best_record
   )
 }
 
 .np_nomad_with_powell_progress <- function(degree, expr, best_record = NULL) {
   old.context <- .np_progress_runtime$bandwidth_context_label
   old.state <- .np_progress_runtime$bandwidth_state
+  old.state.active <- !is.null(old.state) &&
+    identical(.np_progress_registry$active_id, old.state$id)
   local.state <- NULL
   progress.enabled <- isTRUE(.np_progress_enabled(domain = "general"))
 
-  worker_silent <- FALSE
-  if (isTRUE(getOption("npRmpi.mpi.initialized", FALSE))) {
-    attach.size <- tryCatch(as.integer(mpi.comm.size(1L)), error = function(e) NA_integer_)
-    attach.rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) NA_integer_)
-
-    worker_silent <- !is.na(attach.size) && attach.size > 1L &&
-      !is.na(attach.rank) && attach.rank != 0L
-  }
+  worker_silent <- isTRUE(.np_progress_bandwidth_worker_silent())
 
   powell.context <- if (!is.null(old.context) && nzchar(old.context)) old.context else NULL
   .np_progress_bandwidth_set_context(powell.context)
@@ -1890,25 +2071,35 @@
     .np_progress_bandwidth_set_context(old.context)
   }, add = TRUE)
 
-  if (is.null(old.state) && !isTRUE(worker_silent) && isTRUE(progress.enabled)) {
+  if (isTRUE(worker_silent)) {
+    .np_progress_runtime$bandwidth_state <- NULL
+  } else if (!isTRUE(old.state.active) && isTRUE(progress.enabled)) {
     local.state <- .np_progress_begin(
       label = .np_nomad_powell_progress_label(),
       domain = "general",
       surface = "bandwidth"
     )
-    local.state$unknown_total_fields <- .np_nomad_powell_progress_fields
-    local.state$nomad_current_degree <- as.integer(degree)
-    local.state$nomad_best_record <- best_record
-    local.state$nomad_nmulti <- 1L
-    local.state <- .np_progress_show_now(local.state)
+    local.state <- .np_progress_bandwidth_enter_provider_stage(
+      state = local.state,
+      provider = "powell",
+      label = .np_nomad_powell_progress_label(),
+      fields = .np_nomad_powell_progress_fields,
+      degree = degree,
+      best_record = best_record
+    )
     .np_progress_runtime$bandwidth_state <- local.state
-  } else if (isTRUE(worker_silent)) {
-    .np_progress_runtime$bandwidth_state <- NULL
+  } else if (isTRUE(old.state.active) &&
+             !identical(old.state$progress_provider, "powell")) {
+    .np_progress_runtime$bandwidth_state <- .np_nomad_progress_enter_powell(
+      state = old.state,
+      degree = degree,
+      best_record = best_record
+    )
   }
 
   value <- force(expr)
 
-  if (!is.null(local.state) && is.list(value) && !is.null(value$num.feval)) {
+  if (is.list(value) && !is.null(value$num.feval)) {
     done <- suppressWarnings(as.integer(value$num.feval[1L]))
     if (!is.na(done) && done >= 1L && !is.null(.np_progress_runtime$bandwidth_state)) {
       .np_progress_runtime$bandwidth_state <- .np_progress_step_at(
@@ -1935,6 +2126,128 @@
   )
 
   list(value = value, output = output)
+}
+
+.np_nomad_fixed_degree_geometry <- function(degree_spec,
+                                            ncoordinate,
+                                            bbin,
+                                            lb,
+                                            ub,
+                                            start_matrix) {
+  if (is.null(degree_spec) || !length(degree_spec$lower))
+    return(NULL)
+
+  q <- length(degree_spec$lower)
+  if (length(degree_spec$upper) != q || q > ncoordinate)
+    stop("internal NOMAD degree geometry is inconsistent", call. = FALSE)
+
+  degree.offset <- ncoordinate - q
+  fixed.count <- 0L
+  for (j in seq_len(q)) {
+    idx <- degree.offset + j
+    spec.fixed <- isTRUE(degree_spec$lower[j] == degree_spec$upper[j])
+    bound.fixed <- isTRUE(lb[idx] == ub[idx])
+    if (!identical(spec.fixed, bound.fixed)) {
+      stop(
+        "internal NOMAD degree bounds disagree with the normalized degree specification",
+        call. = FALSE
+      )
+    }
+    if (spec.fixed)
+      fixed.count <- fixed.count + 1L
+  }
+
+  if (fixed.count == 0L)
+    return(NULL)
+  if (fixed.count == q) {
+    stop(
+      "internal NOMAD degree search received an all-fixed degree vector; the singleton bypass should have handled it",
+      call. = FALSE
+    )
+  }
+
+  carrier.lower <- as.numeric(lb)
+  carrier.upper <- as.numeric(ub)
+  fixed.tokens <- rep.int("-", ncoordinate)
+  fixed.index <- integer(fixed.count)
+  fixed.value <- integer(fixed.count)
+  k <- 0L
+  for (j in seq_len(q)) {
+    idx <- degree.offset + j
+    if (!isTRUE(degree_spec$lower[j] == degree_spec$upper[j]))
+      next
+
+    value <- degree_spec$lower[j]
+    if (!is.finite(value) || value < 0 || value != round(value) ||
+        value > .Machine$integer.max || bbin[idx] != 1L) {
+      stop("internal NOMAD fixed degree is not a valid integer coordinate", call. = FALSE)
+    }
+    value <- as.integer(value)
+    for (i in seq_len(nrow(start_matrix))) {
+      if (!identical(as.numeric(start_matrix[i, idx]), as.numeric(value))) {
+        stop("internal NOMAD start does not preserve a fixed degree", call. = FALSE)
+      }
+    }
+
+    k <- k + 1L
+    fixed.index[k] <- idx
+    fixed.value[k] <- value
+    fixed.tokens[idx] <- as.character(value)
+    if (value == 0L) {
+      carrier.lower[idx] <- 0
+      carrier.upper[idx] <- 1
+    } else {
+      carrier.lower[idx] <- value - 1
+      carrier.upper[idx] <- value
+    }
+  }
+
+  list(
+    lower = carrier.lower,
+    upper = carrier.upper,
+    option.value = paste0("( ", paste(fixed.tokens, collapse = " "), " )"),
+    fixed.index = fixed.index,
+    fixed.value = fixed.value
+  )
+}
+
+.np_nomad_add_fixed_degree_option <- function(opts, geometry) {
+  if (is.null(geometry))
+    return(opts)
+
+  option.names <- names(opts)
+  if (length(opts) && !is.null(option.names) &&
+      any(toupper(trimws(option.names)) == "FIXED_VARIABLE")) {
+    stop(
+      "'FIXED_VARIABLE' is reserved internally when NOMAD searches mixed fixed/free degree bounds",
+      call. = FALSE
+    )
+  }
+
+  c(opts, list(FIXED_VARIABLE = geometry$option.value))
+}
+
+.np_nomad_assert_fixed_degree_solution <- function(solution, geometry,
+                                                   where = "native NOMAD route") {
+  if (is.null(geometry))
+    return(invisible(TRUE))
+  solution <- as.numeric(solution)
+  if (!length(solution) || any(geometry$fixed.index > length(solution)))
+    stop(sprintf("%s returned a malformed fixed-degree solution", where),
+         call. = FALSE)
+
+  for (i in seq_along(geometry$fixed.index)) {
+    index <- geometry$fixed.index[i]
+    expected <- as.numeric(geometry$fixed.value[i])
+    observed <- solution[index]
+    if (!is.finite(observed) || !identical(observed, expected)) {
+      stop(sprintf(
+        "%s violated fixed-degree coordinate %d: requested %.17g, returned %.17g",
+        where, index, expected, observed
+      ), call. = FALSE)
+    }
+  }
+  invisible(TRUE)
 }
 
 .np_nomad_native_option_vectors <- function(opts) {
@@ -2090,6 +2403,7 @@
     best_record = best_record,
     label = label
   )
+  handle$state$progress_provider <- "nomad_native"
   handle$state$nomad_native_progress <- TRUE
   handle$state$nomad_eval_offset <- 0L
   .np_progress_runtime$bandwidth_state <- handle$state
@@ -2128,7 +2442,8 @@
 .np_progress_nomad_native_step_from_c <- function(iteration,
                                                   current.degree,
                                                   best.degree = integer(),
-                                                  best.objective = NA_real_) {
+                                                  best.objective = NA_real_,
+                                                  force = FALSE) {
   state <- .np_progress_runtime$bandwidth_state
   if (is.null(state) || !isTRUE(state$nomad_native_progress)) {
     return(invisible(FALSE))
@@ -2170,10 +2485,67 @@
   state <- .np_degree_progress_step(
     state = state,
     done = iteration,
-    detail = NULL
+    detail = NULL,
+    force = isTRUE(force)
   )
   .np_progress_runtime$bandwidth_state <- state
   invisible(TRUE)
+}
+
+.np_progress_nomad_native_observer_config <- function() {
+  state <- .np_progress_runtime$bandwidth_state
+  interval <- if (!is.null(state$throttle_sec)) {
+    suppressWarnings(as.numeric(state$throttle_sec)[1L])
+  } else {
+    .np_progress_interval_sec(known_total = FALSE, domain = "general")
+  }
+  if (!is.finite(interval) || is.na(interval) || interval < 0) {
+    interval <- .np_progress_interval_sec(known_total = FALSE, domain = "general")
+  }
+
+  c(
+    enabled = as.numeric(!is.null(state) && isTRUE(state$enabled)),
+    interval = interval
+  )
+}
+
+.np_progress_nomad_native_observer_dispatch <- function(iteration,
+                                                         current.degree,
+                                                         best.degree,
+                                                         best.objective,
+                                                         propagate = FALSE) {
+  tryCatch(
+    {
+      state <- .np_progress_runtime$bandwidth_state
+      if (isTRUE(state$nomad_native_progress)) {
+        .np_progress_nomad_native_step_from_c(
+          iteration = iteration,
+          current.degree = current.degree,
+          best.degree = best.degree,
+          best.objective = best.objective,
+          force = TRUE
+        )
+      } else {
+        .np_progress_bandwidth_activity_step(done = iteration, force = TRUE)
+      }
+      list(0L, "")
+    },
+    interrupt = function(e) {
+      if (propagate) {
+        .Call("C_np_nomad_condition_raise", e, PACKAGE = "npRmpi")
+      }
+      list(2L, conditionMessage(e))
+    },
+    error = function(e) {
+      if (propagate) stop(e)
+      list(1L, conditionMessage(e))
+    }
+  )
+}
+
+.np_progress_nomad_native_observer_report <- function(message) {
+  .np_message("NOMAD progress observer disabled: ", message)
+  invisible(NULL)
 }
 
 .np_nomad_native_progress_restart <- function(handle,
@@ -2282,9 +2654,21 @@
                              native.r.bridge = TRUE,
                              source = "explicit",
                              reason = NULL,
-                             progress_label = NULL) {
+                             progress_label = NULL,
+                             recover_start = NULL,
+                             prepare_starts = NULL,
+                             preserve.eval.error = FALSE,
+                             .native.callback.transaction = NULL,
+                             .rng.collective = .npRmpi_rng_scope_collective()) {
   engine <- match.arg(engine)
   direction <- match.arg(direction)
+  if (!is.null(recover_start) && !is.function(recover_start))
+    stop("'recover_start' must be NULL or a function", call. = FALSE)
+  if (!is.null(prepare_starts) && !is.function(prepare_starts))
+    stop("'prepare_starts' must be NULL or a function", call. = FALSE)
+  if (!is.null(.native.callback.transaction) &&
+      !is.function(.native.callback.transaction))
+    stop("'.native.callback.transaction' must be NULL or a function", call. = FALSE)
   .np_nomad_require_crs()
 
   state <- new.env(parent = emptyenv())
@@ -2298,6 +2682,9 @@
   state$best_payload <- NULL
   state$interrupted <- FALSE
   state$error <- NULL
+  state$preserve.eval.error <- isTRUE(preserve.eval.error)
+  state$evaluator.error <- NULL
+  state$evaluator.interrupt <- NULL
   state$progress_state <- NULL
   state$nomad.time <- NA_real_
   state$powell.time <- NA_real_
@@ -2321,6 +2708,18 @@
     invisible(value)
   }
 
+  abort_progress <- function(detail) {
+    if (!is.null(state$progress_state)) {
+      # Diagnostic rendering must not replace the condition that ended search.
+      tryCatch({
+        set_progress_state(.np_progress_abort(
+          state = state$progress_state, detail = detail))
+      }, error = function(e) invisible(NULL),
+         interrupt = function(e) invisible(NULL))
+    }
+    invisible(NULL)
+  }
+
   nomad.nmulti <- npValidateNmulti(nmulti)
   nomad.inner.nmulti <- npValidateNonNegativeInteger(nomad.inner.nmulti, "nomad.inner.nmulti")
   nomad.opts <- if (is.null(nomad.opts)) list() else nomad.opts
@@ -2333,12 +2732,34 @@
     random.seed = random.seed,
     degree_spec = degree_spec,
     start.lower = start.lower,
-    start.upper = start.upper
+    start.upper = start.upper,
+    .rng.collective = .rng.collective
   )
+  if (!is.null(prepare_starts)) {
+    prepared <- prepare_starts(start_matrix)
+    if (!is.matrix(prepared) || !is.numeric(prepared) ||
+        !identical(dim(prepared), dim(start_matrix)) ||
+        any(!is.finite(prepared)) ||
+        any(sweep(prepared, 2L, lb, "<")) ||
+        any(sweep(prepared, 2L, ub, ">")) ||
+        any(prepared[, bbin != 0L, drop = FALSE] !=
+              round(prepared[, bbin != 0L, drop = FALSE])))
+      stop("NOMAD prepared starts violate the existing coordinate dimensions or search bounds",
+           call. = FALSE)
+    start_matrix <- prepared
+  }
   coordinate.roles <- .np_nomad_validate_coordinate_roles(
     coordinate.roles,
     ncol(start_matrix),
     where = ".np_nomad_search"
+  )
+  fixed.degree.geometry <- .np_nomad_fixed_degree_geometry(
+    degree_spec = degree_spec,
+    ncoordinate = ncol(start_matrix),
+    bbin = bbin,
+    lb = lb,
+    ub = ub,
+    start_matrix = start_matrix
   )
   state$restart_starts <- lapply(
     seq_len(nrow(start_matrix)),
@@ -2379,8 +2800,8 @@
     invisible(rec)
   }
 
-  state$update_best <- function(rec, point) {
-    if (!identical(rec$status, "ok") || !is.finite(rec$objective))
+  state$update_best <- function(rec, point, admissible = TRUE) {
+    if (!isTRUE(admissible) || !identical(rec$status, "ok") || !is.finite(rec$objective))
       return(invisible(NULL))
 
     incumbent <- if (is.null(state$best_record)) {
@@ -2398,48 +2819,10 @@
     invisible(NULL)
   }
 
-  wrapped_eval <- function(point) {
-    point <- as.numeric(point)
-    state$visit_id <- state$visit_id + 1L
-    started <- proc.time()[3L]
-    status <- "ok"
-    msg <- NULL
-    objective <- NA_real_
-    degree <- integer(0)
-    num.feval <- NA_real_
-    num.feval.fast <- NA_real_
-
-    result <- tryCatch(
-      eval_fun(point),
-      interrupt = function(e) {
-        state$interrupted <- TRUE
-        NULL
-      },
-      error = function(e) {
-        status <<- "error"
-        msg <<- conditionMessage(e)
-        NULL
-      }
-    )
-
-    if (isTRUE(state$interrupted))
-      stop(structure(list(message = "interrupt"), class = c("interrupt", "condition")))
-
-    if (!is.null(result)) {
-      if (!is.list(result) || is.null(result$objective) || is.null(result$degree))
-        stop("NOMAD fixed-point evaluator must return a list containing 'objective' and 'degree'")
-
-      objective <- as.numeric(result$objective[1L])
-      degree <- as.integer(result$degree)
-      if (!is.null(result$num.feval))
-        num.feval <- as.numeric(result$num.feval[1L])
-      if (!is.null(result$num.feval.fast))
-        num.feval.fast <- as.numeric(result$num.feval.fast[1L])
-      extra.fields <- result[setdiff(names(result), c("objective", "degree", "num.feval", "num.feval.fast"))]
-    } else {
-      extra.fields <- list()
-    }
-
+  record_evaluation <- function(point, started, status = "ok", msg = NULL,
+                                objective = NA_real_, degree = integer(0),
+                                num.feval = NA_real_, num.feval.fast = NA_real_,
+                                admissible = TRUE, extra.fields = list()) {
     state$eval_id <- state$eval_id + 1L
     rec <- c(list(
       eval_id = state$eval_id,
@@ -2455,7 +2838,7 @@
     if (is.null(state$baseline_record))
       state$baseline_record <- rec
     state$record_trace(rec)
-    state$update_best(rec, point = point)
+    state$update_best(rec, point = point, admissible = admissible)
     state$restart_eval_id <- state$restart_eval_id + 1L
     if (!is.null(state$progress_state)) {
       state$progress_state$nomad_current_degree <- degree
@@ -2479,6 +2862,73 @@
     }
 
     if (identical(direction, "min")) Inf else .Machine$double.xmax
+  }
+
+  wrapped_eval <- function(point) {
+    if (!is.null(state$evaluator.error))
+      stop(state$evaluator.error)
+    if (!is.null(state$evaluator.interrupt))
+      stop(state$evaluator.interrupt)
+    started <- proc.time()[3L]
+    phase <- "input"
+    tryCatch({
+      point <- as.numeric(point)
+      state$visit_id <- state$visit_id + 1L
+      phase <- "evaluate"
+      result <- eval_fun(point)
+      phase <- "result"
+      objective <- NA_real_
+      degree <- integer(0)
+      num.feval <- num.feval.fast <- NA_real_
+      admissible <- TRUE
+      extra.fields <- list()
+      if (!is.null(result)) {
+        if (!is.list(result) || is.null(result$objective) || is.null(result$degree))
+          stop("NOMAD fixed-point evaluator must return a list containing 'objective' and 'degree'")
+        objective <- as.numeric(result$objective[1L])
+        degree <- as.integer(result$degree)
+        if (!is.null(result$num.feval))
+          num.feval <- as.numeric(result$num.feval[1L])
+        if (!is.null(result$num.feval.fast))
+          num.feval.fast <- as.numeric(result$num.feval.fast[1L])
+        if (!is.null(result[["admissible"]])) {
+          admissible <- result[["admissible"]]
+          if (!is.logical(admissible) || length(admissible) != 1L || is.na(admissible))
+            stop("NOMAD evaluator 'admissible' must be TRUE or FALSE", call. = FALSE)
+        }
+        extra.fields <- result[setdiff(names(result), c("objective", "degree", "num.feval", "num.feval.fast", "admissible"))]
+      }
+      record_evaluation(point, started, objective = objective, degree = degree,
+                        num.feval = num.feval, num.feval.fast = num.feval.fast,
+                        admissible = admissible, extra.fields = extra.fields)
+    }, interrupt = function(e) {
+      state$interrupted <- TRUE
+      state$evaluator.interrupt <- e
+      stop(e)
+    }, error = function(e) {
+      # Rejection belongs only to exploratory evaluation, not conversion or
+      # publication. One callback-wide catcher also protects incumbent updates.
+      rejection <- identical(phase, "evaluate") &&
+        (!state$preserve.eval.error || inherits(e, "np_nn_candidate_invalid"))
+      if (rejection) {
+        # A failure while recording a rejection is not itself a rejection.
+        return(tryCatch(
+          record_evaluation(point, started, status = "error",
+                            msg = conditionMessage(e)),
+          error = function(record.error) {
+            if (state$preserve.eval.error)
+              state$evaluator.error <- record.error
+            stop(record.error)
+          }
+        ))
+      }
+      if (state$preserve.eval.error) {
+        if (is.null(state$evaluator.error))
+          state$evaluator.error <- e
+        stop(state$evaluator.error)
+      }
+      stop(e)
+    })
   }
 
   baseline.degree <- if (is.null(start_degree)) {
@@ -2513,6 +2963,8 @@
       geometry.policy = if (is.null(coordinate.roles)) "user-only" else "generate-central",
       where = ".np_nomad_search source geometry"
     )
+    if (!is.null(fixed.degree.geometry))
+      solver.opts <- .np_nomad_add_fixed_degree_option(solver.opts, fixed.degree.geometry)
     start <- as.numeric(start)
 
     if (isTRUE(state$native.r.bridge)) {
@@ -2520,47 +2972,68 @@
         value <- as.numeric(wrapped_eval(point)[1L])
         if (!is.finite(value)) .Machine$double.xmax else value
       }
-      native.option.vectors <- .np_nomad_native_option_vectors(solver.opts)
-      native.call <- .np_nomad_native_r_callback_search(
-        eval.f = native.eval,
-        x0 = start,
-        bbin = bbin,
-        lb = lb,
-        ub = ub,
-        random.seed = random.seed,
-        inner.start.count = nomad.inner.nmulti,
-        option.names = native.option.vectors$names,
-        option.values = native.option.vectors$values,
-        display.nomad.progress = display.nomad.progress
-      )
-      native.value <- native.call$value
-      native.status.raw <- if (!is.null(native.value$status)) native.value$status[1L] else 0L
-      native.status.integer <- suppressWarnings(as.integer(native.status.raw))
-      native.status.failed <- if (!is.na(native.status.integer)) {
-        !identical(native.status.integer, 0L)
-      } else {
-        !(tolower(as.character(native.status.raw)) %in% c("", "ok", "success"))
-      }
-      native.result.status <- if (!is.null(native.value$result_status)) {
-        suppressWarnings(as.integer(native.value$result_status[1L]))
-      } else {
-        0L
-      }
-      native.result.failed <- !is.na(native.result.status) && !identical(native.result.status, 0L)
-      if (native.status.failed || native.result.failed) {
-        native.message <- if (!is.null(native.value$message) &&
-                              nzchar(as.character(native.value$message[1L]))) {
-          as.character(native.value$message[1L])
-        } else {
-          "NOMAD rejected the supplied parameters"
+      if (!is.null(.native.callback.transaction)) {
+        # Select once per native solve. Other families keep the original
+        # callback, including its scalar conversion, without a hot-path hook.
+        native.eval.original <- native.eval
+        native.eval <- function(point) {
+          if (!is.null(state$evaluator.error))
+            stop(state$evaluator.error)
+          tryCatch(
+            .native.callback.transaction(
+              function() native.eval.original(point), point),
+            error = function(e) {
+              # Completion may choose a peer's original cause. Replace a
+              # rank-local latch with that agreed cause on every participant.
+              state$evaluator.error <- e
+              stop(e)
+            }
+          )
         }
-        stop(sprintf(
-          "native NOMAD R-callback route failed (status=%s, result_status=%s): %s",
-          as.character(native.status.raw),
-          native.result.status,
-          native.message
-        ), call. = FALSE)
       }
+      native.option.vectors <- .np_nomad_native_option_vectors(solver.opts)
+      run.native <- function() {
+        .np_nomad_native_r_callback_search(
+          eval.f = native.eval,
+          x0 = start,
+          bbin = bbin,
+          lb = if (is.null(fixed.degree.geometry)) lb else fixed.degree.geometry$lower,
+          ub = if (is.null(fixed.degree.geometry)) ub else fixed.degree.geometry$upper,
+          random.seed = random.seed,
+          inner.start.count = nomad.inner.nmulti,
+          option.names = native.option.vectors$names,
+          option.values = native.option.vectors$values,
+          display.nomad.progress = display.nomad.progress
+        )
+      }
+      if (.npRmpi_mpi_interrupt_defer_on_master()) {
+        completed.call <- NULL
+        native.call <- tryCatch(
+          suspendInterrupts({
+            completed.call <- run.native()
+            completed.call
+          }),
+          interrupt = function(e) {
+            if (is.null(completed.call))
+              stop(e)
+            .npRmpi_mpi_interrupt_set_pending()
+            completed.call
+          }
+        )
+      } else {
+        native.call <- run.native()
+      }
+      native.value <- native.call$value
+      if (!is.null(state$evaluator.error))
+        stop(state$evaluator.error)
+      if (!is.null(state$evaluator.interrupt))
+        stop(state$evaluator.interrupt)
+      .np_nomad_native_status(native.value, "native NOMAD R-callback route")
+      .np_nomad_assert_fixed_degree_solution(
+        solution = native.value$solution,
+        geometry = fixed.degree.geometry,
+        where = "native NOMAD R-callback route"
+      )
       return(native.call)
     }
 
@@ -2571,7 +3044,34 @@
   restart_results <- vector("list", nomad.nmulti)
   best_solution <- NULL
   nomad.elapsed <- 0
-  for (i in seq_len(nomad.nmulti)) {
+  for (i in seq_len(nomad.nmulti + as.integer(!is.null(recover_start)))) {
+    if (i > nomad.nmulti) {
+      if (!is.null(state$best_point) || isTRUE(state$interrupted))
+        break
+      recovery.started <- proc.time()[3L]
+      recovery <- recover_start(as.numeric(start_matrix[1L, ]))
+      nomad.elapsed <- nomad.elapsed + proc.time()[3L] - recovery.started
+      if (!is.list(recovery) || !is.logical(recovery[["found"]]) ||
+          length(recovery[["found"]]) != 1L || is.na(recovery[["found"]]))
+        stop("NOMAD recovery must return a scalar logical 'found'", call. = FALSE)
+      if (!isTRUE(recovery[["found"]]))
+        break
+      point <- recovery[["point"]]
+      if (!is.numeric(point) || length(point) != length(x0) ||
+          any(!is.finite(point)) || any(point < lb | point > ub) ||
+          any(point[bbin != 0L] != round(point[bbin != 0L])))
+        stop("NOMAD recovery returned an invalid start point", call. = FALSE)
+      point <- as.numeric(point)
+      start_matrix <- rbind(start_matrix, point)
+      state$restart_starts[[i]] <- point
+      if (!is.null(state$restart_degree_starts)) {
+        q <- length(degree_spec$lower)
+        state$restart_degree_starts[[i]] <- as.integer(utils::tail(point, q))
+        state$restart_bandwidth_starts[[i]] <- utils::head(point, length(point) - q)
+      }
+      if (!is.null(state$progress_state))
+        state$progress_state$nomad_nmulti <- nrow(start_matrix)
+    }
     state$current_restart <- as.integer(i)
     state$restart_eval_id <- 0L
     restart_degree <- if (!is.null(state$restart_degree_starts) &&
@@ -2619,10 +3119,13 @@
       },
       interrupt = function(e) {
         state$interrupted <- TRUE
+        state$evaluator.interrupt <- e
         NULL
       },
       error = function(e) {
         state$error <- conditionMessage(e)
+        if (state$preserve.eval.error && is.null(state$evaluator.error))
+          state$evaluator.error <- e
         NULL
       }
     )
@@ -2668,16 +3171,18 @@
       }
     )
 
+    if (i > nomad.nmulti) {
+      restart_results[[i]]$recovery <- TRUE
+      restart_results[[i]]$recovery_witness <- recovery
+    }
+
     if (isTRUE(state$interrupted))
       break
 
     if (is.null(solution_i) && !is.null(state$error)) {
-      if (!is.null(state$progress_state)) {
-        state$progress_state <- .np_progress_abort(
-          state = state$progress_state,
-          detail = state$error
-        )
-      }
+      abort_progress(state$error)
+      if (!is.null(state$evaluator.error))
+        stop(state$evaluator.error)
       stop(state$error, call. = FALSE)
     }
 
@@ -2724,6 +3229,7 @@
       state$progress_state$nomad_current_degree <- remin.degree
       state$progress_state$nomad_best_record <- state$best_record
       state$progress_state$nomad_restart_index <- remin.index
+      state$progress_state$nomad_nmulti <- max(nomad.nmulti, remin.index)
       state$progress_state$nomad_restart_durations <- state$restart_durations
       set_progress_state(.np_degree_progress_step(
         state = state$progress_state,
@@ -2748,10 +3254,13 @@
       },
       interrupt = function(e) {
         state$interrupted <- TRUE
+        state$evaluator.interrupt <- e
         NULL
       },
       error = function(e) {
         state$error <- conditionMessage(e)
+        if (state$preserve.eval.error && is.null(state$evaluator.error))
+          state$evaluator.error <- e
         NULL
       }
     )
@@ -2797,12 +3306,9 @@
       }
     )
     if (is.null(solution_i) && !is.null(state$error)) {
-      if (!is.null(state$progress_state)) {
-        state$progress_state <- .np_progress_abort(
-          state = state$progress_state,
-          detail = state$error
-        )
-      }
+      abort_progress(state$error)
+      if (!is.null(state$evaluator.error))
+        stop(state$evaluator.error)
       stop(state$error, call. = FALSE)
     }
     post_restart_best <- if (is.null(state$best_record) || is.null(state$best_record$objective)) {
@@ -2814,6 +3320,10 @@
         .np_degree_better(post_restart_best, pre_restart_best, direction = direction)) {
       best_solution <- solution_i
     }
+  }
+  if (!is.null(state$evaluator.interrupt)) {
+    abort_progress(conditionMessage(state$evaluator.interrupt))
+    stop(state$evaluator.interrupt)
   }
   state$nomad.time <- nomad.elapsed
   state$restart_results <- restart_results
@@ -2829,7 +3339,9 @@
       state$error
     })
 
-  if (identical(engine, "nomad+powell") && !is.null(state$progress_state)) {
+  if (identical(engine, "nomad+powell") &&
+      !isTRUE(handoff_before_build) &&
+      !is.null(state$progress_state)) {
     set_progress_state(.np_nomad_progress_enter_powell(
       state = state$progress_state,
       degree = state$best_record$degree,
@@ -2856,12 +3368,7 @@
       interrupted = state$interrupted
     ),
     error = function(e) {
-      if (!is.null(state$progress_state)) {
-        set_progress_state(.np_progress_abort(
-          state = state$progress_state,
-          detail = conditionMessage(e)
-        ))
-      }
+      abort_progress(conditionMessage(e))
       stop(e)
     }
   )

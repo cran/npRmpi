@@ -1,4 +1,46 @@
-### Copyright (C) 2002 Hao Yu 
+### Copyright (C) 2002 Hao Yu
+.npRmpi_mpi_runtime_state <- function() {
+    state <- .Call("mpi_runtime_state", PACKAGE = "npRmpi")
+    if (!is.logical(state) || length(state) != 2L ||
+        !identical(names(state), c("initialized", "finalized")) ||
+        anyNA(state))
+        stop("npRmpi received invalid MPI lifecycle state from its native backend")
+    state
+}
+
+.npRmpi_sync_mpi_inactive <- function() {
+    options(
+        npRmpi.mpi.initialized = FALSE,
+        npRmpi.pool.active = FALSE,
+        npRmpi.master.only = FALSE
+    )
+    invisible(NULL)
+}
+
+.npRmpi_mpi_finalize_quiet <- function() {
+    if (!isTRUE(getOption("npRmpi.mpi.initialized", TRUE)))
+        return(invisible(FALSE))
+
+    state <- tryCatch(.npRmpi_mpi_runtime_state(), error = function(e) NULL)
+    if (is.null(state))
+        return(invisible(FALSE))
+    if (!isTRUE(state[["initialized"]]) || isTRUE(state[["finalized"]])) {
+        .npRmpi_sync_mpi_inactive()
+        return(invisible(isTRUE(state[["finalized"]])))
+    }
+    .npRmpi_sync_mpi_inactive()
+    out <- tryCatch(.Call("mpi_finalize", PACKAGE = "npRmpi"),
+                    error = function(e) NULL)
+    if (is.null(out) || !isTRUE(as.logical(out)[1L])) {
+        state <- tryCatch(.npRmpi_mpi_runtime_state(), error = function(e) NULL)
+        if (!is.null(state) && isTRUE(state[["initialized"]]) &&
+            !isTRUE(state[["finalized"]]))
+            options(npRmpi.mpi.initialized = TRUE)
+        return(invisible(FALSE))
+    }
+    out
+}
+
 mpi.finalize <- function(){
     if (!isTRUE(getOption("npRmpi.mpi.initialized", TRUE)))
         return(invisible(FALSE))
@@ -7,11 +49,7 @@ mpi.finalize <- function(){
     if (!is.na(is.master) && isTRUE(is.master))
         message("Exiting Rmpi. Rmpi cannot be used unless relaunching R.")
 
-    out <- tryCatch(.Call("mpi_finalize",PACKAGE = "npRmpi"), error = function(e) NULL)
-    options(npRmpi.mpi.initialized = FALSE)
-    if (is.null(out))
-        return(invisible(FALSE))
-    out
+    .npRmpi_mpi_finalize_quiet()
 }
 
 mpi.exit <- function(){

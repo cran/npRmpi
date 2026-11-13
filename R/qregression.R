@@ -1,10 +1,14 @@
 qregression <- 
     function(bws, xeval, tau, quantile, quanterr = NA, quantgrad = NA, quantgerr = NA, ntrain, trainiseval = FALSE, gradients = FALSE,
-             timing = NA, total.time = NA, optim.time = NA, fit.time = NA){
+             timing = NA, total.time = NA, optim.time = NA, fit.time = NA, se = TRUE,
+             fit.controls = NULL, train.rows.omit = NULL, eval.rows.omit = NULL){
 
         if (missing(bws) || missing(xeval) || missing(tau) || missing(quantile) || missing(ntrain))
             stop("improper invocation of qregression constructor")
 
+        train.rows.omit <- as.vector(train.rows.omit)
+        eval.rows.omit <- as.vector(eval.rows.omit)
+        rows.omit <- if (trainiseval) train.rows.omit else eval.rows.omit
         d <- list(
             xbw = bws$xbw,
             ybw = bws$ybw,
@@ -37,6 +41,14 @@ qregression <-
             ntrain = ntrain,
             trainiseval = trainiseval,
             gradients = gradients,
+            se = se,
+            fit.controls = fit.controls,
+            rows.omit = rows.omit,
+            nobs.omit = length(rows.omit),
+            train.rows.omit = train.rows.omit,
+            train.nobs.omit = length(train.rows.omit),
+            eval.rows.omit = eval.rows.omit,
+            eval.nobs.omit = length(eval.rows.omit),
             timing = timing, total.time = total.time,
             optim.time = optim.time, fit.time = fit.time)
 
@@ -84,33 +96,44 @@ fitted.qregression <- function(object, ...){
 }
 quantile.qregression <- function(x, ...){ x$quantile }
 .npqreg_predict_newdata_to_exdat <- function(object, newdata) {
-  if (is.data.frame(newdata) && !is.null(names(newdata))) {
-    xnames <- object$bws$xnames
-    if (length(xnames)) {
-      missing.names <- setdiff(xnames, names(newdata))
-      if (length(missing.names))
-        stop(sprintf(
-          "newdata must contain columns: %s",
-          paste(shQuote(xnames), collapse = ", ")
-        ), call. = FALSE)
-      return(newdata[, xnames, drop = FALSE])
-    }
+  if (!is.null(object$bws$formula)) {
+    npValidateNewdataFormula(newdata, .np_formula_conditional_rhs_terms(object$bws),
+                            include.response = FALSE)
+    return(newdata)
   }
-  newdata
+  .np_native_newdata_parts(
+    newdata, list(exdat = object$bws$xnames), "predict.npqreg")$exdat
+}
+
+.npqreg_replay_controls <- function(object, dots) {
+  controls <- object[["fit.controls", exact = TRUE]]
+  for (name in c("tol", "small", "itmax")) {
+    if (!(name %in% names(dots)) && !is.null(controls[[name, exact = TRUE]]))
+      dots[[name]] <- controls[[name, exact = TRUE]]
+  }
+  dots
 }
 
 predict.qregression <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
+  if ("se" %in% names(dots) &&
+      !identical(npValidateScalarLogical(dots[["se"]], "se"), se.fit))
+    stop("conflicting 'se' and 'se.fit' requests; use se.fit to request prediction standard errors",
+         call. = FALSE)
+  dots[["se"]] <- se.fit
+  dots <- .npqreg_replay_controls(object, dots)
   has.formula.route <- !is.null(object$bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npqreg.condbandwidth,
+                                  c("txdat", "tydat"))
 
   if (!is.null(dots$exdat) && !is.null(dots$newdata))
     dots$newdata <- NULL
   if (has.formula.route) {
-    if (!is.null(dots$exdat)) {
-      dots$newdata <- .npqreg_predict_newdata_to_exdat(object, dots$exdat)
-      dots$exdat <- NULL
-    } else if (!is.null(dots$newdata)) {
+    # Native exdat already contains model coordinates. Only raw newdata
+    # belongs to the formula validation/transformation owner.
+    if (!is.null(dots$newdata)) {
       dots$newdata <- .npqreg_predict_newdata_to_exdat(object, dots$newdata)
     }
   } else {
@@ -123,6 +146,7 @@ predict.qregression <- function(object, se.fit = FALSE, ...) {
   }
   if (is.null(dots$tau))
     dots$tau <- object$tau
+  dots[[".np_conditional_cat_se_demand"]] <- FALSE
   tr <- do.call(npqreg, c(list(bws = object$bws), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
@@ -131,15 +155,39 @@ predict.qregression <- function(object, se.fit = FALSE, ...) {
     return(fitted(tr))
 }
 
-se.qregression <- function(x) { x$quanterr }
-gradients.qregression <- function(x, errors = FALSE, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  gout <- if (!errors) x$quantgrad else x$quantgerr
+.npqreg_refit_tau <- function(x) {
+  tau <- x[["tau", exact = TRUE]]
+  if (!is.null(tau))
+    paste0("tau = ", paste(deparse(tau), collapse = ""))
+}
+
+se.qregression <- function(x) {
+  .np_require_stored_se(x, x[["quanterr", exact = TRUE]], "npqreg",
+                       what = "quantile standard errors", expr = substitute(x),
+                       data.hint = .npqreg_refit_tau(x))
+}
+gradients.qregression <- function(x, se = FALSE, ...) {
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.qregression")
+  npRejectLegacyBooleanErrors(list(...), "gradients.qregression")
+  se <- npValidateScalarLogical(se, "se")
+  if (se) {
+    value <- x[["quantgerr", exact = TRUE]]
+    if (length(value) == 1L && is.logical(value) && is.na(value))
+      value <- NULL
+    return(.np_require_stored_se(
+      x, value, "npqreg",
+      what = "quantile gradient standard errors", expr = substitute(x),
+      switches = "gradients = TRUE, se = TRUE",
+      data.hint = .npqreg_refit_tau(x)
+    ))
+  }
+  gout <- x[["quantgrad", exact = TRUE]]
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop(if (!errors)
-      "gradients are not available: fit the model with gradients=TRUE"
-    else
-      "gradient standard errors are not available: fit the model with gradients=TRUE")
+    stop(paste("gradients are not available.",
+               .np_se_refit_hint(substitute(x), "npqreg", "gradients = TRUE",
+                                 data.hint = .npqreg_refit_tau(x))),
+         call. = FALSE)
   gout
 }
 

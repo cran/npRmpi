@@ -10,27 +10,38 @@ test_that("named bws formula dispatch matches positional density/distribution ro
   nd.u <- data.frame(x = c(0.2, 0.5, 0.8))
   nd.c <- data.frame(x = c(0.2, 0.5, 0.8), y = c(0.25, 0.55, 0.85))
 
-  bw.ud <- npudensbw(~ x, data = d, newdata = nd.u)
-  ud.pos <- npudens(bws = bw.ud, newdata = nd.u)
-  ud.named <- npudens(bws = ~ x, data = d, newdata = nd.u)
+  bw.ud <- npudensbw(~ x, data = d)
+  ud.pos <- npudens(bws = bw.ud, newdata = nd.u, se = TRUE)
+  ud.named <- npudens(bws = ~ x, data = d, newdata = nd.u, se = TRUE)
   expect_equal(as.numeric(ud.named$dens), as.numeric(ud.pos$dens), tolerance = 0)
   expect_equal(as.numeric(ud.named$derr), as.numeric(ud.pos$derr), tolerance = 0)
 
-  bw.udist <- npudistbw(~ x, data = d, newdata = nd.u)
-  udist.pos <- npudist(bws = bw.udist, newdata = nd.u)
-  udist.named <- npudist(bws = ~ x, data = d, newdata = nd.u)
+  bw.udist <- npudistbw(~ x, data = d)
+  udist.pos <- npudist(bws = bw.udist, newdata = nd.u, se = TRUE)
+  udist.named <- npudist(bws = ~ x, data = d, newdata = nd.u, se = TRUE)
   expect_equal(as.numeric(udist.named$dist), as.numeric(udist.pos$dist), tolerance = 0)
   expect_equal(as.numeric(udist.named$derr), as.numeric(udist.pos$derr), tolerance = 0)
+  expect_true(udist.named[["se", exact = TRUE]])
+  expect_length(udist.named$derr, nrow(nd.u))
+  for (fit.args in list(list(), list(se = FALSE))) {
+    udist.off <- do.call(npudist, c(
+      list(bws = ~ x, data = d, newdata = nd.u), fit.args
+    ))
+    expect_false(udist.off[["se", exact = TRUE]])
+    expect_length(udist.off$derr, 0L)
+    expect_equal(as.numeric(udist.off$dist), as.numeric(udist.pos$dist), tolerance = 0)
+    expect_error(se(udist.off), "Refit without repeating bandwidth search", fixed = TRUE)
+  }
 
   bw.cd <- npcdensbw(y ~ x, data = d, nmulti = 1, tol = 1, ftol = 1)
-  cd.pos <- npcdens(bws = bw.cd, data = d, newdata = nd.c)
-  cd.named <- npcdens(bws = y ~ x, data = d, newdata = nd.c, nmulti = 1, tol = 1, ftol = 1)
+  cd.pos <- npcdens(se = TRUE, bws = bw.cd, data = d, newdata = nd.c)
+  cd.named <- npcdens(se = TRUE, bws = y ~ x, data = d, newdata = nd.c, nmulti = 1, tol = 1, ftol = 1)
   expect_lt(max(abs(as.numeric(cd.named$condens) - as.numeric(cd.pos$condens))), 1e-2)
   expect_lt(max(abs(as.numeric(cd.named$conderr) - as.numeric(cd.pos$conderr))), 1e-2)
 
   bw.cdist <- npcdistbw(y ~ x, data = d, nmulti = 1, tol = 1, ftol = 1)
-  cdist.pos <- npcdist(bws = bw.cdist, data = d, newdata = nd.c)
-  cdist.named <- npcdist(bws = y ~ x, data = d, newdata = nd.c, nmulti = 1, tol = 1, ftol = 1)
+  cdist.pos <- npcdist(se = TRUE, bws = bw.cdist, data = d, newdata = nd.c)
+  cdist.named <- npcdist(se = TRUE, bws = y ~ x, data = d, newdata = nd.c, nmulti = 1, tol = 1, ftol = 1)
   expect_lt(max(abs(as.numeric(cdist.named$condist) - as.numeric(cdist.pos$condist))), 1e-2)
   expect_lt(max(abs(as.numeric(cdist.named$conderr) - as.numeric(cdist.pos$conderr))), 1e-2)
 })

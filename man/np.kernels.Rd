@@ -52,17 +52,262 @@
   \deqn{K_U(u)=\frac{1}{2}\mathbf{1}(|u|<1)}
   via \code{ckertype="uniform"} (order ignored).
 
-  Truncated-Gaussian (second-order) kernel via
-  \code{ckertype="truncated gaussian"}:
-  \deqn{K_{TG,2}(u)=\left[\alpha\phi(u)-c_0\right]\mathbf{1}(|u|<b)}
-  with defaults \eqn{b=3} and internal constants calibrated in C.
+  With nearest-neighbor bandwidths, the uniform kernel compares the absolute
+  distance directly with the computed radius: points at the radius are
+  excluded. Tree search uses a conservative candidate box and the same final
+  distance comparison, so rounding of standardized distances or tree endpoints
+  cannot change this boundary convention.
+
+  For generalized- and adaptive-nearest-neighbor modes, each continuous
+  bandwidth is the literal \eqn{k}th admitted distance after any occurrence
+  exclusion required by the route. Exact ties can therefore make the radius
+  zero. A zero continuous radius does not define a positive metric bandwidth
+  and is rejected rather than widened to a more distant observation or
+  replaced by a numerical floor. Fixed bandwidths (\code{bwtype="fixed"},
+  the default) avoid this nearest-neighbor radius limitation. Alternatively,
+  choose a larger \eqn{k} or correct an unintended continuously coded tie.
+  Repeated values alone are not an error: only a requested radius that is
+  actually zero is rejected. Training fits and external evaluations can
+  differ at a tie boundary because their occurrence exclusions differ.
+  Any represented strictly positive
+  radius, including a positive subnormal value, is distinct from this
+  zero-radius condition.
+
+  The beta associated-kernel family is available for continuous data with
+  finite support. For an
+  evaluation point \eqn{x}, observation \eqn{x_i}, fixed support
+  \eqn{[a,b]}, \eqn{L=b-a}, and public metric bandwidth \eqn{h}, define
+  \deqn{t=\frac{x-a}{L},\quad z_i=\frac{x_i-a}{L},\quad
+        \tau=\left(\frac{L}{h}\right)^2.}
+  The implemented PDF contribution is Chen's simple beta kernel
+  \deqn{K_{\mathit{Beta},2}(x_i;x,h,a,b)=
+    \frac{1}{L}\frac{z_i^{t\tau}(1-z_i)^{(1-t)\tau}}
+    {B(1+t\tau,1+(1-t)\tau)}.}
+  Thus \code{ckertype="beta"} uses the evaluation-centered associated-kernel
+  orientation: the beta shape parameters depend on \eqn{x}, and the density
+  is evaluated at \eqn{x_i}.  The bandwidth convention is deliberately
+  metric-compatible with other continuous kernels: Chen's smoothing
+  parameter is \eqn{\rho=(h/L)^2}.  The factor \eqn{1/L} is already included,
+  so callers must not apply either an additional \eqn{1/h} factor or the
+  generic bounded-kernel normalization below.
+
+  Orders 4, 6, and 8 use the additive higher-order construction of Igarashi
+  and Kakizawa (2020). For public order \eqn{2m},
+  \deqn{K_{\mathit{Beta},2m}(x_i;x,h)=
+    \sum_{s=1}^m c_{m,s}K_{\mathit{Beta},2}(x_i;x,h\sqrt{s}),
+    \qquad c_{m,s}=(-1)^{s+1}{m\choose s}.}
+  The coefficient vectors for orders 2, 4, 6, and 8 are respectively
+  \eqn{(1)}, \eqn{(2,-1)}, \eqn{(3,-3,1)}, and
+  \eqn{(4,-6,4,-1)}. The construction preserves unit mass and the original
+  support while deliberately producing signed kernels above order 2.
+  The Igarashi--Kakizawa higher-order bias result is a deterministic/fixed-
+  bandwidth result. The generalized- and adaptive-nearest-neighbour routes
+  below implement the same validated multiscale construction conditional on
+  their realized bandwidths; their availability is an implementation and
+  numerical-validation contract, not a claim that the fixed-bandwidth bias
+  theorem automatically extends to random NN bandwidths.
+
+  In the present implementation orders 2, 4, 6, and 8 are available through
+  \code{npksum}, \code{npudens}, \code{npudist}, \code{npreg},
+  and the conditional density/distribution families. Regression and the
+  conditional families support local-constant, local-linear and
+  local-polynomial fits; categorical coordinates retain their categorical
+  kernels alongside continuous beta coordinates. Manual and cross-validated bandwidth objects support
+  \code{bwtype="fixed"}, \code{"generalized_nn"}, and
+  \code{"adaptive_nn"}. Bounds may be explicit
+  (\code{ckerbound="fixed"}) or inferred from the training sample
+  (\code{ckerbound="range"}); all active beta bounds must be finite.
+  For sorted distinct values \eqn{u_1<\cdots<u_m}, beta range bounds are
+  \deqn{A^*=u_1-(u_2-u_1)/2,\qquad
+    B^*=u_m+(u_m-u_{m-1})/2.}
+  Consequently, beta \code{ckerbound="range"} is not equivalent to
+  \code{ckerbound="fixed"} at the raw sample minima and maxima; its exact
+  fixed-bound equivalent uses the coordinatewise padded bounds \eqn{A^*} and
+  \eqn{B^*}.
+  Thus every training value is strictly inside the fitted support, including
+  tied extrema, and raw-extremum PDF derivatives are finite. At least two
+  distinct finite values are required per continuous coordinate. This is an
+  empirical continuity convention, not an estimate of physical support: it
+  may extend beyond a known population bound. Use \code{ckerbound="fixed"}
+  when bounds are known; fixed bounds are always used literally and retain the
+  documented extended-real derivative convention when observations equal an
+  endpoint. Non-beta \code{ckerbound="range"} continues to use exact sample
+  minima and maxima. Rounded or atomic variables should be modelled with the
+  package's discrete kernels rather than made continuous by range padding.
+
+  Automatic univariate order-2 fixed-bandwidth beta range searches have an
+  additional basin certificate for density CVLS and distribution CDF
+  criteria when Powell is the selected solver. If \eqn{L^*=B^*-A^*}, the
+  official criterion is evaluated once at
+  \eqn{h_{tail}=L^*2^{26}}, where the beta concentration
+  \eqn{(L^*/h_{tail})^2} equals \code{.Machine$double.eps}. If this uniform-
+  limit candidate materially improves the ordinary result, one deterministic
+  Powell refinement starts at \eqn{h=L^*}; the best materially distinct
+  official objective among the ordinary, tail, and refined candidates is
+  returned. The ordinary search uses the user's unchanged \code{nmulti}; the
+  certification and any refinement are separately counted in the bandwidth
+  summary. Cold starts and automatic restarts from a beta range bandwidth
+  object use this same single-certification contract. This safeguard does not
+  apply to explicit fixed bounds, CVML,
+  orders 4--8, nearest-neighbour or multivariate searches, or non-Powell
+  solvers.
+
+  Beta continuous coordinates can be combined with unordered and ordered
+  categorical coordinates in kernel sums and supported estimators. Automatic
+  mixed-data bandwidth selection is available for unconditional density,
+  conditional density/distribution, and regression. Regression supports automatic \code{cv.ls}/\code{cv.aic}
+  selection with fixed, generalized-NN, and adaptive-NN bandwidths; see
+  \code{\link{npregbw}}. Consult each family's bandwidth help page for its
+  supported beta selection criteria and configurations.
+  Regression and conditional fitting support the canonical scalar and general
+  local-polynomial engines. With \code{regtype="ll"} or \code{regtype="lp"},
+  regression \code{gradients=TRUE} reports the fitted local-polynomial slope
+  coefficient, as for the other supported kernels; it is not the derivative
+  of the entire fitted smoother with respect to the evaluation point.
+  \code{npksum} supports categorical products,
+  integer powers, normal, integral, convolution, and one-coordinate
+  PDF-derivative operators; \code{permutation.operator="derivative"} returns
+  every continuous first derivative. Unsupported score, OCG, or mixed
+  derivative requests fail explicitly rather than entering a legacy kernel
+  code.
+
+  For scale component \eqn{s}, put \eqn{\tau_s=\tau/s},
+  \eqn{\alpha_s=1+t\tau_s}, and \eqn{\beta_s=1+(1-t)\tau_s}. At an interior
+  observation \eqn{0<z_i<1}, its evaluation-coordinate derivative is
+  \deqn{\frac{\partial K_s}{\partial x}=\frac{\tau_s}{L}K_s
+    \left\{\log z_i-\log(1-z_i)-\psi(\alpha_s)+\psi(\beta_s)\right\},}
+  where \eqn{\psi} is the digamma function. Higher-order derivatives use the
+  same signed multiscale coefficients as the PDF. Bandwidths are held fixed
+  while differentiating: this includes the evaluation bandwidth selected by a
+  generalized-NN rule and each observation bandwidth selected by an
+  adaptive-NN rule. These are derivatives of the fitted smoother conditional
+  on its realized bandwidths, not derivatives of the NN selection map.
+
+  Density CVLS quadrature integrates with respect to the continuous support
+  measure. At a boundary observation, it therefore uses the interior-limit
+  PDF contribution rather than assigning integration mass to an isolated
+  endpoint value. This is applied separately to each multiscale component;
+  zero-concentration uniform components remain included. Ordinary PDF point
+  evaluations and the leave-one-out cross term retain their point values.
+  This integration convention alone does not guarantee a finite optimum
+  when an automatic search permits bandwidths tending to zero and the data
+  contain repeated boundary observations. Existing positive search bounds
+  are unchanged.
+
+  An observation exactly equal to the lower (upper) support endpoint makes
+  its matching scalar PDF contribution jump downward (upward) when the target
+  crosses that endpoint. The scalar derivative is consequently reported as
+  \eqn{-\infty} at a matching lower endpoint and \eqn{+\infty} at a matching
+  upper endpoint. An observation at the opposite endpoint contributes zero;
+  observations strictly inside the support have finite one-sided derivatives.
+  Local-constant regression and conditional estimators cancel numerator and
+  denominator jumps before classifying their gradient, so a normalized ratio
+  may still have a finite derivative (and a constant response or constant Y
+  factor gives exactly zero). A genuine ratio jump is returned as a signed
+  infinity. Numerically indeterminate cancellation is returned as \code{NA}
+  with a warning. Derivative hat matrices cannot encode response-specific
+  cancellation and therefore mark an affected endpoint row \code{NA}.
+  These distinctions follow R's numeric semantics: signed infinity denotes a
+  proper mathematical limit, whereas \code{NA_real_} denotes an unavailable
+  value. Plot methods preserve the returned values and replace non-finite
+  coordinates only in their temporary drawing geometry; see
+  \code{\link{plot.np}}.
+
+  For nearest-neighbor modes, the
+  existing observation-support nearest-neighbor engine supplies the
+  evaluation-specific metric bandwidth \eqn{h(x)} or observation-specific
+  metric bandwidth \eqn{h_i}, after which the same beta concentration
+  mapping is used.
+  For unconditional density and distribution fits, a generalized-NN query
+  identified as a training observation excludes that occurrence when selecting
+  its radius, for beta as for other continuous kernels. The full fit still
+  averages all donor contributions. Explicit external evaluation data remain
+  external even when their values equal training data.
+  For overlap, generalized bandwidths are evaluated at both centers;
+  adaptive bandwidths remain attached to training centers, while a genuinely
+  new evaluation center receives the established generalized-NN auxiliary
+  bandwidth. PDF, CDF, and overlap operators support both NN modes. See
+  \code{\link{npksum}} for the exact kernel-sum normalization and
+  \code{\link{npudens}} and \code{\link{npudist}} for estimator-specific
+  standard errors and examples.
+
+  The implemented beta CDF factor intentionally uses the complementary
+  observation-centered orientation.  With the notation above,
+  \deqn{H_{\mathit{Beta},2}(x;x_i,h,a,b)=
+    I_t(1+z_i\tau,1+(1-z_i)\tau),}
+  where \eqn{I_t(\alpha,\beta)} is the regularized incomplete beta function.
+  It is evaluated as an analytic incomplete-beta probability, with a
+  symmetry transformation in the upper tail. Thus every order-2
+  contribution is in \eqn{[0,1]}, and with fixed or adaptive bandwidth is
+  nondecreasing in \eqn{x}; it is exactly
+  zero at \eqn{a}, exactly one at \eqn{b}, and tends to
+  \eqn{(x-a)/(b-a)} as \eqn{h\to\infty}. Multivariate CDFs use products of
+  these factors; \code{npksum} may also mix beta PDF and CDF factors across
+  dimensions.
+
+  This observation-centered beta CDF is not the integral, with respect to
+  \eqn{x}, of the evaluation-centered Chen PDF contribution. It is also not
+  the target-centered bounded-CDF estimator of Mansouri, Rastin, and Mombeni
+  (2024). The orientation was selected because it preserves the essential
+  empirical-CDF contribution limit as \eqn{h\to0}, exact endpoint behavior,
+  monotonicity for order 2, and a direct analytic implementation suitable for
+  the existing kernel-sum architecture. Orders 4, 6, and 8 apply the same
+  signed multiscale coefficients to these incomplete-beta factors. The
+  Igarashi--Kakizawa density theorem does not establish a corresponding CDF
+  bias order; the public order identifies the construction. Signed
+  higher-order beta CDFs may overshoot \eqn{[0,1]} or be locally nonmonotone,
+  just as existing higher-order distribution kernels may. Values are not
+  silently clipped or monotonized.
+
+  With \code{bwtype="generalized_nn"}, the CDF bandwidth changes with the
+  target. Every returned order-2 contribution remains an incomplete-beta
+  probability in \eqn{[0,1]} with exact support endpoints, but the resulting
+  curve need not be monotone. A deterministic boundary-heavy comparison was
+  monotone across the recorded chi-square(1), beta-boundary, U-shaped, and
+  uniform designs, while a seeded 300-design adversarial search found local
+  decreases as large as approximately \eqn{8.6\times 10^{-5}}. The
+  implementation neither clips nor monotonizes those values. Inversion-based
+  uses therefore remain outside this generalized-NN CDF contract.
+
+  The beta derivative operator differentiates the PDF contribution with
+  respect to its evaluation coordinate. It does not differentiate the
+  observation-centered CDF factor with respect to Y, and it is not a
+  bandwidth score. As with existing higher-order kernels and local-polynomial
+  derivatives, signed kernels can yield non-proper density or distribution
+  estimates; derivative output is not clipped, monotonized, or otherwise
+  repaired.
+
+  The beta \code{"convolution"} operator is the analytic overlap of two
+  associated beta density weights in their common observation coordinate. If
+  the two centers and bandwidths give shapes
+  \eqn{(\alpha_1,\beta_1)} and \eqn{(\alpha_2,\beta_2)}, then
+  \deqn{\mathcal O=
+    \frac{1}{L}\frac{B(\alpha_1+\alpha_2-1,
+                             \beta_1+\beta_2-1)}
+                        {B(\alpha_1,\beta_1)B(\alpha_2,\beta_2)}.}
+  The diagonal is the exact location- and bandwidth-dependent roughness.
+  This is an \eqn{L^2} overlap, is symmetric, has units \eqn{L^{-1}}, and is
+  evaluated analytically in C with stable log-gamma ratios. It is not a
+  translation convolution and is not Chen's target-coordinate integrated
+  square. In particular, bounded \code{cv.ls} density and conditional-density
+  objectives continue to integrate the actual bounded estimator by their
+  existing quadrature route; they do not substitute this public overlap.
 
   Bounded continuous-kernel normalization (\code{ckerbound} and, for
   conditional objects, \code{cxkerbound}/\code{cykerbound}) reuses the
   selected continuous kernel and renormalizes it on the declared support.
   For a base kernel \eqn{K} and support \eqn{[a,b]}, the bounded kernel is
   \deqn{K_{[a,b]}(u;x,h)=\frac{K(u)}{\int_{(a-x)/h}^{(b-x)/h}K(t)dt}}
-  with \eqn{u=(x_i-x)/h}. Option \code{ckerbound="range"} uses
+  with \eqn{u=(x_i-x)/h}. For bounded adaptive-nearest-neighbor
+  regression, each donor \eqn{x_j} carries its own radius \eqn{h_j} and
+  normalization mass \eqn{D(x_j,h_j)}. Its weight at evaluation point
+  \eqn{x} is \eqn{K((x-x_j)/h_j)/(h_jD(x_j,h_j))}.
+  Regression fitting and bandwidth objectives use this donor-centred
+  convention, as do the corresponding adaptive density and conditional
+  density/distribution kernel factors. Delete-one objectives use radii from the corresponding
+  deleted sample. Fixed and generalized-neighbor regression use the
+  query-centred mass associated with their query bandwidth.
+  Option \code{ckerbound="range"} uses
   sample bounds for \eqn{a,b}; \code{ckerbound="fixed"} uses user-supplied
   bounds via \code{ckerlb}/\code{ckerub} (or the corresponding
   \code{cx*}/\code{cy*} arguments). Infinite bounds recover the unbounded
@@ -119,11 +364,29 @@
   (Aitchison-Aitken)
   via \code{ukertype="aitchisonaitken"}.
 
-  \deqn{L_{LR,u}(x_i,x;\lambda)=\mathbf{1}(x_i=x)+\mathbf{1}(x_i\neq x)\lambda}
-  (Li-Racine unordered kernel)
+  \deqn{L_{LR,u}(x_i,x;\lambda)=\frac{\mathbf{1}(x_i=x)+\mathbf{1}(x_i\neq x)\lambda}{1+(c-1)\lambda}}
+  (normalized Li-Racine unordered kernel returned by \code{npksum})
   via \code{ukertype="liracine"}.
+  Ratio estimators may equivalently use the proportional unnormalized weights,
+  since this common factor cancels in their numerator and denominator.
 
   Ordered-categorical kernels (called via \code{okertype}):
+  Numeric ordered-factor levels retain their numeric distances, including
+  gaps. They must be finite and increasing with a finite numeric span.
+  Li-Racine weights and Racine-Li-Yan kernels accept fractional distances in
+  the original units; there is no inferred lattice spacing, rescaling, or
+  arbitrary denominator cap. Wang-van Ryzin and normalized Li-Racine retain
+  unit-lattice definitions: they require integer distances and total span
+  less than \code{.Machine$integer.max}. Nonnumeric ordered labels use their
+  declared ordinal ranks: for \code{ordered(c("a","b","c","d","e"))}, the
+  distance from \code{a} to \code{e} is four, from \code{c} to \code{d} one.
+  Use explicit nonnumeric labels when rank distance, not numeric distance,
+  is intended.
+  Lattice admission is deliberately conservative: decimal labels at large
+  magnitudes can lose enough precision that integer distances cannot be
+  established reliably. Such lattice-dependent requests report an error;
+  they do not round the labels or substitute another kernel. Select
+  \code{okertype="racineliyan"} explicitly for retained-support smoothing.
   \deqn{L_{WvR}(x_i,x;\lambda)=
     \begin{cases}
       1-\lambda, & x_i=x\\
@@ -142,6 +405,34 @@
   \deqn{L_{RLY}(x_i,x;\lambda)=\frac{\lambda^{|x_i-x|}}{\sum_{z\in\mathcal{S}(x)}\lambda^{|x_i-z|}}}
   (Racine-Li-Yan ordered kernel, normalized on support \eqn{\mathcal{S}(x)}).
   exposed as \code{okertype="racineliyan"}.
+  Here the support is the retained set of factor levels, including unused
+  levels, not an integer interval filling its gaps. The normalizer is indexed
+  by the training value \eqn{x_i}, so weights need not be symmetric in training
+  and evaluation values. Cumulative kernels, overlap integrals, scores and
+  paired regression computations use that same support and direction.
+
+  For density/distribution roles, the public spelling \code{"liracine"}
+  denotes normalized Li-Racine and therefore still requires a unit lattice;
+  select \code{"racineliyan"} for fractional response/density support.
+  Conditional explanatory roles and regression use raw Li-Racine weights.
+  On nonlattice support, the raw Li-Racine cumulative operator sums these
+  unnormalized weights over retained levels at or below the evaluation
+  point; it is not a probability CDF. On a unit lattice, its cumulative
+  operator instead sums over every lattice point between the smallest and
+  largest retained levels up to the evaluation cutoff, including points in
+  gaps. Its convolution sums products over the retained levels, not the
+  gap-filled lattice interval. These are distinct incumbent operator
+  conventions. A fractional evaluation cutoff does not change the retained
+  integration support or turn a lattice cumulative into a nonlattice sum.
+  If a near-integer numeric support is ambiguous at its floating-point
+  precision, the raw Li-Racine cumulative operator reports an error rather
+  than silently selecting a different integration convention. Clearly
+  fractional support remains supported. Racine-Li-Yan provides an explicit
+  retained-support cumulative definition in either case.
+  At \eqn{\lambda=0}, bandwidth scores with positive
+  distances below one have non-finite elementwise one-sided derivatives and
+  report a condition; use an interior bandwidth when requesting such scores.
+  Kernel values at zero and one remain supported.
 
   These univariate kernels are combined as generalized product kernels over
   mixed data types in the estimators and cross-validation criteria.
@@ -168,6 +459,29 @@
   \dQuote{Kernel Smoothed Probability Mass Functions for Ordered Datatypes,}
   \emph{Journal of Nonparametric Statistics}, \bold{32}(3), 563--586.
   doi:10.1080/10485252.2020.1759595
+
+  Chen, S. X. (1999),
+  \dQuote{Beta kernel estimators for density functions,}
+  \emph{Computational Statistics & Data Analysis}, \bold{31}(2), 131--145.
+  doi:10.1016/S0167-9473(99)00010-9
+
+  Jones, M. C. and Henderson, D. A. (2007),
+  \dQuote{Kernel-type density estimation on the unit interval,}
+  \emph{Biometrika}, \bold{94}(4), 977--984.
+  doi:10.1093/biomet/asm068
+
+  Igarashi, G. and Kakizawa, Y. (2020),
+  \dQuote{Higher-order bias corrections for asymmetric kernel density
+  estimators,}
+  \emph{Journal of Nonparametric Statistics}, \bold{32}(3), 716--752.
+  doi:10.1080/10485252.2020.1770754
+
+  Mansouri, B., Rastin, A., and Allah Mombeni, H. (2024),
+  \dQuote{Beta Kernel Estimator for a Cumulative Distribution Function with
+  Bounded Support,}
+  \emph{Journal of Sciences, Islamic Republic of Iran}, \bold{34}(4), 349--361
+  (volume dated 2023; accepted and DOI registered in 2024).
+  doi:10.22059/jsciences.2024.367933.1007836
 
   Hall, P., Racine, J. S., and Li, Q. (2004),
   \dQuote{Cross-validation and the estimation of conditional probability

@@ -1,0 +1,182 @@
+test_that("fixed width-three LP CV accumulates one triangle before solving", {
+  src_dir <- file.path(testthat::test_path("..", ".."), "src")
+  row_file <- file.path(src_dir, "jksum_lp_row.c")
+  sum_file <- file.path(src_dir, "jksum.c")
+  skip_if_not(file.exists(row_file) && file.exists(sum_file),
+              "package C sources unavailable")
+
+  row_text <- paste(readLines(row_file, warn = FALSE), collapse = "\n")
+  sum_text <- paste(readLines(sum_file, warn = FALSE), collapse = "\n")
+  expect_match(row_text, "attribute_hidden void\\s+np_lp_mirror_dense_moments_row3")
+  expect_match(row_text, "s\\[3\\] = s\\[1\\];")
+  expect_match(row_text, "s\\[6\\] = s\\[2\\];")
+  expect_match(row_text, "s\\[7\\] = s\\[5\\];")
+  expect_false(grepl("sj3 += wb1*b0;", row_text, fixed = TRUE))
+  expect_false(grepl("sj6 += wb2*b0;", row_text, fixed = TRUE))
+  expect_false(grepl("sj7 += wb2*b1;", row_text, fixed = TRUE))
+  expect_match(sum_text, "np_lp_mirror_dense_moments_row3\\(moments, num_obs\\)")
+})
+
+test_that("LP row NEON is an Apple-arm64 moving-row specialization", {
+  src_dir <- file.path(testthat::test_path("..", ".."), "src")
+  row_file <- file.path(src_dir, "jksum_lp_row.c")
+  row_header <- file.path(src_dir, "jksum_lp_row.h")
+  skip_if_not(file.exists(row_file) && file.exists(row_header),
+              "package C sources unavailable")
+
+  row_text <- paste(readLines(row_file, warn = FALSE), collapse = "\n")
+  header_text <- paste(readLines(row_header, warn = FALSE), collapse = "\n")
+  expect_match(
+    header_text,
+    "defined\\(__aarch64__\\).*defined\\(NP_USE_ACCELERATE_GAUSS\\)"
+  )
+  expect_match(header_text, "#define NP_LP_ROW_NEON 1", fixed = TRUE)
+  expect_match(row_text, "vfmaq_f64(vld1q_f64(ti), vw, eval_y01)",
+               fixed = TRUE)
+  expect_match(row_text, "vfmaq_f64(vld1q_f64(si), vw, eval_outer01)",
+               fixed = TRUE)
+  expect_match(row_text, "tj0 += wb0*yi;", fixed = TRUE)
+  expect_match(row_text, "vdupq_n_f64(reverse_weight)", fixed = TRUE)
+  expect_match(row_text, "#else\n      ti[0] += reverse_weight*eval_ybasis[0];",
+               fixed = TRUE)
+})
+
+test_that("fixed widths five and six retain only the unique Gram triangle", {
+  src_dir <- file.path(testthat::test_path("..", ".."), "src")
+  row_file <- file.path(src_dir, "jksum_lp_row.c")
+  sum_file <- file.path(src_dir, "jksum.c")
+  skip_if_not(file.exists(row_file) && file.exists(sum_file),
+              "package C sources unavailable")
+
+  row_text <- paste(readLines(row_file, warn = FALSE), collapse = "\n")
+  sum_text <- paste(readLines(sum_file, warn = FALSE), collapse = "\n")
+  for (width in 5:6) {
+    expect_match(
+      row_text,
+      paste0("NP_LP_DEFINE_SYMMETRIC_RESIDENT_WIDTH\\(", width, "\\)")
+    )
+    expect_false(grepl(
+      paste0("NP_LP_DEFINE_RESIDENT_WIDTH(", width, ")"),
+      row_text,
+      fixed = TRUE
+    ))
+  }
+  expect_match(row_text, "for\\(b = a; b < \\(WIDTH\\); b\\+\\+\\)")
+  expect_match(row_text, "a \\+ 1 < \\(WIDTH\\)")
+  expect_match(row_text, "if\\(a < \\(WIDTH\\)\\)")
+  expect_match(
+    sum_text,
+    "!use_sparse_tree && \\(\\(nterms == 5\\) \\|\\| \\(nterms == 6\\)\\)"
+  )
+  expect_match(sum_text, "NP_REG_CV_LP_RESIDENT_MAX_TERMS = 6",
+               fixed = TRUE)
+})
+
+test_that("fixed sparse width six has Apple-arm64 pair and owned-row siblings", {
+  src_dir <- file.path(testthat::test_path("..", ".."), "src")
+  row_header <- file.path(src_dir, "jksum_lp_row.h")
+  sum_file <- file.path(src_dir, "jksum.c")
+  skip_if_not(file.exists(row_header) && file.exists(sum_file),
+              "package C sources unavailable")
+
+  header_text <- paste(readLines(row_header, warn = FALSE), collapse = "\n")
+  sum_text <- paste(readLines(sum_file, warn = FALSE), collapse = "\n")
+  expect_match(
+    header_text,
+    "static inline void np_lp_accumulate_sparse_pair_resident6\\("
+  )
+  expect_match(
+    header_text,
+    "static inline void np_lp_accumulate_sparse_row_resident6\\("
+  )
+  expect_match(header_text, "enum \\{ nterms = 6 \\};")
+  expect_match(header_text, "for\\(b = a; b < nterms; b\\+\\+\\)")
+  expect_match(header_text, "#if NP_LP_ROW_NEON", fixed = TRUE)
+  expect_match(
+    header_text,
+    "#if NP_LP_ROW_NEON\nstatic inline void np_lp_accumulate_sparse_pair_resident6",
+    fixed = TRUE
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("else if\\(nterms > 6\\)", sum_text)
+    )),
+    2L
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("else if\\(nterms == 6\\)", sum_text)
+    )),
+    2L
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("#else\\n\\s+\\} else if\\(nterms > 5\\)", sum_text)
+    )),
+    2L
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("#if NP_LP_ROW_NEON", sum_text, fixed = TRUE)
+    )),
+    4L
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("np_lp_accumulate_sparse_pair_resident6\\(", sum_text)
+    )),
+    2L
+  )
+  expect_equal(
+    lengths(regmatches(
+      sum_text,
+      gregexpr("np_lp_accumulate_sparse_row_resident6\\(", sum_text)
+    )),
+    2L
+  )
+  expect_match(sum_text, "np_lp_accumulate_sparse_pair_wide_resident\\(")
+  expect_match(sum_text, "np_lp_accumulate_sparse_row_wide_resident\\(")
+})
+
+test_that("MPI owned rows specialize widths two through six", {
+  src_dir <- file.path(testthat::test_path("..", ".."), "src")
+  row_file <- file.path(src_dir, "jksum_lp_row.c")
+  sum_file <- file.path(src_dir, "jksum.c")
+  skip_if_not(file.exists(row_file) && file.exists(sum_file),
+              "package C sources unavailable")
+
+  row_text <- paste(readLines(row_file, warn = FALSE), collapse = "\n")
+  sum_text <- paste(readLines(sum_file, warn = FALSE), collapse = "\n")
+  expect_match(
+    row_text,
+    "attribute_hidden int\\s+np_lp_accumulate_owned_resident_row"
+  )
+  for (width in 2:4)
+    expect_match(
+      row_text,
+      paste0("NP_LP_DEFINE_OWNED_WIDTH\\(", width, "\\)")
+    )
+  expect_false(grepl("NP_LP_DEFINE_OWNED_WIDTH(1)", row_text, fixed = TRUE))
+  for (width in 5:6) {
+    expect_false(grepl(
+      paste0("NP_LP_DEFINE_OWNED_WIDTH(", width, ")"),
+      row_text,
+      fixed = TRUE
+    ))
+    expect_match(
+      row_text,
+      paste0("NP_LP_DEFINE_SYMMETRIC_OWNED_WIDTH\\(", width, "\\)")
+    )
+  }
+  expect_match(row_text, "case 6: np_lp_accumulate_owned_row_6\\(ctx\\)")
+  expect_match(sum_text, "if\\(nterms == 1\\)")
+  expect_match(
+    sum_text,
+    "if\\(!np_lp_accumulate_owned_resident_row\\(&owned_context\\)\\)"
+  )
+})

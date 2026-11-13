@@ -43,6 +43,34 @@ test_that("npRmpi explicit k may exceed empirical support size when observation 
     npreg(bws = bw.adap, exdat = data.frame(x = x))
   )
   expect_no_error(
-    npreg(bws = bw.gen, exdat = data.frame(x = x))
+    npreg(bws = bw.gen)
+  )
+  expect_error(
+    npreg(bws = bw.gen, exdat = data.frame(x = x)),
+    "zero literal radius",
+    fixed = TRUE
+  )
+})
+
+test_that("npRmpi conditional nonfixed support failures leave the pool reusable", {
+  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+
+  x <- data.frame(x = rep(1:5, 8))
+  expect_error(
+    suppressWarnings(
+      npcdensbw(
+        ydat = rep(1, 40), xdat = x, bwtype = "adaptive_nn",
+        nomad = TRUE, nmulti = 1
+      )
+    ),
+    "at least two distinct continuous variable values per dimension"
+  )
+  expect_no_error(
+    suppressWarnings(
+      npcdensbw(
+        ydat = rep(1:5, 8), xdat = x, bwtype = "adaptive_nn",
+        nomad = TRUE, nmulti = 1
+      )
+    )
   )
 })

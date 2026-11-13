@@ -256,7 +256,7 @@ test_that("npindex supports residual and mean-error branches with evaluation y d
     expect_equal(length(fit.is$resid), nrow(tx), info = cfg$regtype)
     expect_equal(as.vector(fit.is$resid), y - as.vector(fit.is$mean), tolerance = 1e-8, info = cfg$regtype)
 
-    fit.oos <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = FALSE, errors = TRUE)
+    fit.oos <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = FALSE, se = TRUE)
     expect_equal(length(fit.oos$mean), nrow(ex), info = cfg$regtype)
     expect_equal(length(fit.oos$merr), nrow(ex), info = cfg$regtype)
     expect_true(all(is.finite(fit.oos$mean)), info = cfg$regtype)
@@ -301,7 +301,7 @@ test_that("npindex supports gradient-error branches with evaluation y data", {
     }
 
     bw <- do.call(npindexbw, bw.args)
-    fit.grad <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = TRUE, errors = TRUE)
+    fit.grad <- npindex(bws = bw, txdat = tx, tydat = y, exdat = ex, eydat = ey, gradients = TRUE, se = TRUE)
     expect_equal(dim(fit.grad$grad), c(nrow(ex), ncol(tx)), info = cfg$regtype)
     expect_equal(dim(fit.grad$gerr), c(nrow(ex), ncol(tx)), info = cfg$regtype)
     expect_true(all(is.finite(fit.grad$grad)), info = cfg$regtype)
@@ -309,7 +309,7 @@ test_that("npindex supports gradient-error branches with evaluation y data", {
   }
 })
 
-test_that("predict.singleindex forwards explicit boot.num without changing fitted predictions", {
+test_that("predict.singleindex forwards explicit B without changing fitted predictions", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
   on.exit(close_mpi_slaves(), add = TRUE)
 
@@ -331,7 +331,7 @@ test_that("predict.singleindex forwards explicit boot.num without changing fitte
   fit <- npindex(bws = bw, txdat = tx, tydat = y)
 
   pred <- predict(fit, newdata = nd)
-  pred.se <- predict(fit, newdata = nd, se.fit = TRUE, boot.num = 10)
+  pred.se <- predict(fit, newdata = nd, se.fit = TRUE, se.type = "bootstrap", B = 10)
 
   expect_equal(as.numeric(pred.se$fit), as.numeric(pred), tolerance = 0)
   expect_equal(length(pred.se$se.fit), nrow(nd))

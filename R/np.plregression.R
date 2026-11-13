@@ -1,6 +1,11 @@
 npplreg <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npplreg")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat", "tzdat"),
+      call = sys.call(), caller = parent.frame())
 
     if (!missing(bws)){
       if (is.recursive(bws)){
@@ -21,119 +26,77 @@ npplreg <-
   }
 
 npplreg.formula <-
-  function(bws, data = NULL, newdata = NULL, y.eval = FALSE, ...){
-    
-    tt <- terms(bws)
-    tt.xf <- bws$xterms
-    
-    m <- match(c("formula", "data", "subset", "na.action"),
-               names(bws$call), nomatch = 0)
-    tmf.xf <- tmf <- bws$call[c(1,m)]
-    
-    tmf[[1]] <- as.name("model.frame")
-    tmf.xf[[1]] <- as.name("model.frame")
+  function(bws, data = NULL, newdata = NULL, y.eval = FALSE, ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
 
-    tmf.xf[["formula"]] <- tt.xf
-    tmf[["formula"]] <- tt
-    if (!is.null(data)) {
-      tmf[["data"]] <- substitute(data)
-      tmf.xf[["data"]] <- substitute(data)
+    se <- npValidateScalarLogical(se, "se")
+    dots <- list(...)
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    frame <- if (is.null(frame.state)) .np_plreg_formula_frame(bws, data, overrides = dots)
+             else .np_formula_frame_take(frame.state)
+    if ("tydat" %in% names(dots)) {
+      frame <- .np_formula_replace_response(frame, bws, dots[["tydat"]],
+                                             dots, data.override = !is.null(data))
+      dots$tydat <- NULL
+      dots$na.action <- NULL
     }
-
-    mf.args <- as.list(tmf)[-1L]
-    mf.xf.args <- as.list(tmf.xf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
-    tmf.xf <- do.call(stats::model.frame, mf.xf.args, envir = environment(tt.xf))
-    
-    response.name <- attr(tmf, "names")[attr(attr(tmf, "terms"), "response")]
-    tydat <- model.response(tmf)
-    txdat <- tmf.xf
-    tzdat <- tmf[, bws$chromoly[[3]], drop = FALSE]
-
-    has.eval <- !is.null(newdata)
+    bws <- .np_bws_retain_fit_frame(bws, frame)
+    roles <- .np_plreg_formula_split(frame, bws$terms, bws$xterms)
+    response.name <- names(roles$yz)[attr(bws$terms, "response")]
+    pl.args <- list(txdat = roles$x, tydat = model.response(roles$yz),
+                    tzdat = roles$yz[, .np_formula_term_names(bws$chromoly[[3L]]), drop = FALSE],
+                    se = se)
+    umf <- frame
+    native.eval <- !is.null(dots[["exdat", exact = TRUE]]) ||
+      !is.null(dots[["ezdat", exact = TRUE]])
+    has.eval <- !is.null(newdata) && !native.eval
     if (has.eval) {
-      npValidateNewdataFormula(newdata, tt.xf, include.response = FALSE)
-      if (!y.eval){
-        npValidateNewdataFormula(newdata, tt, include.response = FALSE)
+      tt <- attr(frame, "terms")
+      response.eval <- y.eval && is.null(dots[["eydat", exact = TRUE]])
+      npValidateNewdataFormula(newdata, tt, include.response = response.eval)
+      yzterms <- bws$terms
+      if (!response.eval) {
         tt <- delete.response(tt)
-        
-        bronze <- lapply(bws$chromoly, paste, collapse = " + ")
-        formula.xz <- terms(as.formula(paste(" ~ ",bronze[[2]], " + ",bronze[[3]]),
-                                       env = environment(bws$formula)))
-
-        orig.ts <- .np_terms_ts_mask(terms_obj = formula.xz, data = newdata)
-
-        arguments.mfx <- bws$chromoly[[2]]
-        arguments.mf <- bws$chromoly[[3]]
-
-        if(all(orig.ts)){
-          arguments <- (as.list(attr(formula.xz, "variables"))[-1])
-          attr(tt, "predvars") <- bquote(.(as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments)))))[,.(match(arguments.mf,arguments)),drop = FALSE])
-          attr(tt.xf, "predvars") <- bquote(.(as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments)))))[,.(match(arguments.mfx,arguments)),drop = FALSE])
-        }else if(any(orig.ts)){
-          arguments <- (as.list(attr(formula.xz, "variables"))[-1])
-          arguments.normal <- arguments[which(!orig.ts)]
-          arguments.timeseries <- arguments[which(orig.ts)]
-
-          ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-          attr(tt, "predvars") <- bquote((.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])[,.(match(arguments.mf,arguments)),drop = FALSE])
-          attr(tt.xf, "predvars") <- bquote((.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])[,.(match(arguments.mfx,arguments)),drop = FALSE])
-        }else{
-          attr(tt, "predvars") <- attr(tt, "variables")
-          attr(tt.xf, "predvars") <- attr(tt.xf, "variables")
-        }
-          
+        yzterms <- delete.response(yzterms)
       }
-      
-      if (y.eval)
-        npValidateNewdataFormula(newdata, tt, include.response = TRUE)
-      umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
-      emf <- umf
-      emf.xf.args <- list(formula = tt.xf, data = newdata)
-      emf.xf <- do.call(stats::model.frame, emf.xf.args, envir = parent.frame())
-      
-      if (y.eval)
-        eydat <- model.response(emf)
-
-      exdat <- emf.xf
-      ezdat <- emf[, bws$chromoly[[3]], drop = FALSE]
-    }
-
-    pl.args <- list(txdat = txdat, tydat = tydat, tzdat = tzdat)
-    if (has.eval) {
-      pl.args$exdat <- exdat
-      pl.args$ezdat <- ezdat
-      if (y.eval)
-        pl.args$eydat <- eydat
+      umf <- .np_formula_model_frame(tt, data = newdata)
+      evaluation <- .np_plreg_formula_split(umf, yzterms, bws$xterms)
+      pl.args$exdat <- evaluation$x
+      pl.args$ezdat <- evaluation$yz[, .np_formula_term_names(bws$chromoly[[3L]]), drop = FALSE]
+      if (response.eval)
+        pl.args$eydat <- model.response(evaluation$yz)
     }
     pl.args$bws <- bws
-    ev <- do.call(npplreg, c(pl.args, list(...)))
+    ev <- do.call(npplreg, c(pl.args, dots))
 
     if (length(response.name) == 1L && !is.na(response.name) && nzchar(response.name)) {
       if (!is.null(ev$bws))
         ev$bws$ynames <- response.name
     }
 
-    ev$omit <- attr(umf,"na.action")
+    # Residuals always index the training sample, independently of evaluation.
+    if (ev$residuals)
+      ev$resid <- naresid(attr(frame, "na.action"), ev$resid)
+    # Native evaluation already owns its row omissions and padding.
+    if (native.eval)
+      return(ev)
+    ev$omit <- attr(umf, "na.action")
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
-
     ev$mean <- napredict(ev$omit, ev$mean)
     ev$merr <- napredict(ev$omit, ev$merr)
-
-    if(ev$residuals){
-        ev$resid <- naresid(ev$omit, ev$resid)
-    }    
-    return(ev)
+    ev
   }
 
 npplreg.call <-
   function(bws, ...) {
-    npplreg(txdat = .np_eval_bws_call_arg(bws, "xdat"),
-            tydat = .np_eval_bws_call_arg(bws, "ydat"),
-            tzdat = .np_eval_bws_call_arg(bws, "zdat"),
-            bws = bws, ...)
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    do.call(npplreg, .np_retained_training_args(
+      bws, c(txdat = "xdat", tydat = "ydat", tzdat = "zdat"), list(...), npplreg.plbandwidth))
   }
 
 .np_plreg_fit_progress_targets <- function(xnames) {
@@ -160,15 +123,35 @@ npplreg.call <-
 
 .np_plreg_numeric_response <- function(y, ydati) {
   if (is.factor(y)) {
-    yy <- adjustLevels(data.frame(y), ydati)
+    yy <- .np_regression_response_levels(data.frame(y), ydati)
     return(ydati$all.dlev[[1L]][as.integer(yy[, 1L])])
   }
 
   as.double(y)
 }
 
-.np_plreg_check_residualized_rank <- function(qrX, p, where) {
-  if (qrX$rank < p) {
+.np_plreg_residual_formation_error <- function(x, xhat) {
+  .Machine$double.eps * sqrt(length(x)) * (max(abs(x)) + max(abs(xhat)))
+}
+
+.np_plreg_check_residualized_rank <- function(qrX, p, where,
+                                              formation.error = NULL) {
+  deficient <- qrX[["rank"]] < p
+  if (!deficient) {
+    # Inspect only the existing small factor; do not refactor or change the
+    # pivot/solve. Column scaling makes the guard independent of other units.
+    R <- qrX[["qr"]][seq_len(p), seq_len(p), drop = FALSE]
+    R[lower.tri(R)] <- 0
+    scale <- vapply(seq_len(p), function(j) norm(R[, j, drop = FALSE], "F"),
+                    numeric(1L))
+    precision <- min(max(dim(qrX[["qr"]])) * .Machine$double.eps,
+                     sqrt(.Machine$double.eps))
+    tolerance <- precision * scale
+    if (!is.null(formation.error))
+      tolerance <- tolerance + formation.error[qrX[["pivot"]]]
+    deficient <- any(abs(diag(R)) <= tolerance)
+  }
+  if (deficient) {
     stop(sprintf(
       "%s: residualized linear regressors are rank deficient after smoothing on z; the parametric component is not identified",
       where
@@ -181,7 +164,9 @@ npplreg.call <-
                                    response,
                                    yhat.train,
                                    zdim,
-                                   where = "npplreg") {
+                                   where = "npplreg",
+                                   se = TRUE,
+                                   formation.error = NULL) {
   X <- as.matrix(resx)
   y <- as.double(resy)
   response <- as.double(response)
@@ -189,24 +174,31 @@ npplreg.call <-
   p <- ncol(X)
   qrX <- qr(X, tol = .Machine$double.eps)
 
-  .np_plreg_check_residualized_rank(qrX = qrX, p = p, where = where)
+  .np_plreg_check_residualized_rank(qrX = qrX, p = p, where = where,
+                                    formation.error = formation.error)
 
   beta <- as.double(qr.coef(qrX, y))
   linear.fit <- as.vector(X %*% beta)
   train.fit <- as.vector(yhat.train + linear.fit)
 
-  R <- qr.R(qrX)[seq_len(p), seq_len(p), drop = FALSE]
-  XtX.inv.pivoted <- chol2inv(R)
-  XtX.inv <- matrix(0.0, nrow = p, ncol = p)
-  XtX.inv[qrX$pivot, qrX$pivot] <- XtX.inv.pivoted
+  vcov <- stderr <- NULL
+  if (se) {
+    R <- qr.R(qrX)[seq_len(p), seq_len(p), drop = FALSE]
+    XtX.inv.pivoted <- chol2inv(R)
+    XtX.inv <- matrix(0.0, nrow = p, ncol = p)
+    XtX.inv[qrX$pivot, qrX$pivot] <- XtX.inv.pivoted
 
-  sigma2 <- sum((response - train.fit)^2) / (nrow(X) - p - as.integer(zdim))
-  vcov <- sigma2 * XtX.inv
+    # Factor the heteroskedastic sandwich as a crossproduct of coefficient
+    # influences, preserving the existing residuals and finite-sample factor.
+    scores <- (X %*% XtX.inv) * (response - train.fit)
+    vcov <- crossprod(scores) * (nrow(X) / (nrow(X) - p - as.integer(zdim)))
+    stderr <- sqrt(diag(vcov))
+  }
 
   list(
     coef = beta,
     vcov = vcov,
-    se = sqrt(diag(vcov)),
+    se = stderr,
     train.fit = train.fit,
     qr = qrX
   )
@@ -224,12 +216,18 @@ npplreg.call <-
            ydat,
            zdat,
            exdat,
-           ezdat) {
+           ezdat,
+           .np.empty.report = NULL,
+           se = TRUE) {
+    se <- npValidateScalarLogical(se, "se")
     activity <- .np_plot_activity_begin("Computing partially linear plot fit")
     on.exit(.np_plot_activity_end(activity), add = TRUE)
 
     xdat <- toFrame(xdat)
     zdat <- toFrame(zdat)
+
+    if (missing(exdat) && !missing(ezdat)) exdat <- xdat
+    if (!missing(exdat) && missing(ezdat)) ezdat <- zdat
 
     keep.rows <- rep_len(TRUE, nrow(xdat))
     rows.omit <- attr(na.omit(data.frame(xdat, ydat, zdat)), "na.action")
@@ -247,6 +245,7 @@ npplreg.call <-
     if (!no.exz) {
       exdat <- toFrame(exdat)
       ezdat <- toFrame(ezdat)
+      .np_require_paired_rows(exdat, ezdat, "exdat", "ezdat")
 
       keep.eval <- rep_len(TRUE, nrow(exdat))
       rows.omit <- attr(na.omit(data.frame(exdat, ezdat)), "na.action")
@@ -343,7 +342,7 @@ npplreg.call <-
       }
 
       if (is.factor(ytrain)) {
-        ytrain <- adjustLevels(data.frame(ytrain), regbw$ydati)[, 1L]
+        ytrain <- .np_regression_response_levels(data.frame(ytrain), regbw$ydati)[, 1L]
         ytrain <- (regbw$ydati$all.dlev[[1L]])[as.integer(ytrain)]
       } else {
         ytrain <- as.double(ytrain)
@@ -379,6 +378,8 @@ npplreg.call <-
       profile.mean[eval.cache$id]
     }
 
+    empty.state <- new.env(hash = FALSE, parent = emptyenv())
+    empty.state$rows <- NULL
     reg_mean <- function(regbw, ytrain, zeval = NULL) {
       out <- reg_mean_cat_cached(regbw = regbw, ytrain = ytrain, zeval = zeval)
       if (is.null(out)) {
@@ -400,7 +401,11 @@ npplreg.call <-
       )
       if (!is.null(zeval))
         args$exdat <- zeval
-      as.vector(.npRmpi_with_local_regression(do.call(.np_regression_direct, args))$mean)
+      args$allow.empty.rows <- !is.null(zeval)
+      fit <- .npRmpi_with_local_regression(do.call(.np_regression_direct, args))
+      empty.state$rows <- .npreg_merge_empty_rows(empty.state$rows,
+        attr(fit, ".np.empty.rows", exact = TRUE))
+      as.vector(fit$mean)
     }
 
     yhat.train <- reg_mean(regbw = bws$bw$yzbw, ytrain = ydat)
@@ -414,22 +419,25 @@ npplreg.call <-
     p <- ncol(xdat)
     resx <- matrix(0.0, nrow = ntrain, ncol = p)
     resx.eval <- matrix(0.0, nrow = neval, ncol = p)
+    formation.error <- numeric(p)
 
     for (j in seq_len(p)) {
       xhat.train <- reg_mean(regbw = bws$bw[[j + 1L]], ytrain = xdat[, j])
 
       if (is.factor(xdat[1L, j])) {
-        tmp.dat <- adjustLevels(xdat[, j, drop = FALSE], bws$bw[[j + 1L]]$ydati)
+        tmp.dat <- .np_regression_response_levels(xdat[, j, drop = FALSE], bws$bw[[j + 1L]]$ydati)
         x.num.train <- (bws$bw[[j + 1L]]$ydati$all.dlev[[1L]])[as.integer(tmp.dat[, 1L])]
       } else {
         x.num.train <- as.double(xdat[, j])
       }
       resx[, j] <- x.num.train - xhat.train
+      formation.error[j] <- .np_plreg_residual_formation_error(x.num.train,
+                                                               xhat.train)
 
       if (!no.exz) {
         xhat.eval <- reg_mean(regbw = bws$bw[[j + 1L]], ytrain = xdat[, j], zeval = ezdat)
         if (is.factor(xdat[1L, j])) {
-          tmp.dat <- adjustLevels(exdat[, j, drop = FALSE], bws$bw[[j + 1L]]$ydati, allowNewCells = TRUE)
+          tmp.dat <- .np_regression_response_levels(exdat[, j, drop = FALSE], bws$bw[[j + 1L]]$ydati, allowNewCells = TRUE)
           x.num.eval <- (bws$bw[[j + 1L]]$ydati$all.dlev[[1L]])[as.integer(tmp.dat[, 1L])]
         } else {
           x.num.eval <- as.double(exdat[, j])
@@ -444,7 +452,9 @@ npplreg.call <-
       response = tmp.ty,
       yhat.train = yhat.train,
       zdim = ncol(zdat),
-      where = ".np_plot_plreg_local_fit"
+      where = ".np_plot_plreg_local_fit",
+      se = se,
+      formation.error = formation.error
     )
     B <- solved$coef
     train.fit <- solved$train.fit
@@ -464,11 +474,12 @@ npplreg.call <-
       as.vector(yhat.eval + resx.eval %*% B)
     }
 
-    do.call(plregression, list(
+    fit <- do.call(plregression, list(
       bws = bws,
       xcoef = B,
       xcoeferr = Berr,
       xcoefvcov = Bvcov,
+      se = se,
       evalx = if (no.exz) xdat else exdat,
       evalz = if (no.exz) zdat else ezdat,
       mean = ply,
@@ -477,6 +488,9 @@ npplreg.call <-
       residuals = FALSE,
       xtra = c(RSQ, MSE, MAE, MAPE, CORR, SIGN)
     ))
+    .npreg_publish_plot_rows(fit, empty.state$rows, report = .np.empty.report,
+      omitted = if(no.exz) integer(0) else which(!keep.eval),
+      row.labels = if(no.exz) NULL else row.names(ezdat))
   }
 
 
@@ -485,13 +499,23 @@ npplreg.plbandwidth <-
            txdat = stop("training data txdat missing"),
            tydat = stop("training data tydat missing"),
            tzdat = stop("training data tzdat missing"),
-           exdat, eydat, ezdat, residuals = FALSE, ...){
+           exdat, eydat, ezdat, residuals = FALSE, ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
 
     fit.start <- proc.time()[3]
     residuals <- npValidateScalarLogical(residuals, "residuals")
+    se <- npValidateScalarLogical(se, "se")
     dots <- list(...)
     fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
     .npRmpi_require_active_slave_pool(where = "npplreg()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     use.master.fit.progress <- .npRmpi_autodispatch_active() &&
       is.null(bws$degree.search) &&
       !isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
@@ -500,12 +524,25 @@ npplreg.plbandwidth <-
         .npRmpi_autodispatch_active() &&
         is.null(bws$degree.search) &&
         !isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
-      result <- .npRmpi_autodispatch_call(match.call(), parent.frame())
-      return(.npRmpi_restore_nomad_fit_bws_metadata(result, bws))
+      dispatch.call <- match.call()
+      dispatch.call$se <- se
+      dispatch.call$.np.defer.empty.rows <- TRUE
+      result <- .npRmpi_autodispatch_call(dispatch.call, parent.frame(), owner.name = "npplreg.plbandwidth")
+      return(.npreg_finish_empty_rows(.npRmpi_restore_nomad_fit_bws_metadata(result, bws),
+        defer = isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]]), owner = "npplreg"))
     }
 
     txdat = toFrame(txdat)
     tzdat = toFrame(tzdat)
+    .np_require_numeric_response(tydat, "npplreg", "tydat")
+    if (!missing(eydat))
+      .np_require_numeric_response(eydat, "npplreg", "eydat")
+    .np_require_paired_rows(txdat, tydat, "txdat", "tydat")
+    .np_require_paired_rows(txdat, tzdat, "txdat", "tzdat")
+    bws <- .np_bws_retain_native_training(bws, xdat = txdat, ydat = tydat, zdat = tzdat)
+
+    if (missing(exdat) && !missing(ezdat)) exdat <- txdat
+    if (!missing(exdat) && missing(ezdat)) ezdat <- tzdat
     
     ## catch and destroy NA's, part 1
     keep.rows <- rep_len(TRUE, nrow(txdat))
@@ -520,12 +557,29 @@ npplreg.plbandwidth <-
     tydat <- tydat[keep.rows]
     tzdat <- tzdat[keep.rows,,drop = FALSE]
 
+    native.newdata <- dots[["newdata", exact = TRUE]]
+    if (missing(exdat) && missing(ezdat) && !is.null(native.newdata)) {
+      native.eval <- .np_native_newdata_parts(
+        native.newdata, list(exdat = bws$xnames, ezdat = bws$znames), "npplreg")
+      exdat <- native.eval$exdat
+      ezdat <- native.eval$ezdat
+    }
+
     no.exz = missing(exdat)
     no.ey = missing(eydat)
+
+    if (no.exz && !no.ey) {
+      if (length(eydat) != length(keep.rows))
+        stop("'eydat' must have one value per original training row", call. = FALSE)
+      eydat <- eydat[keep.rows]
+    }
 
     if (!no.exz){
       exdat = toFrame(exdat)
       ezdat = toFrame(ezdat)
+      .np_require_paired_rows(exdat, ezdat, "exdat", "ezdat")
+      if (!no.ey)
+        .np_require_paired_rows(exdat, eydat, "exdat", "eydat")
       exdat.full <- exdat
       ezdat.full <- ezdat
 
@@ -554,6 +608,8 @@ npplreg.plbandwidth <-
     if (!no.ey)
       tmp.ey <- .np_plreg_numeric_response(eydat, bws$bw$yzbw$ydati)
 
+    empty.state <- new.env(hash = FALSE, parent = emptyenv())
+    empty.state$rows <- NULL
     reg_mean <- function(regbw, ytrain, zeval = NULL) {
       out <- .np_regression_cat_profile_mean(
         bws = regbw,
@@ -564,10 +620,21 @@ npplreg.plbandwidth <-
       if (!is.null(out))
         return(as.vector(out))
 
-      args <- list(txdat = tzdat, tydat = ytrain, bws = regbw)
+      # The parent owns this auxiliary response. Prepare its established score
+      # before a public MPI fit entry; keep the retained child data unchanged.
+      fit.response <- ytrain
+      if (.npRmpi_autodispatch_active() && is.factor(ytrain)) {
+        fit.response <- .np_plreg_numeric_response(ytrain, regbw$ydati)
+        names(fit.response) <- names(ytrain)
+      }
+      args <- list(txdat = tzdat, tydat = fit.response, bws = regbw)
       if (!is.null(zeval))
         args$exdat <- zeval
-      as.vector(fitted(do.call(npreg, args)))
+      args$.np.defer.empty.rows <- TRUE
+      fit <- do.call(.npreg_auxiliary, args)
+      empty.state$rows <- .npreg_merge_empty_rows(empty.state$rows,
+        attr(fit, ".np.empty.rows", exact = TRUE))
+      as.vector(fitted(fit))
     }
     
     ## y on z
@@ -586,6 +653,7 @@ npplreg.plbandwidth <-
     B = double(ncol)
     resx = matrix(data = 0, nrow = nrow, ncol = ncol)
     resx.eval = matrix(data = 0, nrow = nrow.eval, ncol = ncol)
+    formation.error <- numeric(ncol)
     fit.progress.targets <- .np_plreg_fit_progress_targets(names(txdat))
     fit.progress <- .np_plreg_fit_progress_begin(
       xnames = names(txdat),
@@ -606,17 +674,21 @@ npplreg.plbandwidth <-
       xhat.train <- reg_mean(regbw = bws$bw[[i+1]], ytrain = txdat[, i])
 
       if (is.factor(txdat[1,i])){
-        tmp.dat <- adjustLevels(txdat[,i, drop=FALSE], bws$bw[[i+1]]$ydati)
-        resx[,i] <- (bws$bw[[i+1]]$ydati$all.dlev[[1]])[as.integer(tmp.dat[,1])] - xhat.train
+        tmp.dat <- .np_regression_response_levels(txdat[,i, drop=FALSE], bws$bw[[i+1]]$ydati)
+        x.num.train <- (bws$bw[[i+1]]$ydati$all.dlev[[1]])[as.integer(tmp.dat[,1])]
+        resx[,i] <- x.num.train - xhat.train
       } else {
-        resx[,i] <- txdat[,i] - xhat.train
+        x.num.train <- txdat[,i]
+        resx[,i] <- x.num.train - xhat.train
       }
+      formation.error[i] <- .np_plreg_residual_formation_error(x.num.train,
+                                                               xhat.train)
 
       if(!no.exz) {
         xhat.eval <- reg_mean(regbw = bws$bw[[i+1]], ytrain = txdat[, i], zeval = ezdat)
 
         if (is.factor(txdat[1,i])){
-          tmp.dat <- adjustLevels(exdat[,i, drop=FALSE], bws$bw[[i+1]]$ydati)
+          tmp.dat <- .np_regression_response_levels(exdat[,i, drop=FALSE], bws$bw[[i+1]]$ydati)
           resx.eval[,i] <- (bws$bw[[i+1]]$ydati$all.dlev[[1]])[as.integer(tmp.dat[,1])] - xhat.eval
         } else {
           resx.eval[,i] <- exdat[,i] - xhat.eval
@@ -642,7 +714,9 @@ npplreg.plbandwidth <-
       response = tmp.ty,
       yhat.train = yhat.train,
       zdim = dim(tzdat)[2],
-      where = "npplreg"
+      where = "npplreg",
+      se = se,
+      formation.error = formation.error
     )
     B <- solved$coef
     Bvcov <- solved$vcov
@@ -676,6 +750,7 @@ npplreg.plbandwidth <-
       xcoef = B,
       xcoeferr = Berr,
       xcoefvcov = Bvcov,
+      se = se,
       evalx = if (no.exz) txdat else exdat.full,
       evalz = if (no.exz) tzdat else ezdat.full,
       mean = ply,
@@ -707,29 +782,51 @@ npplreg.plbandwidth <-
     environment(ev$call) <- parent.frame()
     fit.progress <- .np_progress_end(fit.progress)
     fit.progress.active <- FALSE
-    return(ev)
+    return(.npreg_finish_empty_rows(ev, empty.state$rows,
+      omitted = if(no.exz) integer(0) else which(!keep.eval),
+      defer = isTRUE(list(...)[[".np.defer.empty.rows", exact = TRUE]]),
+      owner = "npplreg", row.labels = if(no.exz) NULL else row.names(exdat)))
   }
 
 
-npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
+npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ..., se = FALSE) {
   .npRmpi_require_active_slave_pool(where = "npplreg()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   explicit.plbandwidth <- (!missing(bws)) && inherits(bws, "plbandwidth")
+  if (!missing(txdat) && "data" %in% names(substitute(list(...))))
+    .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
   formula.forwarded <- (!missing(txdat)) && inherits(txdat, "formula")
+  early.dots <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())
+  formula.input <- early.dots[["formula", exact = TRUE]]
+  formula.only <- missing(tydat) && missing(tzdat) &&
+    (missing(txdat) || formula.forwarded) &&
+    (formula.forwarded || inherits(formula.input, "formula") ||
+     (!missing(bws) && inherits(bws, "formula")))
   nomad <- npValidateNomadControl(nomad, "nomad")
+  se <- npValidateScalarLogical(se, "se")
   degree.select.value <- if (npNomadControlRequested(nomad)) {
     "coordinate"
-  } else if ("degree.select" %in% names(list(...))) {
-    match.arg(list(...)$degree.select, c("manual", "coordinate", "exhaustive"))
+  } else if ("degree.select" %in% names(early.dots)) {
+    match.arg(early.dots$degree.select, c("manual", "coordinate", "exhaustive"))
   } else {
     "manual"
   }
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
   if (.npRmpi_autodispatch_active() &&
-      !formula.forwarded &&
+      (missing(bws) || "bws" %in% names(sc)) &&
+      !formula.forwarded && !formula.only &&
       (explicit.plbandwidth || identical(degree.select.value, "manual")) &&
-      !isTRUE(.npRmpi_autodispatch_called_from_bcast()))
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      !isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
+    dispatch.call <- match.call()
+    dispatch.call$se <- se
+    return(.npRmpi_autodispatch_call(dispatch.call, parent.frame(), owner.name = "npplreg.default"))
+  }
 
-  sc <- sys.call()
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -749,11 +846,25 @@ npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
-  if(txdat.named)
+  if(txdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(txdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
     txdat <- toFrame(txdat)
+    if (!is.null(original.name)) names(txdat) <- original.name
+  }
 
-  if(tzdat.named)
+  if(tzdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(tzdat), "tzdat", sys.call(), parent.frame(), value = tzdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(tzdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(tzdat), parent.frame())), collapse = "") else NULL
     tzdat <- toFrame(tzdat)
+    if (!is.null(original.name)) names(tzdat) <- original.name
+  }
 
   sc.bw <- sc
   
@@ -777,6 +888,18 @@ npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npplregbw")
+  formula.input <- early.dots[["formula", exact = TRUE]]
+  frame.state <- if (!has.explicit.bws &&
+      (bws.formula || inherits(formula.input, "formula") ||
+       (!no.txdat && inherits(txdat, "formula"))) &&
+      no.tydat && no.tzdat &&
+      (no.txdat || inherits(txdat, "formula")))
+    new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+  }
     
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
     sc.bw,
@@ -787,17 +910,29 @@ npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     if (use.outer.bandwidth.progress) {
       .np_progress_select_bandwidth_enhanced(
         "Selecting partially linear regression bandwidth",
-        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
       )
     } else {
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
   }
   
-  call.args <- list(bws = tbw)
-  if (no.bws) {
+  if (!has.explicit.bws && is.null(tbw$formula) && !no.tydat)
+    tbw <- updateBwNameMetadata(list(ynames = paste(deparse(
+      .np_formula_dot_expression(substitute(tydat), parent.frame())), collapse = "")), tbw)
+  tbw$bw$yzbw <- updateBwNameMetadata(list(ynames = tbw$ynames), tbw$bw$yzbw)
+  call.args <- list(bws = tbw, se = se)
+  if (!is.null(frame.state)) {
+    call.args$.np.formula.state <- frame.state
+  } else if (no.bws) {
     call.args$txdat <- txdat
     call.args$tydat <- tydat
     call.args$tzdat <- tzdat
@@ -811,5 +946,8 @@ npplreg.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   }
   if (!has.explicit.bws)
     call.args$.np_fit_progress_handoff <- TRUE
-  do.call(npplreg, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  do.call(npplreg, c(call.args, fit.dots))
 }

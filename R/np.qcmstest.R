@@ -2,6 +2,15 @@
   isTRUE(.npRmpi_autodispatch_called_from_bcast())
 }
 
+.npRmpi_qcms_iid_index_plan <- function(n, boot.num) {
+  index <- matrix(NA_integer_, nrow = boot.num, ncol = n)
+
+  for (ii in seq_len(boot.num))
+    index[ii, ] <- sample.int(n, replace = TRUE)
+
+  index
+}
+
 .npRmpi_qcms_wild_multiplier_plan <- function(n, boot.num, a, b, p.a) {
   mult <- matrix(NA_real_, nrow = boot.num, ncol = n)
 
@@ -45,16 +54,102 @@
   chunks
 }
 
+.npRmpi_qcms_collective_iid_bootstrap <- function(plan,
+                                                  model.resid,
+                                                  yhat,
+                                                  model,
+                                                  tau,
+                                                  pivot,
+                                                  statistic.batch,
+                                                  progress = NULL,
+                                                  comm = 1L) {
+  boot.num <- nrow(plan)
+  size <- mpi.comm.size(comm)
+  rank <- mpi.comm.rank(comm)
+
+  local.idx <- seq_len(boot.num)
+  local.idx <- local.idx[(local.idx - 1L) %% size == rank]
+  .npRmpi_bootstrap_transport_trace(
+    what = "npqcmstest",
+    event = "fanout.collective.start",
+    fields = list(rank = rank, size = size, B = boot.num,
+                  local = length(local.idx), method = "iid")
+  )
+
+  local.Sn <- numeric(length(local.idx))
+  chunk.size <- .np_cms_bootstrap_chunk_size(
+    n = length(model.resid),
+    boot.num = max(1L, ceiling(boot.num / size)),
+    pivot = pivot
+  )
+
+  local.Sn <- as.numeric(unlist(.npRmpi_bootstrap_collective_apply(
+    boot.num, chunk.size, function(ids, pos) {
+      residuals.chunk <- matrix(
+        NA_real_, nrow = length(model.resid), ncol = length(pos)
+      )
+
+      for (jj in seq_along(pos)) {
+        ii <- local.idx[[pos[[jj]]]]
+        y.star <- yhat + model.resid[plan[ii, ]]
+        suppressWarnings(
+          residuals.chunk[, jj] <- .np_cms_refit_residuals(model, y.star, tau)
+        )
+      }
+
+      statistic <- .npRmpi_with_local_regression(
+        statistic.batch(residuals.chunk)
+      )
+      if (pivot) statistic[["Jn"]] else statistic[["In"]]
+    }, progress = progress, comm = comm), use.names = FALSE))
+
+  invisible(gc(FALSE))
+
+  payload <- c(as.numeric(local.idx), local.Sn)
+  gathered <- mpi.gather.Robj(payload, root = 0L, comm = comm)
+
+  if (rank == 0L) {
+    chunks <- .npRmpi_qcms_numeric_chunks(gathered, size = size)
+    Sn.bootstrap <- numeric(boot.num)
+
+    for (rr in seq_len(size)) {
+      vals <- as.numeric(chunks[[rr]])
+      if (!length(vals))
+        next
+      if ((length(vals) %% 2L) != 0L)
+        stop("npqcmstest MPI gather returned malformed bootstrap chunk",
+             call. = FALSE)
+      n.local <- length(vals) / 2L
+      idx <- as.integer(vals[seq_len(n.local)])
+      Sn.bootstrap[idx] <- vals[n.local + seq_len(n.local)]
+    }
+
+    if (!is.null(progress))
+      progress <- .np_progress_step(progress, done = boot.num)
+    .npRmpi_bootstrap_transport_trace(
+      what = "npqcmstest",
+      event = "fanout.collective.done",
+      fields = list(rank = rank, size = size, B = boot.num, method = "iid")
+    )
+    mpi.bcast.Robj(Sn.bootstrap, rank = 0L, comm = comm)
+    Sn.bootstrap
+  } else {
+    .npRmpi_bootstrap_transport_trace(
+      what = "npqcmstest",
+      event = "fanout.collective.done",
+      fields = list(rank = rank, size = size, B = boot.num, method = "iid")
+    )
+    mpi.bcast.Robj(rank = 0L, comm = comm)
+  }
+}
+
 .npRmpi_qcms_collective_multiplier_bootstrap <- function(plan,
                                                          model.resid,
                                                          yhat,
                                                          model,
                                                          tau,
-                                                         xdat,
-                                                         bw,
                                                          pivot,
-                                                         Jn,
-                                                         In,
+                                                         statistic.batch,
                                                          method,
                                                          progress = NULL,
                                                          comm = 1L) {
@@ -63,7 +158,8 @@
   rank <- mpi.comm.rank(comm)
   resid.mean <- mean(model.resid)
 
-  local.idx <- seq.int(rank + 1L, boot.num, by = size)
+  local.idx <- seq_len(boot.num)
+  local.idx <- local.idx[(local.idx - 1L) %% size == rank]
   .npRmpi_bootstrap_transport_trace(
     what = "npqcmstest",
     event = "fanout.collective.start",
@@ -71,16 +167,31 @@
   )
 
   local.Sn <- numeric(length(local.idx))
+  chunk.size <- .np_cms_bootstrap_chunk_size(
+    n = length(model.resid),
+    boot.num = max(1L, ceiling(boot.num / size)),
+    pivot = pivot
+  )
 
-  for (jj in seq_along(local.idx)) {
-    ii <- local.idx[[jj]]
-    y.star <- yhat + (model.resid - resid.mean) * plan[ii, ] + resid.mean
-    suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
+  local.Sn <- as.numeric(unlist(.npRmpi_bootstrap_collective_apply(
+    boot.num, chunk.size, function(ids, pos) {
+      residuals.chunk <- matrix(
+        NA_real_, nrow = length(model.resid), ncol = length(pos)
+      )
 
-    local.Sn[[jj]] <- .npRmpi_with_local_regression(
-      if (pivot) Jn(xdat, resid, bw) else In(xdat, resid, bw)
-    )
-  }
+      for (jj in seq_along(pos)) {
+        ii <- local.idx[[pos[[jj]]]]
+        y.star <- yhat + (model.resid - resid.mean) * plan[ii, ] + resid.mean
+        suppressWarnings(
+          residuals.chunk[, jj] <- .np_cms_refit_residuals(model, y.star, tau)
+        )
+      }
+
+      statistic <- .npRmpi_with_local_regression(
+        statistic.batch(residuals.chunk)
+      )
+      if (pivot) statistic[["Jn"]] else statistic[["In"]]
+    }, progress = progress, comm = comm), use.names = FALSE))
 
   invisible(gc(FALSE))
 
@@ -131,28 +242,44 @@ npqcmstest <- function(formula,
                        distribution = c("bootstrap", "asymptotic"),
                        bwydat = c("y","varepsilon"),
                        boot.method=c("iid","wild","wild-rademacher"),
-                       boot.num = 399,
+                       B = 399,
                        pivot = TRUE,
                        density.weighted = TRUE,
                        random.seed = 42,
                        ...) {
+  if (missing(formula) && !missing(xdat) && !missing(ydat)) {
+    frame.args <- substitute(list(...))[-1L]
+    if (!missing(subset)) frame.args <- c(list(subset = quote(subset)), frame.args)
+    .np_reject_native_frame_args(frame.args)
+  }
+
+  if (missing(formula) && !missing(xdat) && !missing(ydat) &&
+      .np_data_formal_supplied(sys.call(), sys.function()))
+    .np_native_data_error()
+
+
+  if (...length())
+    npRejectLegacyBootstrapCount(names(list(...)), "npqcmstest")
   .npRmpi_require_active_slave_pool(where = "npqcmstest()")
-  if (.npRmpi_autodispatch_active())
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+  if (.npRmpi_autodispatch_active()) {
+    dispatch.call <- match.call()
+    if (!missing(formula) && missing(xdat) && missing(ydat) && !missing(subset))
+      dispatch.call[c("data", "subset")] <- .np_formula_subset_inputs(
+        data, match.call()[["subset"]], parent.frame())
+    return(.npRmpi_autodispatch_call(dispatch.call, parent.frame(), owner.name = "npqcmstest"))
+  }
 
-  pcall = paste(deparse(model$call),collapse="")
-  if(length(grep("model = TRUE", pcall)) == 0)
-    stop(paste(sQuote("model")," is missing components ",
-               sQuote("model"),
-               ".\nTo fix this please invoke ",
-               sQuote("rq"),
-               " with ", sQuote("model=TRUE"),
-               ".\nSee help for further info.",
-               sep=""))
+  .np_cms_validate_model(model, quantile = TRUE)
 
-  if(tau <=0 || tau >=1) stop("tau must lie in (0,1)")
+  if (!is.numeric(tau) || length(tau) != 1L || !is.finite(tau) ||
+      tau <= 0 || tau >= 1)
+    stop("tau must be a finite scalar in (0,1)")
+  model.tau <- model[["tau", exact = TRUE]]
+  if (!is.numeric(model.tau) || length(model.tau) != 1L ||
+      !is.finite(model.tau) || tau != model.tau)
+    stop("tau must match the single quantile fitted by model")
 
-  if(boot.num < 9) stop("number of bootstrap replications must be >= 9")
+  if(B < 9) stop("number of bootstrap replications must be >= 9")
 
   ## checking for consistent interface usage
   miss.xy = c(missing(xdat),missing(ydat))
@@ -165,12 +292,13 @@ npqcmstest <- function(formula,
   else if(all(miss.xy) & !miss.f){
     mf.args <- list(formula = formula, data = data, na.action = na.omit)
     if (!missing(subset))
-      mf.args$subset <- subset
+      mf.args[c("data", "subset")] <- .np_formula_subset_inputs(
+        data, match.call()[["subset"]], parent.frame())
     mf <- do.call(model.frame, mf.args)
     ydat <- model.response(mf)
-    xdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
+    xdat <- mf[, .np_formula_term_names(attr(attr(mf, "terms"),"term.labels")), drop = FALSE]
 
-    na.index <- unclass(attr(xdat,"na.action"))
+    na.index <- unclass(attr(mf,"na.action"))
   } else if(!miss.f){
     stop(paste("A formula was specified along with xdat and ydat.\n",
                "Please see the documentation on proper interface usage."))
@@ -192,10 +320,14 @@ npqcmstest <- function(formula,
     na.index <- which(!keep.rows)
   }
 
+  model <- .np_cms_compact_model(model, xdat, ydat)
+
   ## Save seed prior to setting
 
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
+  seed.state <- .np_rng_scope_capture(collective = .npRmpi_rng_scope_collective(),
+                                      same.kind = TRUE)
+  on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+  .np_rng_scope_seed(seed.state, random.seed)
 
 
   distribution = match.arg(distribution)
@@ -203,11 +335,13 @@ npqcmstest <- function(formula,
   bwydat = match.arg(bwydat)  
 
   qresidual <- function(resid, tau) {
+    resid.dim <- dim(resid)
     n.obs <- length(resid)
     out <- rep.int(-tau, n.obs)
     nonmissing <- !is.na(resid)
     out[nonmissing & resid <= 0] <- 1 - tau
     out[!nonmissing] <- NA_real_
+    dim(out) <- resid.dim
     out
   }
 
@@ -219,18 +353,20 @@ npqcmstest <- function(formula,
 
   ## ydat is model's residuals, xdat all regressors with types
 
-  .np_progress_note("Computing bandwidths")
 
   ## What are the optimal bandwidths? We could proceed to use those
   ## for the conditional expectation with raw y, or along the lines of
   ## Zheng (1998) does GCV where the dep var is varepsilon...
 
   if(bwydat == "y") {
-    bw <- .np_progress_with_legacy_suppressed(npregbw(xdat=xdat, ydat=model$y, ...))
+    bw <- .np_progress_select_bandwidth_enhanced("Computing bandwidths", npregbw(xdat=xdat, ydat=model$y, ...))
   } else if(bwydat == "varepsilon"){
     varepsilon <- qresidual(model.resid, tau)
-    bw <- .np_progress_with_legacy_suppressed(npregbw(xdat=xdat, ydat=varepsilon, ...))
+    bw <- .np_progress_select_bandwidth_enhanced("Computing bandwidths", npregbw(xdat=xdat, ydat=varepsilon, ...))
   }
+
+  # Resolve the kernel once; selection-only dots do not belong to npksum.
+  kernel.bw <- kbandwidth(bw)
 
   ## Now define the Jn test statistic that takes arguments xdat, the
   ## residual vector, the bandwidth object, and the number of bootstrap
@@ -240,12 +376,12 @@ npqcmstest <- function(formula,
 
   prodh <- if (bw$ncon == 0) 1.0
   else
-    prod(bw$bw[bw$icon])
+    prod(kernel.bw$bw[kernel.bw$icon])
 
   if (!density.weighted)
     fhat <- npksum(txdat = xdat,
-                   bws = bw$bw, leave.one.out = TRUE,
-                   bandwidth.divide = FALSE,...)$ksum/(n*prodh)
+                   bws = kernel.bw, leave.one.out = TRUE,
+                   bandwidth.divide = TRUE)$ksum/n
 
   if(min(fhat) == 0)
   stop(paste(sep="","\nAttempt to divide by zero density.",
@@ -264,9 +400,9 @@ npqcmstest <- function(formula,
 
     return( sum(varepsilon*npksum(txdat=xdat,
                                   tydat=varepsilon,
-                                  bws=bw$bw,
+                                  bws=kernel.bw,
                                   leave.one.out=TRUE,
-                                  bandwidth.divide=TRUE,...)$ksum/fhat)/n^2 )
+                                  bandwidth.divide=TRUE)$ksum/fhat)/n^2 )
   }
 
   Omega.hat <- function(xdat, model.resid, bw) {
@@ -278,20 +414,32 @@ npqcmstest <- function(formula,
     
     varepsilon <- qresidual(model.resid, tau)
 
-    return( 2*prod(bw$bw[bw$icon])*
+    return( 2*prodh*
            sum(varepsilon^2*
                npksum(txdat=xdat,
                       tydat=varepsilon^2,
-                      bws=bw$bw,
+                      bws=kernel.bw,
                       leave.one.out=TRUE,
                       kernel.pow=2,
-                      bandwidth.divide=TRUE,...)$ksum/fhat^2)/n^2 )
+                      bandwidth.divide=TRUE)$ksum/fhat^2)/n^2 )
   }
 
   Jn <- function(xdat, model.resid, bw) {
     ## Compute the statistic, supposed to be N(0,1) asymptotically
     n <- length(model.resid)
     n*sqrt(prodh)*In(xdat, model.resid, bw)/sqrt(Omega.hat(xdat, model.resid, bw))
+  }
+
+  statistic.batch <- function(model.resid) {
+    .np_cms_statistics_batch(
+      xdat = xdat,
+      score = qresidual(model.resid, tau),
+      bw = kernel.bw,
+      fhat = fhat,
+      prodh = prodh,
+      pivot = pivot,
+      kernel.args = list()
+    )
   }
 
 
@@ -309,7 +457,7 @@ npqcmstest <- function(formula,
     mult
   }
 
-  boot.wild <- function(model.resid) {
+  resid.wild <- function(model.resid) {
 
     a <- -0.6180339887499 # (1-sqrt(5))/2
     P.a <-0.72360679774998 # (1+sqrt(5))/(2*sqrt(5))
@@ -326,13 +474,12 @@ npqcmstest <- function(formula,
       draw.wild.mult(length(model.resid), a, b, P.a) +
       resid.mean
 
-    suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
+    suppressWarnings(resid <- .np_cms_refit_residuals(model, y.star, tau))
 
-    return(if (pivot) Jn(xdat, resid, bw)
-           else In(xdat, resid, bw))
+    resid
   }
 
-  boot.wild.rademacher <- function(model.resid) {
+  resid.wild.rademacher <- function(model.resid) {
 
     a <- -1
     P.a <- 0.5
@@ -346,32 +493,48 @@ npqcmstest <- function(formula,
       draw.wild.mult(length(model.resid), a, b, P.a) +
       resid.mean
 
-    suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
+    suppressWarnings(resid <- .np_cms_refit_residuals(model, y.star, tau))
 
-    return(if (pivot) Jn(xdat, resid, bw)
-           else In(xdat, resid, bw))
+    resid
   }
 
-  boot.iid <- function(model.resid) {
+  resid.iid <- function(model.resid) {
 
     ## Simple iid resampling
 
     y.star <- yhat + model.resid[sample.int(length(model.resid), replace = TRUE)]
 
-    suppressWarnings(resid <- residuals(rq(y.star~ model$x - 1, tau=tau), type = "response"))
+    suppressWarnings(resid <- .np_cms_refit_residuals(model, y.star, tau))
 
-    return(if (pivot) Jn(xdat, resid, bw)
-           else In(xdat, resid, bw))
+    resid
   }
 
   if(distribution == "bootstrap"){
-    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
+    progress <- .np_progress_begin("Bootstrap replications", total = B, surface = "bootstrap")
     collective.bootstrap <- .npRmpi_qcms_collective_context()
 
-    if (collective.bootstrap && identical(boot.method, "wild")) {
+    if (collective.bootstrap && identical(boot.method, "iid")) {
+      plan <- .npRmpi_qcms_iid_index_plan(
+        n = length(model.resid),
+        boot.num = B
+      )
+      post.boot.seed <- get(".Random.seed", envir = .GlobalEnv,
+                            inherits = FALSE)
+      Sn.bootstrap <- .npRmpi_qcms_collective_iid_bootstrap(
+        plan = plan,
+        model.resid = model.resid,
+        yhat = yhat,
+        model = model,
+        tau = tau,
+        pivot = pivot,
+        statistic.batch = statistic.batch,
+        progress = progress
+      )
+      assign(".Random.seed", post.boot.seed, envir = .GlobalEnv)
+    } else if (collective.bootstrap && identical(boot.method, "wild")) {
       plan <- .npRmpi_qcms_wild_multiplier_plan(
         n = length(model.resid),
-        boot.num = boot.num,
+        boot.num = B,
         a = -0.6180339887499,
         b = 1.6180339887499,
         p.a = 0.72360679774998
@@ -383,11 +546,8 @@ npqcmstest <- function(formula,
         yhat = yhat,
         model = model,
         tau = tau,
-        xdat = xdat,
-        bw = bw,
         pivot = pivot,
-        Jn = Jn,
-        In = In,
+        statistic.batch = statistic.batch,
         method = "wild",
         progress = progress
       )
@@ -395,7 +555,7 @@ npqcmstest <- function(formula,
     } else if (collective.bootstrap && identical(boot.method, "wild-rademacher")) {
       plan <- .npRmpi_qcms_wild_multiplier_plan(
         n = length(model.resid),
-        boot.num = boot.num,
+        boot.num = B,
         a = -1,
         b = 1,
         p.a = 0.5
@@ -407,26 +567,39 @@ npqcmstest <- function(formula,
         yhat = yhat,
         model = model,
         tau = tau,
-        xdat = xdat,
-        bw = bw,
         pivot = pivot,
-        Jn = Jn,
-        In = In,
+        statistic.batch = statistic.batch,
         method = "wild-rademacher",
         progress = progress
       )
       assign(".Random.seed", post.boot.seed, envir = .GlobalEnv)
     } else {
-      Sn.bootstrap <- numeric(boot.num)
-      for (ii in seq_len(boot.num)) {
-        if(boot.method == "iid"){
-          Sn.bootstrap[ii] <- boot.iid(model.resid)
-        } else if(boot.method == "wild"){
-          Sn.bootstrap[ii] <- boot.wild(model.resid)
-        } else if(boot.method == "wild-rademacher"){
-          Sn.bootstrap[ii] <- boot.wild.rademacher(model.resid)
+      Sn.bootstrap <- numeric(B)
+      chunk.size <- .np_cms_bootstrap_chunk_size(
+        n = n,
+        boot.num = B,
+        pivot = pivot
+      )
+      for (start in seq.int(1L, B, by = chunk.size)) {
+        stopi <- min(B, start + chunk.size - 1L)
+        idx <- seq.int(start, stopi)
+        residuals.chunk <- matrix(NA_real_, nrow = n, ncol = length(idx))
+
+        for (jj in seq_along(idx)) {
+          ii <- idx[[jj]]
+          residuals.chunk[, jj] <- if(boot.method == "iid") {
+            resid.iid(model.resid)
+          } else if(boot.method == "wild") {
+            resid.wild(model.resid)
+          } else {
+            resid.wild.rademacher(model.resid)
+          }
+          progress <- .np_progress_step(progress)
         }
-        progress <- .np_progress_step(progress, done = ii)
+
+        statistic <- statistic.batch(residuals.chunk)
+       Sn.bootstrap[idx] <- if (pivot) statistic[["Jn"]] else statistic[["In"]]
+        progress <- .np_progress_step(progress, done = max(idx))
       }
     }
     progress <- .np_progress_end(progress)
@@ -465,9 +638,9 @@ npqcmstest <- function(formula,
       Jn = n*sqrt(prodh)*tIn/sqrt(to.h),
       In = tIn,
       Omega.hat = to.h,
-      q.90=Sn.bootstrap[ceiling(0.90*boot.num)],
-      q.95=Sn.bootstrap[ceiling(0.95*boot.num)],
-      q.99=Sn.bootstrap[ceiling(0.99*boot.num)],
+      q.90=Sn.bootstrap[ceiling(0.90*B)],
+      q.95=Sn.bootstrap[ceiling(0.95*B)],
+      q.99=Sn.bootstrap[ceiling(0.99*B)],
       bw=bw,
       Jn.bootstrap = if(pivot) Sn.bootstrap else NA,
       In.bootstrap = if(pivot) NA else Sn.bootstrap,
@@ -476,14 +649,14 @@ npqcmstest <- function(formula,
 
     Sn = if (pivot) tJn$Jn else tIn
 
-    tJn$P <- mean(Sn.bootstrap > Sn)
+    tJn$P <- .np_bootstrap_upper_tail_pvalue(Sn.bootstrap, Sn)
 
     
   }
   
   ## Restore seed
 
-  .np_seed_exit(seed.state, remove_if_absent = TRUE)
+  .np_rng_scope_restore(seed.state)
   
   cmstest(Jn = tJn$Jn,
           In = tJn$In,
@@ -500,6 +673,6 @@ npqcmstest <- function(formula,
           pivot = pivot,
           model = model,
           boot.method = boot.method,
-          boot.num = boot.num,
+          boot.num = B,
           na.index = na.index)
 }

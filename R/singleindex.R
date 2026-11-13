@@ -1,14 +1,14 @@
 singleindex = 
-  function(bws,  betavcov = NULL, index, mean, merr = NA,
-           grad = NA, gerr = NA,
-           mean.grad = NA, mean.gerr = NA,
+  function(bws,  betavcov = NULL, index, mean, merr = NULL,
+           grad = NA, gerr = NULL,
+           mean.grad = NA, mean.gerr = NULL,
            resid = NA,
            ntrain, trainiseval = FALSE, residuals = FALSE,
-           gradients = FALSE, xtra = NA,
+           gradients = FALSE, se = FALSE, xtra = NA,
            confusion.matrix = NA, CCR.overall = NA,
            CCR.byoutcome =  NA, fit.mcfadden = NA
            , timing = NA, total.time = NA,
-           optim.time = NA, fit.time = NA
+           optim.time = NA, fit.time = NA, se.type = NULL
            ){
 
     if (missing(bws) || missing(index) || missing(mean) || missing(ntrain))
@@ -23,7 +23,7 @@ singleindex =
       pmethod = bws$pmethod,
       xnames = bws$xnames,
       ynames = bws$ynames,
-      nobs = dim(index)[1],
+      nobs = NROW(index),
       ndim = bws$ndim,
       nord = bws$nord,
       nuno = bws$nuno,
@@ -41,6 +41,8 @@ singleindex =
       trainiseval = trainiseval,
       residuals = residuals,
       gradients = gradients,
+      se = se,
+      se.type = se.type,
       R2 = xtra[1],
       MSE = xtra[2],
       MAE = xtra[3],
@@ -66,7 +68,7 @@ print.singleindex <- function(x, digits=NULL, ...){
       "\nRegression data: ", x$ntrain, " training points,",
       if (x$trainiseval) "" else paste(" and ", x$nobs,
                                       " evaluation points,", sep=""),
-      " in ",x$ndim," variable(s)\n",sep="")
+      " in ",x$ndim,if (is.null(x$bws[["index.design", exact = TRUE]])) " variable(s)\n" else " index coordinate(s)\n",sep="")
 
   print(matrix(x$beta,ncol=x$ndim,dimnames=list(paste("Beta",":",sep=""),x$xnames)))
   
@@ -90,7 +92,9 @@ vcov.singleindex <- function(object, ...) {
   if(!is.null(tc)) {
     return(tc)
   } else {
-    .np_warning("variance-covariance matrix does not exist: verify gradients=TRUE")
+    stop(paste("coefficient covariance was not computed.",
+               .np_index_refit_hint(substitute(object), se = TRUE)),
+         call. = FALSE)
   }
 }
 fitted.singleindex <- function(object, ...){
@@ -103,11 +107,15 @@ predict.singleindex <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
   has.formula.route <- !is.null(object$bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npindex.sibandwidth,
+                                  c("txdat", "tydat"))
 
   if (!is.null(dots$exdat) && !is.null(dots$newdata)) {
     dots$newdata <- NULL
   } else if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
-    dots$exdat <- dots$newdata
+    dots$exdat <- .np_native_newdata_parts(
+      dots$newdata, list(exdat = .np_index_predictor_names(object$bws)), "predict")$exdat
     dots$newdata <- NULL
   }
 
@@ -120,31 +128,52 @@ predict.singleindex <- function(object, se.fit = FALSE, ...) {
         fit = fitted(object),
         se.fit = se(object),
         df = object$nobs,
-        residual.scale = object$MSE
+        residual.scale = .np_index_training_mse(object)
       ))
     }
     return(fitted(object))
   }
 
-  tr <- do.call(npindex, c(list(bws = object$bws, errors = se.fit), dots))
-  if (se.fit)
+  npRejectLegacyBooleanErrors(dots, "predict.singleindex")
+  if ("se" %in% names(dots))
+    stop("predict.singleindex uses 'se.fit', not 'se'", call. = FALSE)
+  if (se.fit && is.null(dots$se.type) && !is.null(object[["se.type"]]))
+    dots$se.type <- object[["se.type"]]
+  tr <- do.call(npindex, c(list(bws = object$bws, se = se.fit), dots))
+  if (se.fit) {
+    training.mse <- .np_index_training_mse(tr)
+    if (is.na(training.mse) && length(names(dots)) == length(dots) &&
+        all(!is.na(names(dots)) & nzchar(names(dots))) &&
+        !any(!is.na(pmatch(names(dots),
+          c("data", "txdat", "tydat", "subset", "na.action"), duplicates.ok = TRUE))))
+      training.mse <- .np_index_training_mse(object)
     return(list(fit = fitted(tr), se.fit = se(tr),
-                df = tr$nobs, residual.scale = tr$MSE))
+                df = tr$nobs, residual.scale = training.mse))
+  }
   fitted(tr)
 }
-se.singleindex <- function(x){ x$merr }
-gradients.singleindex <- function(x, errors = FALSE, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
+se.singleindex <- function(x){
+  if (!isTRUE(x$se) || is.null(x$merr) || !length(x$merr))
+    stop(paste("standard errors were not computed.",
+               .np_index_refit_hint(substitute(x), se = TRUE)), call. = FALSE)
+  x$merr
+}
+gradients.singleindex <- function(x, se = FALSE, ...) {
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.singleindex", suggest = TRUE)
+  dots <- list(...)
+  npRejectLegacyBooleanErrors(dots, "gradients.singleindex")
+  se <- npValidateScalarLogical(se, "se")
   .np_singleindex_reject_higher_gradient_order(
-    list(...),
+    dots,
     where = "gradients.singleindex"
   )
-  gout <- if (!errors) x$grad else x$gerr
+  gout <- if (!se) x$grad else x$gerr
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop(if (!errors)
-      "gradients are not available: fit the model with gradients=TRUE"
-    else
-      "gradient standard errors are not available: fit the model with gradients=TRUE")
+    stop(paste(if (!se) "gradients are not available." else
+                 "gradient standard errors were not computed.",
+               .np_index_refit_hint(substitute(x), gradients = TRUE, se = se)),
+         call. = FALSE)
   gout
 }
 
@@ -153,7 +182,7 @@ summary.singleindex <- function(object, ...){
       "\nRegression Data: ", object$ntrain, " training points,",
       if (object$trainiseval) "" else paste(" and ", object$nobs,
                                       " evaluation points,", sep=""),
-      " in ",object$ndim," variable(s)\n\n",sep="")
+      " in ",object$ndim,if (is.null(object$bws[["index.design", exact = TRUE]])) " variable(s)\n\n" else " index coordinate(s)\n\n",sep="")
 
   cat(genOmitStr(object))
   print(matrix(object$beta,ncol=object$ndim,dimnames=list(paste("Beta",":",sep=""),object$xnames)))
@@ -161,8 +190,11 @@ summary.singleindex <- function(object, ...){
   cat("Bandwidth:", object$bw)
   cat(genRegEstStr(object))
   cat("\n")
-  cat(genGofStr(object))
-  pCatGofStr(object)
+  .np_diagnostics_summary(object)
+  if (!identical(object[["diagnostics.sample", exact = TRUE]], "unavailable")) {
+    cat(genGofStr(object))
+    pCatGofStr(object)
+  }
   cat(genBwKerStrs(object$bws))
   cat(genTimingStr(object))
   

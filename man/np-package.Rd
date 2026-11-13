@@ -12,6 +12,8 @@
 	variables respectively). A getting-started vignette containing a
 	short introduction to the \pkg{npRmpi} package can be accessed via
 	\code{vignette("npRmpi_getting_started", package = "npRmpi")}.
+  It includes prediction, no-search uncertainty/gradient refitting, and a
+  migration guide for users updating from 0.70-5.
 
   For a listing of all routines in the \pkg{npRmpi} package type:
   \sQuote{library(help="npRmpi")}.  
@@ -66,6 +68,28 @@
   a number of dummy variables for a factor.  Every function in npRmpi
   supports both interfaces, where appropriate.
 
+  Bandwidth objects for regression, unconditional and conditional
+  density/distribution, single-index, partially linear and smooth-coefficient
+  methods retain their training values. Formula objects retain the prepared
+  model frame and NA policy; native objects retain the supplied training
+  values. Fitting with replacement training data records that sample in the
+  returned fit's bandwidth object, without modifying the original bandwidth
+  object. Evaluation or prediction grids do not replace training data.
+  Objects created without retained samples still require their original data
+  bindings or explicit training inputs. New evaluation data involving custom
+  formula transformations still require those transformation functions.
+
+  Estimator formulas do not support right-hand-side \code{offset()} special
+  terms; these are rejected rather than silently omitted. A variable named
+  \code{offset} is not an offset special. This restriction does not change
+  offset handling by a separately supplied parametric model in a specification
+  test. Conditional density/distribution formulas require response variable
+  names (separated by \code{+} for multiple responses). To transform a
+  conditional response, first create an explicit transformed variable in
+  \code{data}, or supply the transformed values through the native data
+  interface. Supported response transformations in other estimator families,
+  such as \code{npreg(log(y) ~ x)}, retain their existing meaning.
+
   Note that if your factor is in fact a character string such as, say,
 	\code{X} being either \code{"MALE"} or \code{"FEMALE"}, npRmpi will handle
 	this directly, i.e., there is no need to map the string values into
@@ -76,11 +100,12 @@
 	the type and use the appropriate kernel function and method where
 	appropriate.
 
-	All estimation methods are fully multivariate, i.e., there are no
-	limitations on the number of variables one can model (or number of
-	observations for that matter). Execution time for most routines is,
-	however, exponentially increasing in the number of observations and
-	increases with the number of variables involved.
+  Estimators support multivariate data subject to each method's documented
+  requirements and available computational resources. Runtime and memory
+  depend on sample size, evaluation points, dimension, polynomial basis,
+  kernel support, bandwidth type and search settings. Large datasets and
+  high-dimensional fits can be expensive; there is no single exponential
+  sample-size cost rule shared by all routines.
 
 	Nonparametric methods include unconditional density (distribution),
 	conditional density (distribution), regression, mode, and quantile
@@ -95,6 +120,9 @@
 	A variety of bootstrap methods for computing standard errors,
 	nonparametric confidence bounds, and bias-corrected bounds are
 	implemented.
+	All bias-corrected intervals and bands are experimental (pre-beta
+	research), incomplete, and not recommended for general-purpose inference.
+	See \code{\link{plot.np}} for their research status and limitations.
 
 	A variety of bandwidth methods are implemented including fixed,
 	nearest-neighbor, and adaptive nearest-neighbor.
@@ -155,14 +183,6 @@
       and \eqn{h>0}.
     }
     
-    \item{Second Order Truncated Gaussian (\eqn{x} is continuous)}{
-			\eqn{k(z) = (\exp(-z^2/2)-\exp(-b^2/2))/(\textrm{erf}(b/\sqrt{2})\sqrt{2\pi}-2b\exp(-b^2/2))}{k(z) =
-				(exp(-z^2/2)-exp(-b^2/2))/(erf(b/\sqrt{2})\sqrt{2\pi}-2b\exp(-b^2/2))} where \eqn{z=(x_i-x)/h}{z=(x[i]-x)/h}, \eqn{b>0}, \eqn{|z|\le b}
-      and \eqn{h>0}.
-      
-      See \code{\link{nptgauss}} for details on modifying \eqn{b}.
-    }
-
     \item{Second Order Epanechnikov (\eqn{x} is continuous)}{
       \eqn{k(z) =  3\left(1 - z^2/5\right)/(4\sqrt{5})}{
         k(z) =  3(1 - z^2/5)/(4\sqrt 5)}

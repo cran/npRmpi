@@ -2,9 +2,11 @@ npplregbw <-
   function(...){
     mc <- match.call(expand.dots = FALSE)
     npRejectRenamedScaleFactorSearchArgs(names(mc$...), where = "npplregbw")
+    .np_validate_public_dots(mc[["..."]], "npplregbw")
     target <- .np_bw_dispatch_target(dots = mc$...,
                                      data_arg_names = c("xdat", "ydat", "zdat"),
-                                     eval_env = parent.frame())
+                                     eval_env = parent.frame(),
+                                     promise.frame = environment())
     UseMethod("npplregbw", target)
   }
 
@@ -14,107 +16,31 @@ npplregbw.formula <-
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
-
     formula.call <- .np_bw_formula_from_call(call_obj = call, eval_env = parent.frame())
-    if (!is.null(formula.call))
-      mf[[2]] <- formula.call
-
-    mf.xf <- mf
-
-    mf[[1]] <- as.name("model.frame")
-    mf.xf[[1]] <- as.name("model.frame")
-
-    ## mangle formula ...
     formula.obj <- .np_bw_resolve_formula(formula_obj = formula,
                                         formula_call = formula.call,
                                         eval_env = parent.frame())
-    chromoly <- explodePipe(formula.obj, env = environment(formula))
-
-    if (length(chromoly) != 3) ## stop if malformed formula
-      stop("invoked with improper formula, please see npplregbw documentation for proper use")
-
-    ## make formula evaluable, then eval
-    bronze <- lapply(chromoly, paste, collapse = " + ")
-
-    mf.xf[["formula"]] <- as.formula(paste(" ~ ", bronze[[2]]),
-                                    env = environment(formula))
-
-    mf[["formula"]] <- as.formula(paste(bronze[[1]]," ~ ", bronze[[3]]),
-                                  env = environment(formula))
-
-    formula.all <- if(missing(data)) {
-        terms(as.formula(paste(" ~ ",bronze[[1]]," + ",bronze[[2]], " + ",bronze[[3]]),
-                                  env = environment(formula)))
-    } else {
-        terms(as.formula(paste(" ~ ",bronze[[1]]," + ",bronze[[2]], " + ",bronze[[3]]),
-                                  env = environment(formula)), data = data)
-    }
-
-    orig.ts <- if (missing(data))
-      .np_terms_ts_mask(terms_obj = formula.all,
-                        data = environment(formula.all),
-                        eval_env = environment(formula.all))
-    else .np_terms_ts_mask(terms_obj = formula.all,
-                           data = data,
-                           eval_env = environment(formula.all))
-
-    arguments.mfx <- chromoly[[2]]
-    arguments.mf <- c(chromoly[[1]],chromoly[[3]])
-
-    mf[["formula"]] <- terms(mf[["formula"]])
-    mf.xf[["formula"]] <- terms(mf.xf[["formula"]])
-
-    if(all(orig.ts)){
-      arguments <- (as.list(attr(formula.all, "variables"))[-1])
-      attr(mf[["formula"]], "predvars") <- bquote(.(as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments)))))[,.(match(arguments.mf,arguments)),drop = FALSE])
-      attr(mf.xf[["formula"]], "predvars") <- bquote(.(as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments)))))[,.(match(arguments.mfx,arguments)),drop = FALSE])
-    }else if(any(orig.ts)){
-      arguments <- (as.list(attr(formula.all, "variables"))[-1])
-      arguments.normal <- arguments[which(!orig.ts)]
-      arguments.timeseries <- arguments[which(orig.ts)]
-
-      ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-      attr(mf[["formula"]], "predvars") <- bquote((.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])[,.(match(arguments.mf,arguments)),drop = FALSE])
-      attr(mf.xf[["formula"]], "predvars") <- bquote((.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])[,.(match(arguments.mfx,arguments)),drop = FALSE])
-    }
-
-    mf.args <- as.list(mf[-1L])
-    mf.xf.args <- as.list(mf.xf[-1L])
-    mf <- do.call(stats::model.frame, mf.args, envir = parent.frame())
-    mf.xf <- do.call(stats::model.frame, mf.xf.args, envir = parent.frame())
-
-    ydat <- model.response(mf)
-    xdat <- mf.xf
-    zdat <- mf[, chromoly[[3]], drop = FALSE]
-
+    spec <- .np_plreg_formula_spec(formula.obj)
+    mf[["formula"]] <- spec$joint
+    capture <- new.env(parent = emptyenv())
+    frame.args <- as.list(mf[-1L])
+    frame.args$.np.capture <- capture
+    frame <- do.call(.np_formula_model_frame, frame.args,
+                     envir = parent.frame())
+    roles <- .np_plreg_formula_split(frame, spec$terms, spec$xterms)
     dots <- list(...)
-    if ("bws" %in% names(dots)) {
-      tbw <- do.call(npplregbw,
-                     c(list(xdat = xdat, ydat = ydat, zdat = zdat), dots))
-    } else {
-      init.bws <- matrix(data = 0, nrow = 1 + ncol(xdat), ncol = ncol(zdat))
-      tbw <- do.call(npplregbw.default,
-                     c(list(xdat = xdat, ydat = ydat, zdat = zdat, bws = init.bws),
-                       dots))
-    }
+    .np_formula_frame_store(dots[[".np.formula.state", exact = TRUE]], frame)
+    dots$.np.formula.state <- NULL
+    .npRmpi.bw.metadata <- .npRmpi_bw_formula_plan(
+      "npplregbw", .np_formula_call_public(match.call(expand.dots = FALSE)), parent.frame(),
+      formula, frame, capture$na.action, terms = attr(roles$yz, "terms"), xterms = attr(roles$x, "terms"),
+      chromoly = spec$chromoly, ynames = names(roles$yz)[attr(attr(roles$yz, "terms"), "response")])
+    tbw <- do.call(npplregbw,
+                  c(list(xdat = roles$x, ydat = model.response(roles$yz),
+                         zdat = roles$yz[, .np_formula_term_names(spec$chromoly[[3L]]), drop = FALSE]),
+                    dots))
 
-    ## clean up (possible) inconsistencies due to recursion ...
-    tbw$call <- match.call(expand.dots = FALSE)
-    environment(tbw$call) <- parent.frame()
-    tbw$formula <- formula
-    tbw$rows.omit <- as.vector(attr(mf,"na.action"))
-    tbw$nobs.omit <- length(tbw$rows.omit)
-    tbw$terms <- attr(mf,"terms")
-    tbw$xterms <- attr(mf.xf,"terms")
-    tbw$chromoly <- chromoly
-
-    tbw <-
-      updateBwNameMetadata(nameList =
-                           list(ynames =
-                                attr(mf, "names")[attr(tbw$terms, "response")]),
-                           bws = tbw)
-
-    tbw
+    .npRmpi_bw_formula_finish(tbw, .npRmpi.bw.metadata)
   }
 
 
@@ -123,7 +49,15 @@ npplregbw.NULL =
            ydat = stop("invoked without data `ydat'"),
            zdat = stop("invoked without data `zdat'"),
            bws, ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     .npRmpi_require_active_slave_pool(where = "npplregbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     mc <- match.call(expand.dots = FALSE)
     dots <- list(...)
     dot.names <- names(dots)
@@ -161,7 +95,7 @@ npplregbw.NULL =
     if (.npRmpi_autodispatch_active() &&
         !isTRUE(automatic.degree.search) &&
         !isTRUE(.npRmpi_autodispatch_called_from_bcast()))
-      return(.npRmpi_autodispatch_call(mc, parent.frame()))
+      return(.npRmpi_autodispatch_call(mc, parent.frame(), owner.name = "npplregbw.NULL"))
 
     ## maintain x names and 'toFrame'
     xdat <- toFrame(xdat)
@@ -192,6 +126,9 @@ npplregbw.plbandwidth =
            ydat = stop("invoked without data `ydat'"),
            zdat = stop("invoked without data `zdat'"),
            bws, nmulti, ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     ## n observations
     ## rows are observations, columns are variables
     ## x is n x k
@@ -203,12 +140,18 @@ npplregbw.plbandwidth =
     }
     nmulti <- npValidateNmulti(nmulti)
     .npRmpi_require_active_slave_pool(where = "npplregbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_autodispatch_active() &&
         !isTRUE(.npRmpi_autodispatch_called_from_bcast()))
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npplregbw.plbandwidth"))
 
     xdat = toFrame(xdat)
     zdat = toFrame(zdat)
+    .np_require_numeric_response(ydat, "npplregbw", "ydat")
 
     ## catch and destroy NA's
     keep.rows <- rep_len(TRUE, nrow(xdat))
@@ -232,14 +175,14 @@ npplregbw.plbandwidth =
     total.time <-
       system.time({
         .np_progress_bandwidth_set_coordinator_group(1L, "E[y|z]")
-        bws$bw$yzbw  <- npregbw(xdat = zdat, ydat = ydat,
+        bws$bw$yzbw  <- .npregbw_auxiliary(xdat = zdat, ydat = ydat,
                                 bws = bws$bw$yzbw, nmulti = nmulti, ...)
 
         ## x on z
 
         for (i in seq_len(ncol(xdat))) {
           .np_progress_bandwidth_set_coordinator_group(i + 1L, sprintf("E[%s|z]", names(xdat)[[i]]))
-          bws$bw[[i+1]] <- npregbw(xdat=zdat, ydat=xdat[,i],
+          bws$bw[[i+1]] <- .npregbw_auxiliary(xdat=zdat, ydat=xdat[,i],
                   bws = bws$bw[[i+1]], nmulti = nmulti, ...)
         }
       })[["elapsed"]]
@@ -274,16 +217,29 @@ npplregbw.plbandwidth =
                        xnames = bws$xnames,
                        ynames = bws$ynames,
                        znames = bws$znames,
-                       nobs = bws$nobs,
+                       nobs = NROW(xdat),
                        fval = fval,
                        num.feval = num.feval,
                        num.feval.fast = num.feval.fast,
                        rows.omit = rows.omit,
                        total.time = total.time)
+    bws$bw <- .npplregbw_retain_child_training(bws$bw, xdat, ydat, zdat)
     bws$degree.policy <- if (isTRUE(bws$child.degree.common)) "common-child-degree" else "child-specific"
     bws
 
   }
+
+.npplregbw_retain_child_training <- function(children, xdat, ydat, zdat) {
+  # These calls were made inside package activations, not user formula frames.
+  # Keep the native samples needed by an extracted child without serializing
+  # an enclosing namespace and the constructor's transient search state.
+  for (i in seq_along(children)) {
+    children[[i]] <- .np_bws_retain_native_training(
+      children[[i]], xdat = zdat,
+      ydat = if (i == 1L) ydat else xdat[, i - 1L])
+  }
+  children
+}
 
 .npplregbw_sanitize_yname <- function(yname) {
   yname <- paste(yname, collapse = " ")
@@ -307,7 +263,7 @@ npplregbw.plbandwidth =
   if (!is.null(child.degree))
     child.reg.args$degree <- child.degree[[1L]]
   plband$yzbw <- do.call(
-    npregbw,
+    .npregbw_auxiliary,
     c(list(xdat = zdat, ydat = ydat, bws = bws[1, ]), child.reg.args)
   )
 
@@ -316,14 +272,14 @@ npplregbw.plbandwidth =
     if (!is.null(child.degree))
       child.reg.args$degree <- child.degree[[i + 1L]]
     plband[[i + 1L]] <- do.call(
-      npregbw,
+      .npregbw_auxiliary,
       c(list(xdat = zdat, ydat = xdat[, i], bws = bws[i + 1L, ]), child.reg.args)
     )
   }
 
   plbw.args <- c(
     list(
-      bws = plband,
+      bws = .npplregbw_retain_child_training(plband, xdat, ydat, zdat),
       nobs = dim(xdat)[1],
       fval = {
         fv <- unlist(lapply(plband, function(bwi) bwi$fval))
@@ -354,6 +310,68 @@ npplregbw.plbandwidth =
   tbw
 }
 
+.npplregbw_build_plbandwidth_bcast_payload <- function(xdat, ydat, zdat,
+                                                       bws, reg.args,
+                                                       outer.args,
+                                                       child.degree = NULL) {
+  old.messages <- getOption("np.messages")
+  if (!identical(as.integer(mpi.comm.rank(1L)), 0L))
+    options(np.messages = FALSE)
+  on.exit(options(np.messages = old.messages), add = TRUE)
+
+  # Child construction here is metadata-only (bandwidth.compute = FALSE
+  # in reg.args). Complete the error exchange before leaving the broadcast;
+  # workers must return normally to their existing command loop.
+  value <- .npRmpi_capture_local_work(.npplregbw_build_plbandwidth(
+    xdat = xdat, ydat = ydat, zdat = zdat, bws = bws,
+    bandwidth.compute = TRUE, reg.args = reg.args,
+    outer.args = outer.args, child.degree = child.degree
+  ))
+  rank <- as.integer(mpi.comm.rank(1L))
+  size <- as.integer(mpi.comm.size(1L))
+  failed.rank <- mpi.allreduce(
+    if (inherits(value, "npRmpi_local_failure")) rank else size,
+    type = 1L, op = "min", comm = 1L
+  )
+  if (failed.rank < size) {
+    shared.failure <- mpi.bcast.Robj(if (rank == failed.rank) value else NULL,
+                                    rank = failed.rank, comm = 1L)
+    return(if (rank == failed.rank) value else shared.failure)
+  }
+  value
+}
+
+.npplregbw_build_plbandwidth_collective <- function(xdat, ydat, zdat,
+                                                    bws, reg.args,
+                                                    outer.args,
+                                                    child.degree = NULL) {
+  # Only preparation is collective here. The following public parent RPC
+  # remains the numerical search and result-publication owner.
+  if (.npRmpi_autodispatch_active() &&
+      .npRmpi_has_active_slave_pool(comm = 1L) &&
+      !isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
+      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE))) {
+    mc <- substitute(
+      get(".npplregbw_build_plbandwidth_bcast_payload",
+          envir = asNamespace("npRmpi"), inherits = FALSE)(
+        XDAT, YDAT, ZDAT, BWS, REGARGS, OUTERARGS, CHILDDEGREE),
+      list(XDAT = xdat, YDAT = ydat, ZDAT = zdat, BWS = bws,
+           REGARGS = reg.args, OUTERARGS = outer.args,
+           CHILDDEGREE = child.degree)
+    )
+    value <- .npRmpi_bcast_cmd_expr(mc, comm = 1L, caller.execute = TRUE)
+    if (inherits(value, "npRmpi_local_failure"))
+      .npRmpi_raise_completed_failure(value)
+    return(value)
+  }
+
+  .npplregbw_build_plbandwidth(
+    xdat = xdat, ydat = ydat, zdat = zdat, bws = bws,
+    bandwidth.compute = TRUE, reg.args = reg.args,
+    outer.args = outer.args, child.degree = child.degree
+  )
+}
+
 .npplregbw_run_fixed_degree <- function(xdat,
                                         ydat,
                                         zdat,
@@ -362,12 +380,11 @@ npplregbw.plbandwidth =
                                         outer.args,
                                         opt.args,
                                         child.degree = NULL) {
-  tbw <- .npplregbw_build_plbandwidth(
+  tbw <- .npplregbw_build_plbandwidth_collective(
     xdat = xdat,
     ydat = ydat,
     zdat = zdat,
     bws = bws,
-    bandwidth.compute = TRUE,
     reg.args = reg.args,
     outer.args = outer.args,
     child.degree = child.degree
@@ -387,55 +404,6 @@ npplregbw.plbandwidth =
     options(np.messages = FALSE)
 
   on.exit(options(np.messages = old.messages), add = TRUE)
-
-  .npplregbw_run_fixed_degree(
-    xdat = xdat,
-    ydat = ydat,
-    zdat = zdat,
-    bws = bws,
-    reg.args = reg.args,
-    outer.args = outer.args,
-    opt.args = opt.args,
-    child.degree = child.degree
-  )
-}
-
-.npplregbw_run_fixed_degree_collective <- function(xdat,
-                                                   ydat,
-                                                   zdat,
-                                                   bws,
-                                                   reg.args,
-                                                   outer.args,
-                                                   opt.args,
-                                                   child.degree = NULL,
-                                                   comm = 1L) {
-  if (.npRmpi_has_active_slave_pool(comm = comm) &&
-      !isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
-      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE))) {
-    mc <- substitute(
-      get(".npplregbw_run_fixed_degree_bcast_payload", envir = asNamespace("npRmpi"), inherits = FALSE)(
-        XDAT,
-        YDAT,
-        ZDAT,
-        BWS,
-        REGARGS,
-        OUTERARGS,
-        OPTARGS,
-        CHILDDEGREE
-      ),
-      list(
-        XDAT = xdat,
-        YDAT = ydat,
-        ZDAT = zdat,
-        BWS = bws,
-        REGARGS = reg.args,
-        OUTERARGS = outer.args,
-        OPTARGS = opt.args,
-        CHILDDEGREE = child.degree
-      )
-    )
-    return(.npRmpi_bcast_cmd_expr(mc, comm = comm, caller.execute = TRUE))
-  }
 
   .npplregbw_run_fixed_degree(
     xdat = xdat,
@@ -550,7 +518,7 @@ npplregbw.plbandwidth =
         nomad.inner.nmulti = nomad.inner.nmulti,
         random.seed = random.seed
       )
-      do.call(npregbw, child.args)
+      do.call(.npregbw_auxiliary, child.args)
     }, finally = {
       .np_progress_bandwidth_set_context(old.context)
     })
@@ -590,7 +558,7 @@ npplregbw.plbandwidth =
 
   plbw.args <- c(
     list(
-      bws = child.list,
+      bws = .npplregbw_retain_child_training(child.list, xdat, ydat, zdat),
       nobs = dim(xdat)[1],
       fval = if (all(!is.finite(child.fval))) NA_real_ else sum(child.fval[is.finite(child.fval)]),
       num.feval = sum(child.feval),
@@ -773,1367 +741,6 @@ npplregbw.plbandwidth =
   out
 }
 
-.npplregbw_nomad_prepare_state <- function(xdat,
-                                           ydat,
-                                           zdat,
-                                           bws,
-                                           reg.args,
-                                           outer.args,
-                                           degree.search) {
-  template.reg.args <- reg.args
-  template.reg.args$regtype <- "lp"
-  template.reg.args$degree <- as.integer(degree.search$start.degree)
-  template.reg.args$bernstein.basis <- degree.search$bernstein.basis
-  template.outer.args <- outer.args
-  template.outer.args$regtype <- "lp"
-  template.outer.args$degree <- as.integer(degree.search$start.degree)
-  template.outer.args$bernstein.basis <- degree.search$bernstein.basis
-
-  template <- .npplregbw_build_plbandwidth(
-    xdat = xdat,
-    ydat = ydat,
-    zdat = zdat,
-    bws = bws,
-    bandwidth.compute = FALSE,
-    reg.args = template.reg.args,
-    outer.args = template.outer.args
-  )
-
-  child.templates <- template$bw
-  if (!length(child.templates))
-    stop("automatic degree search with search.engine='nomad' could not initialize child bandwidth templates")
-  if (any(vapply(child.templates, function(tb) !(tb$type %in% c("fixed", "generalized_nn", "adaptive_nn")), logical(1))))
-    stop("automatic degree search with search.engine='nomad' requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'")
-
-  child.responses <- .npplregbw_child_responses(
-    xdat = xdat,
-    ydat = ydat,
-    yname = template$ynames
-  )
-  child.setup <- lapply(child.templates, function(tb) .npregbw_nomad_bw_setup(xdat = zdat, template = tb, allow.extended.nn = TRUE))
-  child.point.length <- vapply(seq_along(child.templates), function(i) {
-    length(.npregbw_nomad_bw_to_point(child.templates[[i]]$bw, template = child.templates[[i]], setup = child.setup[[i]]))
-  }, integer(1L))
-
-  list(
-    template = template,
-    child.templates = child.templates,
-    child.responses = child.responses,
-    child.setup = child.setup,
-    child.point.length = child.point.length
-  )
-}
-
-.npplregbw_nomad_point_to_matrix <- function(point,
-                                             child.templates,
-                                             child.setup,
-                                             child.point.length = NULL) {
-  point <- as.numeric(point)
-  if (is.null(child.point.length)) {
-    child.point.length <- vapply(seq_along(child.templates), function(i) {
-      length(.npregbw_nomad_bw_to_point(child.templates[[i]]$bw, template = child.templates[[i]], setup = child.setup[[i]]))
-    }, integer(1L))
-  }
-
-  ncol.out <- if (length(child.templates)) length(child.templates[[1L]]$bw) else 0L
-  out <- matrix(0, nrow = length(child.templates), ncol = ncol.out)
-  cursor <- 1L
-  for (i in seq_along(child.templates)) {
-    seg <- point[cursor:(cursor + child.point.length[i] - 1L)]
-    out[i, ] <- .npregbw_nomad_point_to_bw(seg, template = child.templates[[i]], setup = child.setup[[i]])
-    cursor <- cursor + child.point.length[i]
-  }
-  out
-}
-
-.npplregbw_eval_child_payload_subset <- function(zdat,
-                                                 reg.args,
-                                                 degree.search,
-                                                 child.responses,
-                                                 child.templates,
-                                                 child.setup,
-                                                 bw.matrix,
-                                                 degree,
-                                                 penalty.multiplier = 10,
-                                                 child.indices = seq_along(child.templates),
-                                                 include_payloads = TRUE,
-                                                 localize = TRUE) {
-  total.objective <- 0
-  total.feval <- 0
-  total.feval.fast <- 0
-  child.payloads <- if (isTRUE(include_payloads)) vector("list", length(child.templates)) else NULL
-
-  for (i in as.integer(child.indices)) {
-    child.reg.args <- reg.args
-    child.reg.args$regtype <- "lp"
-    child.reg.args$degree <- as.integer(degree)
-    child.reg.args$bernstein.basis <- degree.search$bernstein.basis
-    child.reg.args$bandwidth.compute <- NULL
-    child.reg.args$bwtype <- child.templates[[i]]$type
-    resp <- child.responses[[i]]
-    tbw <- .npregbw_build_rbandwidth(
-      xdat = zdat,
-      ydat = resp$values,
-      bws = bw.matrix[i, ],
-      bandwidth.compute = FALSE,
-      reg.args = child.reg.args,
-      yname = resp$name
-    )
-    out <- .npregbw_eval_only(
-      xdat = zdat,
-      ydat = resp$values,
-      bws = tbw,
-      invalid.penalty = "baseline",
-      penalty.multiplier = penalty.multiplier,
-      localize = localize
-    )
-    total.objective <- total.objective + out$objective
-    total.feval <- total.feval + out$num.feval
-    total.feval.fast <- total.feval.fast + out$num.feval.fast
-
-    if (isTRUE(include_payloads)) {
-      child.payloads[[i]] <- list(
-        bws = tbw,
-        objective = out$objective,
-        response = resp,
-        num.feval = out$num.feval,
-        num.feval.fast = out$num.feval.fast
-      )
-    }
-  }
-
-  list(
-    objective = total.objective,
-    num.feval = total.feval,
-    num.feval.fast = total.feval.fast,
-    child.payloads = child.payloads
-  )
-}
-
-.npplregbw_eval_child_payload_serial <- function(zdat,
-                                                 reg.args,
-                                                 degree.search,
-                                                 child.responses,
-                                                 child.templates,
-                                                 child.setup,
-                                                 bw.matrix,
-                                                 degree,
-                                                 penalty.multiplier = 10) {
-  .npplregbw_eval_child_payload_subset(
-    zdat = zdat,
-    reg.args = reg.args,
-    degree.search = degree.search,
-    child.responses = child.responses,
-    child.templates = child.templates,
-    child.setup = child.setup,
-    bw.matrix = bw.matrix,
-    degree = degree,
-    penalty.multiplier = penalty.multiplier,
-    child.indices = seq_along(child.templates),
-    include_payloads = TRUE
-  )
-}
-
-.npplregbw_eval_child_payload_collective <- function(zdat,
-                                                     reg.args,
-                                                     degree.search,
-                                                     child.responses,
-                                                     child.templates,
-                                                     child.setup,
-                                                     bw.matrix,
-                                                     degree,
-                                                     penalty.multiplier = 10,
-                                                     comm = 1L,
-                                                     eval_id = NA_integer_) {
-  if (!isTRUE(getOption("npRmpi.mpi.initialized", FALSE)))
-    return(.npplregbw_eval_child_payload_subset(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = penalty.multiplier,
-      child.indices = seq_along(child.templates),
-      include_payloads = FALSE
-    ))
-
-  size <- tryCatch(as.integer(mpi.comm.size(comm)), error = function(e) 1L)
-  rank <- tryCatch(as.integer(mpi.comm.rank(comm)), error = function(e) 0L)
-  if (!is.finite(size) || size < 2L) {
-    return(.npplregbw_eval_child_payload_subset(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = penalty.multiplier,
-      child.indices = seq_along(child.templates),
-      include_payloads = FALSE
-    ))
-  }
-
-  profile.manual <- isTRUE(getOption("npRmpi.profile.active", FALSE)) &&
-    isTRUE(.npRmpi_manual_bcast_in_context())
-  attach.state <- as.character(getOption("npRmpi.attach.close.state", "closed"))[1L]
-  attach.world <- identical(attach.state, "open") && !isTRUE(profile.manual)
-  allrank.mode <- isTRUE(profile.manual) || isTRUE(attach.world)
-  use.allrank <- isTRUE(allrank.mode) &&
-    length(child.templates) > 0L
-
-  if (isTRUE(use.allrank)) {
-    all.indices <- seq_along(child.templates)
-
-    .npRmpi_transport_trace(
-      role = "npplreg.nomad",
-      event = "collective.eval.start",
-      fields = list(
-        eval_id = eval_id,
-        rank = rank,
-        strategy = "regression_allrank",
-        degree = paste(as.integer(degree), collapse = ","),
-        child_indices = paste(as.integer(all.indices), collapse = ",")
-      )
-    )
-
-    out <- .npplregbw_eval_child_payload_subset(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = penalty.multiplier,
-      child.indices = all.indices,
-      include_payloads = FALSE,
-      localize = FALSE
-    )
-
-    .npRmpi_transport_trace(
-      role = "npplreg.nomad",
-      event = "collective.eval.done",
-      fields = list(
-        eval_id = eval_id,
-        rank = rank,
-        strategy = "regression_allrank",
-        total_objective = out$objective,
-        total_num_feval = out$num.feval,
-        total_num_feval_fast = out$num.feval.fast
-      )
-    )
-
-    return(list(
-      objective = out$objective,
-      num.feval = out$num.feval,
-      num.feval.fast = out$num.feval.fast,
-      child.payloads = NULL
-    ))
-  }
-
-  assignments <- .splitIndices(length(child.templates), size)
-  local.indices <- if (length(assignments) >= (rank + 1L)) assignments[[rank + 1L]] else integer(0)
-
-  .npRmpi_transport_trace(
-    role = "npplreg.nomad",
-    event = "collective.eval.start",
-    fields = list(
-      eval_id = eval_id,
-      rank = rank,
-      degree = paste(as.integer(degree), collapse = ","),
-      child_indices = paste(as.integer(local.indices), collapse = ",")
-    )
-  )
-
-  local.out <- .npplregbw_eval_child_payload_subset(
-    zdat = zdat,
-    reg.args = reg.args,
-    degree.search = degree.search,
-    child.responses = child.responses,
-    child.templates = child.templates,
-    child.setup = child.setup,
-    bw.matrix = bw.matrix,
-    degree = degree,
-    penalty.multiplier = penalty.multiplier,
-    child.indices = local.indices,
-    include_payloads = FALSE
-  )
-
-  totals <- mpi.allreduce(
-    as.double(c(local.out$objective, local.out$num.feval, local.out$num.feval.fast)),
-    type = 2,
-    op = "sum",
-    comm = comm
-  )
-
-  .npRmpi_transport_trace(
-    role = "npplreg.nomad",
-    event = "collective.eval.done",
-    fields = list(
-      eval_id = eval_id,
-      rank = rank,
-      local_objective = local.out$objective,
-      local_num_feval = local.out$num.feval,
-      local_num_feval_fast = local.out$num.feval.fast,
-      total_objective = totals[1L],
-      total_num_feval = totals[2L],
-      total_num_feval_fast = totals[3L]
-    )
-  )
-
-  list(
-    objective = totals[1L],
-    num.feval = totals[2L],
-    num.feval.fast = totals[3L],
-    child.payloads = NULL
-  )
-}
-
-npRmpiNomadShadowSearchPlreg <- function(zdat,
-                                         child.responses,
-                                         child.templates,
-                                         child.setup,
-                                         reg.args,
-                                         degree.search,
-                                         x0,
-                                         bbin,
-                                         lb,
-                                         ub,
-                                         start.lower = NULL,
-                                         start.upper = NULL,
-                                         coordinate.roles = NULL,
-                                         nomad.nmulti = 1L,
-                                         nomad.inner.nmulti = 0L,
-                                         random.seed = 42L,
-                                         remin = FALSE,
-                                         source = "explicit",
-                                         reason = NULL,
-                                         progress_label = NULL) {
-  rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
-  old.messages <- getOption("np.messages")
-  old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
-
-  if (!isTRUE(rank == 0L))
-    options(np.messages = FALSE)
-  options(npRmpi.autodispatch.disable = TRUE)
-  on.exit(options(np.messages = old.messages), add = TRUE)
-  on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
-
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
-  if (isTRUE(rank == 0L))
-    .np_nomad_baseline_note(degree.search$start.degree)
-
-  child.point.length <- vapply(seq_along(child.templates), function(i) {
-    length(.npregbw_nomad_bw_to_point(child.templates[[i]]$bw, template = child.templates[[i]], setup = child.setup[[i]]))
-  }, integer(1L))
-  bwdim <- sum(child.point.length)
-  ndeg <- length(degree.search$start.degree)
-  nomad.num.feval.total <- 0
-  nomad.num.feval.fast.total <- 0
-  eval.counter <- 0L
-
-  eval_fun <- function(point) {
-    point <- as.numeric(point)
-    degree <- as.integer(round(point[bwdim + seq_len(ndeg)]))
-    degree <- .np_degree_clip_to_grid(degree, degree.search$candidates)
-    bw.matrix <- .npplregbw_nomad_point_to_matrix(
-      point = point[seq_len(bwdim)],
-      child.templates = child.templates,
-      child.setup = child.setup,
-      child.point.length = child.point.length
-    )
-    eval.counter <<- eval.counter + 1L
-    out <- .npplregbw_eval_child_payload_collective(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = 10,
-      comm = 1L,
-      eval_id = eval.counter
-    )
-    nomad.num.feval.total <<- nomad.num.feval.total + as.numeric(out$num.feval[1L])
-    nomad.num.feval.fast.total <<- nomad.num.feval.fast.total + as.numeric(out$num.feval.fast[1L])
-
-    list(
-      objective = as.numeric(out$objective[1L]),
-      degree = degree,
-      num.feval = as.numeric(out$num.feval[1L]),
-      num.feval.fast = as.numeric(out$num.feval.fast[1L])
-    )
-  }
-
-  search.engine.used <- if (identical(degree.search$engine, "nomad+powell")) {
-    "nomad"
-  } else {
-    degree.search$engine
-  }
-
-  search.result <- .np_nomad_search(
-    engine = search.engine.used,
-    baseline_record = NULL,
-    start_degree = degree.search$start.degree,
-    x0 = x0,
-    bbin = bbin,
-    lb = lb,
-    ub = ub,
-    eval_fun = eval_fun,
-    build_payload = function(point, best_record, solution, interrupted) {
-      list(
-        payload = NULL,
-        objective = as.numeric(best_record$objective),
-        powell.time = NA_real_
-      )
-    },
-    direction = "min",
-    objective_name = "fval",
-    nmulti = nomad.nmulti,
-    nomad.inner.nmulti = nomad.inner.nmulti,
-    random.seed = random.seed,
-    remin = isTRUE(remin),
-    source = source,
-    reason = reason,
-    progress_label = progress_label,
-    start.lower = start.lower,
-    start.upper = start.upper,
-    coordinate.roles = coordinate.roles,
-    degree_spec = list(
-      initial = degree.search$start.degree,
-      lower = degree.search$lower,
-      upper = degree.search$upper,
-      basis = degree.search$basis,
-      nobs = degree.search$nobs,
-      user_supplied = degree.search$start.user
-    )
-  )
-  if (!identical(search.engine.used, degree.search$engine)) {
-    search.result$method <- degree.search$engine
-  }
-
-  search.result$best_payload <- NULL
-  search.result$powell.time <- NA_real_
-  search.result$num.feval.total <- as.numeric(nomad.num.feval.total)
-  search.result$num.feval.fast.total <- as.numeric(nomad.num.feval.fast.total)
-  search.result
-}
-
-npRmpiNomadSessionServicePlreg <- function(zdat,
-                                           child.responses,
-                                           child.templates,
-                                           child.setup,
-                                           reg.args,
-                                           degree.search,
-                                           x0,
-                                           bbin,
-                                           lb,
-                                           ub,
-                                           start.lower = NULL,
-                                           start.upper = NULL,
-                                           coordinate.roles = NULL,
-                                           nomad.nmulti = 1L,
-                                           nomad.inner.nmulti = 0L,
-                                           random.seed = 42L,
-                                           remin = FALSE,
-                                           source = "explicit",
-                                           reason = NULL,
-                                           progress_label = NULL) {
-  with.active.comm <- function(comm, expr) {
-    .Call("C_np_set_active_comm", TRUE, as.integer(comm), PACKAGE = "npRmpi")
-    on.exit(.Call("C_np_set_active_comm", FALSE, as.integer(1L), PACKAGE = "npRmpi"), add = TRUE)
-    force(expr)
-  }
-
-  receive_final <- function() {
-    final <- mpi.bcast.Robj(rank = 0L, comm = 1L)
-    if (is.list(final) && identical(final$kind, "error"))
-      stop(final$message, call. = FALSE)
-    if (is.list(final) && identical(final$kind, "result"))
-      return(final$value)
-    final
-  }
-
-  rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
-  size <- tryCatch(as.integer(mpi.comm.size(1L)), error = function(e) 1L)
-  if (!is.finite(rank)) rank <- 0L
-  if (!is.finite(size) || size < 1L) size <- 1L
-
-  nchild <- length(child.templates)
-  if (size < 2L || nchild < 1L) {
-    return(npRmpiNomadShadowSearchPlreg(
-      zdat = zdat,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      x0 = x0,
-      bbin = bbin,
-      lb = lb,
-      ub = ub,
-      start.lower = start.lower,
-      start.upper = start.upper,
-      coordinate.roles = coordinate.roles,
-      nomad.nmulti = nomad.nmulti,
-      nomad.inner.nmulti = nomad.inner.nmulti,
-      random.seed = random.seed,
-      remin = isTRUE(remin),
-      source = source,
-      reason = reason,
-      progress_label = progress_label
-    ))
-  }
-
-  task.tag <- .npRmpi_protocol_tag("plreg_task")
-  result.tag <- .npRmpi_protocol_tag("plreg_result")
-  team.comm <- 3L
-  use.fullcomm <- TRUE
-  use.team <- FALSE
-  strategy.label <- "full_communicator"
-
-  active.count <- min(size, nchild)
-  assignments <- .splitIndices(nchild, active.count)
-  rank_indices <- function(rk) {
-    if (rk >= active.count || !length(assignments))
-      integer(0L)
-    else
-      assignments[[rk + 1L]]
-  }
-
-  old.messages <- getOption("np.messages")
-  old.disable <- getOption("npRmpi.autodispatch.disable", FALSE)
-  if (!isTRUE(rank == 0L))
-    options(np.messages = FALSE)
-  options(npRmpi.autodispatch.disable = TRUE)
-  on.exit(options(np.messages = old.messages), add = TRUE)
-  on.exit(options(npRmpi.autodispatch.disable = old.disable), add = TRUE)
-
-  child.point.length <- vapply(seq_along(child.templates), function(i) {
-    length(.npregbw_nomad_bw_to_point(child.templates[[i]]$bw, template = child.templates[[i]], setup = child.setup[[i]]))
-  }, integer(1L))
-  bwdim <- sum(child.point.length)
-  ndeg <- length(degree.search$start.degree)
-  worker.ranks <- if (size > 1L) seq_len(size - 1L) else integer(0L)
-  service.worker.ranks <- worker.ranks[worker.ranks < active.count]
-  team.child <- NA_integer_
-  team.rank <- NA_integer_
-  team.root.ranks <- integer(0L)
-
-  if (isTRUE(use.team)) {
-    team.sizes <- rep.int(1L, nchild)
-    extra <- size - nchild
-    if (extra > 0L) {
-      extra.order <- c(1L, seq_len(nchild))
-      for (k in seq_len(extra)) {
-        target <- extra.order[((k - 1L) %% length(extra.order)) + 1L]
-        team.sizes[target] <- team.sizes[target] + 1L
-      }
-    }
-    team.child.by.rank <- rep(seq_len(nchild), times = team.sizes)
-    team.child <- as.integer(team.child.by.rank[rank + 1L])
-    team.color <- as.integer(team.child - 1L)
-    mpi.comm.split(comm = 1L, color = team.color, key = rank, newcomm = team.comm)
-    on.exit(try(mpi.comm.free(team.comm), silent = TRUE), add = TRUE)
-    team.rank <- tryCatch(as.integer(mpi.comm.rank(team.comm)), error = function(e) NA_integer_)
-    team.root.ranks <- match(seq_len(nchild), team.child.by.rank) - 1L
-    service.worker.ranks <- worker.ranks
-  }
-
-  if (rank != 0L) {
-    if (isTRUE(use.fullcomm)) {
-      repeat {
-        task <- mpi.bcast.Robj(rank = 0L, comm = 1L)
-        if (is.list(task) && identical(task$kind, "stop"))
-          break
-        if (!is.list(task) || !identical(task$kind, "eval")) {
-          out <- list(ok = FALSE, error = "malformed npplreg session full-communicator task")
-        } else {
-          out <- tryCatch({
-            .npRmpi_transport_trace(
-              role = "npplreg.nomad.session_service",
-              event = "eval.start",
-              fields = list(
-                eval_id = task$eval_id,
-                rank = rank,
-                strategy = strategy.label,
-                child_indices = paste(as.integer(seq_along(child.templates)), collapse = ",")
-              )
-            )
-            local.out <- .npplregbw_eval_child_payload_subset(
-              zdat = zdat,
-              reg.args = reg.args,
-              degree.search = degree.search,
-              child.responses = child.responses,
-              child.templates = child.templates,
-              child.setup = child.setup,
-              bw.matrix = task$bw.matrix,
-              degree = task$degree,
-              penalty.multiplier = 10,
-              child.indices = seq_along(child.templates),
-              include_payloads = FALSE,
-              localize = FALSE
-            )
-            .npRmpi_transport_trace(
-              role = "npplreg.nomad.session_service",
-              event = "eval.done",
-              fields = list(
-                eval_id = task$eval_id,
-                rank = rank,
-                strategy = strategy.label,
-                objective = as.numeric(local.out$objective[1L]),
-                num_feval = as.numeric(local.out$num.feval[1L]),
-                num_feval_fast = as.numeric(local.out$num.feval.fast[1L])
-              )
-            )
-            list(ok = TRUE)
-          }, error = function(e) {
-            list(ok = FALSE, eval_id = task$eval_id, error = conditionMessage(e))
-          })
-        }
-        if (is.list(out) && !isTRUE(out$ok))
-          stop(out$error, call. = FALSE)
-      }
-      return(receive_final())
-    }
-
-    if (isTRUE(use.team)) {
-      repeat {
-        task <- mpi.bcast.Robj(rank = 0L, comm = 1L)
-        if (is.list(task) && identical(task$kind, "stop"))
-          break
-        if (!is.list(task) || !identical(task$kind, "eval")) {
-          out <- list(ok = FALSE, error = "malformed npplreg session team-service task")
-        } else {
-          out <- tryCatch({
-            .npRmpi_transport_trace(
-              role = "npplreg.nomad.session_service",
-              event = "eval.start",
-              fields = list(
-                eval_id = task$eval_id,
-                rank = rank,
-                strategy = strategy.label,
-                team_child = team.child,
-                team_rank = team.rank,
-                child_indices = as.integer(team.child)
-              )
-            )
-            eval.child <- function() .npplregbw_eval_child_payload_subset(
-                zdat = zdat,
-                reg.args = reg.args,
-                degree.search = degree.search,
-                child.responses = child.responses,
-                child.templates = child.templates,
-                child.setup = child.setup,
-                bw.matrix = task$bw.matrix,
-                degree = task$degree,
-                penalty.multiplier = 10,
-                child.indices = team.child,
-                include_payloads = FALSE,
-                localize = FALSE
-              )
-            local.out <- with.active.comm(team.comm, eval.child())
-            .npRmpi_transport_trace(
-              role = "npplreg.nomad.session_service",
-              event = "eval.done",
-              fields = list(
-                eval_id = task$eval_id,
-                rank = rank,
-                strategy = strategy.label,
-                team_child = team.child,
-                team_rank = team.rank,
-                objective = as.numeric(local.out$objective[1L]),
-                num_feval = as.numeric(local.out$num.feval[1L]),
-                num_feval_fast = as.numeric(local.out$num.feval.fast[1L])
-              )
-            )
-            list(
-              ok = TRUE,
-              eval_id = task$eval_id,
-              objective = as.numeric(local.out$objective[1L]),
-              num.feval = as.numeric(local.out$num.feval[1L]),
-              num.feval.fast = as.numeric(local.out$num.feval.fast[1L])
-            )
-          }, error = function(e) {
-            list(ok = FALSE, eval_id = task$eval_id, error = conditionMessage(e))
-          })
-        }
-        if (identical(as.integer(team.rank), 0L))
-          mpi.send.Robj(out, dest = 0L, tag = result.tag, comm = 1L)
-      }
-      return(receive_final())
-    }
-
-    repeat {
-      task <- mpi.recv.Robj(source = 0L, tag = task.tag, comm = 1L)
-      if (is.list(task) && identical(task$kind, "stop"))
-        break
-      if (!is.list(task) || !identical(task$kind, "eval")) {
-        out <- list(ok = FALSE, error = "malformed npplreg session service task")
-      } else {
-        out <- tryCatch({
-          child.indices <- task$child.indices
-          .npRmpi_transport_trace(
-            role = "npplreg.nomad.session_service",
-            event = "eval.start",
-            fields = list(
-              eval_id = task$eval_id,
-              rank = rank,
-              strategy = "split_child",
-              child_indices = paste(as.integer(child.indices), collapse = ",")
-            )
-          )
-          local.out <- .npplregbw_eval_child_payload_subset(
-            zdat = zdat,
-            reg.args = reg.args,
-            degree.search = degree.search,
-            child.responses = child.responses,
-            child.templates = child.templates,
-            child.setup = child.setup,
-            bw.matrix = task$bw.matrix,
-            degree = task$degree,
-            penalty.multiplier = 10,
-            child.indices = child.indices,
-            include_payloads = FALSE,
-            localize = TRUE
-          )
-          .npRmpi_transport_trace(
-            role = "npplreg.nomad.session_service",
-            event = "eval.done",
-            fields = list(
-              eval_id = task$eval_id,
-              rank = rank,
-              strategy = "split_child",
-              objective = as.numeric(local.out$objective[1L]),
-              num_feval = as.numeric(local.out$num.feval[1L]),
-              num_feval_fast = as.numeric(local.out$num.feval.fast[1L])
-            )
-          )
-          list(
-            ok = TRUE,
-            eval_id = task$eval_id,
-            objective = as.numeric(local.out$objective[1L]),
-            num.feval = as.numeric(local.out$num.feval[1L]),
-            num.feval.fast = as.numeric(local.out$num.feval.fast[1L])
-          )
-        }, error = function(e) {
-          list(ok = FALSE, eval_id = task$eval_id, error = conditionMessage(e))
-        })
-      }
-      mpi.send.Robj(out, dest = 0L, tag = result.tag, comm = 1L)
-    }
-    return(receive_final())
-  }
-
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
-  .np_nomad_baseline_note(degree.search$start.degree)
-
-  nomad.num.feval.total <- 0
-  nomad.num.feval.fast.total <- 0
-  eval.counter <- 0L
-  workers.stopped <- FALSE
-
-  stop_workers <- function() {
-    if (isTRUE(workers.stopped))
-      return(invisible(TRUE))
-    if (!length(worker.ranks))
-      return(invisible(TRUE))
-    if (isTRUE(use.fullcomm)) {
-      try(mpi.bcast.Robj(list(kind = "stop"), rank = 0L, comm = 1L), silent = TRUE)
-    } else if (isTRUE(use.team)) {
-      try(mpi.bcast.Robj(list(kind = "stop"), rank = 0L, comm = 1L), silent = TRUE)
-    } else {
-      for (rk in worker.ranks) {
-        try(mpi.send.Robj(list(kind = "stop"), dest = rk, tag = task.tag, comm = 1L),
-            silent = TRUE)
-      }
-    }
-    workers.stopped <<- TRUE
-    invisible(TRUE)
-  }
-  on.exit(stop_workers(), add = TRUE)
-
-  eval_fun <- function(point) {
-    point <- as.numeric(point)
-    degree <- as.integer(round(point[bwdim + seq_len(ndeg)]))
-    degree <- .np_degree_clip_to_grid(degree, degree.search$candidates)
-    bw.matrix <- .npplregbw_nomad_point_to_matrix(
-      point = point[seq_len(bwdim)],
-      child.templates = child.templates,
-      child.setup = child.setup,
-      child.point.length = child.point.length
-    )
-    eval.counter <<- eval.counter + 1L
-
-    if (isTRUE(use.fullcomm)) {
-      mpi.bcast.Robj(
-        list(
-          kind = "eval",
-          eval_id = eval.counter,
-          bw.matrix = bw.matrix,
-          degree = degree
-        ),
-        rank = 0L,
-        comm = 1L
-      )
-      local.child.indices <- seq_along(child.templates)
-    } else if (isTRUE(use.team)) {
-      mpi.bcast.Robj(
-        list(
-          kind = "eval",
-          eval_id = eval.counter,
-          bw.matrix = bw.matrix,
-          degree = degree
-        ),
-        rank = 0L,
-        comm = 1L
-      )
-      local.child.indices <- team.child
-    } else {
-      for (rk in service.worker.ranks) {
-        mpi.send.Robj(
-          list(
-            kind = "eval",
-            eval_id = eval.counter,
-            child.indices = rank_indices(rk),
-            bw.matrix = bw.matrix,
-            degree = degree
-          ),
-          dest = rk,
-          tag = task.tag,
-          comm = 1L
-        )
-      }
-      local.child.indices <- rank_indices(0L)
-    }
-
-    .npRmpi_transport_trace(
-      role = "npplreg.nomad.session_service",
-      event = "eval.start",
-      fields = list(
-        eval_id = eval.counter,
-        rank = rank,
-        strategy = strategy.label,
-        team_child = if (isTRUE(use.team)) team.child else NA_integer_,
-        team_rank = if (isTRUE(use.team)) team.rank else NA_integer_,
-        child_indices = paste(as.integer(local.child.indices), collapse = ",")
-      )
-    )
-
-    eval.local <- function() .npplregbw_eval_child_payload_subset(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = 10,
-      child.indices = local.child.indices,
-      include_payloads = FALSE,
-      localize = !isTRUE(use.team) && !isTRUE(use.fullcomm)
-    )
-    local.out <- if (isTRUE(use.team)) with.active.comm(team.comm, eval.local()) else eval.local()
-
-    .npRmpi_transport_trace(
-      role = "npplreg.nomad.session_service",
-      event = "eval.done",
-      fields = list(
-        eval_id = eval.counter,
-        rank = rank,
-        strategy = strategy.label,
-        team_child = if (isTRUE(use.team)) team.child else NA_integer_,
-        team_rank = if (isTRUE(use.team)) team.rank else NA_integer_,
-        objective = as.numeric(local.out$objective[1L]),
-        num_feval = as.numeric(local.out$num.feval[1L]),
-        num_feval_fast = as.numeric(local.out$num.feval.fast[1L])
-      )
-    )
-
-    total.objective <- as.numeric(local.out$objective[1L])
-    total.feval <- as.numeric(local.out$num.feval[1L])
-    total.feval.fast <- as.numeric(local.out$num.feval.fast[1L])
-
-    result.ranks <- if (isTRUE(use.fullcomm)) {
-      integer(0L)
-    } else if (isTRUE(use.team)) {
-      setdiff(team.root.ranks, 0L)
-    } else {
-      service.worker.ranks
-    }
-    for (rk in result.ranks) {
-      msg <- mpi.recv.Robj(source = rk, tag = result.tag, comm = 1L)
-      if (!is.list(msg) || !isTRUE(msg$ok)) {
-        err <- if (is.list(msg) && !is.null(msg$error)) msg$error else "unknown worker error"
-        stop(sprintf("npplreg session worker rank %d failed: %s", rk, err), call. = FALSE)
-      }
-      total.objective <- total.objective + as.numeric(msg$objective[1L])
-      total.feval <- total.feval + as.numeric(msg$num.feval[1L])
-      total.feval.fast <- total.feval.fast + as.numeric(msg$num.feval.fast[1L])
-    }
-
-    nomad.num.feval.total <<- nomad.num.feval.total + total.feval
-    nomad.num.feval.fast.total <<- nomad.num.feval.fast.total + total.feval.fast
-
-    list(
-      objective = total.objective,
-      degree = degree,
-      num.feval = total.feval,
-      num.feval.fast = total.feval.fast
-    )
-  }
-
-  root.error <- NULL
-  search.result <- tryCatch({
-    search.engine.used <- if (identical(degree.search$engine, "nomad+powell")) {
-      "nomad"
-    } else {
-      degree.search$engine
-    }
-
-    out <- .np_nomad_search(
-      engine = search.engine.used,
-      baseline_record = NULL,
-      start_degree = degree.search$start.degree,
-      x0 = x0,
-      bbin = bbin,
-      lb = lb,
-      ub = ub,
-      eval_fun = eval_fun,
-      build_payload = function(point, best_record, solution, interrupted) {
-        list(
-          payload = NULL,
-          objective = as.numeric(best_record$objective),
-          powell.time = NA_real_
-        )
-      },
-      direction = "min",
-      objective_name = "fval",
-      nmulti = nomad.nmulti,
-      nomad.inner.nmulti = nomad.inner.nmulti,
-      random.seed = random.seed,
-      remin = isTRUE(remin),
-      source = source,
-      reason = reason,
-      progress_label = progress_label,
-      start.lower = start.lower,
-      start.upper = start.upper,
-      coordinate.roles = coordinate.roles,
-      degree_spec = list(
-        initial = degree.search$start.degree,
-        lower = degree.search$lower,
-        upper = degree.search$upper,
-        basis = degree.search$basis,
-        nobs = degree.search$nobs,
-        user_supplied = degree.search$start.user
-      )
-    )
-    if (!identical(search.engine.used, degree.search$engine))
-      out$method <- degree.search$engine
-    out$best_payload <- NULL
-    out$powell.time <- NA_real_
-    out$num.feval.total <- as.numeric(nomad.num.feval.total)
-    out$num.feval.fast.total <- as.numeric(nomad.num.feval.fast.total)
-    out
-  }, error = function(e) {
-    root.error <<- conditionMessage(e)
-    NULL
-  })
-
-  stop_workers()
-  if (!is.null(root.error)) {
-    mpi.bcast.Robj(list(kind = "error", message = root.error), rank = 0L, comm = 1L)
-    stop(root.error, call. = FALSE)
-  }
-
-  mpi.bcast.Robj(list(kind = "result", value = search.result), rank = 0L, comm = 1L)
-  search.result
-}
-
-.npplregbw_nomad_search <- function(xdat,
-                                    ydat,
-                                    zdat,
-                                    bws,
-                                    reg.args,
-                                    outer.args,
-                                    opt.args,
-                                    degree.search,
-                                    nomad.inner.nmulti = 0L,
-                                    random.seed = 42L,
-                                    source = "explicit",
-                                    reason = NULL,
-                                    progress_label = NULL) {
-  if (isTRUE(degree.search$verify))
-    stop("automatic degree search with search.engine='nomad' does not support degree.verify")
-
-  search.state <- .npplregbw_nomad_prepare_state(
-    xdat = xdat,
-    ydat = ydat,
-    zdat = zdat,
-    bws = bws,
-    reg.args = reg.args,
-    outer.args = outer.args,
-    degree.search = degree.search
-  )
-  template <- search.state$template
-  child.templates <- search.state$child.templates
-  child.responses <- search.state$child.responses
-  child.setup <- search.state$child.setup
-  child.point.length <- search.state$child.point.length
-
-  child.bounds <- lapply(seq_along(child.templates), function(i) {
-    .npregbw_nomad_bw_bounds(template = child.templates[[i]], setup = child.setup[[i]])
-  })
-  opt.value <- function(name, default) {
-    if (is.null(opt.args[[name]])) default else opt.args[[name]]
-  }
-  child.start.bounds <- lapply(seq_along(child.templates), function(i) {
-    .np_nomad_bw_restart_start_bounds(
-      bounds = child.bounds[[i]],
-      setup = child.setup[[i]],
-      opt.value = opt.value,
-      where = "npplregbw"
-    )
-  })
-  child.lower <- unlist(lapply(child.bounds, `[[`, "lower"), use.names = FALSE)
-  child.upper <- unlist(lapply(child.bounds, `[[`, "upper"), use.names = FALSE)
-  child.bbin <- unlist(lapply(child.bounds, `[[`, "bbin"), use.names = FALSE)
-  child.coordinate.roles <- unlist(lapply(child.bounds, .np_nomad_coordinate_roles),
-                                   use.names = FALSE)
-  child.start.lower <- unlist(lapply(child.start.bounds, `[[`, "lower"), use.names = FALSE)
-  child.start.upper <- unlist(lapply(child.start.bounds, `[[`, "upper"), use.names = FALSE)
-  child.start <- unlist(lapply(seq_along(child.templates), function(i) {
-    raw <- child.templates[[i]]$bw
-    explicit.start <- !all(as.numeric(bws[i, ]) == 0)
-    point.start <- if (!explicit.start || all(raw == 0)) NULL else .npregbw_nomad_bw_to_point(raw, template = child.templates[[i]], setup = child.setup[[i]])
-    .npregbw_nomad_complete_bw_start_point(
-      point = point.start,
-      bounds = child.bounds[[i]],
-      setup = child.setup[[i]],
-      initial = child.start.bounds[[i]]$initial,
-      where = "npplregbw"
-    )
-  }), use.names = FALSE)
-  bwdim <- length(child.start)
-  ndeg <- length(degree.search$start.degree)
-  nomad.nmulti <- if (is.null(opt.args$nmulti)) npDefaultNmulti(dim(zdat)[2]) else npValidateNmulti(opt.args$nmulti[1L])
-
-  x0 <- c(child.start, as.integer(degree.search$start.degree))
-  lb <- c(child.lower, degree.search$lower)
-  ub <- c(child.upper, degree.search$upper)
-  bbin <- c(child.bbin, rep.int(1L, ndeg))
-  coordinate.roles <- c(child.coordinate.roles, rep.int("degree", ndeg))
-  baseline.record <- NULL
-  nomad.num.feval.total <- 0
-  nomad.num.feval.fast.total <- 0
-
-  .np_nomad_baseline_note(degree.search$start.degree)
-
-  point_to_matrix <- function(point) {
-    .npplregbw_nomad_point_to_matrix(
-      point = point,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      child.point.length = child.point.length
-    )
-  }
-
-  child_eval_payload <- function(bw.matrix, degree, penalty.multiplier) {
-    .npplregbw_eval_child_payload_serial(
-      zdat = zdat,
-      reg.args = reg.args,
-      degree.search = degree.search,
-      child.responses = child.responses,
-      child.templates = child.templates,
-      child.setup = child.setup,
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = penalty.multiplier
-    )
-  }
-
-  eval_fun <- function(point) {
-    point <- as.numeric(point)
-    degree <- as.integer(round(point[bwdim + seq_len(ndeg)]))
-    degree <- .np_degree_clip_to_grid(degree, degree.search$candidates)
-    bw.matrix <- point_to_matrix(point[seq_len(bwdim)])
-    out <- child_eval_payload(
-      bw.matrix = bw.matrix,
-      degree = degree,
-      penalty.multiplier = 10
-    )
-    nomad.num.feval.total <<- nomad.num.feval.total + as.numeric(out$num.feval[1L])
-    nomad.num.feval.fast.total <<- nomad.num.feval.fast.total + as.numeric(out$num.feval.fast[1L])
-    list(
-      objective = out$objective,
-      degree = degree,
-      num.feval = out$num.feval,
-      num.feval.fast = out$num.feval.fast,
-      timing.profile = out$timing.profile
-    )
-  }
-
-  build_payload <- function(point, best_record, solution, interrupted) {
-    point <- as.numeric(point)
-    degree <- as.integer(best_record$degree)
-    bw.matrix <- point_to_matrix(point[seq_len(bwdim)])
-    powell.elapsed <- NA_real_
-
-    build_direct_payload <- function() {
-      child.out <- child_eval_payload(
-        bw.matrix = bw.matrix,
-        degree = degree,
-        penalty.multiplier = 10
-      )
-      child.list <- vector("list", length(child.templates))
-      names(child.list) <- c("yzbw", names(xdat))
-
-      for (i in seq_along(child.templates)) {
-        resp <- child.responses[[i]]
-        tbw <- child.out$child.payloads[[i]]$bws
-        tbw$fval <- as.numeric(child.out$child.payloads[[i]]$objective)
-        tbw$ifval <- as.numeric(child.out$child.payloads[[i]]$objective)
-        tbw$num.feval <- as.numeric(child.out$child.payloads[[i]]$num.feval)
-        tbw$num.feval.fast <- as.numeric(child.out$child.payloads[[i]]$num.feval.fast)
-        tbw$fval.history <- as.numeric(child.out$child.payloads[[i]]$objective)
-        tbw$eval.history <- 1
-        tbw$invalid.history <- 0
-        tbw$timing <- NA_real_
-        tbw$total.time <- NA_real_
-        child.list[[i]] <- npregbw.rbandwidth(
-          xdat = zdat,
-          ydat = resp$values,
-          bws = tbw,
-          bandwidth.compute = FALSE
-        )
-        if (!is.null(child.list[[i]]$method) && length(child.list[[i]]$method))
-          child.list[[i]]$pmethod <- bwmToPrint(as.character(child.list[[i]]$method[1L]))
-      }
-
-      plbw.args <- c(
-        list(
-          bws = child.list,
-          nobs = dim(xdat)[1],
-          fval = child.out$objective,
-          num.feval = as.numeric(nomad.num.feval.total),
-          num.feval.fast = as.numeric(nomad.num.feval.fast.total),
-          xdati = untangle(xdat),
-          ydati = untangle(data.frame(ydat)),
-          zdati = untangle(zdat),
-          xnames = names(xdat),
-          ynames = template$ynames,
-          znames = names(zdat),
-          bandwidth.compute = TRUE
-        ),
-        utils::modifyList(outer.args, list(regtype = "lp", degree = degree, bernstein.basis = degree.search$bernstein.basis))
-      )
-      do.call(plbandwidth, plbw.args)
-    }
-
-    direct.payload <- build_direct_payload()
-    if (is.null(direct.payload$timing.profile) && is.list(best_record$timing.profile))
-      direct.payload$timing.profile <- best_record$timing.profile
-    direct.objective <- as.numeric(best_record$objective)
-
-    if (identical(degree.search$engine, "nomad+powell")) {
-      hot.reg.args <- reg.args
-      hot.reg.args$regtype <- "lp"
-      hot.reg.args$degree <- degree
-      hot.reg.args$bernstein.basis <- degree.search$bernstein.basis
-      hot.outer.args <- outer.args
-      hot.outer.args$regtype <- "lp"
-      hot.outer.args$degree <- degree
-      hot.outer.args$bernstein.basis <- degree.search$bernstein.basis
-      hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
-        opt.args,
-        strategy = "disable_multistart",
-        remin = isTRUE(opt.args$powell.remin)
-      )
-      powell.start <- proc.time()[3L]
-      hot.payload <- .np_nomad_with_powell_progress(
-        degree = degree,
-        best_record = best_record,
-        expr = .npplregbw_run_fixed_degree_collective(
-          xdat = xdat,
-          ydat = ydat,
-          zdat = zdat,
-          bws = bw.matrix,
-          reg.args = hot.reg.args,
-          outer.args = hot.outer.args,
-          opt.args = hot.opt.args
-        )
-      )
-      powell.elapsed <- proc.time()[3L] - powell.start
-      direct.payload$num.feval <- as.numeric(direct.payload$num.feval[1L]) + as.numeric(hot.payload$num.feval[1L])
-      direct.payload$num.feval.fast <- as.numeric(direct.payload$num.feval.fast[1L]) + as.numeric(hot.payload$num.feval.fast[1L])
-      hot.payload$num.feval <- direct.payload$num.feval
-      hot.payload$num.feval.fast <- direct.payload$num.feval.fast
-      hot.objective <- as.numeric(hot.payload$fval[1L])
-      if (is.finite(hot.objective) &&
-          .np_degree_better(hot.objective, direct.objective, direction = "min")) {
-        return(list(payload = hot.payload, objective = hot.objective, powell.time = powell.elapsed))
-      }
-    }
-
-    list(payload = direct.payload, objective = direct.objective, powell.time = powell.elapsed)
-  }
-
-  if (.npRmpi_has_active_slave_pool(comm = 1L) &&
-      !isTRUE(getOption("npRmpi.local.regression.mode", FALSE))) {
-    search.degree <- list(
-      engine = degree.search$engine,
-      start.degree = degree.search$start.degree,
-      candidates = degree.search$candidates,
-      lower = degree.search$lower,
-      upper = degree.search$upper,
-      basis = degree.search$basis,
-      nobs = degree.search$nobs,
-      start.user = degree.search$start.user,
-      bernstein.basis = degree.search$bernstein.basis
-    )
-
-    mc <- substitute(
-      get("npRmpiNomadShadowSearchPlreg", envir = asNamespace("npRmpi"), inherits = FALSE)(
-        ZDAT,
-        CHILDRESPONSES,
-        CHILDTEMPLATES,
-        CHILDSETUP,
-        REGARGS,
-        DEGREESEARCH,
-        X0,
-        BBIN,
-        LB,
-        UB,
-        STARTLOWER,
-        STARTUPPER,
-        COORDINATEROLES,
-        NOMADNMULTI,
-        INNERNMULTI,
-        RSEED,
-        REMIN,
-        SOURCE,
-        REASON,
-        PROGRESSLABEL
-      ),
-      list(
-        ZDAT = zdat,
-        CHILDRESPONSES = child.responses,
-        CHILDTEMPLATES = child.templates,
-        CHILDSETUP = child.setup,
-        REGARGS = reg.args,
-        DEGREESEARCH = search.degree,
-        X0 = x0,
-        BBIN = bbin,
-        LB = lb,
-        UB = ub,
-        STARTLOWER = c(child.start.lower, degree.search$lower),
-        STARTUPPER = c(child.start.upper, degree.search$upper),
-        COORDINATEROLES = coordinate.roles,
-        NOMADNMULTI = nomad.nmulti,
-        INNERNMULTI = nomad.inner.nmulti,
-        RSEED = random.seed,
-        REMIN = isTRUE(opt.args$nomad.remin),
-        SOURCE = source,
-        REASON = reason,
-        PROGRESSLABEL = progress_label
-      )
-    )
-
-    session.service <- !isTRUE(getOption("npRmpi.profile.active", FALSE)) &&
-      !identical(as.character(getOption("npRmpi.attach.close.state", "closed"))[1L], "open")
-
-    if (isTRUE(session.service) && isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
-      session.mc <- mc
-      session.mc[[1L]] <- quote(get("npRmpiNomadSessionServicePlreg", envir = asNamespace("npRmpi"), inherits = FALSE))
-      search.result <- eval(session.mc, envir = environment())
-    } else if (isTRUE(session.service)) {
-      session.mc <- mc
-      session.mc[[1L]] <- quote(get("npRmpiNomadSessionServicePlreg", envir = asNamespace("npRmpi"), inherits = FALSE))
-      .npRmpi_bcast_cmd_expr(quote(invisible(NULL)), comm = 1L, caller.execute = TRUE)
-      search.result <- .npRmpi_bcast_cmd_expr(session.mc, comm = 1L, caller.execute = TRUE)
-    } else if (isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
-      search.result <- eval(mc, envir = environment())
-    } else {
-      .npRmpi_bcast_cmd_expr(quote(invisible(NULL)), comm = 1L, caller.execute = TRUE)
-      search.result <- .npRmpi_bcast_cmd_expr(mc, comm = 1L, caller.execute = TRUE)
-    }
-    if (!is.null(search.result$num.feval.total))
-      nomad.num.feval.total <- as.numeric(search.result$num.feval.total[1L])
-    if (!is.null(search.result$num.feval.fast.total))
-      nomad.num.feval.fast.total <- as.numeric(search.result$num.feval.fast.total[1L])
-    best.solution <- NULL
-    if (!is.null(search.result$best.restart) &&
-        is.finite(search.result$best.restart) &&
-        length(search.result$restart.results) >= as.integer(search.result$best.restart)) {
-      best.solution <- search.result$restart.results[[as.integer(search.result$best.restart)]]
-    }
-
-    payload_result <- build_payload(
-      point = search.result$best_point,
-      best_record = search.result$best,
-      solution = best.solution,
-      interrupted = !isTRUE(search.result$completed)
-    )
-
-    if (is.list(payload_result) && !is.null(payload_result$payload)) {
-      search.result$best_payload <- payload_result$payload
-      if (!is.null(payload_result$powell.time))
-        search.result$powell.time <- as.numeric(payload_result$powell.time[1L])
-      if (!is.null(payload_result$objective) &&
-          .np_degree_better(payload_result$objective, search.result$best$objective, direction = "min")) {
-        search.result$best$objective <- as.numeric(payload_result$objective[1L])
-      }
-    } else {
-      search.result$best_payload <- payload_result
-    }
-
-    return(.npRmpi_reconcile_nomad_search_timing(search.result))
-  }
-
-  .np_nomad_search(
-    engine = degree.search$engine,
-    baseline_record = baseline.record,
-    start_degree = degree.search$start.degree,
-    x0 = x0,
-    bbin = bbin,
-    lb = lb,
-    ub = ub,
-    eval_fun = eval_fun,
-    build_payload = build_payload,
-    direction = "min",
-    objective_name = "fval",
-    nmulti = nomad.nmulti,
-    nomad.inner.nmulti = nomad.inner.nmulti,
-    random.seed = random.seed,
-    remin = isTRUE(opt.args$nomad.remin),
-    source = source,
-    reason = reason,
-    progress_label = progress_label,
-    start.lower = c(child.start.lower, degree.search$lower),
-    start.upper = c(child.start.upper, degree.search$upper),
-    coordinate.roles = coordinate.roles,
-    degree_spec = list(
-      initial = degree.search$start.degree,
-      lower = degree.search$lower,
-      upper = degree.search$upper,
-      basis = degree.search$basis,
-      nobs = degree.search$nobs,
-      user_supplied = degree.search$start.user
-    )
-  )
-}
-
 .npplregbw_degree_search_controls <- function(regtype,
                                               regtype.named,
                                               bandwidth.compute,
@@ -2259,14 +866,23 @@ npplregbw.default =
            scale.factor.search.lower = NULL,
            ftol, itmax, nmulti, nomad.remin, powell.remin, small, tol,
            ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute, "bandwidth.compute")
     .npRmpi_require_active_slave_pool(where = "npplregbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
 
     ## maintain x names and 'toFrame'
     xdat <- toFrame(xdat)
 
     ## maintain z names and 'toFrame'
     zdat <- toFrame(zdat)
+    .np_require_numeric_response(ydat, "npplregbw", "ydat")
 
     dots <- list(...)
     npRejectUnsupportedBwsolver(dots, "npplregbw")
@@ -2395,7 +1011,7 @@ npplregbw.default =
     if (.npRmpi_autodispatch_active() &&
         is.null(degree.search) &&
         !isTRUE(.npRmpi_autodispatch_called_from_bcast()))
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npplregbw.default"))
 
     reg.args <- list(
       regtype = spec$regtype.engine,
@@ -2457,6 +1073,17 @@ npplregbw.default =
       opt.args$scale.factor.search.lower <- scale.factor.search.lower
 
       if (!is.null(degree.search)) {
+        # Keep search setup, degree admission and all child fits on one sample.
+        train.df <- data.frame(xdat, ydat, zdat)
+        rows.omit <- attr(na.omit(train.df), "na.action")
+        keep.rows <- rep_len(TRUE, NROW(xdat))
+        if (length(rows.omit)) keep.rows[as.integer(rows.omit)] <- FALSE
+        if (!any(keep.rows)) stop("Data has no rows without NAs")
+        search.xdat <- xdat[keep.rows, , drop = FALSE]
+        search.ydat <- ydat[keep.rows]
+        search.zdat <- zdat[keep.rows, , drop = FALSE]
+        degree.search$nobs <- sum(keep.rows)
+
         eval_fun <- function(degree.vec) {
           cell.reg.args <- reg.args
           cell.reg.args$regtype <- "lp"
@@ -2467,9 +1094,9 @@ npplregbw.default =
           cell.outer.args$degree <- as.integer(degree.vec)
           cell.outer.args$bernstein.basis <- degree.search$bernstein.basis
           cell.bws <- .npplregbw_run_fixed_degree(
-            xdat = xdat,
-            ydat = ydat,
-            zdat = zdat,
+            xdat = search.xdat,
+            ydat = search.ydat,
+            zdat = search.zdat,
             bws = bws,
             reg.args = cell.reg.args,
             outer.args = cell.outer.args,
@@ -2508,9 +1135,9 @@ npplregbw.default =
           )
         } else {
           search.result <- .npplregbw_child_specific_nomad_search(
-            xdat = xdat,
-            ydat = ydat,
-            zdat = zdat,
+            xdat = search.xdat,
+            ydat = search.ydat,
+            zdat = search.zdat,
             bws = bws,
             reg.args = reg.args,
             outer.args = outer.args,
@@ -2527,14 +1154,27 @@ npplregbw.default =
           bws = search.result$best_payload,
           search_result = search.result
         )
+        tbw$rows.omit <- if (length(rows.omit)) rows.omit else NA
+        tbw$nobs.omit <- length(rows.omit)
         mc <- match.call(expand.dots = FALSE)
         environment(mc) <- parent.frame()
         tbw$call <- mc
         tbw <- .np_attach_nomad_shortcut(tbw, nomad.shortcut$metadata)
-        return(tbw)
+        return(.np_bws_retain_native_training(tbw, xdat = xdat, ydat = ydat, zdat = zdat))
       }
     }
 
+    stored.data <- NULL
+    if (!bandwidth.compute) {
+      .np_require_paired_rows(xdat, ydat, "xdat", "ydat")
+      .np_require_paired_rows(xdat, zdat, "xdat", "zdat")
+      stored.data <- list(xdat = xdat, ydat = ydat, zdat = zdat)
+      keep <- complete.cases(xdat, ydat, zdat)
+      if (!any(keep)) stop("Data has no rows without NAs")
+      xdat <- xdat[keep, , drop = FALSE]
+      ydat <- ydat[keep]
+      zdat <- zdat[keep, , drop = FALSE]
+    }
     tbw <- .npplregbw_build_plbandwidth(
       xdat = xdat,
       ydat = ydat,
@@ -2558,5 +1198,12 @@ npplregbw.default =
     tbw$call <- mc
     tbw <- .np_attach_nomad_shortcut(tbw, nomad.shortcut$metadata)
 
-    return(tbw)
+    if (!is.null(stored.data)) {
+      tbw$rows.omit <- if (all(keep)) NA else which(!keep)
+      tbw$nobs.omit <- sum(!keep)
+      xdat <- stored.data$xdat
+      ydat <- stored.data$ydat
+      zdat <- stored.data$zdat
+    }
+    return(.np_bws_retain_native_training(tbw, xdat = xdat, ydat = ydat, zdat = zdat))
   }

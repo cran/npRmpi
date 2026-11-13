@@ -46,14 +46,14 @@ test_that("npcmstest single-line bootstrap progress matches legacy semantics", {
   on.exit(options(old_opts), add = TRUE)
 
   legacy <- capture_progress_shadow_trace(
-    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", boot.num = 9),
+    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", B = 9),
     force_renderer = "legacy",
     now = progress_time_counter()
   )
 
   set.seed(42)
   single_line <- capture_progress_shadow_trace(
-    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", boot.num = 9),
+    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", B = 9),
     force_renderer = "single_line",
     now = progress_time_counter()
   )
@@ -61,6 +61,11 @@ test_that("npcmstest single-line bootstrap progress matches legacy semantics", {
   lines <- shadow_lines(single_line)
 
   expect_s3_class(single_line$value, "cmstest")
+  bandwidth <- Filter(function(event) grepl("Bandwidth selection", event$line, fixed = TRUE),
+                      single_line$trace)
+  expect_gt(length(bandwidth), 0L)
+  expect_length(unique(vapply(bandwidth, `[[`, character(1L), "id")), 1L)
+  expect_identical(tail(bandwidth, 1L)[[1L]]$event, "finish")
   expect_equal(shadow_bootstrap_signature(single_line), shadow_bootstrap_signature(legacy))
   expect_true(any(grepl("^\\[npRmpi\\] Bootstrap replications [0-9]+/9 \\([0-9]+\\.[0-9]%.*, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$", lines)))
   expect_true(any(grepl("^\\[npRmpi\\] Bootstrap replications 9/9 \\([0-9]+\\.[0-9]%.*, elapsed [0-9]+\\.[0-9]s, eta [0-9]+\\.[0-9]s\\)$", lines)))
@@ -82,7 +87,7 @@ test_that("npcmstest progress respects np.messages FALSE", {
   on.exit(options(old_opts), add = TRUE)
 
   res <- capture_progress_shadow_trace(
-    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", boot.num = 9),
+    npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", B = 9),
     now = progress_time_counter()
   )
 
@@ -105,7 +110,7 @@ test_that("npcmstest progress respects suppressMessages", {
   on.exit(options(old_opts), add = TRUE)
 
   res <- capture_progress_shadow_trace(
-    suppressMessages(npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", boot.num = 9)),
+    suppressMessages(npcmstest_fun(model = model, xdat = x, ydat = y, distribution = "bootstrap", B = 9)),
     now = progress_time_counter()
   )
 

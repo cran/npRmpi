@@ -17,6 +17,63 @@
   accuracy.
 }
 \details{
+  Conditional fitting and replay use the literal categorical kernels for
+  both explanatory and response variables. Near-upper categorical bandwidths
+  are not replaced by approximate constant factors. The same target is used
+  for levels, gradients, standard errors, conditional hats, and reconstructed
+  plot uncertainty. This conditional-family policy does not change direct
+  regression or unconditional kernel-sum evaluation and does not modify the
+  caller's \code{np.largelambda} option.
+
+  New fitted objects record \code{conditional.kernel.policy}. Stored values
+  in older objects remain available without refitting. A plot that combines
+  such historical stored class probabilities or effects with newly
+  reconstructed bootstrap or joint asymptotic uncertainty requires an explicit
+  refit under the current policy. Stored pointwise probability standard errors
+  remain readable. Explicit predictions at new evaluation data use the current
+  conditional target and retain the object's probability-normalization controls.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For both formula and native bandwidth objects, \code{newdata} supplies
+  evaluation predictors and, when present, named evaluation outcomes. Explicit
+  native evaluation arguments take precedence. This evaluates at the requested
+  rows without repeating bandwidth selection.
+
+  With evaluation predictors and outcomes, the confusion matrix and accuracy
+  describe the evaluation sample. With evaluation predictors only, predictions
+  are returned normally and these diagnostics are \code{NA}. Without evaluation
+  inputs, diagnostics describe training data. Missing evaluation outcomes do
+  not remove predictor-complete prediction rows: scores use observed
+  outcome/prediction pairs, and are \code{NA} when none are available. Supplying
+  outcomes never changes fitted class support, probabilities or gradients.
+
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
+  Local-polynomial calculations inherit numerical ridging from
+  \code{\link{npcdens}}. See that estimator's help for the solve
+  policy and its distinct conditional uncertainty formula.
+
   For MPI startup/performance guidance (including message-passing tradeoffs and the manual-broadcast template), see \code{\link{npRmpi.init}} details and \code{inst/Rprofile}.
   Documentation guide: see \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, and
@@ -61,7 +118,8 @@ npconmode(bws, \dots)
 \method{npconmode}{formula}(bws, 
           data = NULL, 
           newdata = NULL, 
-          \dots)
+          \dots,
+          se = FALSE)
 
 \method{npconmode}{default}(bws, 
           txdat, 
@@ -72,7 +130,8 @@ npconmode(bws, \dots)
           probabilities = FALSE,
           gradients = FALSE,
           level = NULL,
-          \dots)
+          \dots,
+          se = FALSE)
 
 \method{npconmode}{conbandwidth}(bws,
           txdat = stop("invoked without training data 'txdat'"),
@@ -84,7 +143,8 @@ npconmode(bws, \dots)
           probabilities = FALSE,
           gradients = FALSE,
           level = NULL,
-          \dots)
+          \dots,
+          se = FALSE)
 
 \method{predict}{conmode}(object,
           newdata = NULL,
@@ -109,6 +169,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -153,9 +220,10 @@ These arguments control where the conditional mode is evaluated.
 
 
   \item{eydat}{
-    a one (1) dimensional numeric or integer vector of the true values
-    (outcomes) of the dependent variable. By default,
-    evaluation takes place on the data provided by \code{tydat}.
+    Optional observed categorical outcomes at \code{exdat}, supplied as a
+    factor or a one-column data frame. Used only for evaluation diagnostics.
+    When \code{exdat} is supplied without outcomes, classification diagnostics
+    are \code{NA}; training outcomes are not substituted.
   }
 
 
@@ -181,6 +249,21 @@ These arguments control where the conditional mode is evaluated.
     class-probability target, not for the discrete modal class label.
   }
 
+  \item{se}{
+    a scalar logical controlling raw class-probability asymptotic
+    standard errors. Defaults to \code{FALSE}; class selection, fitted
+    probabilities and requested probability gradients are unchanged.
+    With \code{TRUE}, selected-probability errors are stored, together with
+    the full error matrix when probabilities are retained. This does not
+    add standard errors for the modal class label or probability gradients,
+    or change the existing unavailable-error treatment after projection.
+    To add uncertainty without repeating bandwidth search, use
+    \code{npconmode(bws=fit$bws, probabilities=TRUE, se=TRUE)}, supplying
+    the original training/evaluation data if needed. Prediction with new
+    evaluation rows and \code{se.fit=TRUE} requests this work explicitly;
+    prediction without evaluation rows only extracts stored results.
+  }
+
 
 \subsection{Probability And Gradient Controls}{
 These arguments control stored class probabilities, proper probability
@@ -190,6 +273,9 @@ normalization, and level-specific class-probability effects.
   \item{probabilities}{
     a logical value. If \code{TRUE}, store the full matrix of fitted
     probabilities over the discrete response support in the returned object.
+    This support is retained from the fitted training data. Response values
+    supplied for evaluation diagnostics, including unused or unseen factor
+    levels, do not enlarge or reorder the predicted class support.
     The default \code{FALSE} keeps returned objects compact. If
     \code{gradients=TRUE}, probabilities are stored automatically because
     they are the object-fed target for \code{\link{plot.conmode}}.
@@ -205,6 +291,12 @@ normalization, and level-specific class-probability effects.
     probability \eqn{\Pr(Y=\ell\mid X=x)}, not the derivative of the
     discrete modal class label. Gradients are stored for one selected response
     level at a time.
+    With a heterogeneous local-polynomial conditional-density degree vector, a
+    degree-zero continuous coordinate has no available first-derivative
+    estimate and is stored as \code{NA}; the established all-degree-zero
+    compatibility route is unchanged. Its plot panel remains present but empty when another derivative
+    or categorical first-difference effect is available; a request with no
+    available component is rejected.
   }
 
   \item{level}{
@@ -277,7 +369,7 @@ prediction/evaluation route, or plot route as appropriate.
     probability/effect display; common controls include
     \code{gradients}, \code{level}, \code{output}, \code{data_rug},
     \code{layout}, \code{legend}, \code{view}, \code{neval},
-    \code{grid_control}, \code{perspective}, \code{plot.vars},
+    \code{grid_control}, \code{perspective}, \code{plot_vars},
     \code{renderer}, and graphics arguments. The default
     \code{view="sample"} draws the stored fitted probabilities/effects at the
     fitted evaluation points. The \code{view="fixed"} route constructs
@@ -287,12 +379,12 @@ prediction/evaluation route, or plot route as appropriate.
     range and holdout quantiles. With \code{perspective=TRUE}, the same
     fixed-grid route draws a base-graphics probability surface for one selected
     response level over two continuous conditioning variables; use
-    \code{plot.vars} to name the displayed pair when more than two continuous
+    \code{plot_vars} to name the displayed pair when more than two continuous
     conditioning variables are present; \code{renderer="rgl"} requests the
-    corresponding interactive surface when \pkg{rgl} is available. The public
-    \code{output="both"} spelling is
-    accepted as an alias for the historical \code{output="plot-data"}
-    behavior. For class-probability plots, \code{errors="asymptotic"}
+    corresponding interactive surface when \pkg{rgl} is available. Both
+    renderers use the package-wide viridis surface palette and neutral-gray
+    three-face reference grid. Use \code{output="data"} to return an \code{\link{np_plot_data}}
+    object or \code{output="plot-data"} to draw and return the same object. For class-probability plots, \code{errors="asymptotic"}
     adds probability-level asymptotic standard errors and intervals for the
     selected response level. These intervals target the smooth probability
     \eqn{\Pr(Y=\ell\mid X=x)}, not the discrete modal class label. Rows whose
@@ -301,9 +393,53 @@ prediction/evaluation route, or plot route as appropriate.
     standard errors as projected-probability standard errors. Bootstrap
     intervals are available for one-dimensional \code{view="sample"} and
     \code{view="fixed"} probability plots and use the stored bandwidth object
-    without recomputing bandwidths. Surface asymptotic intervals are available
-    as \code{output="data"} payload columns; surface band rendering and
-    surface bootstrap intervals are intentionally deferred.
+    without recomputing bandwidths. Class-probability bootstrap plots default
+    to \code{B=399}; an explicit \code{B} overrides this count.
+    Asymptotic joint bands are available for regular local-constant and
+    local-polynomial probability and first-gradient/effect routes. A joint
+    Gaussian maximum is calibrated for one named response level on the
+    declared grid within each panel. The complete response support enters
+    the proper-probability Jacobian, including smooth positive normalization,
+    clipping with a stable sign pattern, and projection onto a stable simplex
+    face. Branch seams or unidentified zero-variance rows remain unavailable.
+    A zero Jacobian caused by clipping or projection onto an inactive class or a
+    singleton face does not certify a constant sampling target. Such a panel
+    warns and returns unavailable simultaneous limits, retaining the plotted
+    probabilities and any available pointwise and Bonferroni intervals.
+    Proper probability bands use standard errors from that transformed
+    influence; existing pointwise and Bonferroni probability bands retain
+    their own convention in \code{band="all"}.
+
+    Continuous gradient plots retain the raw underlying conditional-density
+    derivative documented above, including when \code{proper=TRUE}; the
+    derivative is not silently changed to a normalized-probability
+    derivative. Categorical effects retain the existing view/engine policy:
+    fixed-view and positive-degree sample effects difference endpoint
+    probabilities, while local-constant and degree-zero sample effects retain
+    their native raw contrast. New asymptotic gradient intervals use the
+    covariance and marginal scale of that particular target. Bootstrap
+    gradient intervals remain unsupported.
+
+    These are selected-smoothing variability approximations for the named
+    level, not confidence bands for the winning class, all classes jointly,
+    smoothing bias or values between grid points. Independent observations,
+    regular local neighborhoods and valid covariance/marginal approximations
+    are required. Local-polynomial and fixed-view response factors use local
+    response moments as a working covariance approximation conditional on the
+    accepted design and response map. At fixed nonshrinking bandwidths they
+    need not equal a full empirical-caseweight derivative, which also perturbs
+    the design map. Their leading interpretation requires smooth shrinking
+    neighborhoods and nondegenerate local response variation.
+    A growing or data-dependent sample grid additionally needs
+    uniform linearization, non-dominating influences and a Gaussian-maximum
+    approximation; arbitrary sample grids do not carry a uniform-coverage
+    guarantee. \code{gaussian_draws} (default 9999) and \code{random_seed}
+    control reproducible joint calibration; pointwise and Bonferroni-only
+    gradient requests need no Gaussian simulation.
+    Surface asymptotic intervals are available as \code{output="data"}
+    payload columns and are drawn with graphical surface output. The two
+    conditioning variables selected by \code{plot_vars} must be distinct.
+    Surface bootstrap intervals remain unsupported.
     See \code{\link{npcdensbw}} and \code{\link{plot.np}} for the complete
     bandwidth-selection and plotting argument surfaces.
   }
@@ -312,6 +448,14 @@ prediction/evaluation route, or plot route as appropriate.
 \value{
   \code{npconmode} returns a \code{conmode} object with the following
   components:
+
+  \item{omit, rows.omit, nobs.omit}{ omitted-row information for the active
+    result: training rows for training evaluation, otherwise evaluation rows.
+    Existing NA padding of row outputs is unchanged. }
+  \item{train.rows.omit, train.nobs.omit}{ training omissions, retained
+    separately even when the result evaluates external data. }
+  \item{eval.omit, eval.rows.omit, eval.nobs.omit}{ omission information for
+    external evaluation data, when supplied. }
 
   \item{bws}{ the \code{conbandwidth} object used to compute the conditional
     mode }
@@ -322,6 +466,7 @@ prediction/evaluation route, or plot route as appropriate.
     estimates at each evaluation point}
   \item{conderr}{ a vector of numeric type containing asymptotic
     standard errors for the modal density estimates at each evaluation point.
+    This component is \code{NULL} when \code{se=FALSE}.
     If a row is materially properized by probability projection, this value is
     set to \code{NA} for that row rather than reporting a standard error for
     the unrepaired raw probability.}
@@ -329,6 +474,9 @@ prediction/evaluation route, or plot route as appropriate.
   \item{yeval}{ a vector of type \code{factor} (or \code{ordered
       factor}) containing the actual outcomes, or \code{NA} if not
     provided }
+  \item{diagnostics.sample}{\code{"training"}, \code{"evaluation"}, or
+    \code{"unavailable"}, identifying the sample used for classification diagnostics.}
+  \item{diagnostics.nobs}{Number of observed outcome/prediction pairs scored.}
   \item{confusion.matrix}{ the confusion matrix or \code{NA} if outcomes
     are not available }
   \item{CCR.overall}{ the overall correct
@@ -345,7 +493,9 @@ prediction/evaluation route, or plot route as appropriate.
   \item{probability.errors}{ if \code{probabilities} are stored, a matrix of
     asymptotic standard errors for the raw selected-level conditional
     probability estimates, with rows set to \code{NA} where simplex projection
-    materially repaired the fitted probability vector }
+    materially repaired the fitted probability vector; omitted when
+    \code{se=FALSE} }
+  \item{se}{ whether probability uncertainty was requested }
   \item{probability.repaired.rows}{ if \code{probabilities} are stored, a
     logical vector identifying rows whose fitted probability vector was
     materially repaired by proper probability projection }
@@ -387,9 +537,15 @@ prediction/evaluation route, or plot route as appropriate.
   probability surface for one selected response level over two continuous
   conditioning variables, and \code{renderer="rgl"} for the corresponding
   interactive surface. Use \code{errors="asymptotic"} for probability-level
-  standard errors and intervals in one-dimensional plots, or with
-  \code{output="data"} for surface interval payloads. Bootstrap intervals and
-  surface band rendering are not yet implemented for \code{plot.conmode}.
+  standard errors and intervals in one-dimensional plots and fixed surfaces.
+  Surface \code{band="all"} draws the pointwise, simultaneous and Bonferroni
+  endpoints already present in \code{output="data"}; coverage remains for
+  the selected response level on the declared evaluation grid, not jointly
+  across response levels. Automatic surface limits include finite interval
+  endpoints without truncating them to \eqn{[0,1]}. Explicit \code{zlim}
+  controls drawing only and does not alter returned endpoints. Unavailable
+  interval cells remain missing. Surface bootstrap intervals and gradient
+  surfaces are not implemented.
 }
 \section{Book And Method Pointers}{
   The conditional-mode target is
@@ -461,13 +617,22 @@ prediction/evaluation route, or plot route as appropriate.
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
 }
 
 \seealso{\code{\link{npRmpi.init}}.

@@ -52,9 +52,9 @@ expect_npreg_powell_progress_surface <- function(lines) {
     "^\\[npRmpi\\] Bandwidth selection \\(Refining NOMAD solution",
     lines
   )), info = info)
-  expect_false(any(grepl("best (", powell.lines, fixed = TRUE)), info = info)
+  expect_true(any(grepl("best (", powell.lines, fixed = TRUE)), info = info)
   expect_true(any(grepl(
-    "^\\[npRmpi\\] Refining bandwidth \\(elapsed [0-9]+\\.[0-9]s, degree \\([^)]*\\), iter [0-9]+\\)$",
+    "^\\[npRmpi\\] Refining bandwidth \\(iteration [0-9]+, elapsed [0-9]+\\.[0-9]s, deg \\([^)]*\\), best \\([^)]*\\)\\)$",
     powell.lines
   )), info = info)
 }
@@ -68,7 +68,7 @@ ensure_npreg_subprocess_nprmpi_lib <- local({
     }
 
     pkg.root <- tryCatch(
-      normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
+      npRmpi_namespace_hygiene_root(),
       error = function(e) ""
     )
     if (!nzchar(pkg.root)) {
@@ -79,7 +79,7 @@ ensure_npreg_subprocess_nprmpi_lib <- local({
     dir.create(lib.path.cache, recursive = TRUE, showWarnings = FALSE)
 
     cmd <- file.path(R.home("bin"), "R")
-    out <- suppressWarnings(system2(
+    out <- suppressWarnings(npRmpi_test_system2(
       cmd,
       c("CMD", "INSTALL", "--no-test-load", "-l", lib.path.cache, pkg.root),
       stdout = TRUE,
@@ -127,7 +127,7 @@ npreg_subprocess_lib <- function(env) {
 }
 
 run_npreg_cmd_subprocess <- function(cmd, args = character(), timeout = 60L, env = character()) {
-  out <- suppressWarnings(system2(
+  out <- suppressWarnings(npRmpi_test_system2(
     cmd,
     args,
     stdout = TRUE,
@@ -277,8 +277,7 @@ run_npreg_profile_progress_contract <- function(timeout = 120L) {
   skip_if(!file.exists(profile.path), "npRmpi profile template unavailable in subprocess lib")
 
   script <- tempfile("npRmpi-npreg-profile-", fileext = ".R")
-  batch_file <- tempfile("npRmpi-npreg-profile-", fileext = ".Rout")
-  on.exit(unlink(c(script, batch_file)), add = TRUE)
+  on.exit(unlink(script), add = TRUE)
   writeLines(c(
     "mpi.bcast.cmd(np.mpi.initialize(), caller.execute = TRUE)",
     "mpi.bcast.cmd(options(",
@@ -307,7 +306,7 @@ run_npreg_profile_progress_contract <- function(timeout = 120L) {
 
   res <- run_npreg_cmd_subprocess(
     mpiexec,
-    args = c("-n", "2", file.path(R.home("bin"), "R"), "CMD", "BATCH", "--no-save", script, batch_file),
+    args = c("-n", "2", file.path(R.home("bin"), "Rscript"), "--no-save", script),
     timeout = timeout,
     env = c(
       env_common,
@@ -319,10 +318,10 @@ run_npreg_profile_progress_contract <- function(timeout = 120L) {
       "FI_SOCKETS_IFACE=en0"
     )
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && npreg_is_mpi_init_env_failure(res$output)) {
     res <- run_npreg_cmd_subprocess(
       mpiexec,
-      args = c("-n", "2", file.path(R.home("bin"), "R"), "CMD", "BATCH", "--no-save", script, batch_file),
+      args = c("-n", "2", file.path(R.home("bin"), "Rscript"), "--no-save", script),
       timeout = timeout,
       env = c(
         env_common,
@@ -340,12 +339,10 @@ run_npreg_profile_progress_contract <- function(timeout = 120L) {
     skip("MPI runtime interface unavailable in this environment for profile-mode smoke")
   }
 
-  batch_lines <- if (file.exists(batch_file)) readLines(batch_file, warn = FALSE) else character()
-
   list(
     status = res$status,
-    lines = normalize_npreg_progress_output(batch_lines),
-    raw = c(batch_lines, res$output)
+    lines = normalize_npreg_progress_output(res$output),
+    raw = res$output
   )
 }
 
@@ -514,7 +511,7 @@ test_that("npreg bw to fit route hands off immediately into single-line fit prog
   lines <- npreg_fit_progress_lines(actual)
   bandwidth.pos <- grep("^\\[npRmpi\\] Bandwidth selection", lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta estimating\\): starting$",
     lines
   )
   fit.finish.pos <- grep(
@@ -562,7 +559,7 @@ test_that("npreg nomad to powell to fit route preserves single-line fit handoff"
   bandwidth.pos <- grep("^\\[npRmpi\\] (Selecting degree and bandwidth|NOMAD degree/bw|Exhaustive degree/bw|Auto:NOMAD degree/bw|Auto:exhaustive degree/bw)", lines)
   powell.pos <- grep("^\\[npRmpi\\] Refining bandwidth \\(", lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta estimating\\): starting$",
     lines
   )
   fit.finish.pos <- grep(
@@ -625,7 +622,7 @@ test_that("session npreg nomad route keeps visible powell handoff in subprocess"
   bandwidth.pos <- grep("^\\[npRmpi\\] (Selecting degree and bandwidth|NOMAD degree/bw|Exhaustive degree/bw|Auto:NOMAD degree/bw|Auto:exhaustive degree/bw)", block)
   powell.pos <- grep("^\\[npRmpi\\] Refining bandwidth \\(", block)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta estimating\\): starting$",
     block
   )
 
@@ -645,7 +642,7 @@ test_that("attach npreg nomad route does not duplicate fit-start lines in subpro
   actual <- run_npreg_attach_progress_contract()
   block <- npreg_case_progress_lines(actual$lines)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta estimating\\): starting$",
     block
   )
 
@@ -663,7 +660,7 @@ test_that("profile npreg nomad route keeps visible powell handoff in subprocess"
   bandwidth.pos <- grep("^\\[npRmpi\\] (Selecting degree and bandwidth|NOMAD degree/bw|Exhaustive degree/bw|Auto:NOMAD degree/bw|Auto:exhaustive degree/bw)", block)
   powell.pos <- grep("^\\[npRmpi\\] Refining bandwidth \\(", block)
   fit.start.pos <- grep(
-    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta 0\\.0s\\): starting$",
+    "^\\[npRmpi\\] Fitting regression 0/24 \\(0\\.0%, elapsed 0\\.0s, eta estimating\\): starting$",
     block
   )
 

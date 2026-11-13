@@ -2,9 +2,11 @@ npudistbw <- function(...){
   mc <- match.call(expand.dots = FALSE)
   npRejectRenamedScaleFactorSearchArgs(names(mc$...), where = "npudistbw")
   npRejectUnsupportedLpDegreeSearchArgs(names(mc$...), where = "npudistbw")
+  .np_validate_public_dots(mc[["..."]], "npudistbw")
   target <- .np_bw_dispatch_target(dots = mc$...,
                                    data_arg_names = c("dat", "gdat"),
-                                   eval_env = parent.frame())
+                                     eval_env = parent.frame(),
+                                     promise.frame = environment())
   UseMethod("npudistbw", target)
 }
 
@@ -71,44 +73,22 @@ npudistbw <- function(...){
 
 npudistbw.formula <-
   function(formula, data, subset, na.action, call, gdata = NULL, ...){
-    formula.terms <- terms(formula)
-    orig.ts <- if (missing(data))
-      .np_terms_ts_mask(terms_obj = formula.terms,
-                        data = environment(formula),
-                        eval_env = environment(formula))
-    else .np_terms_ts_mask(terms_obj = formula.terms,
-                           data = data,
-                           eval_env = environment(formula))
-
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
 
-    if(all(orig.ts)){
-      args <- (as.list(attr(formula.terms, "variables"))[-1])
-      formula <- formula.terms
-      attr(formula, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
-      mf[["formula"]] <- formula
-    }else if(any(orig.ts)){
-      arguments <- (as.list(attr(formula.terms, "variables"))[-1])
-      arguments.normal <- arguments[which(!orig.ts)]
-      arguments.timeseries <- arguments[which(orig.ts)]
-
-      ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-      formula <- formula.terms
-      attr(formula, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
-      mf[["formula"]] <- formula
-    }
-
     mf[[1]] <- as.name("model.frame")
     mf.args <- as.list(mf[-1L])
-    mf <- do.call(stats::model.frame, mf.args, envir = parent.frame())
+    mf.args[["formula"]] <- substitute(quote(VALUE), list(VALUE = formula))
+    capture <- new.env(parent = emptyenv())
+    mf.args$.np.capture <- capture
+    mf <- do.call(.np_formula_model_frame, mf.args, envir = parent.frame())
 
     if (attr(attr(mf, "terms"), "response") != 0)
       stop("invalid distribution formula")
 
-    dat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
+    dat <- mf[, .np_formula_term_names(attr(attr(mf, "terms"),"term.labels")), drop = FALSE]
 
     has.gval <- !is.null(gdata)
     if (has.gval) {
@@ -118,20 +98,24 @@ npudistbw.formula <-
 
       gmf[[1]] <- as.name("model.frame")
       names(gmf)[3] <- "data"
-      gmf.args <- as.list(gmf[-1L])
-      gmf <- do.call(stats::model.frame, gmf.args, envir = parent.frame())
+      gmf[["formula"]] <- attr(mf, "terms")
+      gmf.args <- .np_formula_frame_promises(as.list(gmf[-1L]), environment(), c(data = "gdata"))
+      gmf <- do.call(.np_formula_model_frame, gmf.args, envir = parent.frame())
 
-      gdat <- gmf[, attr(attr(gmf, "terms"),"term.labels"), drop = FALSE]
+      gdat <- gmf[, .np_formula_term_names(attr(attr(gmf, "terms"),"term.labels")), drop = FALSE]
 
     }
 
     dots <- list(...)
+    .np_formula_frame_store(dots[[".np.formula.state", exact = TRUE]], mf)
+    dots$.np.formula.state <- NULL
     seed.args <- c(list(dat = dat), if (has.gval) list(gdat = gdat) else list(), dots)
     tbw <- do.call(npudistbw, seed.args)
-    tbw$call <- match.call(expand.dots = FALSE)
+    tbw$call <- .np_formula_call_public(match.call(expand.dots = FALSE))
     environment(tbw$call) <- parent.frame()
     tbw$formula <- formula
     tbw$terms <- attr(mf,"terms")
+    tbw <- .np_bws_retain_formula_training(tbw, mf, capture$na.action)
     tbw$rows.omit <- as.vector(attr(mf,"na.action"))
     tbw$nobs.omit <- length(tbw$rows.omit)
     tbw
@@ -141,7 +125,15 @@ npudistbw.formula <-
 npudistbw.NULL <-
   function(dat = stop("invoked without input data 'dat'"),
            bws, ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     .npRmpi_require_active_slave_pool(where = "npudistbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     dots <- list(...)
     .np_nomad_native_reject_unsupported_options_from_dots(
       dots,
@@ -154,7 +146,7 @@ npudistbw.NULL <-
           stop("Data has no rows without NAs")
       return(.npRmpi_autodispatch_call(
         .npRmpi_autodispatch_expand_dots_call(match.call(expand.dots = FALSE)),
-        parent.frame()))
+        parent.frame(), owner.name = "npudistbw.NULL"))
       }
 
     t.names <- NULL
@@ -200,9 +192,9 @@ npudistbw.NULL <-
 
 .npudistbw_nomad_native_require_crs <- function() {
   if (!requireNamespace("crs", quietly = TRUE))
-    stop("native npudist NOMAD route requires crs >= 0.15-44", call. = FALSE)
-  if (utils::packageVersion("crs") < "0.15.44")
-    stop("native npudist NOMAD route requires crs >= 0.15-44", call. = FALSE)
+    stop("native npudist NOMAD route requires crs >= 0.15-46", call. = FALSE)
+  if (utils::packageVersion("crs") < "0.15.46")
+    stop("native npudist NOMAD route requires crs >= 0.15-46", call. = FALSE)
   invisible(TRUE)
 }
 
@@ -286,11 +278,7 @@ npudistbw.NULL <-
     int_RESTART_FROM_MIN = RE_MIN_FALSE,
     int_MINIMIZE_IO = IO_MIN_TRUE,
     bwmethod = .npudistbw_method_code(bws, where = "npudistbw"),
-    ckerneval = switch(bws$ckertype,
-      gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
-      epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
-      uniform = CKER_UNI,
-      "truncated gaussian" = CKER_TGAUSS),
+    ckerneval = npContinuousKernelCode(bws),
     ukerneval = switch(bws$ukertype,
       aitchisonaitken = UKER_AIT,
       liracine = UKER_LR),
@@ -309,6 +297,13 @@ npudistbw.NULL <-
     scale.init.categorical.sample = scale.init.categorical.sample,
     dfc.dir = 3L,
     transform.bounds = transform.bounds
+  )
+  myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
+  myopti <- c(
+    myopti,
+    categorical.compress = npStrictLogicalOption(
+      "np.categorical.compress", TRUE
+    )
   )
 
   myoptd <- list(
@@ -348,7 +343,8 @@ npudistbw.NULL <-
     penalty_mode = as.integer(if (invalid.penalty == "baseline") 1L else 0L),
     penalty_multiplier = as.double(penalty.multiplier),
     ckerlb = as.double(cker.bounds$lb),
-    ckerub = as.double(cker.bounds$ub)
+    ckerub = as.double(cker.bounds$ub),
+    declared.support = .np_native_categorical_support(bws)
   )
 }
 
@@ -386,6 +382,7 @@ npNomadNativeSearchDistribution <- function(prep,
     as.double(prep$penalty_multiplier),
     as.double(prep$ckerlb),
     as.double(prep$ckerub),
+    prep$declared.support,
     PACKAGE = "npRmpi"
   ), capture.output = TRUE)
   .np_nomad_native_call_value(native.call)
@@ -441,43 +438,85 @@ npNomadNativeSearchDistribution <- function(prep,
     list(objective = out$fval, degree = integer(0L), num.feval = out$num.feval)
   }
 
+  raw_eval_fun <- function(point) {
+    bw_vec <- .npregbw_nomad_point_to_bw(point, template = template, setup = setup)
+    tbw <- bws
+    tbw$bw <- bw_vec
+    raw_eval_bandwidth(tbw)
+  }
+
+  raw_eval_bandwidth <- function(tbw) {
+    out <- npudistbw.dbandwidth(
+      dat = dat,
+      bws = tbw,
+      gdat = gdat,
+      bandwidth.compute = TRUE,
+      nmulti = 1L,
+      powell.remin = FALSE,
+      invalid.penalty = "dbmax",
+      penalty.multiplier = opt.value("penalty.multiplier", 10),
+      scale.factor.search.lower = opt.value("scale.factor.search.lower", NULL),
+      do.full.integral = opt.value("do.full.integral", FALSE),
+      ngrid = opt.value("ngrid", 100L),
+      memfac = opt.value("memfac", 500.0),
+      bwsolver = "powell",
+      eval.only = TRUE
+    )
+    as.numeric(out$fval[1L])
+  }
+
   build_payload <- function(point, best_record, solution, interrupted) {
+    .np_nn_certify_raw_point(
+      point = point,
+      raw.eval = raw_eval_fun,
+      owner = "native npudist fixed-degree NOMAD route"
+    )
+    direct.objective <- as.numeric(best_record$objective)
     bw_vec <- .npregbw_nomad_point_to_bw(point, template = template, setup = setup)
     final.tbw <- bws
     final.tbw$bw <- bw_vec
-    final.tbw$fval <- final.tbw$ifval <- as.numeric(best_record$objective)
+    final.tbw$fval <- final.tbw$ifval <- direct.objective
     final.tbw$num.feval <- as.numeric(mads.num.feval.total)
     final.tbw$num.feval.fast <- as.numeric(mads.num.feval.fast.total)
-    final.tbw$fval.history <- as.numeric(best_record$objective)
+    final.tbw$fval.history <- direct.objective
     final.tbw$eval.history <- if (!is.null(solution$bbe)) rep(1, max(1L, as.integer(solution$bbe))) else 1
     final.tbw$invalid.history <- 0
     final.tbw$timing <- NA_real_
     direct.payload <- npudistbw.dbandwidth(dat = dat, bws = final.tbw, gdat = gdat, bandwidth.compute = FALSE)
-    direct.objective <- as.numeric(best_record$objective)
     powell.elapsed <- NA_real_
 
     if (identical(bwsolver, "mads+powell")) {
       hot.start <- proc.time()[3L]
-      hot.payload <- npudistbw.dbandwidth(
-        dat = dat,
-        bws = final.tbw,
-        gdat = gdat,
-        bandwidth.compute = TRUE,
-        nmulti = 1L,
-        powell.remin = isTRUE(opt.args$powell.remin),
-        invalid.penalty = opt.value("invalid.penalty", "baseline"),
-        penalty.multiplier = opt.value("penalty.multiplier", 10),
-        scale.factor.search.lower = opt.value("scale.factor.search.lower", NULL),
-        do.full.integral = opt.value("do.full.integral", FALSE),
-        ngrid = opt.value("ngrid", 100L),
-        memfac = opt.value("memfac", 500.0),
-        bwsolver = "powell"
+      hot.payload <- .np_nomad_with_powell_progress(
+        degree = integer(0L),
+        best_record = best_record,
+        expr = local({
+          npudistbw.dbandwidth(
+            dat = dat,
+            bws = final.tbw,
+            gdat = gdat,
+            bandwidth.compute = TRUE,
+            nmulti = 1L,
+            powell.remin = isTRUE(opt.args$powell.remin),
+            invalid.penalty = opt.value("invalid.penalty", "baseline"),
+            penalty.multiplier = opt.value("penalty.multiplier", 10),
+            scale.factor.search.lower = opt.value("scale.factor.search.lower", NULL),
+            do.full.integral = opt.value("do.full.integral", FALSE),
+            ngrid = opt.value("ngrid", 100L),
+            memfac = opt.value("memfac", 500.0),
+            bwsolver = "powell"
+          )
+        })
       )
       powell.elapsed <- proc.time()[3L] - hot.start
       hot.payload$num.feval <- as.numeric(direct.payload$num.feval[1L]) + as.numeric(hot.payload$num.feval[1L])
       hot.payload$num.feval.fast <- as.numeric(direct.payload$num.feval.fast[1L]) + as.numeric(hot.payload$num.feval.fast[1L])
+      .np_nn_certify_raw_value(
+        value = raw_eval_bandwidth(hot.payload), point = hot.payload$bw,
+        owner = "npudist MADS+Powell handoff"
+      )
       hot.objective <- as.numeric(hot.payload$fval[1L])
-      if (is.finite(hot.objective) &&
+      if (
           .np_degree_better(hot.objective, direct.objective, direction = "min"))
         return(list(payload = hot.payload, objective = hot.objective, powell.time = powell.elapsed))
     }
@@ -578,24 +617,22 @@ npNomadNativeSearchDistribution <- function(prep,
       )
       native.elapsed <- proc.time()[3L] - native.start
       native.nomad.elapsed <- native.nomad.elapsed + native.elapsed
-      if (!identical(as.integer(native.i$status[1L]), 0L) ||
-          !identical(as.integer(native.i$result_status[1L]), 0L)) {
-        stop(sprintf(
-          "native npudist NOMAD route failed (status=%s, result_status=%s): %s",
-          as.integer(native.i$status[1L]),
-          as.integer(native.i$result_status[1L]),
-          as.character(native.i$message[1L])
-        ), call. = FALSE)
-      }
+      .np_nomad_native_status(native.i, "native npudist NOMAD route")
       official.objective.i <- as.numeric(native.i$official_objective[1L])
       objective.i <- as.numeric(native.i$objective[1L])
+      raw.objective.i <- if (is.null(native.i$best_point) ||
+                             any(!is.finite(native.i$best_point))) {
+        NA_real_
+      } else {
+        raw_eval_fun(as.numeric(native.i$best_point))
+      }
       native.results[[i]] <- list(
         restart = i,
         start = as.numeric(native.start.matrix[i, ]),
         elapsed = native.elapsed,
         status = "ok",
         message = as.character(native.i$message[1L]),
-        objective = official.objective.i,
+        objective = raw.objective.i,
         bbe = as.numeric(native.i$blackbox_evaluations[1L]),
         iterations = as.numeric(native.i$iterations[1L]),
         solution = as.numeric(native.i$solution),
@@ -606,13 +643,90 @@ npNomadNativeSearchDistribution <- function(prep,
       native.num.feval.total <- native.num.feval.total + as.numeric(native.i$total_num.feval[1L])
       native.num.feval.fast.total <- native.num.feval.fast.total + as.numeric(native.i$total_num.feval.fast[1L])
       native.num.feval.guarded.total <- native.num.feval.guarded.total + as.numeric(native.i$total_num.feval.guarded[1L])
-      if (is.finite(objective.i) && objective.i < native.best.objective) {
-        native.best.objective <- objective.i
-        native.best.index <- i
+      if (.np_nn_raw_objective_valid(raw.objective.i) &&
+          objective.i < Inf) {
+        if (raw.objective.i < native.best.objective) {
+          native.best.objective <- raw.objective.i
+          native.best.index <- i
+        }
+      }
+    }
+    if (!is.finite(native.best.index) && is.null(point.start) &&
+        template$type %in% c("generalized_nn", "adaptive_nn") &&
+        bounds$ncon > 0L) {
+      penalty.objectives <- vapply(
+        native.results,
+        function(result) as.numeric(result$best_objective[1L]),
+        numeric(1L)
+      )
+      penalty.objectives[!is.finite(penalty.objectives)] <- Inf
+      incumbent.index <- if (any(is.finite(penalty.objectives))) {
+        which.min(penalty.objectives)
+      } else {
+        1L
+      }
+      # Both NN CDF criteria evaluate an n-1-row deleted-sample fit.
+      ordinary.cap <- setup$nobs - 2L
+      recovery <- .np_nn_find_raw_valid_start(
+        point = native.results[[incumbent.index]]$best_point,
+        nn.indices = seq_len(bounds$ncon),
+        caps = rep.int(ordinary.cap, bounds$ncon),
+        raw.eval = raw_eval_fun,
+        incumbent.caps = rep.int(setup$nobs - 1L, bounds$ncon)
+      )
+      if (isTRUE(recovery$found)) {
+        recovery.index <- length(native.results) + 1L
+        native.start <- proc.time()[3L]
+        native.i <- npNomadNativeSearchDistribution(
+          prep = native.prep,
+          x0 = as.numeric(recovery$point),
+          bbin = bounds$bbin,
+          lb = bounds$lower,
+          ub = bounds$upper,
+          max.eval = 0L,
+          random.seed = native.random.seed,
+          inner.start.count = native.inner.nmulti,
+          option.names = native.option.vectors$names,
+          option.values = native.option.vectors$values
+        )
+        native.elapsed <- proc.time()[3L] - native.start
+        native.nomad.elapsed <- native.nomad.elapsed + native.elapsed
+        .np_nomad_native_status(native.i, "native npudist NOMAD recovery route")
+        if (is.null(native.i$best_point) || any(!is.finite(native.i$best_point)))
+          stop("native npudist NOMAD recovery route did not return a finite best point", call. = FALSE)
+        official.objective.i <- as.numeric(native.i$official_objective[1L])
+        objective.i <- as.numeric(native.i$objective[1L])
+        raw.objective.i <- raw_eval_fun(as.numeric(native.i$best_point))
+        native.results[[recovery.index]] <- list(
+          restart = recovery.index,
+          start = as.numeric(recovery$point),
+          elapsed = native.elapsed,
+          status = "ok",
+          message = as.character(native.i$message[1L]),
+          objective = raw.objective.i,
+          bbe = as.numeric(native.i$blackbox_evaluations[1L]),
+          iterations = as.numeric(native.i$iterations[1L]),
+          solution = as.numeric(native.i$solution),
+          best_point = as.numeric(native.i$best_point),
+          best_objective = objective.i,
+          native = native.i,
+          recovery = TRUE,
+          recovery_witness = recovery
+        )
+        native.num.feval.total <- native.num.feval.total +
+          as.numeric(native.i$total_num.feval[1L])
+        native.num.feval.fast.total <- native.num.feval.fast.total +
+          as.numeric(native.i$total_num.feval.fast[1L])
+        native.num.feval.guarded.total <- native.num.feval.guarded.total +
+          as.numeric(native.i$total_num.feval.guarded[1L])
+        if (.np_nn_raw_objective_valid(raw.objective.i)) {
+          native.best.objective <- raw.objective.i
+          native.best.index <- recovery.index
+        }
       }
     }
     if (!is.finite(native.best.index))
-      stop("native npudist NOMAD route did not return a finite solution", call. = FALSE)
+      stop("native npudist NOMAD route did not return a raw-valid solution", call. = FALSE)
 
     native.best <- native.results[[native.best.index]]
     native.handoff.point <- as.numeric(native.best$best_point)
@@ -659,7 +773,7 @@ npNomadNativeSearchDistribution <- function(prep,
         bandwidth = native.bw,
         objective = native.best.objective,
         official.solution = as.numeric(native.best$solution),
-        official.objective = as.numeric(native.best$objective[1L]),
+        official.objective = as.numeric(native.best$native$official_objective[1L]),
         compiled.callback.count = as.integer(native.best$native$compiled_callback_calls[1L]),
         compiled.callback.failures = as.integer(native.best$native$compiled_callback_failures[1L]),
         crs.callback.evaluations = as.integer(native.best$native$crs_callback_evaluations[1L]),
@@ -746,10 +860,31 @@ npudistbw.dbandwidth <-
            eval.only = FALSE,
            ...,
            nomad.opts = list()){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npudistbw")
     dot.args <- list(...)
+    internal.certify <- dot.args[[".beta.range.certify", exact = TRUE]]
+    beta.range.certify <- if (is.null(internal.certify)) {
+      TRUE
+    } else {
+      npValidateScalarLogical(
+        internal.certify, ".beta.range.certify"
+      )
+    }
+    dot.args[[".beta.range.certify"]] <- NULL
     if (length(nomad.opts))
       dot.args$nomad.opts <- nomad.opts
+    certification.call <- match.call(expand.dots = FALSE)
+    certification.names <- setdiff(
+      names(certification.call)[-1L], "..."
+    )
+    certification.args <- mget(
+      certification.names, envir = environment(), inherits = FALSE
+    )
+    if (length(dot.args))
+      certification.args[names(dot.args)] <- dot.args
     elapsed.start <- proc.time()[3]
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute, "bandwidth.compute")
     bwsolver <- npValidateBwsolver(bwsolver)
@@ -772,6 +907,11 @@ npudistbw.dbandwidth <-
     if (!missing(nmulti))
       nmulti <- npValidateNmulti(nmulti)
     .npRmpi_require_active_slave_pool(where = "npudistbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_autodispatch_active()) {
       if (bandwidth.compute)
         .npudistbw_method_name(bws, where = "npudistbw")
@@ -780,7 +920,7 @@ npudistbw.dbandwidth <-
         stop("Data has no rows without NAs")
       return(.npRmpi_autodispatch_call(
         .npRmpi_autodispatch_expand_dots_call(match.call(expand.dots = FALSE)),
-        parent.frame()))
+        parent.frame(), owner.name = "npudistbw.dbandwidth"))
     }
 
     dat = toFrame(dat)
@@ -795,6 +935,20 @@ npudistbw.dbandwidth <-
       stop(paste("length of bandwidth vector does not match number of columns of",
            "'dat'"))
 
+    npValidateBetaKernelSpecification(
+      ckertype = bws[["ckertype", exact = TRUE]],
+      ckerorder = bws[["ckerorder", exact = TRUE]],
+      bwtype = bws[["type", exact = TRUE]],
+      ckerbound = bws[["ckerbound", exact = TRUE]],
+      ckerlb = bws[["ckerlb", exact = TRUE]],
+      ckerub = bws[["ckerub", exact = TRUE]],
+      dati = bws[["xdati", exact = TRUE]],
+      bw = bws[["bw", exact = TRUE]],
+      bandwidth.compute = bandwidth.compute,
+      where = "beta distribution",
+      allow.categorical = TRUE
+    )
+
     if ((any(bws$icon) &&
          !all(vapply(as.data.frame(dat[, bws$icon]), inherits, logical(1), c("integer", "numeric")))) ||
         (any(bws$iord) &&
@@ -803,8 +957,6 @@ npudistbw.dbandwidth <-
          !all(vapply(as.data.frame(dat[, bws$iuno]), inherits, logical(1), "factor"))))
       stop(paste("supplied bandwidths do not match", "'dat'", "in type"))
 
-    npValidateExtendedNnContinuousBandwidth(bws, where = "npudistbw")
-
     if(any(bws$iuno))
       stop("distribution bandwidth selection does not support unordered data types")
 
@@ -812,6 +964,9 @@ npudistbw.dbandwidth <-
     rows.omit <- unclass(na.action(dat))
     if (nrow(dat) == 0L)
       stop("Data has no rows without NAs")
+
+    npValidateExtendedNnContinuousBandwidth(bws, where = "npudistbw",
+                                           nobs = nrow(dat))
 
     nrow = dim(dat)[1]
     ncol = dim(dat)[2]
@@ -850,7 +1005,7 @@ npudistbw.dbandwidth <-
     penalty_mode <- (if (invalid.penalty == "baseline") 1L else 0L)
 
     if (bandwidth.compute && !eval.only && npBwsolverUsesMads(bwsolver)) {
-      return(.npudistbw_run_mads(
+      return(.np_bw_procedure_record(.npudistbw_run_mads(
         dat = dat.frame,
         bws = bws,
         gdat = gdat,
@@ -882,7 +1037,7 @@ npudistbw.dbandwidth <-
           nomad.opts = dot.args$nomad.opts
         ),
         bwsolver = bwsolver
-      ))
+      ), bws, "distribution", environment()))
     }
 
     if (bandwidth.compute){
@@ -906,11 +1061,7 @@ npudistbw.dbandwidth <-
         itmax=itmax, int_RESTART_FROM_MIN=(if (remin) RE_MIN_TRUE else RE_MIN_FALSE),
         int_MINIMIZE_IO=if (isTRUE(getOption("np.messages"))) IO_MIN_FALSE else IO_MIN_TRUE,
         bwmethod = .npudistbw_method_code(bws, where = "npudistbw"),
-        ckerneval = switch(bws$ckertype,
-          gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
-          epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
-          uniform = CKER_UNI,
-          "truncated gaussian" = CKER_TGAUSS),
+        ckerneval = npContinuousKernelCode(bws),
         ukerneval = switch(bws$ukertype,
           aitchisonaitken = UKER_AIT,
           liracine = UKER_LR),
@@ -929,6 +1080,13 @@ npudistbw.dbandwidth <-
         scale.init.categorical.sample = scale.init.categorical.sample,
         dfc.dir = dfc.dir,
         transform.bounds = transform.bounds)
+      myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
+      myopti <- c(
+        myopti,
+        categorical.compress = npStrictLogicalOption(
+          "np.categorical.compress", TRUE
+        )
+      )
 
       myoptd = list(ftol=ftol, tol=tol, small=small,
         lbc.dir = lbc.dir, cfac.dir = cfac.dir, initc.dir = initc.dir,
@@ -954,6 +1112,7 @@ npudistbw.dbandwidth <-
                   as.double(penalty.multiplier),
                   as.double(cker.bounds.c$lb),
                   as.double(cker.bounds.c$ub),
+                  .np_native_categorical_support(bws),
                   PACKAGE="npRmpi")
         } else {
           myout <-
@@ -967,6 +1126,7 @@ npudistbw.dbandwidth <-
                 as.double(penalty.multiplier),
                 as.double(cker.bounds.c$lb),
                 as.double(cker.bounds.c$ub),
+                .np_native_categorical_support(bws),
                 PACKAGE="npRmpi")
         }
         total.time <- proc.time()[3] - elapsed.start
@@ -1020,7 +1180,8 @@ npudistbw.dbandwidth <-
     }
 
 
-    if (tbw$ncon > 0){
+    ## Continuous NN coordinates remain counts in both metadata fields.
+    if (tbw$ncon > 0 && tbw$type == "fixed"){
       dfactor <- mysd*nconfac
 
       if (tbw$scaling) {
@@ -1049,7 +1210,7 @@ npudistbw.dbandwidth <-
                       fval.history = tbw$fval.history,
                       eval.history = tbw$eval.history,
                       invalid.history = tbw$invalid.history,
-                      nobs = tbw$nobs,
+                      nobs = nrow,
                       xdati = tbw$xdati,
                       xnames = tbw$xnames,
                       sfactor = tbw$sfactor,
@@ -1063,7 +1224,15 @@ npudistbw.dbandwidth <-
                       total.time = tbw$total.time)
     tbw <- npSetScaleFactorSearchLower(tbw, scale.factor.search.lower)
 
-    tbw
+    if (isTRUE(beta.range.certify)) {
+      tbw <- npBetaRangeCertifySelector(
+        ordinary = tbw, args = certification.args,
+        selector = npudistbw.dbandwidth, method = "cv.cdf",
+        direction = "min", elapsed.start = elapsed.start,
+        where = "beta range distribution CDF certification"
+      )
+    }
+    .np_bw_procedure_record(tbw, bws, "distribution", environment())
   }
 
 npudistbw.default <-
@@ -1111,15 +1280,23 @@ npudistbw.default <-
            transform.bounds,
            ...,
            nomad.opts = list()){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "npudistbw")
     .npRmpi_require_active_slave_pool(where = "npudistbw()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_autodispatch_active()) {
       dat.preflight <- toFrame(dat)
       if (anyNA(dat.preflight) && !any(stats::complete.cases(dat.preflight)))
         stop("Data has no rows without NAs")
       return(.npRmpi_autodispatch_call(
         .npRmpi_autodispatch_expand_dots_call(match.call(expand.dots = FALSE)),
-        parent.frame()))
+        parent.frame(), owner.name = "npudistbw.default"))
     }
 
     t.names <- NULL
@@ -1133,6 +1310,13 @@ npudistbw.default <-
 
     if (anyNA(dat) && !any(stats::complete.cases(dat)))
       stop("Data has no rows without NAs")
+
+    uniform.call.names <- names(match.call(expand.dots = FALSE))
+    npWarnIgnoredUniformKernelOrder(
+      call.names = uniform.call.names,
+      kernel.type = if ("ckertype" %in% uniform.call.names) ckertype else "gaussian",
+      order.arg = "ckerorder"
+    )
 
     ## first grab dummy args for bandwidth() and perform 'bootstrap'
     ## bandwidth() call
@@ -1193,5 +1377,5 @@ npudistbw.default <-
     environment(mc) <- parent.frame()
     tbw$call <- mc
 
-    return(tbw)
+    return(.np_bws_retain_native_training(tbw, dat = dat))
   }

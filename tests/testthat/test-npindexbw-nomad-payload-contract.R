@@ -29,6 +29,7 @@ with_nprmpi_npindex_nomad_payload_bindings <- function(bindings, code) {
 
 test_that("npindexbw retains Powell evaluation counts when Powell does not improve", {
   ns <- asNamespace("npRmpi")
+  hot.certify <- NULL
 
   result <- with_nprmpi_npindex_nomad_payload_bindings(
     list(
@@ -46,8 +47,12 @@ test_that("npindexbw retains Powell evaluation counts when Powell does not impro
           ynames = "y"
         )
       },
-      .npindexbw_eval_objective = function(param, xmat, ydat, bws, spec) {
+      .npindexbw_prepare_lp_regression_leaf_owner = function(...) list(),
+      .npindexbw_eval_objective = function(param, xmat, ydat, bws, spec, ...) {
         list(objective = 10, num.feval.fast = 3L)
+      },
+      .npindexbw_eval_objective_raw = function(param, xmat, ydat, bws, spec, ...) {
+        list(objective = 10, num.feval.fast = 3L, raw.valid = TRUE)
       },
       .np_nomad_baseline_note = function(degree) invisible(NULL),
       .np_nomad_search = function(engine,
@@ -77,8 +82,15 @@ test_that("npindexbw retains Powell evaluation counts when Powell does not impro
         )
       },
       .np_nomad_with_powell_progress = function(degree, expr, best_record = NULL) expr,
-      .npindexbw_run_fixed_degree = function(xdat, ydat, bws, template, reg.args, opt.args) {
+      .npindexbw_run_fixed_degree = function(xdat, ydat, bws, template,
+                                             reg.args, opt.args,
+                                             .certify.selected = TRUE,
+                                             .fixed.h.lower = NULL,
+                                             .rng.collective = FALSE) {
+        hot.certify <<- .certify.selected
         list(
+          beta = c(1, 0.5),
+          bw = 0.3,
           method = "ichimura",
           fval = 11,
           num.feval = 7L,
@@ -117,9 +129,10 @@ test_that("npindexbw retains Powell evaluation counts when Powell does not impro
   )
 
   expect_equal(result$payload$fval, 10)
-  expect_equal(result$payload$num.feval, 8)
-  expect_equal(result$payload$num.feval.fast, 8)
+  expect_equal(result$payload$num.feval, 9)
+  expect_equal(result$payload$num.feval.fast, 11)
   expect_equal(result$objective, 10)
+  expect_false(hot.certify)
 })
 
 test_that("npindexbw fixed NOMAD route normalizes internal h starts but keeps public restart starts raw", {
@@ -165,6 +178,7 @@ test_that("npindexbw fixed NOMAD route normalizes internal h starts but keeps pu
       .npindexbw_build_sibandwidth = function(xdat, ydat, bws, template, bandwidth.compute, reg.args) {
         baseline.bws
       },
+      .npindexbw_prepare_lp_regression_leaf_owner = function(...) list(),
       .np_nomad_baseline_note = function(degree) invisible(NULL),
       .np_nomad_search = function(engine,
                                   baseline_record,
@@ -289,6 +303,7 @@ test_that("npindexbw fixed NOMAD route preserves explicit user fixed starts", {
       .npindexbw_build_sibandwidth = function(xdat, ydat, bws, template, bandwidth.compute, reg.args) {
         baseline.bws
       },
+      .npindexbw_prepare_lp_regression_leaf_owner = function(...) list(),
       .np_nomad_baseline_note = function(degree) invisible(NULL),
       .np_nomad_search = function(engine,
                                   baseline_record,

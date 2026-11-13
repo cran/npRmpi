@@ -52,13 +52,29 @@ These arguments identify the fitted bandwidth object, formula/data interface, tr
   \item{bws}{An object of class \code{rbandwidth} or \code{npregression}.}
 
 
-  \item{data}{A data frame used with the formula interface.}
+  \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+A data frame used with the formula interface.}
 
 
   \item{exdat}{Optional evaluation predictors.}
 
 
-  \item{newdata}{Optional evaluation data for formula and predict methods.}
+  \item{newdata}{Optional evaluation data for formula and predict methods.
+    Without a new evaluation grid, prediction retains the operator's original
+    training-observation or external-query identity, including when changing
+    the derivative order. An explicit grid remains external even when its
+    coordinates equal the training data; this distinction can affect
+    nearest-neighbor radii. Formula newdata is evaluated with the trained
+    predictor transformations. Explicit native \code{exdat} takes precedence
+    over \code{newdata} and is already in the transformed predictor coordinates.
+    Retained operators carry their effective polynomial specification,
+    including construction-time degree, basis and Bernstein overrides.}
 
 
   \item{txdat}{Training predictors.}
@@ -71,7 +87,10 @@ These arguments control local-polynomial basis, degree, derivatives, leave-one-o
   \item{basis}{Local polynomial basis: \code{"glp"}, \code{"additive"}, or \code{"tensor"}.}
 
 
-  \item{bernstein.basis}{Logical; use Bernstein basis for LP terms.}
+  \item{bernstein.basis}{Logical; select the stabilized LP representation. For
+    GLP, \code{TRUE} selects the degree-graded, orthonormal shifted-Legendre
+    representation; additive and tensor bases retain their Bernstein
+    representations. See \code{\link{npreg}} for the definitions.}
 
 
   \item{degree}{Optional local polynomial degree vector override (LP path).}
@@ -80,13 +99,29 @@ These arguments control local-polynomial basis, degree, derivatives, leave-one-o
   \item{deriv}{Convenience alias for \code{s}.}
 
 
-  \item{leave.one.out}{Logical; if \code{TRUE}, compute in-sample leave-one-out hat weights. This cannot be combined with explicit \code{exdat}/\code{newdata}.}
+  \item{leave.one.out}{Logical; if \code{TRUE}, compute in-sample leave-one-out hat weights. This cannot be combined with explicit \code{exdat}/\code{newdata}.
+  Local-constant first-derivative weights with \code{leave.one.out = TRUE}
+  are not currently supported; local-constant level weights and the supported
+  local-polynomial leave-one-out derivatives remain available.}
 
 
-  \item{ridge}{Base diagonal regularization used when local systems are ill-conditioned. The ridge sequence starts at \code{0} (no regularization) and then increments by \code{1/n.train} as needed for stable solves.}
+  \item{ridge}{A finite nonnegative scalar. The default \code{0} retains the
+  existing automatic numerical ridging policy. Computational owners that
+  implement only that policy reject an explicit nonzero value rather than
+  ignoring it; the generic mixed-derivative owner continues to support an
+  explicit base ridge, with absolute increments \code{1/n.train} on that
+  explicit-ridge route. Default higher and mixed derivatives instead share
+  the canonical LP solve-admission and automatic ridge policy used by fitting.
+  Wider systems restore the response intercept from the signed pristine
+  Gram intercept.}
 
 
-  \item{s}{Derivative multi-index over continuous predictors.}
+  \item{s}{Derivative multi-index over continuous predictors, with finite
+  non-negative integer entries. A named vector selects predictors by their
+  continuous-variable names; omitted coordinates have order zero. An unnamed
+  scalar selects the first continuous predictor. Unknown or duplicated names
+  are errors. Explicit \code{s} takes precedence over the \code{deriv} alias;
+  an explicit \code{deriv} in prediction overrides the retained selector.}
 
 
 \subsection{Method Objects}{
@@ -103,7 +138,11 @@ These arguments control whether the operator is returned as a matrix, applied di
   \item{output}{Either \code{"matrix"} for the hat matrix, \code{"apply"} for direct application to \code{y}, or \code{"constraint"} for the row-weighted transpose \code{t(H) * y}.}
 
 
-  \item{y}{Optional response vector or matrix for apply mode. For \code{output = "constraint"}, \code{y} is required and must be a vector or one-column object.}
+  \item{y}{Optional response vector or matrix for apply mode. For \code{output = "constraint"}, \code{y} is required and must be a vector or one-column object.
+    When the fitted response is a factor, explicit or borrowed factor responses
+    use its retained numerical level coding, including numeric level labels.
+    Payload levels are aligned to the fitted levels. Explicit numerical vectors or matrices are
+    applied as supplied, without recoding.}
 
 
 \subsection{Additional Arguments}{
@@ -114,6 +153,31 @@ Further arguments are passed to methods.
 
 }
 \details{
+  With a formula-derived bandwidth object, supplying only \code{y}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
+Local-polynomial operators retain the fitted solve's numerical ridge
+adjustment; see Numerical Ridging in \code{\link{npreg}} and its
+Seifert--Gasser reference. A hat operator alone does not estimate residual
+variance or apply the residual normalization used by regression inference.
+Fewer nonzero-weight donor rows than basis coefficients trigger the same
+existing ridge policy as fitting, for levels and derivative operators.
+This is a structural rank bound, not a new numerical conditioning threshold.
+
 For \code{output = "matrix"}, the return value is a matrix with class
 \code{c("npreghat", "matrix")} so it can be used directly in matrix products,
 e.g. \code{H \%*\% y}. Attributes on the matrix store metadata used by
@@ -121,6 +185,44 @@ e.g. \code{H \%*\% y}. Attributes on the matrix store metadata used by
 
 For \code{output = "apply"}, the function returns \code{H^{(s)} y} directly and
 accepts matrix right-hand sides for one-shot bootstrap-style calculations.
+
+An evaluation row whose required kernel normalization is exactly zero or
+non-finite is returned as an \code{NA} hat row. Defined rows remain available,
+and every finite nonzero normalization is used literally.
+
+For non-beta local-polynomial mean operators with fixed or generalized
+nearest-neighbor bandwidths, a failed external evaluation row is returned as
+\code{NA} only when its pristine moment system is finite and every computed
+kernel weight is exactly zero. One warning identifies the affected result rows
+(after missing evaluation rows are omitted). This reports the computed weights;
+it does not distinguish absence of geometric support from numerical underflow.
+Defined rows retain their ordinary values. In matrix output, the corresponding
+\code{ridge.used} entries are \code{NA}; apply output has undefined rows, and
+constraint output has the corresponding undefined columns. Other solve failures
+and zero nearest-neighbor radii remain errors. Training, leave-one-out and
+internal complete-operator consumers retain strict failure behavior.
+
+The same all-zero-weight certificate is used for external non-beta
+local-constant (including degree-zero local-polynomial) first-derivative
+operators with fixed, generalized-nearest-neighbor or adaptive-nearest-neighbor
+bandwidths. Unsupported rows become \code{NA}, while supported derivative
+rows keep their usual values. A zero sum formed by cancellation of nonzero
+weights, non-finite arithmetic, and invalid nearest-neighbor radii remain
+errors; they are not classified as empty rows.
+
+Default higher and mixed local-polynomial derivative operators also use the
+finite-pristine-system, all-zero-weight certificate for external rows. Their
+\code{ridge.used} entries are then \code{NA}, with the same warning and output
+shapes described above. An explicit positive \code{ridge} retains its requested
+regularized operator; it is not replaced by automatic ridging or this default
+unavailable-row policy.
+
+For local-constant beta kernels, one first derivative is evaluated by the
+same analytic C kernel used by \code{npreg(..., gradients=TRUE)}. If an exact
+support endpoint creates a raw-kernel jump, the hat operator cannot know
+whether a future response will cancel it in the normalized ratio; the entire
+affected row is therefore returned as \code{NA} with a warning. The compiled
+estimator route can still return a finite response-specific gradient.
 
 For \code{output = "constraint"}, the function returns \code{t(H^{(s)}) * y},
 the row-weighted transpose commonly used as the design matrix in

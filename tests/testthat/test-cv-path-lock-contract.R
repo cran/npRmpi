@@ -34,20 +34,65 @@ locate_kernelcv_c <- function() {
   hits[[1L]]
 }
 
-test_that("CVLS LL/LP route predicate is centralized in one helper", {
+test_that("canonical LP CV route predicates remain centralized", {
   src_file <- locate_jksum_c()
   skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
 
-  lines <- readLines(src_file, warn = FALSE)
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
 
   expect_true(any(grepl("np_reg_cv_use_symmetric_dropone_path", lines, fixed = TRUE)))
   expect_true(any(grepl("np_reg_cv_use_canonical_lp_fixed_kernel", lines, fixed = TRUE)))
   expect_equal(sum(grepl("np_reg_cv_use_degree1_rawbasis_kernel", lines, fixed = TRUE)), 0L)
   expect_equal(sum(grepl("np_regression_cv_degree1_rawbasis_fixed", lines, fixed = TRUE)), 0L)
   expect_equal(sum(grepl("np_reg_degree1_center_raw_moments_at_eval", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_center_raw_moments_at_eval", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_fill_shift_raw_from_center", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_binom_coeff", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_reg_use_canonical_glp_degree1_estimation", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("use_ll_compatible_gnn_se", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("raw_degree1_glp", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_fill_basis_raw_train_centered", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_fill_basis_eval_raw_centered", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("np_glp_fill_basis_eval_deriv_raw_centered", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("LL_LL", lines, fixed = TRUE)), 0L)
+  expect_equal(sum(grepl("const int lp_engine_est = lp_engine;", lines, fixed = TRUE)), 1L)
+  # CF196 gives dense and sparse producers distinct initialized domains.
+  # Each domain retains the same multiplication fast path; neither may read
+  # sparse weights outside the XL ranges consumed by this owner.
+  weighted_owner <- grep("^void np_outer_weighted_sum\\(", lines)
+  power_start <- grep("  if(use_wpow){", lines, fixed = TRUE)
+  power_stop <- grep("  int restore_weight = do_leave_one_out;", lines,
+                     fixed = TRUE)
+  sparse_start <- grep(
+    "/* Sparse producers define only the ranges consumed below. */",
+    lines, fixed = TRUE
+  )
+  expect_length(weighted_owner, 1L)
+  expect_length(power_start, 1L)
+  expect_length(power_stop, 1L)
+  expect_length(sparse_start, 1L)
+  expect_lt(weighted_owner, power_start)
+  expect_lt(power_start, sparse_start)
+  expect_lt(sparse_start, power_stop)
+  dense_power <- lines[power_start:(sparse_start - 1L)]
+  sparse_power <- lines[sparse_start:(power_stop - 1L)]
+  for (domain in list(dense_power, sparse_power)) {
+    expect_equal(sum(grepl("if(kpow == 2)", domain, fixed = TRUE)), 1L)
+    expect_equal(sum(grepl(
+      "wbuf[k] = (weights[k] == 0.0) ? 0.0 : wk*wk;",
+      domain, fixed = TRUE
+    )), 1L)
+  }
+  expect_true(any(grepl("if(xl == NULL){", dense_power, fixed = TRUE)))
+  expect_true(any(grepl("for(k = 0; k < num_weights; k++){",
+                        dense_power, fixed = TRUE)))
+  for (token in c("m < xl->n", "begin = xl->istart[m]",
+                  "end = begin + xl->nlev[m]", "k = begin; k < end"))
+    expect_true(any(grepl(token, sparse_power, fixed = TRUE)), info = token)
+  expect_false(any(grepl("k = 0;", sparse_power, fixed = TRUE)))
 
   helper_start <- grep("^static inline int np_reg_cv_use_symmetric_dropone_path\\(", lines)
-  helper_stop <- grep("^static inline int np_reg_cv_use_canonical_ll_degree1_lp_objective\\(", lines)
+  helper_stop <- grep("^static int np_lp_fixed_tree_sparse_supported\\(", lines)
   expect_length(helper_start, 1L)
   expect_length(helper_stop, 1L)
   expect_lt(helper_start, helper_stop)
@@ -58,50 +103,860 @@ test_that("CVLS LL/LP route predicate is centralized in one helper", {
   expect_true(grepl("BANDWIDTH_reg == BW_ADAP_NN", helper_body, fixed = TRUE))
 
   helper_calls <- sum(grepl("np_reg_cv_use_symmetric_dropone_path\\(", lines))
-  expect_gte(helper_calls, 3L)
+  expect_gte(helper_calls, 2L)
 
   canonical_lp_calls <- sum(grepl("np_reg_cv_use_canonical_lp_fixed_kernel\\(", lines))
-  expect_gte(canonical_lp_calls, 3L)
+  expect_gte(canonical_lp_calls, 2L)
+
+  canonical_start <- grep(
+    "^static inline int np_reg_cv_use_canonical_lp_fixed_kernel\\(",
+    lines
+  )
+  canonical_stop <- grep(
+    "^static int np_lp_fixed_tree_sparse_supported\\(",
+    lines
+  )
+  expect_length(canonical_start, 1L)
+  expect_length(canonical_stop, 1L)
+  expect_lt(canonical_start, canonical_stop)
+
+  canonical_body <- paste(
+    lines[canonical_start:(canonical_stop - 1L)],
+    collapse = "\n"
+  )
+  expect_true(grepl("const int nterms", canonical_body, fixed = TRUE))
+  expect_true(any(grepl(
+    "NP_REG_CV_LP_RESIDENT_MAX_TERMS = 6",
+    lines,
+    fixed = TRUE
+  )))
+  expect_true(grepl(
+    "return use_tree || (nterms <= NP_REG_CV_LP_RESIDENT_MAX_TERMS);",
+    canonical_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("const int *kernel_c", canonical_body, fixed = TRUE))
+  expect_false(grepl("int_glp_basis_extern", canonical_body, fixed = TRUE))
+  expect_false(grepl("NP_REG_CV_LP_TOPOLOGY_GAUSSIAN_MAX_TERMS", canonical_body, fixed = TRUE))
+  expect_false(grepl("NP_REG_CV_LP_TOPOLOGY_EPAN_MAX_TERMS", canonical_body, fixed = TRUE))
+  expect_false(grepl("use_bernstein", canonical_body, fixed = TRUE))
+  expect_false(any(grepl(
+    "np_regression_cv_lp_rawbasis_fixed",
+    lines,
+    fixed = TRUE
+  )))
 })
 
-test_that("density CV tree-bypass predicate is centralized in one helper", {
+test_that("legacy LL compute engines and restoration switches are absent", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "package C sources unavailable in this test context")
+
+  src_dir <- dirname(src_file)
+  source_files <- file.path(src_dir, c(
+    "headers.h", "jksum.c", "kernelcv.c", "np.c"
+  ))
+  skip_if_not(all(file.exists(source_files)), "complete package C sources unavailable")
+
+  source <- paste(unlist(lapply(source_files, np_test_read_incumbent_c_source, warn = FALSE)),
+                  collapse = "\n")
+  forbidden <- c(
+    "LL_LL",
+    "REGTYPE_LL",
+    "REG_OLDREGI",
+    "old_reg",
+    "kernel_estimate_regression_categorical_leave_one_out",
+    "kernel_estimate_regression_categorical_no_stderr",
+    "kernel_estimate_regression_categorical_aic_c",
+    "kernel_estimate_categorical_gradient_ocg_fast"
+  )
+  for (token in forbidden)
+    expect_false(grepl(token, source, fixed = TRUE), info = token)
+
+  for (token in c("LL_LC", "LL_LP", "LL_GLP", "int_ll", "int_ll_extern"))
+    expect_false(grepl(token, source, fixed = TRUE), info = token)
+  expect_true(grepl("NP_LP_ENGINE_SCALAR", source, fixed = TRUE))
+  expect_true(grepl("NP_LP_ENGINE_GENERAL", source, fixed = TRUE))
+})
+
+test_that("fixed resident-row LP CV uses the reusable uncentered solve workspace", {
   src_file <- locate_jksum_c()
   skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
 
-  lines <- readLines(src_file, warn = FALSE)
-  expect_true(any(grepl("np_den_cv_use_tree_bypass_path", lines, fixed = TRUE)))
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^static NPRegCvLpResult np_regression_cv_lp_basis_fixed\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^double np_kernel_estimate_regression_categorical_ls_aic\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
 
-  raw_pred <- "gate_x_all_large_fixed || !int_TREE_XY || (BANDWIDTH_den == BW_ADAP_NN)"
-  # One raw predicate instance is allowed (the helper definition itself).
-  expect_equal(sum(grepl(raw_pred, lines, fixed = TRUE)), 1L)
-  # No inline ad hoc usage in if-statements.
-  expect_equal(sum(grepl("if\\(gate_x_all_large_fixed \\|\\| !int_TREE_XY \\|\\| \\(BANDWIDTH_den == BW_ADAP_NN\\)\\)", lines)), 0L)
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "solve_workspace.gram_source[a + b*nterms] = sj[a*nterms+b];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "fit += eval_basis[a]*solve_workspace.rhs_work[a];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "hii += eval_basis[a]*solve_workspace.rhs_work[nterms + a];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_response_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl(
+    "ridge_steps >= NP_LP_SOLVE_MAX_RIDGE_STEPS",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("fit = DELTA[0][0];", helper_body, fixed = TRUE))
+  expect_false(grepl("center_raw", helper_body, fixed = TRUE))
+  expect_false(grepl("SHIFT", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_inv00", helper_body, fixed = TRUE))
 })
 
-test_that("conditional CV large-kernel gating keeps Y and XY activation routes live", {
+test_that("all-large, packed, and nearest-neighbor LP CV avoid legacy solve marshalling", {
   src_file <- locate_jksum_c()
   skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
 
-  lines <- readLines(src_file, warn = FALSE)
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^double np_kernel_estimate_regression_categorical_ls_aic\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^np_distribution_cvls_ordered_profile_stream\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
 
-  expect_false(any(grepl("Canonical conditional CV gate policy: large-kernel shortcuts are X-only", lines, fixed = TRUE)))
-  expect_gte(sum(grepl("^\\s*gate_y_active = 1;\\s*$", lines)), 2L)
-  expect_gte(sum(grepl("^\\s*gate_xy_active = 1;\\s*$", lines)), 1L)
-  expect_equal(sum(grepl("^\\s*gate_y_active = 0;\\s*$", lines)), 0L)
-  expect_equal(sum(grepl("^\\s*gate_xy_active = 0;\\s*$", lines)), 0L)
+  helper_lines <- lines[helper_start:(helper_stop - 1L)]
+  helper_body <- paste(helper_lines, collapse = "\n")
+  lp_gate_anchor <- grep(
+    "if\\(use_canonical_lp_kernel && !all_large_gate\\)",
+    helper_lines
+  )
+  lp_alllarge_start <- grep(
+    "^      if\\(all_large_gate\\)\\{$",
+    helper_lines
+  )
+  lp_alllarge_start <- lp_alllarge_start[
+    lp_alllarge_start > lp_gate_anchor
+  ][1L]
+  lp_alllarge_stop <- grep(
+    "^    const int nrc1 = glp_nterms;$",
+    helper_lines
+  )
+  expect_length(lp_gate_anchor, 1L)
+  expect_length(lp_alllarge_start, 1L)
+  expect_length(lp_alllarge_stop, 1L)
+  expect_lt(lp_alllarge_start, lp_alllarge_stop)
+  lp_alllarge_body <- paste(
+    helper_lines[lp_alllarge_start:(lp_alllarge_stop - 1L)],
+    collapse = "\n"
+  )
+  expect_true(grepl(
+    paste(
+      "np_lp_solve_workspace_reserve(",
+      "      &solve_workspace,",
+      "      nrc1,",
+      "      solve_nrhs)",
+      sep = "\n"
+    ),
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "solve_workspace.gram_source[i+k*nrc1]",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "mhat += evalv[i]*solve_workspace.rhs_work[i];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_response_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl(
+    "np_lp_solve_workspace_solve_response(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl(
+    "np_lp_solve_workspace_solve_adjoint_factored(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "hii += evalv[i]*solve_workspace.rhs_work[nrc1 + i];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_reserve(&inverse_workspace, k, 1)",
+    lp_alllarge_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_invert_retryable(",
+    lp_alllarge_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "inverse_workspace.matrix_copy[a + b*k] += za*zb;",
+    lp_alllarge_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_inv(", lp_alllarge_body, fixed = TRUE))
+  expect_false(grepl("MATRIX XtX", lp_alllarge_body, fixed = TRUE))
+  expect_false(grepl("MATRIX XTKY", helper_body, fixed = TRUE))
+  expect_false(grepl("DELTA", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
 })
 
-test_that("conditional public LP CV routes stay thin kernelcv dispatches", {
+test_that("canonical LP fit and evaluation avoid legacy solve marshalling", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  shortcut_start <- grep(
+    "^int kernel_estimate_regression_categorical_tree_np\\(",
+    lines
+  )
+  shortcut_stop <- grep("^  if\\(estimation_shortcut_done\\) \\{$", lines)
+  expect_length(shortcut_start, 1L)
+  expect_length(shortcut_stop, 1L)
+  expect_lt(shortcut_start, shortcut_stop)
+
+  shortcut_body <- paste(
+    lines[shortcut_start:(shortcut_stop - 1L)],
+    collapse = "\n"
+  )
+  expect_true(grepl(
+    "np_lp_full_row_workspace_reserve(",
+    shortcut_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_invert_retryable(",
+    shortcut_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_pack_inverse_rows(",
+    shortcut_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "inverse_workspace.matrix_copy[a + b*glp_nterms] += za*zb;",
+    shortcut_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("mat_inv(", shortcut_body, fixed = TRUE))
+  expect_false(grepl("MATRIX XtX", shortcut_body, fixed = TRUE))
+
+  helper_start <- grep(
+    "^static NP_ALWAYS_INLINE SEXP np_regression_general_lp_fit_body\\($",
+    lines
+  )
+  helper_stop <- grep("^static int np_regression_general_lp_fit\\($", lines)
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&owner->solve_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "call->mean[j] += owner->eval_basis[i]*owner->coefficient[i];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "call->gradient[l][j] += direction[i]*owner->coefficient[i];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "owner->solve_workspace.rhs_source[i] = owner->eval_basis[i];",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_factored(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_variance_quadratic(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX XTKY", helper_body, fixed = TRUE))
+  expect_false(grepl("DELTA", helper_body, fixed = TRUE))
+  expect_false(grepl("KWM_INV", helper_body, fixed = TRUE))
+  expect_false(grepl("center_raw", helper_body, fixed = TRUE))
+  expect_false(grepl("SHIFT", helper_body, fixed = TRUE))
+})
+
+test_that("canonical LP hat and apply routes share the typed solve policy", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  hat_start <- grep("^int np_regression_lp_hat_matrix\\(", lines)
+  hat_stop <- grep("^typedef struct \\{$", lines)
+  hat_stop <- hat_stop[hat_stop > hat_start][1L]
+  apply_start <- grep("^int np_regression_lp_apply_matrix\\(", lines)
+  apply_stop <- grep("^static void np_conditional_yrow_ctx_clear\\(", lines)
+  expect_length(hat_start, 1L)
+  expect_length(hat_stop, 1L)
+  expect_length(apply_start, 1L)
+  expect_length(apply_stop, 1L)
+  expect_lt(hat_start, hat_stop)
+  expect_lt(apply_start, apply_stop)
+
+  hat_body <- paste(lines[hat_start:(hat_stop - 1L)], collapse = "\n")
+  apply_body <- paste(lines[apply_start:(apply_stop - 1L)], collapse = "\n")
+  for (helper_body in list(hat_body, apply_body)) {
+    expect_true(grepl(
+      "np_lp_solve_workspace_reserve(&solve_workspace,",
+      helper_body,
+      fixed = TRUE
+    ))
+    expect_false(grepl(
+      "np_lp_solve_workspace_solve(&solve_workspace,",
+      helper_body,
+      fixed = TRUE
+    ))
+    expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+    expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+    expect_false(grepl("MATRIX XTKY", helper_body, fixed = TRUE))
+    expect_false(grepl("DELTA", helper_body, fixed = TRUE))
+  }
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    hat_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "&solve_diagnostics",
+    hat_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "ridge_used_out[i] = solve_diagnostics.ridge_total;",
+    hat_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_conditional_kernel_row(kernel_cx,",
+    hat_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl(
+    "np_conditional_kernel_row_raw(kernel_cx,",
+    hat_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_response_ranked(",
+    apply_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "matrix_bandwidth_eval_one[l][0] =",
+    apply_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "matrix_bandwidth_eval_one,",
+    apply_body,
+    fixed = TRUE
+  ))
+
+  np_source_file <- file.path(dirname(src_file), "np.c")
+  skip_if_not(file.exists(np_source_file), "source file src/np.c unavailable")
+  np_source <- paste(np_test_read_incumbent_c_source(np_source_file, warn = FALSE), collapse = "\n")
+  expect_true(grepl(
+    "setAttrib(out, install(\"ridge.used\"), ridge_used);",
+    np_source,
+    fixed = TRUE
+  ))
+})
+
+test_that("conditional LP LOO rows preserve signed deletion and beta deleted-sample rows and no QR", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  source <- paste(lines, collapse = "\n")
+  solve_file <- file.path(dirname(src_file), "jksum_lp_solve.c")
+  skip_if_not(file.exists(solve_file), "source file src/jksum_lp_solve.c unavailable")
+  solve_source <- paste(np_test_read_incumbent_c_source(solve_file, warn = FALSE), collapse = "\n")
+  header_file <- file.path(dirname(src_file), "jksum_lp_solve.h")
+  skip_if_not(file.exists(header_file), "source file src/jksum_lp_solve.h unavailable")
+  header_source <- paste(np_test_read_incumbent_c_source(header_file, warn = FALSE), collapse = "\n")
+
+  for (obsolete in c(
+    "NPGLPQRDropWorkspace",
+    "np_glp_qr_drop_workspace_",
+    "dqrdc2",
+    "dqrqy",
+    "positive_weights_only"
+  )) {
+    expect_false(grepl(obsolete, source, fixed = TRUE))
+    expect_false(grepl(obsolete, solve_source, fixed = TRUE))
+    expect_false(grepl(obsolete, header_source, fixed = TRUE))
+  }
+
+  delete_calls <- gregexpr(
+    "np_lp_delete_denominator\\(", source, perl = TRUE
+  )[[1L]]
+  guarded_delete_calls <- gregexpr(
+    "(?:if\\s*\\(|&&\\s*|\\|\\|\\s*)!np_lp_delete_denominator\\(",
+    source,
+    perl = TRUE
+  )[[1L]]
+  expect_gt(sum(delete_calls > 0L), 0L)
+  expect_identical(
+    sum(guarded_delete_calls > 0L),
+    sum(delete_calls > 0L)
+  )
+  beta_provider_start <- grep(
+    "static int np_conditional_cvls_provider_x_row(",
+    lines,
+    fixed = TRUE
+  )
+  beta_provider_stop <- grep(
+    "static int np_conditional_cvls_provider_y_train_row(",
+    lines,
+    fixed = TRUE
+  )
+  expect_length(beta_provider_start, 1L)
+  expect_length(beta_provider_stop, 1L)
+  expect_lt(beta_provider_start, beta_provider_stop)
+  beta_provider <- paste(
+    lines[beta_provider_start:(beta_provider_stop - 1L)],
+    collapse = "\n"
+  )
+  expect_true(grepl(
+    "np_beta_scaled_row_context_fill_omitting(",
+    beta_provider,
+    fixed = TRUE
+  ))
+  expect_false(grepl("np_lp_delete_denominator(", beta_provider, fixed = TRUE))
+  expect_false(grepl("fabs(", beta_provider, fixed = TRUE))
+  expect_true(grepl(
+    "np_regression_cv_lp_continuous_route",
+    source,
+    fixed = TRUE
+  ))
+  for (owner in c("np_conditional_xrow_from_ctx_impl",
+                  "np_conditional_deleted_from_ctx_core",
+                  "np_conditional_x_weight_row_stream_core_impl",
+                  "np_conditional_x_weight_block_stream_core_impl",
+                  "np_conditional_deleted_block")) {
+    body <- npRmpi_test_extract_c_function(lines, owner)
+    expect_match(body, "if(!(fabs(row_sum) > DBL_MIN))", fixed = TRUE)
+    expect_match(body, "kw[j]/row_sum", fixed = TRUE)
+  }
+
+  expect_false(grepl("np_conditional_x_weight_block_pair", source,
+                     fixed = TRUE))
+  expect_true(grepl(
+    "denominator += kw[i]*zi*zi;",
+    solve_source,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "const double value = kw[i]*basis_train[i]*projection;",
+    solve_source,
+    fixed = TRUE
+  ))
+})
+
+test_that("conditional LP block rows reuse one canonical solve workspace", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^static int np_conditional_x_weight_block_stream_core_impl\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^static int np_conditional_x_weight_block_stream_core_ctx\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "NPLPSolveWorkspace solve_workspace;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&solve_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "solve_workspace.gram_source[a + b*k] += wj*za*zb;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_delete_denominator(rows_out[i][eval_idx], &den)",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl("suppress_nn_parallel", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("np_mat_bad_rcond_sym(", helper_body, fixed = TRUE))
+})
+
+test_that("conditional and regression LP rows share one canonical solve policy", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  struct_start <- grep("^typedef struct \\{$", lines)
+  struct_stop <- grep("^} NPConditionalXRowCtx;$", lines)
+  impl_start <- grep(
+    "^static int (NP_NOINLINE )?(NP_HOT_ALIGN )?np_conditional_xrow_from_ctx_impl\\(",
+    lines
+  )
+  conditional_start <- grep("^static int np_conditional_xrow_influence\\(", lines)
+  regression_start <- grep("^static int np_regression_xrow_canonical_influence\\(", lines)
+  prepare_start <- grep("^static int np_conditional_xrow_ctx_prepare_impl\\(", lines)
+  clear_start <- grep("^static void np_conditional_xrow_ctx_clear\\(", lines)
+  wrapper_start <- grep("^static int np_conditional_xrow_from_ctx\\(", lines)
+  expect_length(struct_stop, 1L)
+  struct_start <- struct_start[struct_start < struct_stop]
+  struct_start <- tail(struct_start, 1L)
+  expect_length(struct_start, 1L)
+  expect_length(clear_start, 1L)
+  expect_length(prepare_start, 1L)
+  expect_length(conditional_start, 1L)
+  expect_length(regression_start, 1L)
+  expect_length(impl_start, 1L)
+  expect_length(wrapper_start, 1L)
+
+  struct_body <- paste(lines[struct_start:struct_stop], collapse = "\n")
+  clear_body <- paste(lines[clear_start:(prepare_start - 1L)], collapse = "\n")
+  prepare_body <- paste(lines[prepare_start:(conditional_start - 1L)], collapse = "\n")
+  conditional_body <- paste(lines[conditional_start:(regression_start - 1L)], collapse = "\n")
+  regression_body <- paste(lines[regression_start:(impl_start - 1L)], collapse = "\n")
+  impl_body <- paste(lines[impl_start:(wrapper_start - 1L)], collapse = "\n")
+
+  expect_true(grepl(
+    "NPLPSolveWorkspace regression_solve_workspace;",
+    struct_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_clear(&ctx->regression_solve_workspace);",
+    clear_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&ctx->regression_solve_workspace,",
+    prepare_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    conditional_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "ctx->regression_solve_workspace.gram_source[a + b*k] += wj*za*zb;",
+    conditional_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    regression_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_conditional_xrow_influence(",
+    impl_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_regression_xrow_canonical_influence(",
+    impl_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("MATRIX KWM", impl_body, fixed = TRUE))
+  expect_false(grepl("mat_creat(", impl_body, fixed = TRUE))
+  expect_false(grepl("mat_solve(", impl_body, fixed = TRUE))
+  expect_false(grepl("np_mat_bad_rcond_sym(", impl_body, fixed = TRUE))
+})
+
+test_that("conditional LP block rows reuse canonical solve storage", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^static int np_conditional_x_weight_block_stream_core_impl\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^static int np_conditional_x_weight_block_stream_core_ctx\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "NPLPSolveWorkspace solve_workspace;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("if((!drop_eval_self) &&", helper_body, fixed = TRUE))
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&solve_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "solve_workspace.gram_source[a + b*k] += wj*za*zb;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_creat(", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("np_mat_bad_rcond_sym(", helper_body, fixed = TRUE))
+})
+
+test_that("conditional LP dense proof-row graph is absent from production", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  source <- paste(np_test_read_incumbent_c_source(src_file, warn = FALSE), collapse = "\n")
+  retired <- c(
+    "np_shadow_conditional_build_x_weights_core",
+    "np_shadow_conditional_build_x_weights",
+    "np_shadow_conditional_build_x_weights_full",
+    "np_shadow_conditional_build_y_matrix",
+    "np_shadow_cv_con_density_ml",
+    "np_shadow_cv_con_density_ls",
+    "np_shadow_cv_con_distribution_ls"
+  )
+  for (symbol in retired) {
+    expect_false(grepl(symbol, source, fixed = TRUE))
+  }
+})
+
+test_that("conditional LP row-stream rows use bounded canonical solve storage", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^static int np_conditional_x_weight_row_stream_core_impl\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^static int np_conditional_x_weight_row_stream_core\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "NPLPSolveWorkspace solve_workspace;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("if((!drop_eval_self) &&", helper_body, fixed = TRUE))
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&solve_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "solve_workspace.gram_source[a + b*k] += wj*za*zb;",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_creat(", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("np_mat_bad_rcond_sym(", helper_body, fixed = TRUE))
+})
+
+test_that("conditional LP all-large retained inverses use bounded workspace storage", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep(
+    "^static int np_conditional_lp_all_large_ctx_prepare_core\\(",
+    lines
+  )
+  helper_stop <- grep(
+    "^static int np_conditional_lp_all_large_ctx_prepare_cvml\\(",
+    lines
+  )
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "np_lp_full_row_workspace_reserve(&ctx->inverse_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_invert(&ctx->inverse_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_full_row_workspace_invert(&ctx->inverse_original_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("MATRIX XtX", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_creat(", helper_body, fixed = TRUE))
+  expect_false(grepl("mat_inv(", helper_body, fixed = TRUE))
+  expect_false(grepl("np_mat_bad_rcond_sym(", helper_body, fixed = TRUE))
+})
+
+test_that("canonical LP direct-apply route uses the typed response solve", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  helper_start <- grep("^int np_regression_lp_apply_matrix\\(", lines)
+  helper_stop <- grep("^static void np_conditional_yrow_ctx_clear\\(", lines)
+  expect_length(helper_start, 1L)
+  expect_length(helper_stop, 1L)
+  expect_lt(helper_start, helper_stop)
+
+  helper_body <- paste(lines[helper_start:(helper_stop - 1L)], collapse = "\n")
+  expect_true(grepl(
+    "np_lp_solve_workspace_reserve(&solve_workspace,",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_response_ranked(",
+    helper_body,
+    fixed = TRUE
+  ))
+  expect_false(grepl("mat_solve(", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX KWM", helper_body, fixed = TRUE))
+  expect_false(grepl("MATRIX XTKY", helper_body, fixed = TRUE))
+  expect_false(grepl("DELTA", helper_body, fixed = TRUE))
+})
+
+test_that("obsolete density CV tree-bypass shim remains eradicated", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  expect_false(any(grepl(
+    "np_den_cv_use_tree_bypass_path",
+    lines,
+    fixed = TRUE
+  )))
+})
+
+test_that("live generic conditional CV keeps Y-side gating enabled", {
+  src_file <- locate_jksum_c()
+  skip_if(is.null(src_file), "source file src/jksum.c unavailable in this test context")
+
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
+  start <- grep(
+    "^int np_kernel_estimate_con_distribution_categorical_leave_one_out_ls_cv\\(",
+    lines
+  )
+  stop <- grep(
+    "^int np_kernel_estimate_con_density_categorical_leave_one_out_ls_cv\\(",
+    lines
+  )
+  expect_length(start, 1L)
+  expect_length(stop, 1L)
+  expect_gt(stop, start)
+  body <- lines[start:(stop - 1L)]
+
+  expect_false(any(grepl(
+    "Canonical conditional CV gate policy: large-kernel shortcuts are X-only",
+    body,
+    fixed = TRUE
+  )))
+  expect_equal(sum(grepl("^\\s*gate_y_active = 1;\\s*$", body)), 1L)
+  expect_equal(sum(grepl("^\\s*gate_y_active = 0;\\s*$", body)), 0L)
+})
+
+test_that("conditional public LP CV routes have one kernelcv dispatch", {
   src_file <- locate_kernelcv_c()
   skip_if(is.null(src_file), "source file src/kernelcv.c unavailable in this test context")
 
-  lines <- readLines(src_file, warn = FALSE)
+  lines <- np_test_read_incumbent_c_source(src_file, warn = FALSE)
 
-  expect_equal(sum(grepl("^double cv_func_con_density_categorical_ml\\(", lines)), 1L)
-  expect_equal(sum(grepl("^double cv_func_con_density_categorical_ls\\(", lines)), 1L)
+  expect_equal(sum(grepl("^double cv_func_con_density_categorical_ml\\(", lines)), 0L)
+  expect_equal(sum(grepl("^double cv_func_con_density_categorical_ls\\(", lines)), 0L)
   expect_equal(sum(grepl("^double cv_func_con_distribution_categorical_ls\\(", lines)), 1L)
   expect_equal(sum(grepl("^double np_cv_func_con_density_categorical_ml\\(", lines)), 1L)
-  expect_equal(sum(grepl("^double np_cv_func_con_density_categorical_ls\\(", lines)), 1L)
+  expect_equal(sum(grepl("^double np_cv_func_con_density_categorical_ls\\(", lines)), 0L)
+  expect_equal(sum(grepl("^double np_cv_func_con_density_categorical_ls_npksum\\(", lines)), 1L)
   expect_false(any(grepl("np_shadow_proof_cv_con_density_ml\\(", lines)))
   expect_false(any(grepl("np_shadow_proof_cv_con_density_ls\\(", lines)))
   expect_false(any(grepl("np_shadow_proof_cv_con_distribution_ls\\(", lines)))

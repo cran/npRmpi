@@ -25,6 +25,7 @@ npscoef(bws, \dots)
         data = NULL, 
         newdata = NULL, 
         y.eval = FALSE, 
+        se = FALSE,
         \dots)
 
 
@@ -33,6 +34,7 @@ npscoef(bws, \dots)
         tydat, 
         tzdat, 
         nomad = FALSE, 
+        se = FALSE,
         \dots)
 
 \method{npscoef}{scbandwidth}(bws,
@@ -43,7 +45,7 @@ npscoef(bws, \dots)
         eydat,
         ezdat,
         betas = FALSE,
-        errors = TRUE,
+        se = FALSE,
         iterate = TRUE,
         leave.one.out = FALSE,
         maxiter = 100,
@@ -71,6 +73,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing
     the variables
@@ -155,7 +164,12 @@ These arguments control where the smooth-coefficient fit is evaluated and which 
     which
     the regression will be estimated
     (evaluation data), which corresponds to \eqn{Z}
-    in the model equation. Defaults to be the same as \code{txdat}.
+    in the model equation. With separate training \code{tzdat}, this defaults
+    to \code{tzdat}; otherwise it follows \code{exdat}. Supplying only
+    \code{ezdat} evaluates at the original training \code{txdat}. The two
+    evaluation roles must have the same row count before omitting missing rows.
+    Native \code{exdat} and \code{ezdat} columns correspond positionally to
+    their training roles; different column labels do not change this mapping.
   }
 
 
@@ -184,16 +198,19 @@ These arguments control returned coefficient estimates, errors, residuals, and i
   }
 
 
-  \item{errors}{
+  \item{se}{
     a logical value indicating whether or not asymptotic standard errors
     should be computed and returned in the resulting
-    \code{smoothcoefficient} object. Defaults to \code{TRUE}.
+    \code{smoothcoefficient} object. Defaults to \code{FALSE}.
   }
 
 
   \item{iterate}{
     a logical value indicating whether or not backfitted estimates
     should be iterated for self-consistency. Defaults to \code{TRUE}.
+    Fitted objects retain this control, \code{maxiter}, \code{tol}, and
+    \code{leave.one.out} for prediction and lazy residual extraction.
+    Explicit controls supplied to \code{predict} override retained values.
   }
 
 
@@ -214,7 +231,8 @@ These arguments control returned coefficient estimates, errors, residuals, and i
   \item{residuals}{
     a logical value indicating that you want residuals computed and
     returned in the resulting \code{smoothcoefficient} object. Defaults to
-    \code{FALSE}.
+    \code{FALSE}. Residuals refer to the training sample, including when
+    evaluation data are supplied, and do not require \code{se = TRUE}.
   }
 
 
@@ -238,7 +256,68 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
 
   }
 }
+\details{
+  The primary response must be a one-dimensional numeric (integer or double)
+  vector. Factors and ordered factors are not accepted as primary responses,
+  including retained responses used in a new fit or bandwidth search.
+  The same requirement applies to explicitly selected evaluation responses.
+  Prediction without selected evaluation outcomes does not require a response
+  column. An explicit formula transformation that returns numeric values is
+  accepted; numerical scores are a modeling choice made by the user.
+  Categorical predictors retain their existing support. Internal auxiliary
+  responses used to represent predictors retain their established encoding.
+
+  Prediction with \code{se.fit = TRUE} reports known training mean squared
+  error in \code{residual.scale}, retaining MSE units, or \code{NA} when
+  training provenance is unavailable. Evaluation outcomes do not replace this
+  training score. No additional fit is performed to recover it.
+
+  In native calls, three unnamed arguments follow the fitter's bandwidth-first
+  convention: \code{npscoef(bws, txdat, tydat)}; replacing training data
+  does not reuse a separate smoothing sample from the bandwidth object.
+  Supply \code{tzdat} explicitly to replace that role; otherwise the smoothing data default
+  to the training predictors. Numeric argument types cannot distinguish this
+  from an intended data-first call. To select bandwidths with separate smoothing
+  data, write \code{npscoef(xdat, ydat, zdat = zdat)} or name all data roles.
+  The selector \code{npscoefbw(xdat, ydat, zdat)} retains its data-first
+  convention. No argument roles are inferred from vector lengths or values.
+
+  With a formula-derived bandwidth object, supplying only \code{tydat}
+  replaces the evaluated response in retained-training-sample order: one row
+  per observation retained after the original subset and missing-value selection.
+  Original excluded rows are not restored; row names or equal lengths do not
+  imply original-data order. The effective \code{na.action} is then applied
+  jointly to the retained predictors and replacement response; any new omission
+  indices refer to this retained sample. The selected bandwidths remain fixed,
+  and the returned object retains the replacement sample for subsequent refits.
+  Use \code{data} for full formula-data replacement, not together with a partial
+  response replacement. Explicit native training arguments retain their separate
+  positional contract.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} is split into
+  \code{exdat} and \code{ezdat} using the retained predictor and smoothing
+  variable names. Names must identify both roles unambiguously;
+  explicitly supplied native evaluation arguments take precedence. This
+  evaluates at the requested rows without repeating bandwidth selection.
+
+}
 \value{
+  When an external evaluation row has no usable kernel support or its
+  kernel-weighted system cannot be solved, the corresponding fitted value,
+  coefficients and requested standard errors are \code{NA}. One warning
+  identifies affected rows; valid rows are retained in their original order.
+  A larger bandwidth or another kernel may provide usable support.
+  Required training and bootstrap fits instead signal an error on this
+  failure; they do not silently discard rows. Being outside the training
+  range alone does not imply that a local fit is undefined.
+
   \code{npscoef} returns a \code{smoothcoefficient} object.   The generic
   functions \code{\link{fitted}}, \code{\link{residuals}}, \code{\link{coef}},
   \code{\link{se}}, and \code{\link{predict}},
@@ -252,7 +331,7 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   \item{eval}{ evaluation points }
   \item{mean}{ estimation of the regression function (conditional mean) at the
     evaluation points }
-  \item{merr}{ if \code{errors = TRUE}, standard errors of the
+  \item{merr}{ if \code{se = TRUE}, standard errors of the
     regression estimates }
   \item{beta}{ if \code{betas = TRUE}, estimates of the coefficients
     \eqn{\gamma}{gamma} at the
@@ -260,12 +339,17 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   \item{grad}{ estimated derivatives of the conditional mean with
     respect to the regressors in \code{xdat}; these correspond to the
     non-intercept smooth coefficient estimates at each evaluation point}
-  \item{gerr}{ if \code{errors = TRUE}, asymptotic standard errors for
+  \item{gerr}{ if \code{se = TRUE}, asymptotic standard errors for
     \code{grad} }
-  \item{resid}{ if \code{residuals = TRUE}, in-sample or out-of-sample
-    residuals where appropriate (or possible) }
+  \item{resid}{ if \code{residuals = TRUE}, training responses minus their
+    fitted training values, restored to training rows under \code{na.exclude}.
+    Evaluation responses, when supplied, are used for evaluation goodness-of-fit
+    summaries, not to redefine these residuals. }
   \item{R2}{ coefficient of determination (Doksum and Samarov (1995))}
   \item{MSE}{ mean squared error }
+  \item{training.MSE}{Known mean squared error against the training outcomes,
+    retained independently of any evaluation-outcome override; \code{NA} when
+    it is unavailable without another fit.}
   \item{MAE}{ mean absolute error }
   \item{MAPE}{ mean absolute percentage error }
   \item{CORR}{ absolute value of Pearson's correlation coefficient }
@@ -274,6 +358,11 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
 
 }
 \section{Book And Method Pointers}{
+  Smooth-coefficient moment solves use their own bounded numerical ridging;
+  see \code{\link{npreg}} for its Seifert--Gasser motivation.
+  The smooth-coefficient covariance is a separate moment calculation, not
+  the ordinary-regression residual-normalized sandwich.
+
   The smooth-coefficient model lets slopes vary with conditioning
   variables, typically written
   \eqn{Y=X^\prime\beta(Z)+\epsilon}. The functions estimate the
@@ -335,13 +424,22 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
 
   For practitioners who want the recommended automatic local-polynomial degree-and-bandwidth NOMAD route
   without spelling out all LP tuning arguments,
@@ -355,6 +453,24 @@ Further arguments are passed to the bandwidth-selection counterpart when bandwid
   Support for backfitted bandwidths is experimental and is limited in
   functionality. The code does not support asymptotic standard errors
   or out of sample estimates with backfitting.
+}
+
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{
@@ -405,7 +521,7 @@ bw <- npscoefbw(y~x|z)
 
 summary(bw)
 
-model <- npscoef(bws=bw, gradients=TRUE)
+model <- npscoef(bws=bw)
 
 summary(model)
 

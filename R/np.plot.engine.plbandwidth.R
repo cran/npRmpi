@@ -39,9 +39,9 @@
            plot.errors.method = c("none","bootstrap","asymptotic"),
            plot.errors.boot.method = c("wild", "inid", "fixed", "geom"),
            plot.errors.boot.nonfixed = c("exact", "frozen"),
-           plot.errors.boot.wild = c("rademacher", "mammen"),
+           plot.errors.boot.wild = c("mammen", "rademacher"),
            plot.errors.boot.blocklen = NULL,
-           plot.errors.boot.num = 1999,
+           plot.errors.boot.num = 9999,
            plot.errors.center = c("estimate", "bias-corrected"),
            plot.errors.type = c("pmzsd","pointwise","bonferroni","simultaneous","all"),
            plot.errors.alpha = 0.05,
@@ -54,10 +54,28 @@
            plot.data.overlay = TRUE,
            plot.rug = FALSE,
            ...,
-           random.seed){
+           random.seed, .np.empty.report = NULL, gaussian.draws = 9999L){
+
+    if (.np_data_formal_supplied(sys.call(), sys.function()) &&
+        !(missing(xdat) && missing(ydat) && missing(zdat) &&
+          !is.null(bws[["formula", exact = TRUE]])))
+      .np_plot_data_error()
+
+    saved.plot.style <- list(xlab = xlab, ylab = ylab,
+        main = main, sub = sub, xlim = xlim, ylim = ylim, col = col,
+        lty = lty, lwd = lwd, type = type,
+        theta = theta, phi = phi, zlab = zlab, zlim = zlim)
+    publish.plot <- function(value) .np_plot_data_publish_display(value,
+      coordinates = cbind(xdat, zdat), roles = c(rep("X", ncol(xdat)), rep("Z", if (is.null(zdat)) 0L else ncol(zdat))), response = ydat,
+      overlay = isTRUE(plot.data.overlay) && !coef, rug = plot.rug,
+      style = utils::modifyList(plot.user.args, saved.plot.style),
+      points_args = points.user.args, boxplot = plot.bxp,
+      interval_style = list(style = plot.errors.style, bar = plot.errors.bar,
+        bar_num = plot.errors.bar.num, boxplot_outliers = plot.bxp.out))
+
+    sub.supplied <- !missing(sub)
 
     engine.ctx <- .np_plot_engine_begin(plot.par.mfrow = plot.par.mfrow)
-    on.exit(.np_plot_restore_par(engine.ctx$oldpar), add = TRUE)
     plot.par.mfrow <- engine.ctx$plot.par.mfrow
     scalar_default <- .np_plot_scalar_default
 
@@ -67,15 +85,7 @@
     points.user.args <- .np_plot_user_args(dots, "points")
     persp.user.args <- .np_plot_user_args(dots, "persp")
     bxp.user.args <- .np_plot_user_args(dots, "bxp")
-    rgl.persp3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.persp3d", "rgl.persp3d.")
-    rgl.view3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.view3d", "rgl.view3d.")
-    rgl.par3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.par3d", "rgl.par3d.")
-    rgl.grid3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.grid3d", "rgl.grid3d.")
-    rgl.widget.user.args <- .np_plot_collect_rgl_args(dots, "rgl.widget", "rgl.widget.")
-    rgl.legend3d.user.args <- .np_plot_collect_rgl_args(dots, "rgl.legend3d", "rgl.legend3d.")
-    rgl.legend3d.user.args <- .np_plot_merge_rgl_legend_control(rgl.legend3d.user.args, plot.legend)
-    rgl.points3d.user.args <- .np_plot_extract_prefixed_args(dots, "rgl.points3d.")
-    rgl.surface3d.user.args <- .np_plot_extract_prefixed_args(dots, "rgl.surface3d.")
+    rgl.controls <- .np_plot_rgl_controls(dots, legend = plot.legend)
     if (!is.null(cex)) {
       if (is.null(plot.user.args$cex)) plot.user.args$cex <- cex
       if (is.null(points.user.args$cex)) points.user.args$cex <- cex
@@ -103,33 +113,18 @@
     if (any(miss.xyz) && !all(miss.xyz))
       stop("one of, but not both, xdat and ydat was specified")
     else if(all(miss.xyz) && !is.null(bws$formula)){
-      tt <- terms(bws)
-      m <- match(c("formula", "data", "subset", "na.action"),
-               names(bws$call), nomatch = 0)
-
-      tmf.xf <- tmf.x <- tmf <- bws$call[c(1,m)]
-      tmf.xf[[1]] <- tmf[[1]] <- as.name("model.frame")
-      tmf[["formula"]] <- tt
-      mf.args <- as.list(tmf)[-1L]
-      umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
-
-      bronze <- lapply(bws$chromoly, paste, collapse = " + ")
-
-      tmf.xf[["formula"]] <- as.formula(paste(" ~ ", bronze[[2]]),
-                                      env = environment(tt))
-      mf.xf.args <- as.list(tmf.xf)[-1L]
-      tmf.xf <- do.call(stats::model.frame, mf.xf.args, envir = environment(tt))
-      
-      ydat <- model.response(tmf)
-      xdat <- tmf.xf
-
-      zdat <- tmf[, bws$chromoly[[3]], drop = FALSE]
+      training <- .np_plreg_formula_training(bws, data)
+      xdat <- training$txdat
+      ydat <- training$tydat
+      .np_plot_require_response(ydat, bws, "plot.plbandwidth")
+      zdat <- training$tzdat
     } else {
       if(all(miss.xyz) && !is.null(bws$call)){
-        xdat <- data.frame(.np_eval_bws_call_arg(bws, "xdat"))
+        xdat <- data.frame(.np_eval_bws_call_arg(bws, "xdat"), check.names = FALSE)
         ydat = .np_eval_bws_call_arg(bws, "ydat")
-        zdat <- data.frame(.np_eval_bws_call_arg(bws, "zdat"))
+        zdat <- data.frame(.np_eval_bws_call_arg(bws, "zdat"), check.names = FALSE)
       }
+      .np_plot_require_response(ydat, bws, "plot.plbandwidth")
       xdat = toFrame(xdat)
       zdat = toFrame(zdat)
       
@@ -159,7 +154,7 @@
     xq = double(bws$xndim)+xq
     zq = double(bws$zndim)+zq
     
-    xtrim = double(bws$xndim)+xtrim
+    xtrim = .np_plot_recycle_xtrim(xtrim, bws$xndim)
     ztrim = double(bws$zndim)+ztrim
 
 
@@ -173,6 +168,43 @@
       )
     }
     
+    error.request <- .np_plot_normalize_error_request(plot.errors.method,
+                                                      plot.errors.type)
+    joint.request <- identical(error.request$method, "asymptotic") &&
+      error.request$type %in% c("simultaneous", "all")
+    if (!missing(gaussian.draws) && !joint.request)
+      stop("gaussian_draws requires asymptotic simultaneous or all bands", call. = FALSE)
+    joint.eligible <- FALSE
+    joint.calibration <- NULL
+    if (joint.request) {
+      if (isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+        stop("asymptotic joint bands require coordinator context in an active session or attach pool; they cannot run inside mpi.bcast.cmd(...)",
+             call. = FALSE)
+      gaussian.draws <- .np_plot_gaussian_integer(gaussian.draws, "gaussian.draws")
+      joint.eligible <- !coef && all(vapply(bws[["bw", exact = TRUE]],
+        .np_plot_regression_joint_supported, logical(1L)))
+    }
+    joint_update <- function(interval, fit) {
+      .np_plot_joint_try({
+      joint.calibration <<- NULL
+      if (!joint.eligible) return(interval)
+      reason <- fit[[".np.plot.joint.unavailable", exact = TRUE]]
+      if (!is.null(reason)) .np_plot_joint_unavailable(reason)
+      if (any(!is.finite(fit$merr)))
+        .np_plot_joint_unavailable("joint variability bands require identified finite uncertainty at every grid point",
+             call. = FALSE)
+      joint.calibration <<- .np_plot_activity_run("Calibrating Gaussian partially linear maximum",
+        .np_plot_gaussian_factor_calibrate(fit[[".np.plot.influence", exact = TRUE]],
+          alpha = plot.errors.alpha, draws = gaussian.draws))
+      joint.calibration$conditioning <<- "fixed design and fitted smoothing specification; includes coefficient estimation"
+      simultaneous <- cbind(fit$merr, fit$merr, deparse.level = 0L) * joint.calibration$critical
+      if (identical(plot.errors.type, "all"))
+        interval$all.err$simultaneous <- simultaneous
+      else
+        interval$err <- simultaneous
+      interval
+          }, unavailable = interval)
+    }
     normalized.opts <- .np_plot_normalize_common_options(
       plot.behavior = plot.behavior,
       plot.errors.method = plot.errors.method,
@@ -188,11 +220,18 @@
       xdat = xdat,
       common.scale = common.scale,
       ylim = ylim,
-      allow_asymptotic_quantile = FALSE
+      allow_asymptotic_quantile = FALSE,
+      allow_asymptotic_simultaneous = joint.eligible
     )
 
     plot.behavior <- .npRmpi_plot_behavior_for_rank(normalized.opts$plot.behavior)
+    # Data-only evaluation does not own the caller's graphics state.
+    if (plot.behavior != "data")
+      on.exit(.np_plot_restore_par(engine.ctx$oldpar), add = TRUE)
     plot.errors.method <- normalized.opts$plot.errors.method
+    # Private to this asymptotic plot; no retained objects or cross-call cache.
+    training.cache <- if (identical(plot.errors.method, "asymptotic"))
+      new.env(parent = emptyenv()) else NULL
     plot.errors.boot.method <- normalized.opts$plot.errors.boot.method
     plot.errors.boot.nonfixed <- normalized.opts$plot.errors.boot.nonfixed
     plot.errors.boot.wild <- normalized.opts$plot.errors.boot.wild
@@ -227,14 +266,17 @@
           bws = bws,
           txdat = xdat,
           tydat = ydat,
-          tzdat = zdat
+          tzdat = zdat,
+          se = TRUE
         )
       } else {
         .np_plot_plreg_local_fit(
           bws = bws,
           xdat = xdat,
           ydat = ydat,
-          zdat = zdat
+          zdat = zdat,
+          .np.empty.report = .np.empty.report,
+          se = plot.errors || plot.behavior != "plot"
         )
       }
       cf <- as.double(fit.coef$xcoef)
@@ -252,7 +294,9 @@
                       col = scalar_default(col, .np_plot_color("component_context")),
                       border = scalar_default(border, par("fg")))
         if (plot.errors && length(se) == length(cf) && all(is.finite(se))) {
-          arrows(bp, cf - se, bp, cf + se, angle = 90, code = 3, length = 0.05, lwd = .np_plot_lwd("component_context"))
+          draw.error.bars(as.vector(bp), cf - se, cf + se,
+                          lty = par("lty"), col = par("fg"),
+                          lwd = .np_plot_lwd("component_context"))
         }
       }
 
@@ -312,6 +356,7 @@
         !any(xor(bws$zdati$iord, bws$zdati$inumord))){
 
       view = match.arg(view)
+      .np_plot_progress_plan(1L)
       rotate = (view == "rotate")
       
       if (is.ordered(xdat[,1])){
@@ -347,7 +392,9 @@
           ydat = ydat,
           zdat = zdat,
           exdat = x.eval[,1, drop = FALSE],
-          ezdat = x.eval[,2, drop = FALSE]
+          ezdat = x.eval[,2, drop = FALSE],
+          .np.empty.report = .np.empty.report,
+          joint = joint.eligible, .training.cache = training.cache
         )
       } else {
         .np_plot_plreg_local_fit(
@@ -356,7 +403,9 @@
           ydat = ydat,
           zdat = zdat,
           exdat = x.eval[,1, drop = FALSE],
-          ezdat = x.eval[,2, drop = FALSE]
+          ezdat = x.eval[,2, drop = FALSE],
+          .np.empty.report = .np.empty.report,
+          se = plot.behavior != "plot"
         )
       }
 
@@ -374,6 +423,7 @@
           band.type = plot.errors.type,
           m = nrow(x.eval)
         )
+        terr.obj <- joint_update(terr.obj, tobj)
         terr[,1:2] <- terr.obj$err
         terr.all <- terr.obj$all.err
         lerr = matrix(data = tobj$mean - terr[,1],
@@ -426,7 +476,8 @@
       if(is.null(zlim)) {
           zlim =
               if (plot.errors && plot.errors.type == "all" && !is.null(lerr.all))
-                  c(min(c(unlist(lerr.all), lerr)), max(c(unlist(herr.all), herr)))
+                  .np_plot_all_surface_range(tobj$mean, lerr, herr,
+                                             lerr.all, herr.all)
               else if (plot.errors)
                   c(min(lerr),max(herr))
               else
@@ -439,14 +490,20 @@
         r1 = plregression(bws = bws, xcoef = tobj$xcoef,
           xcoefvcov = vcov(tobj),
           xcoeferr = tobj$xcoeferr,
-          evalx =  x.eval[,1],
-          evalz =  x.eval[,2],
+          evalx = stats::setNames(x.eval[,1, drop = FALSE], names(xdat)),
+          evalz = stats::setNames(x.eval[,2, drop = FALSE], names(zdat)),
           mean = tobj$mean,
           ntrain = dim(xdat)[1],
           trainiseval = FALSE,
-          xtra=c(tobj$RSQ,tobj$MSE,0,0,0,0))
+          xtra=rep(NA_real_, 6L))
 
         r1$merr = NA
+        if (identical(plot.errors.method, "asymptotic"))
+          r1[[".plot_std_error"]] <- tobj$merr
+        if (plot.errors && identical(plot.errors.type, "all"))
+          r1[[".plot_band_widths"]] <- terr.all
+        r1[[".plot_rows"]] <- list(estimate = tobj$mean,
+          corrected = terr[, 3L], widths = terr[, 1:2, drop = FALSE])
         r1$bias = NA
         r1$bias.corrected = NA
 
@@ -456,8 +513,11 @@
         if (.np_plot_center_is_bias_corrected(plot.errors.center))
           r1 <- .np_plot_add_bias_fields(r1, tobj$mean, terr[,3])
 
+        if (joint.request)
+          r1 <- .np_plot_joint_band_fields(r1, joint.calibration,
+            if (identical(plot.errors.type, "all")) terr.all else NULL)
         if (plot.behavior == "data")
-          return ( list(r1 = r1) )
+          return(publish.plot(list(r1 = r1)))
 
       }
 
@@ -488,11 +548,11 @@
           theta = rgl.view$theta,
           phi = rgl.view$phi,
           main = main.val,
-          par3d.args = rgl.par3d.user.args,
-          view3d.args = rgl.view3d.user.args,
-          persp3d.args = rgl.persp3d.user.args,
-          grid3d.args = rgl.grid3d.user.args,
-          widget.args = rgl.widget.user.args,
+          par3d.args = rgl.controls$par3d,
+          view3d.args = rgl.controls$view3d,
+          persp3d.args = rgl.controls$persp3d,
+          grid3d.args = rgl.controls$grid3d,
+          widget.args = rgl.controls$widget,
           draw.extras = function() {
             if (plot.rug) {
               .np_plot_draw_floor_rug_rgl(
@@ -506,12 +566,13 @@
                 x = x1.eval,
                 y = z1.eval,
                 plot.errors.type = plot.errors.type,
+                plot.errors.method = plot.errors.method,
                 lerr = lerr,
                 herr = herr,
                 lerr.all = lerr.all,
                 herr.all = herr.all,
-                surface3d.args = rgl.surface3d.user.args,
-                legend3d.args = rgl.legend3d.user.args
+                surface3d.args = rgl.controls$surface3d,
+                legend3d.args = rgl.controls$legend3d
               )
             }
             if (overlay.ok) {
@@ -519,7 +580,7 @@
                 x1 = overlay.x1,
                 x2 = overlay.x2,
                 y = ydat,
-                points3d.args = rgl.points3d.user.args
+                points3d.args = rgl.controls$points3d
               )
             }
           }
@@ -528,7 +589,7 @@
         return(.np_plot_rgl_finalize(
           rgl.out = rgl.out,
           plot.behavior = plot.behavior,
-          plot.data = list(r1 = r1)
+          plot.data = publish.plot(list(r1 = r1))
         ))
       }
 
@@ -537,7 +598,7 @@
 
       persp.col = grDevices::adjustcolor(
         .np_plot_persp_surface_colors(z = treg, col = col),
-        alpha.f = 0.5
+        alpha.f = .np_plot_surface_alpha("base")
       )
       overlay.x1 <- xdat[,1]
       if (is.factor(overlay.x1) || is.ordered(overlay.x1))
@@ -572,14 +633,13 @@
                              phi = phi,
                              main = scalar_default(main, ""))
           persp.args <- .np_plot_merge_user_args(persp.args, persp.user.args)
-          persp.mat <- do.call(persp, persp.args)
-          .np_plot_first_render_end(first.render)
-          .np_plot_draw_box_grid_persp(
+          persp.mat <- .np_plot_render_surface_base_frame(
+            persp.args = persp.args,
             xlim = range(x1.eval, finite = TRUE),
             ylim = range(z1.eval, finite = TRUE),
-            zlim = zlim,
-            persp.mat = persp.mat
+            zlim = zlim
           )
+          .np_plot_first_render_end(first.render)
           if (plot.rug) {
             .np_plot_draw_floor_rug_persp(
               x1 = overlay.x1,
@@ -600,14 +660,28 @@
               lerr.all = lerr.all,
               herr.all = herr.all,
               border = scalar_default(border, .np_plot_color("context_border")),
-              lwd = scalar_default(lwd, par()$lwd)
+              lwd = scalar_default(lwd, par()$lwd),
+              annotation = .np_plot_variability_annotation_spec(
+                plot.errors.method = plot.errors.method,
+                plot.errors.type = plot.errors.type,
+                plot.errors.alpha = plot.errors.alpha,
+                plot.errors.center = plot.errors.center,
+                sub.supplied = sub.supplied,
+                plot.args = persp.args,
+                context = engine.ctx$annotation,
+                continuous = isTRUE(nxcon == 1L && nzcon == 1L),
+                fixed = !isTRUE(rotate)
+              )
             )
             if (plot.errors.type == "all" && !is.null(lerr.all) && !is.null(herr.all)) {
               .np_plot_draw_all_band_legend(
                 legend = plot.legend,
                 x = "topright",
                 lty = .np_plot_lty("solid"),
-                lwd = .np_plot_lwd("band_all_surface", scalar_default(lwd, par()$lwd))
+                lwd = .np_plot_lwd("band_all_surface", scalar_default(lwd, par()$lwd)),
+                plot.errors.method = plot.errors.method,
+                lerr.all = lerr.all,
+                herr.all = herr.all
               )
             }
           }
@@ -625,7 +699,7 @@
       ##}
 
       if (plot.behavior == "plot-data")
-        return ( list(r1 = r1) )
+        return(publish.plot(list(r1 = r1)))
 
     } else {
       plot.layout <- .np_plot_layout_begin(
@@ -633,6 +707,7 @@
         plot.par.mfrow = plot.par.mfrow,
         mfrow = n2mfrow(bws$xndim + bws$zndim)
       )
+      .np_plot_progress_plan(bws$xndim + bws$zndim)
 
       x.ev = xdat[1,,drop = FALSE]
       z.ev = zdat[1,,drop = FALSE]
@@ -697,7 +772,7 @@
         
         if (xi.factor){
           ei = levels(xdat[,i])
-          ei = factor(ei, levels = ei)
+          ei = .np_factor_with_levels(ei, levels = ei)
           xi.neval = length(ei)
         } else {
           xi.neval = neval
@@ -717,7 +792,9 @@
             ydat = ydat,
             zdat = zdat,
             exdat = subcol(exdat,ei,i)[seq_len(xi.neval),, drop = FALSE],
-            ezdat = ezdat[seq_len(xi.neval),, drop = FALSE]
+            ezdat = ezdat[seq_len(xi.neval),, drop = FALSE],
+            .np.empty.report = .np.empty.report,
+            joint = joint.eligible, .training.cache = training.cache
           )
         } else {
           .np_plot_plreg_local_fit(
@@ -726,7 +803,9 @@
             ydat = ydat,
             zdat = zdat,
             exdat = subcol(exdat,ei,i)[seq_len(xi.neval),, drop = FALSE],
-            ezdat = ezdat[seq_len(xi.neval),, drop = FALSE]
+            ezdat = ezdat[seq_len(xi.neval),, drop = FALSE],
+            .np.empty.report = .np.empty.report,
+            se = plot.behavior != "plot"
           )
         }
 
@@ -740,6 +819,7 @@
               band.type = plot.errors.type,
               m = xi.neval
             )
+            asym.obj <- joint_update(asym.obj, tobj)
             temp.err[seq_len(xi.neval),1:2] <- asym.obj$err
             temp.all.err <- asym.obj$all.err
           } else if (plot.errors.method == "bootstrap"){
@@ -787,6 +867,7 @@
           }
         } else if (plot.behavior != "data") {
           plot.layout <- .np_plot_layout_activate(plot.layout)
+          .np_plot_variability_panel_begin(engine.ctx$annotation)
           ## plot evaluation
           plot.fun <- if (xi.factor) {
             .np_plot_panel_fun(plot.bootstrap = plot.bootstrap, plot.bxp = plot.bxp)
@@ -803,7 +884,9 @@
             plot.args$y <- temp.mean
           panel.ylim <- NULL
           if (plot.errors)
-            panel.ylim <- if (plot.errors.type == "all")
+            panel.ylim <- if (joint.request && identical(plot.errors.type, "simultaneous"))
+              .np_plot_joint_panel_range(temp.mean, temp.err, plotOnEstimate)
+            else if (plot.errors.type == "all")
               compute.all.error.range(if (plotOnEstimate) temp.mean else temp.err[,3], temp.all.err)
             else
               c(min(na.omit(c(temp.mean - temp.err[,1], temp.err[,3] - temp.err[,1]))),
@@ -912,6 +995,16 @@
 
           ## error plotting evaluation
           if (plot.errors && !(xi.factor && plot.bootstrap && plot.bxp)){
+            panel.annotation <- .np_plot_variability_annotation_spec(
+              plot.errors.method = plot.errors.method,
+              plot.errors.type = plot.errors.type,
+              plot.errors.alpha = plot.errors.alpha,
+              plot.errors.center = plot.errors.center,
+              sub.supplied = sub.supplied,
+              plot.args = plot.args,
+              context = engine.ctx$annotation,
+              continuous = !xi.factor
+            )
             .np_plot_draw_bias_center_1d(
               x = ei,
               center = temp.err[, 3],
@@ -926,17 +1019,20 @@
                 ex = as.numeric(na.omit(ei)),
                 center = na.omit(if (plotOnEstimate) temp.mean else temp.err[,3]),
                 all.err = temp.all.err,
+                plot.errors.method = plot.errors.method,
                 xi.factor = xi.factor,
-                  legend = plot.legend)
+                legend = plot.legend,
+                annotation = panel.annotation)
             } else {
               draw.args <- list(
-                ex = as.numeric(na.omit(ei)),
-                ely = if (plotOnEstimate) na.omit(temp.mean - temp.err[,1]) else na.omit(temp.err[,3] - temp.err[,1]),
-                ehy = if (plotOnEstimate) na.omit(temp.mean + temp.err[,2]) else na.omit(temp.err[,3] + temp.err[,2]),
+                ex = as.numeric(ei),
+                ely = if (plotOnEstimate) temp.mean - temp.err[,1] else temp.err[,3] - temp.err[,1],
+                ehy = if (plotOnEstimate) temp.mean + temp.err[,2] else temp.err[,3] + temp.err[,2],
                 plot.errors.style = if (xi.factor) "bar" else plot.errors.style,
                 plot.errors.bar = if (xi.factor) "I" else plot.errors.bar,
                 plot.errors.bar.num = plot.errors.bar.num,
-                lty = if (xi.factor) 1 else 2
+                lty = if (xi.factor) 1 else 2,
+                annotation = panel.annotation
               )
               do.call(draw.errors, draw.args)
             }
@@ -956,7 +1052,7 @@
                            mean = na.omit(temp.mean),
                            ntrain = dim(xdat)[1],
                            trainiseval = FALSE,
-                           xtra = c(tobj$RSQ, tobj$MSE, 0, 0, 0, 0))
+                           xtra = rep(NA_real_, 6L))
             plot.out[[plot.index]]$merr = NA
             plot.out[[plot.index]]$bias = NA
             plot.out[[plot.index]]$bias.corrected = NA
@@ -973,6 +1069,17 @@
                 temp.err[eval.rows, 3]
               )
             plot.out[[plot.index]]$bxp = temp.boot
+            plot.out[[plot.index]][[".plot_rows"]] <- list(estimate = temp.mean[seq_len(xi.neval)],
+              corrected = temp.err[seq_len(xi.neval), 3L],
+              widths = temp.err[seq_len(xi.neval), 1:2, drop = FALSE])
+            if (identical(plot.errors.method, "asymptotic"))
+              plot.out[[plot.index]][[".plot_std_error"]] <- tobj$merr
+            if (identical(plot.errors.type, "all"))
+              plot.out[[plot.index]][[".plot_band_widths"]] <- temp.all.err
+            if (joint.request)
+              plot.out[[plot.index]] <- .np_plot_joint_band_fields(
+                plot.out[[plot.index]], joint.calibration,
+                if (identical(plot.errors.type, "all")) temp.all.err else NULL)
           }
         }
       }
@@ -989,7 +1096,7 @@
         
         if (xi.factor){
           ei = levels(zdat[,i])
-          ei = factor(ei, levels = ei)
+          ei = .np_factor_with_levels(ei, levels = ei)
           xi.neval = length(ei)
         } else {
           xi.neval = neval
@@ -1008,7 +1115,9 @@
             ydat = ydat,
             zdat = zdat,
             exdat = exdat[seq_len(xi.neval),, drop = FALSE],
-            ezdat = subcol(ezdat,ei,i)[seq_len(xi.neval),, drop = FALSE]
+            ezdat = subcol(ezdat,ei,i)[seq_len(xi.neval),, drop = FALSE],
+            .np.empty.report = .np.empty.report,
+            joint = joint.eligible, .training.cache = training.cache
           )
         } else {
           .np_plot_plreg_local_fit(
@@ -1017,7 +1126,9 @@
             ydat = ydat,
             zdat = zdat,
             exdat = exdat[seq_len(xi.neval),, drop = FALSE],
-            ezdat = subcol(ezdat,ei,i)[seq_len(xi.neval),, drop = FALSE]
+            ezdat = subcol(ezdat,ei,i)[seq_len(xi.neval),, drop = FALSE],
+            .np.empty.report = .np.empty.report,
+            se = plot.behavior != "plot"
           )
         }
 
@@ -1031,6 +1142,7 @@
               band.type = plot.errors.type,
               m = xi.neval
             )
+            asym.obj <- joint_update(asym.obj, tobj)
             temp.err[seq_len(xi.neval),1:2] <- asym.obj$err
             temp.all.err <- asym.obj$all.err
           } else if (plot.errors.method == "bootstrap"){
@@ -1078,6 +1190,7 @@
           }
         } else if (plot.behavior != "data") {
           plot.layout <- .np_plot_layout_activate(plot.layout)
+          .np_plot_variability_panel_begin(engine.ctx$annotation)
           ## plot evaluation
           plot.fun <- if (xi.factor) {
             .np_plot_panel_fun(plot.bootstrap = plot.bootstrap, plot.bxp = plot.bxp)
@@ -1093,7 +1206,9 @@
           if (!(xi.factor && plot.bootstrap && plot.bxp))
             plot.args$y <- temp.mean
           if (plot.errors)
-            plot.args$ylim <- if (plot.errors.type == "all")
+            plot.args$ylim <- if (joint.request && identical(plot.errors.type, "simultaneous"))
+              .np_plot_joint_panel_range(temp.mean, temp.err, plotOnEstimate)
+            else if (plot.errors.type == "all")
               compute.all.error.range(if (plotOnEstimate) temp.mean else temp.err[,3], temp.all.err)
             else
               c(min(na.omit(c(temp.mean - temp.err[,1], temp.err[,3] - temp.err[,1]))),
@@ -1145,6 +1260,16 @@
 
           ## error plotting evaluation
           if (plot.errors && !(xi.factor && plot.bootstrap && plot.bxp)){
+            panel.annotation <- .np_plot_variability_annotation_spec(
+              plot.errors.method = plot.errors.method,
+              plot.errors.type = plot.errors.type,
+              plot.errors.alpha = plot.errors.alpha,
+              plot.errors.center = plot.errors.center,
+              sub.supplied = sub.supplied,
+              plot.args = plot.args,
+              context = engine.ctx$annotation,
+              continuous = !xi.factor
+            )
             .np_plot_draw_bias_center_1d(
               x = ei,
               center = temp.err[, 3],
@@ -1159,17 +1284,20 @@
                 ex = as.numeric(na.omit(ei)),
                 center = na.omit(if (plotOnEstimate) temp.mean else temp.err[,3]),
                 all.err = temp.all.err,
+                plot.errors.method = plot.errors.method,
                 xi.factor = xi.factor,
-                  legend = plot.legend)
+                legend = plot.legend,
+                annotation = panel.annotation)
             } else {
               draw.args <- list(
-                ex = as.numeric(na.omit(ei)),
-                ely = if (plotOnEstimate) na.omit(temp.mean - temp.err[,1]) else na.omit(temp.err[,3] - temp.err[,1]),
-                ehy = if (plotOnEstimate) na.omit(temp.mean + temp.err[,2]) else na.omit(temp.err[,3] + temp.err[,2]),
+                ex = as.numeric(ei),
+                ely = if (plotOnEstimate) temp.mean - temp.err[,1] else temp.err[,3] - temp.err[,1],
+                ehy = if (plotOnEstimate) temp.mean + temp.err[,2] else temp.err[,3] + temp.err[,2],
                 plot.errors.style = if (xi.factor) "bar" else plot.errors.style,
                 plot.errors.bar = if (xi.factor) "I" else plot.errors.bar,
                 plot.errors.bar.num = plot.errors.bar.num,
-                lty = if (xi.factor) 1 else 2
+                lty = if (xi.factor) 1 else 2,
+                annotation = panel.annotation
               )
               do.call(draw.errors, draw.args)
             }
@@ -1191,7 +1319,7 @@
                            mean = na.omit(temp.mean),
                            ntrain = dim(zdat)[1],
                            trainiseval = FALSE,
-                           xtra = c(tobj$RSQ, tobj$MSE, 0, 0, 0, 0))
+                           xtra = rep(NA_real_, 6L))
             plot.out[[plot.index]]$merr = NA
             plot.out[[plot.index]]$bias = NA
             plot.out[[plot.index]]$bias.corrected = NA
@@ -1208,12 +1336,31 @@
                 temp.err[eval.rows, 3]
               )
             plot.out[[plot.index]]$bxp = temp.boot
+            plot.out[[plot.index]][[".plot_rows"]] <- list(estimate = temp.mean[seq_len(xi.neval)],
+              corrected = temp.err[seq_len(xi.neval), 3L],
+              widths = temp.err[seq_len(xi.neval), 1:2, drop = FALSE])
+            if (identical(plot.errors.method, "asymptotic"))
+              plot.out[[plot.index]][[".plot_std_error"]] <- tobj$merr
+            if (identical(plot.errors.type, "all"))
+              plot.out[[plot.index]][[".plot_band_widths"]] <- temp.all.err
+            if (joint.request)
+              plot.out[[plot.index]] <- .np_plot_joint_band_fields(
+                plot.out[[plot.index]], joint.calibration,
+                if (identical(plot.errors.type, "all")) temp.all.err else NULL)
           }
         }
       }
 
       if (common.scale && (plot.behavior != "data")){
-        if (plot.errors && plot.errors.type == "all") {
+        if (joint.request && identical(plot.errors.type, "simultaneous")) {
+          columns <- 3L * seq_len(ncol(data.eval))
+          joint.range <- .np_plot_joint_panel_range(as.double(data.eval),
+            cbind(as.double(data.err[, columns - 2L, drop = FALSE]),
+                  as.double(data.err[, columns - 1L, drop = FALSE]),
+                  as.double(data.err[, columns, drop = FALSE])), plotOnEstimate)
+          y.min <- joint.range[1L]
+          y.max <- joint.range[2L]
+        } else if (plot.errors && plot.errors.type == "all") {
           y.min <- Inf
           y.max <- -Inf
           for (k in seq_len(bws$xndim + bws$zndim)) {
@@ -1235,12 +1382,12 @@
         } else {
           jj = seq_len(bws$xndim + bws$zndim)*3
           if (plot.errors.center == "estimate" || !plot.errors) {
-            y.max = max(na.omit(as.double(data.eval)) +
-              if (plot.errors) na.omit(as.double(data.err[,jj-1]))
-              else 0)
-            y.min = min(na.omit(as.double(data.eval)) -
-              if (plot.errors) na.omit(as.double(data.err[,jj-2]))
-              else 0)
+            y.max = max(na.omit(as.double(data.eval) +
+              if (plot.errors) as.double(data.err[,jj-1])
+              else 0))
+            y.min = min(na.omit(as.double(data.eval) -
+              if (plot.errors) as.double(data.err[,jj-2])
+              else 0))
           } else if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
             y.max = max(na.omit(as.double(data.err[,jj] + data.err[,jj-1])))
             y.min = min(na.omit(as.double(data.err[,jj] - data.err[,jj-2])))
@@ -1262,6 +1409,7 @@
         
         for (plot.index in seq_len(bws$xndim + bws$zndim)){
           plot.layout <- .np_plot_layout_activate(plot.layout)
+          .np_plot_variability_panel_begin(engine.ctx$annotation)
           i = if (plot.index <= bws$xndim) plot.index else plot.index - bws$xndim
 
           if (plot.index > bws$xndim)
@@ -1383,6 +1531,16 @@
 
           ## error plotting evaluation
           if (plot.errors && !(xi.factor && plot.bootstrap && plot.bxp)){
+            panel.annotation <- .np_plot_variability_annotation_spec(
+              plot.errors.method = plot.errors.method,
+              plot.errors.type = plot.errors.type,
+              plot.errors.alpha = plot.errors.alpha,
+              plot.errors.center = plot.errors.center,
+              sub.supplied = sub.supplied,
+              plot.args = plot.args,
+              context = engine.ctx$annotation,
+              continuous = !xi.factor
+            )
             .np_plot_draw_bias_center_1d(
               x = allei[, plot.index],
               center = data.err[, 3 * plot.index],
@@ -1400,21 +1558,24 @@
                 else
                   na.omit(data.err[,3*plot.index]),
                 all.err = data.err.all[[plot.index]],
+                plot.errors.method = plot.errors.method,
                 xi.factor = xi.factor,
-                  legend = plot.legend)
+                legend = plot.legend,
+                annotation = panel.annotation)
             } else {
               draw.args <- list(
-                ex = as.numeric(na.omit(allei[,plot.index])),
-                ely = if (plotOnEstimate) na.omit(data.eval[,plot.index] - data.err[,3*plot.index-2]) else na.omit(data.err[,3*plot.index] - data.err[,3*plot.index-2]),
-                ehy = if (plotOnEstimate) na.omit(data.eval[,plot.index] + data.err[,3*plot.index-1]) else na.omit(data.err[,3*plot.index] + data.err[,3*plot.index-1]),
+                ex = as.numeric(allei[,plot.index]),
+                ely = if (plotOnEstimate) data.eval[,plot.index] - data.err[,3*plot.index-2] else data.err[,3*plot.index] - data.err[,3*plot.index-2],
+                ehy = if (plotOnEstimate) data.eval[,plot.index] + data.err[,3*plot.index-1] else data.err[,3*plot.index] + data.err[,3*plot.index-1],
                 plot.errors.style = if (xi.factor) "bar" else plot.errors.style,
                 plot.errors.bar = if (xi.factor) "I" else plot.errors.bar,
                 plot.errors.bar.num = plot.errors.bar.num,
-                lty = if (xi.factor) 1 else 2
+                lty = if (xi.factor) 1 else 2,
+                annotation = panel.annotation
               )
               do.call(draw.errors, draw.args)
             }
-            
+
 
           }
         }
@@ -1429,7 +1590,7 @@
           else
             paste("plr", seq_len(bws$xndim + bws$zndim), sep = "")
         
-        return (plot.out)
+        return(publish.plot(plot.out))
       }
     }
   }

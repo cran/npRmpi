@@ -1,0 +1,146 @@
+test_that("conditional ambiguous trials retain search and same-process recovery", {
+  skip_if_not_installed("crs")
+  pkg <- getNamespaceName(environment(npcdensbw))
+  old <- options(np.messages=FALSE, np.tree=FALSE)
+  on.exit(options(old), add=TRUE)
+  loadNamespace("crs")
+  quadratic <- function() {
+    command <- quote({
+      loadNamespace("crs")
+      .Call("crs_nomad_native_test_solve", list(
+        x0=c(.1,.2), lower=c(-1,-1), upper=c(1,1), input_type=c(0L,0L),
+        output_type=0L, max_eval=12L, random_seed=42L), PACKAGE="crs")
+    })
+    # This private test entry mutates native NOMAD state. Every participating
+    # rank must execute it before the next distributed conditional search.
+    if (.mpi_pool_active() && !.mpi_suite_local_mode_owned())
+      npRmpi:::.npRmpi_bcast_cmd_expr(command, comm=1L, caller.execute=TRUE)
+    else
+      eval(command)
+  }
+  expected <- quadratic()
+  expect_identical(expected$status, 0L)
+  recover <- function() {
+    got <- quadratic()
+    expect_identical(got$status, 0L)
+    expect_identical(got$solution, expected$solution)
+    expect_identical(got$objective, expected$objective)
+  }
+  # Pin the original failing point; distributed free-degree search is checked separately.
+  for (visible in c(FALSE, TRUE)) {
+    options(np.messages=visible)
+    set.seed(20260322)
+    dat <- data.frame(x=sort(runif(14)), y=sort(runif(14)))
+    bw <- npcdensbw(y~x, data=dat, regtype='lp', degree=1L,
+      bws=c(0.048130207494902745,0.025634352719319447),
+      bwsolver='mads', nmulti=1L, nomad.opts=list(MAX_BB_EVAL=8L))
+    expect_true(is.finite(bw$fval) && abs(bw$fval) < .Machine$double.xmax)
+    recover()
+  }
+  # The original CDF trajectory must complete with a raw-valid endpoint.
+  options(np.messages=FALSE)
+  set.seed(20260401)
+  x <- sort(runif(18)); z <- sort(runif(18))
+  y <- sin(2*pi*x)+rnorm(18,sd=.05)
+  bw <- npcdistbw(y~x, data=data.frame(x,y), regtype="lp",
+    degree.select="coordinate", search.engine="nomad+powell",
+    degree.min=0L, degree.max=1L, degree.verify=FALSE, bwtype="fixed",
+    bwmethod="cv.ls", nmulti=2L, ngrid=30L)
+  expect_true(is.finite(bw$fval) && abs(bw$fval) < .Machine$double.xmax)
+  recover()
+  # Actual conditional native work still succeeds after both formerly failing owners.
+  set.seed(952)
+  dat <- data.frame(x=seq(-1,1,length.out=48),y=rnorm(48))
+  for (fun in list(npcdensbw,npcdistbw)) {
+    bw <- fun(y~x, data=dat, regtype="lp", degree=0L,
+      bwsolver="mads", bws=c(.5,.8), nmulti=1L,
+      nomad.opts=list(MAX_BB_EVAL=12L))
+    expect_true(all(is.finite(c(bw$xbw,bw$ybw))))
+  }
+  recover()
+})
+
+
+test_that("conditional MPI row completions share numerical metadata", {
+  source_file <- npRmpi_test_source_path("src", "jksum.c")
+  lines <- readLines(source_file, warn=FALSE)
+  owners <- c(
+    "np_conditional_density_cvls_lp_stream_impl",
+    "np_conditional_density_cvls_lp_supertile2_stream",
+    "np_conditional_density_cvls_bounded_i1_eval_on_grid",
+    "np_conditional_density_cvls_bounded_i1_quadrature_general_row_stream",
+    "np_conditional_distribution_cvls_lp_supertile",
+    "np_conditional_distribution_cvls_lp_one")
+  for (name in owners) {
+    owner <- npRmpi_test_extract_c_function(lines, name)
+    expect_match(owner, "np_conditional_failure_reduce(1, local_fail)",
+                 fixed=TRUE, info=name)
+    expect_false(grepl("MPI_Allreduce(&local_fail", owner, fixed=TRUE), info=name)
+  }
+})
+
+
+test_that("conditional density ambiguous preparation does not poison later penalties", {
+  old <- options(np.messages=FALSE, np.tree=FALSE)
+  on.exit(options(old), add=TRUE)
+  ns <- asNamespace(getNamespaceName(environment(npcdensbw)))
+  prepare <- get("npRmpiPreparedObjectivePrepareConditionalDensity", ns)
+  destroy <- get("npRmpiPreparedObjectiveDestroyConditionalDensity", ns)
+  evaluate <- get("npRmpiPreparedObjectiveEvalConditionalDensity", ns)
+  args_for <- function(dat, degree, bandwidth) {
+    bw <- npcdensbw(y~x, data=dat, regtype="lp", degree=degree,
+                   bws=bandwidth, bandwidth.compute=FALSE)
+    args <- get(".npcdensbw_prepared_prepare_args", ns)(
+      dat["x"], dat["y"], bw, start.bw=bandwidth, invalid.penalty="baseline")
+    names(args)[names(args)=="penalty_mode"] <- "penalty.mode"
+    names(args)[names(args)=="penalty_multiplier"] <- "penalty.multiplier"
+    args
+  }
+  set.seed(952)
+  healthy <- data.frame(x=seq(-1,1,length.out=48), y=rnorm(48))
+  healthy_args <- args_for(healthy, 0L, c(.5,.8))
+  # These private prepared entry points do not autodispatch. Exercise their
+  # lifetime locally; the public searches below still use the active pool.
+  penalty <- function() npRmpi:::.npRmpi_with_local_regression({
+    on.exit(destroy(), add=TRUE)
+    expect_true(as.logical(do.call(prepare, healthy_args)))
+    evaluate(c(-1,-1), 0L)
+  })
+  before <- penalty()
+  set.seed(20260322)
+  bad <- data.frame(x=sort(runif(14)), y=sort(runif(14)))
+  bandwidth <- c(.048130207494902745,.025634352719319447)
+  bad_args <- args_for(bad, 1L, bandwidth)
+  npRmpi:::.npRmpi_with_local_regression({
+    on.exit(destroy(), add=TRUE)
+    expect_true(as.logical(do.call(prepare, bad_args)))
+    value <- evaluate(bandwidth, 0L)
+    expect_true(all(is.finite(value)))
+  })
+  expect_identical(penalty(), before)
+  bw <- npcdensbw(y~x, data=bad, regtype="lp", degree=1L,
+    bws=bandwidth, bwsolver="mads", nmulti=1L,
+    nomad.opts=list(MAX_BB_EVAL=1L))
+  expect_true(is.finite(bw$fval) && abs(bw$fval) < .Machine$double.xmax)
+  expect_identical(penalty(), before)
+})
+
+
+test_that("mixed-predictor wage1 ambiguous trial retains the conditional score", {
+  old <- options(np.messages=FALSE, np.tree=FALSE)
+  on.exit(options(old), add=TRUE)
+  pkg <- getNamespaceName(environment(npcdensbw))
+  ns <- asNamespace(pkg)
+  data("wage1", package=pkg, envir=environment())
+  X <- wage1[c("married", "female", "nonwhite", "educ", "exper", "tenure")]
+  Y <- wage1["lwage"]
+  bandwidth <- c(.12134193201574466, .385, .325, .385,
+                 .33874335307089481, 62022.24099856431, .13549734122835794)
+  for (family in c("npcdensbw", "npcdistbw")) {
+    bw <- get(family, ns)(xdat=X, ydat=Y, bws=bandwidth, regtype="lp",
+      degree=c(1L,0L,0L), bandwidth.compute=FALSE)
+    value <- get(paste0(".",family,"_eval_only"), ns)(xdat=X, ydat=Y,
+      bws=bw, invalid.penalty="dbmax")$objective
+    expect_true(is.finite(value) && abs(value) < .Machine$double.xmax)
+  }
+})

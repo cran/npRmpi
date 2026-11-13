@@ -1,13 +1,139 @@
+.npreg_owned_dispatch_call <- function(context) {
+  call <- context$expanded
+  if (identical(context$public, FALSE)) {
+    if (!identical(call[[1L]], quote(npreg.rbandwidth)))
+      stop("invalid private regression fit dispatch owner", call. = FALSE)
+    # The auxiliary entry already selected this package leaf. Its public
+    # wrapper is absent from the dynamic stack; retain the declared owner.
+    attr(call, ".npRmpi.bound.call.owner") <- TRUE
+  }
+  call
+}
+
+# Required inference/refit consumers must not publish partial external fits.
+.npreg_report_variance_unavailable <- function(native.output) {
+  if (isTRUE(attr(native.output, ".np.variance.unavailable", exact = TRUE))) {
+    comm <- if (mpi.comm.size(1L) > 0L) 1L else 0L
+    if (mpi.comm.rank(comm) == 0L)
+      .npRmpi_defer_named_warning(.np_warning(paste0(
+        "Some standard errors are unavailable because the fitted smoother ",
+        "leaves no residual information for observations used by those estimates. ",
+        "Point estimates are unchanged.")))
+  }
+  invisible(NULL)
+}
+
+.npreg_complete <- function(...) {
+  args <- list(...)
+  args[[".np.require.complete"]] <- TRUE
+  do.call(npreg, args)
+}
+
+.npreg_merge_empty_rows <- function(current, incoming) {
+  if(is.null(incoming)) return(current)
+  if(is.null(current)) return(incoming)
+  if(length(current) != length(incoming))
+    stop("internal external-row metadata length mismatch", call. = FALSE)
+  out <- as.integer(current == 1L | incoming == 1L)
+  names(out) <- if(!is.null(names(current))) names(current) else names(incoming)
+  out
+}
+
+.npreg_finish_empty_rows <- function(value, flags = NULL,
+                                     omitted = integer(0), defer = FALSE,
+                                     owner = "npreg", row.labels = NULL) {
+  if(is.null(flags)) flags <- attr(value, ".np.empty.rows", exact = TRUE)
+  if(is.null(flags)) return(value)
+  attr(value, ".np.empty.rows") <- NULL
+  # Preserve caller row labels through the existing distributed return.
+  if(length(row.labels) == length(flags)) names(flags) <- row.labels
+  labels <- if(!is.null(names(flags))) names(flags)[flags == 1L] else NULL
+  if(length(omitted)) {
+    complete <- setdiff(seq_len(length(flags) + length(omitted)), omitted)
+    expanded <- integer(length(flags) + length(omitted))
+    expanded[complete] <- flags
+    if(!is.null(names(flags))) {
+      names(expanded) <- as.character(seq_along(expanded))
+      names(expanded)[complete] <- names(flags)
+    }
+    flags <- expanded
+  }
+  if(defer) {
+    attr(value, ".np.empty.rows") <- flags
+    return(value)
+  }
+  comm <- if(mpi.comm.size(1L) > 0L) 1L else 0L
+  if(mpi.comm.rank(comm) != 0L) return(value)
+  rows <- which(flags == 1L)
+  if(is.null(labels)) labels <- rows
+  .np_warning(sprintf(
+    "%s: all computed kernel weights are zero for a fit or contrast at %d external evaluation row(s) (%s%s); returning NA for undefined output components",
+    owner, length(rows), paste(utils::head(labels, 8L), collapse = ", "),
+    if(length(rows) > 8L) ", ..." else ""), call. = FALSE)
+  value
+}
+
+# Each callback belongs to one public plot invocation. Grid/row identifiers
+# distinguish separate evaluation grids; required failures never call finish.
+.npreg_plot_empty_publisher <- function(owner = "plot()") {
+  state <- new.env(hash = FALSE, parent = emptyenv())
+  state$rows <- character()
+  state$grid <- 0L
+  list(record = function(flags, labels = NULL) {
+    state$grid <- state$grid + 1L
+    if(is.null(flags)) return(invisible(NULL))
+    missing <- which(flags == 1L)
+    state$rows <- c(state$rows, paste0(state$grid, "/", missing))
+    invisible(NULL)
+  }, finish = function() {
+    if(length(state$rows))
+      .npreg_finish_empty_rows(list(), rep.int(1L, length(state$rows)),
+        owner = paste0(owner, " [grid/row]"), row.labels = state$rows)
+    invisible(NULL)
+  })
+}
+
+.npreg_publish_plot_rows <- function(value, flags = NULL, report = NULL,
+                                      omitted = integer(0), row.labels = NULL,
+                                      owner = "plot()") {
+  if(is.null(flags)) flags <- attr(value, ".np.empty.rows", exact = TRUE)
+  if(is.null(report))
+    return(.npreg_finish_empty_rows(value, flags, omitted = omitted,
+      row.labels = row.labels, owner = owner))
+  if(!is.null(flags)) {
+    value <- .npreg_finish_empty_rows(value, flags, omitted = omitted,
+      row.labels = row.labels, defer = TRUE)
+    flags <- attr(value, ".np.empty.rows", exact = TRUE)
+    attr(value, ".np.empty.rows") <- NULL
+  }
+  report(flags, names(flags))
+  value
+}
+
+.npreg_finish_plot_call <- function(expr, publisher) {
+  result <- withVisible(force(expr))
+  publisher$finish()
+  if(result$visible) result$value else invisible(result$value)
+}
+
 npreg <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npreg")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat"),
+      call = sys.call(), caller = parent.frame())
+    npRejectLegacyBooleanErrors(args, "npreg")
 
+    # Raw formulas must reach npregbw.formula before a fitting frame is made:
+    # the constructor records the time alignment for lagged ts variables.
     if (!missing(bws)){
-      if (inherits(bws, "formula") && is.null(args$txdat))
-        UseMethod("npreg", bws)
       if (is.recursive(bws)){
         if (!is.null(bws$formula) && is.null(args$txdat))
           UseMethod("npreg",bws$formula)
+        else if (is.null(bws$call) && !is.null(bws[[".np.native.training", exact = TRUE]]) && is.null(args$txdat))
+          return(npreg.call(bws, ...))
         else if (!is.null(bws$call) && is.null(args$txdat))
           UseMethod("npreg",bws$call)
         else if (!is.call(bws))
@@ -22,24 +148,76 @@ npreg <-
     }
   }
 
+.np_regression_output_request <- function(se, gradients, gradient.errors = NULL) {
+  se <- npValidateScalarLogical(se, "se")
+  gradients <- npValidateScalarLogical(gradients, "gradients")
+  if (is.null(gradient.errors))
+    gradient.errors <- se && gradients
+  else
+    gradient.errors <- npValidateScalarLogical(gradient.errors, ".np.gradient.errors")
+  if (gradient.errors && !(se && gradients))
+    stop("gradient errors require both se=TRUE and gradients=TRUE", call. = FALSE)
+  # Masks 0--3 retain their existing meaning. Bit 4 omits only derivative
+  # errors for an internal consumer that still needs mean SE and derivatives.
+  as.integer(se) + 2L * as.integer(gradients) +
+    if (se && gradients && !gradient.errors) 4L else 0L
+}
+
 .npreg_fit_tree_code <- function(bws, ncon, ncat) {
+  reg.spec <- npValidatedConditionalRegSpec(
+    bws,
+    where = "npreg tree routing",
+    ncon.field = "ncon"
+  )
   code <- npDoTreeOrCategoricalCompress(ncon = ncon, ncat = ncat, bws = bws)
 
   if (!identical(code, DO_TREE_YES))
     return(code)
 
-  regtype <- if (!is.null(bws$regtype.engine) && length(bws$regtype.engine)) {
-    as.character(bws$regtype.engine[1L])
-  } else if (!is.null(bws$regtype) && length(bws$regtype)) {
-    as.character(bws$regtype[1L])
-  } else {
-    "lc"
+  if (!identical(reg.spec$regtype.engine, "lc")) {
+    if (bws[["type", exact = TRUE]] %in% c("generalized_nn", "adaptive_nn") &&
+        identical(npTreeMode(), "on") &&
+        npTreeAutoKernelEligible(bws = bws) &&
+        identical(as.integer(bws[["ckerorder", exact = TRUE]]), 2L) &&
+        identical(bws[["ckerbound", exact = TRUE]], "none"))
+      return(code)
+    return(DO_TREE_NO)
   }
 
-  if (!identical(regtype, "lc"))
-    return(DO_TREE_NO)
-
   code
+}
+
+.npreg_glp_categorical_gradients_from_npreghat <- function(bws,
+                                                            txdat,
+                                                            tydat,
+                                                            exdat,
+                                                            grad,
+                                                            where) {
+  cat.idx <- which(bws$iuno | bws$iord)
+  if (!length(cat.idx))
+    return(grad)
+
+  evaldat <- if (is.null(exdat)) txdat else exdat
+  eval.hat <- function(z) {
+    as.vector(.npreghat_complete(
+      bws = bws,
+      txdat = txdat,
+      exdat = z,
+      y = tydat,
+      output = "apply"
+    ))
+  }
+
+  for (jj in cat.idx) {
+    frames <- npCategoricalFirstDifferenceFrames(
+      exdat = evaldat,
+      index = jj,
+      where = where
+    )
+    grad[, jj] <- eval.hat(frames$upper) - eval.hat(frames$lower)
+  }
+
+  grad
 }
 
 .npreg_glp_partial_gradients_from_npreghat <- function(bws,
@@ -52,9 +230,6 @@ npreg <-
                                                        ncol.x) {
   grad <- matrix(NA_real_, nrow = nrow.eval, ncol = ncol.x)
   cont.idx <- which(bws$icon)
-
-  if (!length(cont.idx) || !any(available))
-    return(grad)
 
   for (jj in which(available)) {
     svec <- integer(bws$ncon)
@@ -69,14 +244,29 @@ npreg <-
     if (!is.null(exdat))
       hat.args$exdat <- exdat
 
-    grad[, cont.idx[jj]] <- as.vector(do.call(npreghat, hat.args))
+    grad[, cont.idx[jj]] <- as.vector(do.call(.npreghat_complete, hat.args))
   }
 
-  grad
+  .npreg_glp_categorical_gradients_from_npreghat(
+    bws = bws,
+    txdat = txdat,
+    tydat = tydat,
+    exdat = exdat,
+    grad = grad,
+    where = "npreg"
+  )
 }
 
 npreg.formula <-
-  function(bws, data = NULL, newdata = NULL, y.eval = FALSE, ...){
+  function(bws, data = NULL, newdata = NULL, y.eval = FALSE,
+           se = FALSE, ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+
+    dots <- list(...)
+    npRejectLegacyBooleanErrors(dots, "npreg")
+    se <- npValidateScalarLogical(se, "se")
+    explicit.eval.exclude <- .npreg_explicit_eval_exclude(dots)
 
     mc <- match.call(expand.dots = FALSE)
     tt <- terms(bws)
@@ -96,59 +286,54 @@ npreg.formula <-
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
     if (!missing(data) && !is.null(data))
-      tmf[["data"]] <- substitute(data)
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    umf <- tmf <- if (is.null(frame.state)) .np_bws_formula_model_frame(
+      bws, mf.args, data.override = !missing(data) && !is.null(data), overrides = dots) else
+        .np_formula_frame_take(frame.state)
+    if ("tydat" %in% names(dots)) {
+      umf <- tmf <- .np_formula_replace_response(tmf, bws, dots[["tydat"]],
+                                                 dots, data.override = !is.null(data))
+      dots$tydat <- NULL
+      dots$na.action <- NULL
+    }
+    tt <- attr(tmf, "terms")
+    bws <- .np_bws_retain_fit_frame(bws, tmf)
 
     response.name <- attr(tmf, "names")[attr(attr(tmf, "terms"), "response")]
     tydat <- model.response(tmf)
-    txdat <- tmf[, attr(attr(tmf, "terms"),"term.labels"), drop = FALSE]
-    has.eval <- !is.null(newdata)
+    txdat <- tmf[, .np_formula_term_names(attr(attr(tmf, "terms"),"term.labels")), drop = FALSE]
+    has.eval <- !is.null(newdata) && !("exdat" %in% names(dots))
     if (has.eval) {
       if (!y.eval){
         npValidateNewdataFormula(newdata, tt, include.response = FALSE)
         tt <- delete.response(tt)
-
-        orig.ts <- .np_terms_ts_mask(terms_obj = tt, data = newdata)
-        
-        ## delete.response clobbers predvars, which is used for timeseries objects
-        ## so we need to reconstruct it
-
-        if(all(orig.ts)){
-          args <- (as.list(attr(tt, "variables"))[-1])
-          attr(tt, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
-        }else if(any(orig.ts)){
-          arguments <- (as.list(attr(tt, "variables"))[-1])
-          arguments.normal <- arguments[which(!orig.ts)]
-          arguments.timeseries <- arguments[which(orig.ts)]
-
-          ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-          attr(tt, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
-        }else{
-          attr(tt, "predvars") <- attr(tt, "variables")
-        }
       }
       
       if (y.eval)
         npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      if (explicit.eval.exclude)
+        umf.args$na.action <- stats::na.exclude
+      umf <- do.call(.np_formula_model_frame, umf.args, envir = parent.frame())
       emf <- umf
 
       if (y.eval)
         eydat <- model.response(emf)
       
-      exdat <- emf[, attr(attr(emf, "terms"),"term.labels"), drop = FALSE]
+      exdat <- emf[, .np_formula_term_names(attr(attr(emf, "terms"),"term.labels")), drop = FALSE]
     }
 
-    dots <- list(...)
-    reg.bws <- if (!is.null(dots$bws)) {
-      out <- dots$bws
-      dots$bws <- NULL
+    reg.bws <- if (!is.null(dots[["bws", exact = TRUE]])) {
+      out <- dots[["bws", exact = TRUE]]
+      dots[["bws"]] <- NULL
       out
     } else {
       bws
     }
+    dots$.np.formula.state <- NULL
 
     reg.args <- list(txdat = txdat, tydat = tydat, bws = reg.bws)
     if (has.eval) {
@@ -156,7 +341,7 @@ npreg.formula <-
       if (y.eval)
         reg.args$eydat <- eydat
     }
-    ev <- do.call(npreg, c(reg.args, dots))
+    ev <- do.call(npreg, c(reg.args, list(se = se), dots))
     if (!is.null(ev$bws)) {
       preserve.bws.call <- inherits(bws, "rbandwidth") && !is.null(bws$call)
       bw.call <- mc[c(1, match(c("bws", "data", "subset", "na.action"),
@@ -171,7 +356,7 @@ npreg.formula <-
       ev$bws$rows.omit <- as.vector(attr(tmf, "na.action"))
       ev$bws$nobs.omit <- length(ev$bws$rows.omit)
     }
-    ev$call <- match.call(expand.dots = FALSE)
+    ev$call <- .np_formula_call_public(match.call(expand.dots = FALSE))
     environment(ev$call) <- parent.frame()
 
     if (length(response.name) == 1L && !is.na(response.name) && nzchar(response.name)) {
@@ -179,46 +364,85 @@ npreg.formula <-
         ev$bws$ynames <- response.name
     }
 
-    ev$omit <- attr(umf,"na.action")
+    if (explicit.eval.exclude && !isTRUE(ev$trainiseval)) {
+      # Frame omissions index the original rows; native omissions index the
+      # remaining frame. Keep their composition separate from training rows.
+      eval.omit <- if (has.eval) {
+        .npreg_compose_eval_omissions(attr(umf, "na.action"),
+                                     ev$eval.rows.omit, nrow(umf), ev$nobs)
+      } else {
+        .npreg_eval_omit_indices(ev$eval.rows.omit)
+      }
+      train.action <- attr(tmf, "na.action")
+      train.omit <- as.vector(train.action)
+      ev$omit <- structure(eval.omit, class = "exclude")
+      ev$rows.omit <- as.vector(eval.omit)
+      ev$nobs.omit <- length(eval.omit)
+      ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
+      ev$train.nobs.omit <- length(train.omit)
+      ev$eval.rows.omit <- if (length(eval.omit)) as.vector(eval.omit) else NA
+      ev$eval.nobs.omit <- length(eval.omit)
+      ev <- .npreg_restore_eval_exclude(
+        ev, fields = c("mean", "merr", if (ev$gradients) c("grad", "gerr")))
+      if (ev$residuals)
+        ev$resid <- naresid(train.action, ev$resid)
+      return(ev)
+    }
+
+    ev$omit <- .np_formula_output_action(ev, umf, has.eval)
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
     train.omit <- as.vector(attr(tmf, "na.action"))
-    eval.omit <- if (has.eval) as.vector(attr(umf, "na.action")) else integer(0)
+    eval.omit <- if (isTRUE(ev$trainiseval)) integer(0) else as.vector(ev$omit)
     ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
     ev$train.nobs.omit <- length(train.omit)
     ev$eval.rows.omit <- if (length(eval.omit)) eval.omit else NA
     ev$eval.nobs.omit <- length(eval.omit)
 
     ev$mean <- napredict(ev$omit, ev$mean)
-    ev$merr <- napredict(ev$omit, ev$merr)
+    if (!is.null(ev$merr))
+      ev$merr <- napredict(ev$omit, ev$merr)
 
     if(ev$gradients){
         ev$grad <- napredict(ev$omit, ev$grad)
-        ev$gerr <- napredict(ev$omit, ev$gerr)
+        if (!is.null(ev$gerr))
+          ev$gerr <- napredict(ev$omit, ev$gerr)
+        certificate <- attr(ev, ".np.gradient.structural.zero", exact = TRUE)
+        if (!is.null(certificate))
+          attr(ev, ".np.gradient.structural.zero") <-
+            napredict(ev$omit, certificate)
     }
 
     if(ev$residuals){
-        ev$resid <- naresid(ev$omit, ev$resid)
+        # Residuals always belong to training rows, not the evaluation grid.
+        ev$resid <- naresid(attr(tmf, "na.action"), ev$resid)
     }    
     return(ev)
   }
 
 npreg.call <-
   function(bws, ...) {
-    ev <- npreg(txdat = .np_eval_bws_call_arg(bws, "xdat"),
-                tydat = .np_eval_bws_call_arg(bws, "ydat"),
-                bws = bws, ...)
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    ev <- do.call(npreg, .np_retained_training_args(
+      bws, c(txdat = "xdat", tydat = "ydat"), list(...), npreg.rbandwidth))
     ev$call <- match.call(expand.dots = FALSE)
     environment(ev$call) <- parent.frame()
     return(ev)
   }
 
-.np_reg_fit_total <- function(bws, tnrow, enrow) {
-  if (identical(as.character(bws$type)[1L], "adaptive_nn")) {
+.np_reg_fit_total <- function(bws, tnrow, enrow, se, reg.code) {
+  base.total <- if (identical(as.character(bws$type)[1L], "adaptive_nn")) {
     as.integer(tnrow)
   } else {
     as.integer(enrow)
   }
+  ordinary.hc0 <- isTRUE(se) &&
+    as.integer(reg.code) %in% as.integer(c(REGTYPE_LP0, REGTYPE_LP))
+
+  if (ordinary.hc0) as.integer(tnrow) + base.total else base.total
 }
 
 npreg.rbandwidth <-
@@ -226,34 +450,51 @@ npreg.rbandwidth <-
            txdat = stop("training data 'txdat' missing"),
            tydat = stop("training data 'tydat' missing"),
            exdat, eydat, gradient.order = 1L, gradients = FALSE,
-           residuals = FALSE,
+           residuals = FALSE, se = FALSE,
            ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_regression_forward(.npreg_fit_impl, environment(),
+    match.call(expand.dots = FALSE), match.call(), parent.frame(),
+    substitute(tydat), substitute(list(...))[-1L], TRUE)
+}
+
+.npreg_fit_impl <-
+  function(bws,
+           txdat = stop("training data 'txdat' missing"),
+           tydat = stop("training data 'tydat' missing"),
+           exdat, eydat, gradient.order = 1L, gradients = FALSE,
+           residuals = FALSE, se = FALSE,
+           ..., .np.context){
+  .np_reject_native_data(.np.context$dots)
+
     fit.start <- proc.time()[3]
     gradients <- npValidateScalarLogical(gradients, "gradients")
+    se <- npValidateScalarLogical(se, "se")
     residuals <- npValidateScalarLogical(residuals, "residuals")
     .npRmpi_require_active_slave_pool(where = "npreg()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     dots <- list(...)
+    npRejectLegacyBooleanErrors(dots, "npreg")
     fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
-    regtype.raw <- if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+    reg.spec.raw <- npValidatedConditionalRegSpec(
+      bws,
+      where = "npreg",
+      ncon.field = "ncon"
+    )
+    output.request <- .np_regression_output_request(
+      se, gradients, dots[[".np.gradient.errors", exact = TRUE]])
+    gradient.errors <- identical(output.request, 3L)
+    regtype.raw <- reg.spec.raw$regtype
     if ("remin" %in% names(dots)) {
       warning("npreg: bandwidth-selection argument 'remin' is ignored when a bandwidth object is supplied",
               call. = FALSE)
       dots$remin <- NULL
     }
-    basis.raw <- npValidateLpBasis(regtype = regtype.raw, basis = bws$basis)
-    degree.raw <- npValidateGlpDegree(regtype = regtype.raw,
-                                      degree = bws$degree,
-                                      ncon = bws$ncon)
-    bernstein.raw <- npValidateGlpBernstein(regtype = regtype.raw,
-                                            bernstein.basis = bws$bernstein.basis)
-    reg.spec.raw <- npCanonicalConditionalRegSpec(
-      regtype = regtype.raw,
-      basis = basis.raw,
-      degree = degree.raw,
-      bernstein.basis = bernstein.raw,
-      ncon = bws$ncon,
-      where = "npreg"
-    )
     if (isTRUE(gradients) && identical(regtype.raw, "lc")) {
       npValidateLcGradientOrder(
         regtype = regtype.raw,
@@ -293,9 +534,16 @@ npreg.rbandwidth <-
         gradient.order = glp.gradient.order.raw,
         ncon = bws$ncon
       )
-      if (!any(glp.gradient.available.raw)) {
-        stop("npreg has no available derivative components for the requested gradient.order and fitted polynomial degree",
-             call. = FALSE)
+      if (!any(glp.gradient.available.raw) &&
+          (bws$nuno + bws$nord == 0L)) {
+        npStopGlpGradientNoneAvailable(
+          where = "npreg",
+          action = "compute",
+          degree.engine = reg.spec.raw$degree.engine,
+          gradient.order = glp.gradient.order.raw,
+          available = glp.gradient.available.raw,
+          con.names = names(toFrame(txdat))[bws$icon]
+        )
       }
       glp.gradient.partial.raw <- !lp.degree0.lc.gradient.raw &&
         any(!glp.gradient.available.raw)
@@ -304,7 +552,8 @@ npreg.rbandwidth <-
         identical(reg.spec.raw$regtype.engine, "lp") &&
         (bws$ncon > 0L) &&
         !lp.degree0.lc.gradient.raw &&
-        all(reg.spec.raw$degree.engine == 0L)) {
+        all(reg.spec.raw$degree.engine == 0L) &&
+        (bws$nuno + bws$nord == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
     if (isTRUE(gradients) &&
@@ -347,6 +596,7 @@ npreg.rbandwidth <-
           bws = .npRmpi_autodispatch_untag(bws),
           txdat = txdat,
           tydat = tydat,
+          se = se,
           gradient.order = gradient.order,
           gradients = gradients,
           residuals = residuals
@@ -358,7 +608,9 @@ npreg.rbandwidth <-
       return(.npRmpi_autodispatch_tag_result(result, mode = "auto"))
     }
     if (.npRmpi_autodispatch_active()) {
-      result <- .npRmpi_autodispatch_call(match.call(), parent.frame())
+      dispatch.call <- .npreg_owned_dispatch_call(.np.context)
+      dispatch.call$.np.defer.empty.rows <- TRUE
+      result <- .npRmpi_autodispatch_call(dispatch.call, .np.context$caller, owner.name = "npreg.rbandwidth")
       if (is.list(result) && is.list(bws)) {
         has.nomad.optim <- (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) ||
           (!is.null(bws$powell.time) && is.finite(bws$powell.time))
@@ -389,7 +641,15 @@ npreg.rbandwidth <-
         }
         result <- .npRmpi_restore_nomad_fit_bws_metadata(result, bws)
       }
-      return(result)
+      return(.npreg_finish_empty_rows(result,
+        defer = isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]])))
+    }
+
+    native.newdata <- dots[["newdata", exact = TRUE]]
+    if (missing(exdat) && !is.null(native.newdata)) {
+      native.eval <- .np_native_newdata_parts(
+        native.newdata, list(exdat = bws$xnames), "npreg")
+      exdat <- native.eval$exdat
     }
 
     no.ex = missing(exdat)
@@ -397,7 +657,15 @@ npreg.rbandwidth <-
     npRejectLegacyLpArgs(names(dots), where = "npreg")
     warn.glp.gradient <- if (is.null(dots$warn.glp.gradient)) TRUE else isTRUE(dots$warn.glp.gradient)
 
+    inference.bws <- if (isTRUE(dots[[".np.fit.inference", exact = TRUE]])) bws else NULL
     txdat = toFrame(txdat)
+    bws <- .np_bws_retain_native_training(bws, xdat = txdat, ydat = tydat)
+
+    if (.np.context$public) {
+      .np_require_numeric_response(tydat, "npreg", "tydat")
+      if (!no.ey)
+        .np_require_numeric_response(eydat, "npreg", "eydat")
+    }
 
     if (!(is.vector(tydat) || is.factor(tydat)))
       stop("'tydat' must be a vector or a factor")
@@ -433,6 +701,22 @@ npreg.rbandwidth <-
     if (length(bws$bw) != length(txdat))
       stop("length of bandwidth vector does not match number of columns of 'txdat'")
 
+    beta.kernel <- identical(bws[["ckertype", exact = TRUE]], "beta")
+    npValidateBetaKernelSpecification(
+      ckertype = bws[["ckertype", exact = TRUE]],
+      ckerorder = bws[["ckerorder", exact = TRUE]],
+      bwtype = bws[["type", exact = TRUE]],
+      ckerbound = bws[["ckerbound", exact = TRUE]],
+      ckerlb = bws[["ckerlb", exact = TRUE]],
+      ckerub = bws[["ckerub", exact = TRUE]],
+      dati = bws[["xdati", exact = TRUE]],
+      bw = bws[["bw", exact = TRUE]],
+      bandwidth.compute = FALSE,
+      where = "beta regression",
+      regtype = bws[["regtype", exact = TRUE]],
+      allow.categorical = TRUE,
+      allow.general.lp = TRUE
+    )
     npValidateRegressionNnLowerBound(bws, where = "npreg")
     npValidateRegressionExtendedNn(
       bws,
@@ -440,23 +724,13 @@ npreg.rbandwidth <-
       bandwidth.compute = FALSE
     )
 
-    bws$basis <- npValidateLpBasis(regtype = bws$regtype,
-                                   basis = bws$basis)
-    bws$degree <- npValidateGlpDegree(regtype = bws$regtype,
-                                      degree = bws$degree,
-                                      ncon = bws$ncon)
-    bws$bernstein.basis <- npValidateGlpBernstein(regtype = bws$regtype,
-                                                  bernstein.basis = bws$bernstein.basis)
-    reg.spec <- npCanonicalConditionalRegSpec(
-      regtype = bws$regtype,
-      basis = bws$basis,
-      degree = bws$degree,
-      bernstein.basis = bws$bernstein.basis,
-      ncon = bws$ncon,
-      where = "npreg"
+    reg.spec <- npValidatedConditionalRegSpec(
+      bws,
+      where = "npreg",
+      ncon.field = "ncon"
     )
-    if (isTRUE(gradients) && identical(bws$regtype, "lc")) {
-      npValidateLcGradientOrder(
+    if (isTRUE(gradients) && bws$regtype %in% c("lc", "ll")) {
+      npValidateFirstDerivativeOrder(
         regtype = bws$regtype,
         gradient.order = gradient.order,
         ncon = bws$ncon,
@@ -494,9 +768,15 @@ npreg.rbandwidth <-
         gradient.order = glp.gradient.order,
         ncon = bws$ncon
       )
-      if (!any(glp.gradient.available)) {
-        stop("npreg has no available derivative components for the requested gradient.order and fitted polynomial degree",
-             call. = FALSE)
+      if (!any(glp.gradient.available) && (bws$nuno + bws$nord == 0L)) {
+        npStopGlpGradientNoneAvailable(
+          where = "npreg",
+          action = "compute",
+          degree.engine = reg.spec$degree.engine,
+          gradient.order = glp.gradient.order,
+          available = glp.gradient.available,
+          con.names = names(txdat)[bws$icon]
+        )
       }
       glp.gradient.partial <- !lp.degree0.lc.gradient &&
         any(!glp.gradient.available)
@@ -513,9 +793,10 @@ npreg.rbandwidth <-
     }
     if (isTRUE(gradients) &&
         identical(reg.spec$regtype.engine, "lp") &&
-        (bws$ncon > 0L) &&
-        !lp.degree0.lc.gradient &&
-        all(reg.spec$degree.engine == 0L)) {
+      (bws$ncon > 0L) &&
+      !lp.degree0.lc.gradient &&
+      all(reg.spec$degree.engine == 0L) &&
+      (bws$nuno + bws$nord == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
     if (isTRUE(gradients) &&
@@ -562,6 +843,8 @@ npreg.rbandwidth <-
 
     txdat <- txdat[keep.rows,,drop = FALSE]
     tydat <- tydat[keep.rows]
+    if (no.ex && !no.ey)
+      eydat <- eydat[keep.rows]
     resid.response <- tydat
 
     ## no.ex = missing(exdat)
@@ -618,9 +901,10 @@ npreg.rbandwidth <-
           output = "apply",
           s = integer(bws$ncon)
         )
-        resid <- tydat - as.vector(do.call(npreghat, mean.args))
+        resid <- tydat - as.vector(do.call(.npreghat_complete, mean.args))
       } else {
-        resid <- tydat - npreg(txdat = txdat, tydat = tydat, bws = bws)$mean
+        resid <- tydat - npreg(txdat = txdat, tydat = tydat, bws = bws,
+                               se = FALSE)$mean
       }
     }
 
@@ -629,11 +913,14 @@ npreg.rbandwidth <-
     enrow = (if (no.ex) tnrow else dim(exdat)[1])
     ncol = dim(txdat)[2]
 
+    inference.response <- if (!is.null(inference.bws))
+      .np_hat_response(tydat, bws[["ydati", exact = TRUE]]) else NULL
+
     ## convert tydat, eydat to numeric, from a factor with levels from the y-data
     ## used during bandwidth selection.
     
     if (is.factor(tydat)){
-      tydat <- adjustLevels(data.frame(tydat), bws$ydati)[,1]
+      tydat <- .np_regression_response_levels(data.frame(tydat), bws$ydati)[,1]
       tydat <- (bws$ydati$all.dlev[[1]])[as.integer(tydat)]
     }
     else
@@ -644,7 +931,7 @@ npreg.rbandwidth <-
       eydat <- double()
     else {
       if (is.factor(eydat)){
-        eydat <- adjustLevels(data.frame(eydat), bws$ydati, allowNewCells = TRUE)
+        eydat <- .np_regression_response_levels(data.frame(eydat), bws$ydati, allowNewCells = TRUE)
         eydat <- toMatrix(eydat)[,1]
       }
       else
@@ -657,10 +944,11 @@ npreg.rbandwidth <-
     grad.override <- isTRUE(gradients) &&
       identical(bws$regtype, "lc") &&
       identical(bws$type, "adaptive_nn") &&
+      !beta.kernel &&
       (bws$ncon > 0L)
     txdat.frame <- txdat
     exdat.frame <- if (no.ex) NULL else exdat
-    do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
+    do.compiled.gradients <- isTRUE(gradients)
 
     ## re-assign levels in training and evaluation data to ensure correct
     ## conversion to numeric type.
@@ -708,12 +996,15 @@ npreg.rbandwidth <-
       econ = data.frame()
     }
 
+    # Fit the bandwidth retained by the constructor. Native scale-factor
+    # reconstruction uses a legacy scale rule and can fit a different model.
+    physical.bw <- .np_physical_bandwidth(bws)
     myopti = list(
       num_obs_train = tnrow,
       num_obs_eval = enrow,
       num_uno = bws$nuno, num_ord = bws$nord,
       num_con = bws$ncon,
-      int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
+      int_LARGE_SF = SF_ARB,
       BANDWIDTH_reg_extern = switch(bws$type,
         fixed = BW_FIXED,
         generalized_nn = BW_GEN_NN,
@@ -723,7 +1014,8 @@ npreg.rbandwidth <-
         gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
         uniform = CKER_UNI,
-        "truncated gaussian" = CKER_TGAUSS),
+        beta = CKER_COORDINATE
+),
       ukerneval = switch(bws$ukertype,
         aitchisonaitken = UKER_AIT,
         liracine = UKER_LR),
@@ -736,8 +1028,18 @@ npreg.rbandwidth <-
       regtype = reg.c$code,
       no.ex = no.ex,
       mcv.numRow = attr(bws$xmcv, "num.row"),
-      int_do_tree = .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
-      old.reg = FALSE)
+      int_do_tree = if (beta.kernel) DO_TREE_NO else
+        .npreg_fit_tree_code(bws, ncon = bws$ncon, ncat = bws$nuno + bws$nord),
+      categorical.compress = if (
+        beta.kernel &&
+          (bws[["nuno", exact = TRUE]] > 0L ||
+             bws[["nord", exact = TRUE]] > 0L)
+      ) {
+        npStrictLogicalOption("np.categorical.compress", TRUE)
+      } else {
+        FALSE
+      })
+    myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
 
     cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
     
@@ -758,11 +1060,19 @@ npreg.rbandwidth <-
       integer(1)
     }
 
+    native.output.request <- c(output.request,
+      as.integer(!no.ex && !isTRUE(dots[[".np.require.complete", exact = TRUE]]) &&
+        reg.spec$regtype.engine %in% c("ll", "lp")))
+    capture.inference <- isTRUE(dots[[".np.fit.inference", exact = TRUE]])
+    if (capture.inference)
+      native.output.request <- .np_regression_inference_request(
+        native.output.request, bws, reg.spec, degree.c, se, no.ex)
+
     call_regression <- function() {
       .Call("C_np_regression",
             asDouble(tuno), asDouble(tord), asDouble(tcon), asDouble(tydat),
             asDouble(euno), asDouble(eord), asDouble(econ), asDouble(eydat),
-            asDouble(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+            asDouble(c(physical.bw[bws$icon], physical.bw[bws$iuno], physical.bw[bws$iord])),
             asDouble(bws$xmcv), asDouble(attr(bws$xmcv, "pad.num")),
             asDouble(bws$nconfac), asDouble(bws$ncatfac), asDouble(bws$sdev),
             as.integer(myopti),
@@ -772,15 +1082,13 @@ npreg.rbandwidth <-
             as.integer(npLpBasisCode(reg.spec$basis.engine)),
             as.integer(enrow),
             as.integer(ncol),
-            as.logical(do.compiled.gradients),
+            native.output.request,
             as.double(cker.bounds.c$lb),
             as.double(cker.bounds.c$ub),
             PACKAGE = "npRmpi")
     }
 
-    local.regression.context <- .npRmpi_has_active_slave_pool(comm = 1L) ||
-      isTRUE(.npRmpi_autodispatch_in_context()) ||
-      isTRUE(.npRmpi_autodispatch_called_from_bcast())
+    local.regression.context <- .npRmpi_rank_local_regression_context(comm = 1L)
 
     use.local.regression <- (
       identical(bws$type, "generalized_nn") &&
@@ -802,9 +1110,15 @@ npreg.rbandwidth <-
       isTRUE(local.regression.context)
     )
 
-    myout <- .np_with_compiled_fit_progress(
+    myout <- .np_with_nn_radius_context(.np_with_compiled_fit_progress(
       label = "Fitting regression",
-      total = .np_reg_fit_total(bws = bws, tnrow = tnrow, enrow = enrow),
+      total = .np_reg_fit_total(
+        bws = bws,
+        tnrow = tnrow,
+        enrow = enrow,
+        se = se,
+        reg.code = reg.c$code
+      ),
       handoff = fit.progress.handoff,
       handoff.detail = if (fit.progress.handoff) "starting" else NULL,
       if (use.local.regression) {
@@ -812,48 +1126,66 @@ npreg.rbandwidth <-
       } else {
         call_regression()
       }
-    )
+    ), continuous.names = bws[["xnames", exact = TRUE]][bws[["icon", exact = TRUE]]],
+       bws = bws, ntrain = tnrow)
 
+    invalid.rows <- integer()
     if (mean.override) {
-      myout$mean <- .np_regression_lc_mean_from_kernel_weights(
-        bws = bws,
-        txdat = txdat.frame,
-        tydat = tydat,
-        exdat = exdat.frame
-      )
-    }
-
-    if (gradients && !glp.gradient.partial){
-      myout$g = matrix(data=myout$g, nrow = enrow, ncol = ncol, byrow = FALSE) 
-      rorder = numeric(ncol)
-      ord_idx <- seq_len(ncol)
-      rorder[c(ord_idx[bws$icon], ord_idx[bws$iuno], ord_idx[bws$iord])] <- ord_idx
-      myout$g = as.matrix(myout$g[,rorder])
-
-      myout$gerr = matrix(data=myout$gerr, nrow = enrow, ncol = ncol, byrow = FALSE) 
-      myout$gerr = as.matrix(myout$gerr[,rorder])
-
-      if (grad.override) {
-        myout$g[, bws$icon] <- .np_regression_lc_gradient_from_kernel_weights(
-          bws = bws,
-          txdat = txdat.frame,
-          tydat = tydat,
-          exdat = exdat.frame
-        )
-      }
-
-    } else if (gradients) {
-      myout$g <- .npreg_glp_partial_gradients_from_npreghat(
+      override <- .np_regression_lc_mean_from_kernel_weights(
         bws = bws,
         txdat = txdat.frame,
         tydat = tydat,
         exdat = exdat.frame,
-        gradient.order = glp.gradient.order,
-        available = glp.gradient.available,
-        nrow.eval = enrow,
-        ncol.x = ncol
+        return.status = TRUE
       )
-      myout$gerr <- matrix(NA_real_, nrow = enrow, ncol = ncol)
+      myout$mean <- override$value
+      invalid.rows <- override$invalid
+    }
+
+    empty.eval.rows <- attr(myout, ".np.empty.rows", exact = TRUE)
+    .npreg_report_variance_unavailable(myout)
+
+    if (gradients){
+      myout$g = matrix(data=myout$g, nrow = enrow, ncol = ncol, byrow = FALSE) 
+      rorder = numeric(ncol)
+      ord_idx <- seq_len(ncol)
+      rorder[c(ord_idx[bws$icon], ord_idx[bws$iuno], ord_idx[bws$iord])] <- ord_idx
+      myout$g = as.matrix(myout$g[,rorder, drop = FALSE])
+
+      if (gradient.errors) {
+        myout$gerr = matrix(data=myout$gerr, nrow = enrow, ncol = ncol, byrow = FALSE)
+        myout$gerr = as.matrix(myout$gerr[,rorder, drop = FALSE])
+      }
+
+      if (grad.override) {
+        override <- .np_regression_lc_gradient_from_kernel_weights(
+          bws = bws,
+          txdat = txdat.frame,
+          tydat = tydat,
+          exdat = exdat.frame,
+          return.status = TRUE
+        )
+        myout$g[, bws$icon] <- override$value
+        invalid.rows <- override$invalid
+      }
+
+      if (glp.gradient.partial) {
+        unavailable <- which(bws$icon)[!glp.gradient.available]
+        myout$g[, unavailable] <- NA_real_
+        if (gradient.errors)
+          myout$gerr[, unavailable] <- NA_real_
+      }
+    }
+
+    if (length(invalid.rows)) {
+      myout$mean[invalid.rows] <- NA_real_
+      if (se)
+        myout$merr[invalid.rows] <- NA_real_
+      if (gradients) {
+        myout$g[invalid.rows, ] <- NA_real_
+        if (gradient.errors)
+          myout$gerr[invalid.rows, ] <- NA_real_
+      }
     }
 
     if (compute.resid.from.fit)
@@ -870,9 +1202,11 @@ npreg.rbandwidth <-
       merr = myout$merr,
       ntrain = tnrow,
       trainiseval = no.ex,
+      se = se,
       gradients = gradients,
       residuals = residuals,
-      xtra = myout$xtra,
+      # Native output has zero-filled scores when evaluation outcomes are absent.
+      xtra = if (!no.ex && no.ey) rep(NA_real_, 6L) else myout$xtra,
       rows.omit = if (no.ex) train.rows.omit else eval.rows.omit,
       train.rows.omit = train.rows.omit,
       eval.rows.omit = if (no.ex) integer(0) else eval.rows.omit,
@@ -883,38 +1217,93 @@ npreg.rbandwidth <-
     )
     if (gradients) {
       ev.args$grad <- myout$g
-      ev.args$gerr <- myout$gerr
+      if (gradient.errors)
+        ev.args$gerr <- myout$gerr
     }
     if (residuals)
       ev.args$resid <- resid
     if (identical(bws$regtype, "lp"))
       ev.args$gradient.order <- glp.gradient.order
     ev <- do.call(npregression, ev.args)
+    if (capture.inference) {
+      ev$fit.projection <- attr(myout, ".np.fit.projection", exact = TRUE)
+      ev$fit.inference <- attr(myout, ".np.fit.inference", exact = TRUE)
+      ev$fit.request <- list(bws = inference.bws, xdat = txdat.frame, ydat = inference.response,
+        exdat = exdat.frame, gradients = gradients, gradient.order = gradient.order)
+    }
+    certificate <- attr(myout, ".np.gradient.structural.zero", exact = TRUE)
+    if (gradient.errors && !is.null(certificate))
+      attr(ev, ".np.gradient.structural.zero") <-
+        matrix(certificate, enrow, ncol)[, rorder, drop = FALSE]
     ev$nomad.time <- if (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) as.double(bws$nomad.time) else NA_real_
     ev$powell.time <- if (!is.null(bws$powell.time) && is.finite(bws$powell.time)) as.double(bws$powell.time) else NA_real_
 
 
-    ev$call <- match.call(expand.dots = FALSE)
-    environment(ev$call) <- parent.frame()
-    return(ev)
+    ev$call <- .np.context$call
+    environment(ev$call) <- .np.context$caller
+    if (length(invalid.rows))
+      .np_undefined_fit_rows(invalid.rows, "npreg()", external = !no.ex,
+                             reason = "kernel weight sum is zero")
+    return(.npreg_finish_empty_rows(ev, empty.eval.rows,
+      omitted = if(no.ex) integer(0) else eval.rows.omit,
+      defer = isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]]),
+      row.labels = row.names(teval)))
   }
 
-npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
+.npreg_auxiliary <-
+  function(bws,
+           txdat = stop("training data 'txdat' missing"),
+           tydat = stop("training data 'tydat' missing"),
+           exdat, eydat, gradient.order = 1L, gradients = FALSE,
+           residuals = FALSE, se = FALSE,
+           ...){
+  call <- match.call(expand.dots = FALSE)
+  expanded <- match.call()
+  call[[1L]] <- expanded[[1L]] <- quote(npreg.rbandwidth)
+  .np_regression_forward(.npreg_fit_impl, environment(), call, expanded,
+    parent.frame(), substitute(tydat), substitute(list(...))[-1L], FALSE)
+}
+
+npreg.default <- function(bws, txdat, tydat, nomad = FALSE,
+                          se = FALSE, ...){
+
   .npRmpi_require_active_slave_pool(where = "npreg()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npreg()")
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
+  sc.names <- names(sc)
+  dots <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())
+  npRejectLegacyBooleanErrors(dots, "npreg")
+  se <- npValidateScalarLogical(se, "se")
   nomad <- npValidateNomadControl(nomad, "nomad")
 
-  if (!missing(bws) &&
+  named.formula <- missing(bws) && missing(txdat) && missing(tydat) &&
+    inherits(dots[["formula", exact = TRUE]], "formula")
+  if (named.formula || (!missing(bws) &&
       !isa(bws, "rbandwidth") &&
-      (inherits(bws, "formula") || is.call(bws))) {
-    dots <- list(...)
+      (inherits(bws, "formula") || is.call(bws)))) {
     dots$nomad <- nomad
     bw.args <- if (missing(txdat) && missing(tydat)) {
-      list(formula = bws)
+      list(formula = if (named.formula) dots[["formula", exact = TRUE]] else bws)
     } else {
       list(xdat = txdat, ydat = tydat)
     }
-    tbw <- do.call(npregbw, c(bw.args, dots))
+    if (named.formula) dots$formula <- NULL
+    frame.state <- if ("formula" %in% names(bw.args)) new.env(parent = emptyenv()) else NULL
+    if (!is.null(frame.state)) {
+      dots$.np.formula.state <- frame.state
+      on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+    }
+    tbw <- .np_formula_dispatch_call(
+      npregbw,
+      .np_public_dots_filter_args(c(bw.args, dots), "npregbw"),
+      substitute(list(...))[-1L], environment()
+    )
     reg.args <- list(bws = tbw)
     if (!missing(txdat))
       reg.args$txdat <- txdat
@@ -923,14 +1312,14 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     fit.dots <- dots
     fit.dots$remin <- NULL
     fit.dots$.np_fit_progress_handoff <- TRUE
-    return(do.call(npreg, c(reg.args, fit.dots)))
+    return(do.call(npreg, c(reg.args, list(se = se), fit.dots)))
   }
 
   has.fixed.bws.value <- !missing(bws) && !isa(bws, "rbandwidth")
   if (.npRmpi_autodispatch_active() && !npNomadControlRequested(nomad) && !isTRUE(has.fixed.bws.value))
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npreg.default"))
 
-  sc <- sys.call()
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -959,11 +1348,19 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     sc.bw <- sc
     sc.bw[[1]] <- quote(npregbw)
   }
+  sc.bw$se <- NULL
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
-  if(txdat.named)
+  if(txdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(txdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
     txdat <- toFrame(txdat)
+    if (!is.null(original.name)) names(txdat) <- original.name
+  }
 
   if(bws.named){
     sc.bw$bandwidth.compute <- FALSE
@@ -977,6 +1374,17 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npregbw")
+  formula.input <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())[["formula", exact = TRUE]]
+  frame.state <- if (!has.explicit.bws &&
+      (inherits(formula.input, "formula") ||
+       (!no.txdat && inherits(txdat, "formula"))))
+    new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+  }
     
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
     sc.bw,
@@ -987,16 +1395,24 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     if (use.outer.bandwidth.progress) {
       .np_progress_select_bandwidth_enhanced(
         "Selecting regression bandwidth",
-        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
       )
     } else {
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
   }
   
   call.args <- list(bws = tbw)
+  if (!is.null(frame.state))
+    call.args$.np.formula.state <- frame.state
   if (no.bws) {
     call.args$txdat <- txdat
     call.args$tydat <- tydat
@@ -1009,7 +1425,10 @@ npreg.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   }
   if (!has.explicit.bws)
     call.args$.np_fit_progress_handoff <- TRUE
-  ev <- do.call(npreg, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  ev <- do.call(npreg, c(call.args, list(se = se), fit.dots))
 
   ev$call <- match.call(expand.dots = FALSE)
   environment(ev$call) <- parent.frame()

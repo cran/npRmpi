@@ -54,6 +54,13 @@ and training data.
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment containing the variables
     in the model. If not found in \code{data}, the variables are taken
     from \code{environment(bws)}.
@@ -105,6 +112,10 @@ the location-scale transformation.
     an optional strictly positive scale vector interpreted as the
     conditional standard deviation at the training observations. If
     omitted, a pilot scale is computed automatically.
+    In formula calls, a full-length vector follows the formula's time
+    alignment, \code{subset} and missing-value selection. A vector already
+    having the selected sample length remains accepted when that length
+    differs from the original sample length.
   }
 
   \item{regtype.pilot}{
@@ -148,9 +159,11 @@ These arguments control the main check-loss bandwidth and
   }
 
   \item{nomad}{
-    logical value indicating whether to use the local-polynomial NOMAD
-    route for joint bandwidth, \code{delta}, and continuous degree-vector
-    search. Defaults to \code{FALSE}.
+    logical value or the character string \code{"auto"}. \code{TRUE} uses
+    the local-polynomial NOMAD route for joint bandwidth, \code{delta}, and
+    continuous degree-vector search. \code{"auto"} uses exhaustive/cell
+    degree search for one continuous smoothing dimension and NOMAD/Powell for
+    two or more. Defaults to \code{FALSE}.
   }
 
   \item{nomad.opts}{
@@ -189,6 +202,9 @@ These arguments control the main check-loss bandwidth and
   }
 }
 \details{
+  Regression searches and pilot fits inherit numerical ridging from
+  \code{\link{npregbw}} and \code{\link{npreg}}.
+
   For a requested quantile probability \eqn{\tau}{tau},
   \code{nplsqregbw} chooses bandwidths and \code{delta} for the
   transformed response
@@ -198,6 +214,14 @@ These arguments control the main check-loss bandwidth and
   by minimizing the leave-one-out check loss. The selected bandwidths
   are then used by \code{\link{nplsqreg}} for the final mixed-data
   \code{\link{npreg}} fit of the transformed response.
+
+  When the response fitted inside a leave-one-out fold differs from the
+  response entering the requested check loss, the deleted fitted value is
+  reconstructed with the fitted response while the residual is formed with
+  the requested loss response. Invalid search guidance is the exact
+  constrained constant-quantile check-loss null. A final NOMAD or Powell
+  payload is accepted only when replay of its selected point returns a raw
+  finite objective.
 
   The default pilot scale is a residual scale: first \code{\link{npreg}}
   estimates the conditional mean, then \code{\link{npreg}} smooths
@@ -211,7 +235,11 @@ These arguments control the main check-loss bandwidth and
   local-polynomial degree vector in addition to bandwidths and
   \code{delta}. The \code{search.engine="nomad+powell"} route uses NOMAD
   for degree search and Powell for hot-start refinement at the selected
-  degree.
+  degree. When \code{nomad="auto"}, a one-dimensional smoothing problem
+  instead evaluates the complete requested degree lattice and jointly
+  optimizes bandwidth and \code{delta} at every degree; higher-dimensional
+  problems use the NOMAD/Powell policy. \code{nomad.pilot} remains an
+  independent logical control and is not enabled by primary AUTO.
 }
 \value{
   \code{nplsqregbw} returns an object of class

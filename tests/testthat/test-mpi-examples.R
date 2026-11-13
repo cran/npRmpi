@@ -28,7 +28,7 @@ test_that("MPI examples from man pages work in an isolated session", {
       "stopifnot(inherits(model.iv, 'npregiv'))",
       "data('USArrests')",
       "dat <- USArrests[1:20, ]",
-      "pair_list <- np.pairs(y_vars = c('Murder', 'UrbanPop'), y_dat = dat)",
+      "pair_list <- np.pairs(y.vars = c('Murder', 'UrbanPop'), y.dat = dat)",
       "stopifnot(is.list(pair_list))",
       "stopifnot(identical(length(pair_list$pair_kerns), 4L))",
       "cat('MPI_EXAMPLES_SUBPROCESS_OK\\n')"
@@ -38,7 +38,7 @@ test_that("MPI examples from man pages work in an isolated session", {
   )
 
   info <- paste(res$output, collapse = "\n")
-  expect_true(res$status %in% c(0L, 137L), info = info)
+  expect_equal(res$status, 0L, info = info)
   expect_true(any(grepl("MPI_EXAMPLES_SUBPROCESS_OK", res$output, fixed = TRUE)),
               info = info)
 })

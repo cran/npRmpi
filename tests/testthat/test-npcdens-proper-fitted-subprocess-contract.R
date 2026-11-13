@@ -1,67 +1,5 @@
 local_npRmpi_subprocess_env <- function(extra = character()) {
-  pkg.root <- tryCatch(
-    normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
-    error = function(e) ""
-  )
-  if (!nzchar(pkg.root))
-    return(NULL)
-
-  src.copy <- tempfile("npRmpi-fitted-subprocess-src-")
-  dir.create(src.copy, recursive = TRUE, showWarnings = FALSE)
-  pkg.copy <- file.path(src.copy, "np-npRmpi")
-  if (!isTRUE(file.copy(pkg.root, src.copy, recursive = TRUE)))
-    return(NULL)
-
-  vignette.index <- file.path(pkg.copy, "build", "vignette.rds")
-  if (file.exists(vignette.index))
-    unlink(vignette.index, force = TRUE)
-
-  build.dir <- tempfile("npRmpi-fitted-subprocess-build-")
-  dir.create(build.dir, recursive = TRUE, showWarnings = FALSE)
-
-  old.wd <- getwd()
-  on.exit(setwd(old.wd), add = TRUE)
-  setwd(build.dir)
-
-  build.out <- suppressWarnings(system2(
-    file.path(R.home("bin"), "R"),
-    c("CMD", "build", "--no-build-vignettes", "--no-manual", pkg.copy),
-    stdout = TRUE,
-    stderr = TRUE
-  ))
-  build.status <- attr(build.out, "status")
-  if (is.null(build.status))
-    build.status <- 0L
-  if (build.status != 0L)
-    return(NULL)
-
-  tarballs <- Sys.glob(file.path(build.dir, "npRmpi_*.tar.gz"))
-  if (!length(tarballs))
-    return(NULL)
-
-  lib.path <- tempfile("npRmpi-fitted-subprocess-lib-")
-  dir.create(lib.path, recursive = TRUE, showWarnings = FALSE)
-
-  out <- suppressWarnings(system2(
-    file.path(R.home("bin"), "R"),
-    c("CMD", "INSTALL", "--no-test-load", "-l", lib.path, tail(tarballs, 1L)),
-    stdout = TRUE,
-    stderr = TRUE
-  ))
-  status <- attr(out, "status")
-  if (is.null(status))
-    status <- 0L
-
-  if (status != 0L) {
-    unlink(lib.path, recursive = TRUE, force = TRUE)
-    return(NULL)
-  }
-
-  c(
-    sprintf("R_LIBS=%s", paste(c(lib.path, .libPaths()), collapse = .Platform$path.sep)),
-    "NP_RMPI_NO_REUSE_SLAVES=1",
-    extra
-  )
+  npRmpi_subprocess_env(extra)
 }
 
 skip_slow_npcdens_fitted_subprocess <- function() {
@@ -82,10 +20,14 @@ test_that("npcdens formula route keeps estimator-only proper arguments out of ba
       "set.seed(42)",
       "x <- rnorm(40)",
       "y <- x + rnorm(40)",
-      "fit <- npcdens(y ~ x, regtype='lp', degree=1L, bernstein=TRUE, proper=TRUE, gradients=TRUE, nmulti=1)",
+      "fit <- npcdens(y ~ x, regtype='lp', degree=1L, bernstein.basis=TRUE, proper=TRUE, gradients=TRUE, nmulti=1)",
       "stopifnot(inherits(fit, 'condensity'))",
+      "stopifnot(isTRUE(fit$bws$bernstein.basis))",
+      "stopifnot(isTRUE(fit$bws$bernstein.basis.engine))",
       "stopifnot(isTRUE(fit$proper.requested))",
       "stopifnot(identical(dim(fit$congrad), c(40L, 1L)))",
+      "stopifnot(all(is.finite(fit$condens)))",
+      "stopifnot(all(is.finite(fit$congrad)))",
       "cat('NPCDENS_FORMULA_PROPER_ARGS_OK\\n')"
     ),
     timeout = 120L,

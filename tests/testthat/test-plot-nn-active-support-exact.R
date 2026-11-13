@@ -13,7 +13,9 @@ test_that("nonfixed unconditional exact bootstrap matches duplicate-row oracle",
   storage.mode(counts) <- "double"
 
   for (bt in c("generalized_nn", "adaptive_nn")) {
-    bw.val <- if (identical(bt, "adaptive_nn")) 2 else 1
+    # Generalized evaluation at zero sees both coincident training rows; the
+    # third order statistic is the first strictly positive literal radius.
+    bw.val <- if (identical(bt, "adaptive_nn")) 2 else 3
     bw <- do.call(npudensbw, list(
       dat = xdat,
       bwtype = bt,
@@ -88,7 +90,7 @@ test_that("nonfixed unconditional exact helper matches direct kbandwidth precomp
   active <- counts > 0
 
   for (bt in c("generalized_nn", "adaptive_nn")) {
-    bw.val <- if (identical(bt, "adaptive_nn")) 2 else 1
+    bw.val <- if (identical(bt, "adaptive_nn")) 2 else 3
     bw <- do.call(npudensbw, list(
       dat = xdat,
       bwtype = bt,
@@ -136,9 +138,15 @@ test_that("nonfixed conditional exact bootstrap matches duplicate-row oracle", {
     c(0, 2, 1, 0, 1, 2)
   )
   storage.mode(counts) <- "double"
+  positive.occurrence <- max(vapply(seq_len(ncol(counts)), function(j) {
+    max(c(
+      tapply(counts[, j], xdat$x, sum),
+      tapply(counts[, j], ydat$y, sum)
+    ))
+  }, numeric(1L))) + 1L
 
   for (bt in c("generalized_nn", "adaptive_nn")) {
-    bw.val <- if (identical(bt, "adaptive_nn")) c(2, 2) else c(1, 1)
+    bw.val <- rep.int(positive.occurrence, 2L)
     bw <- do.call(npcdensbw, list(
       xdat = xdat,
       ydat = ydat,
@@ -191,73 +199,6 @@ test_that("nonfixed conditional exact bootstrap matches duplicate-row oracle", {
   }
 })
 
-test_that("generalized conditional exact state apply matches weighted active-support oracle", {
-  if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
-
-  old_opts <- options(np.messages = FALSE, np.tree = FALSE)
-  on.exit(options(old_opts), add = TRUE)
-
-  xdat <- data.frame(x = c(0, 0, 1, 3, 3, 10))
-  ydat <- data.frame(y = c(0, 0, 1, 2, 2, 4))
-  exdat <- data.frame(x = c(0, 2, 5, 9))
-  eydat <- data.frame(y = c(0, 1, 2, 4))
-  counts <- c(1, 0, 1, 2, 0, 2)
-  active <- counts > 0
-
-  bw <- npcdensbw(
-    xdat = xdat,
-    ydat = ydat,
-    bwtype = "generalized_nn",
-    bws = c(1, 1),
-    bandwidth.compute = FALSE
-  )
-
-  den.state <- npRmpi:::.np_ksum_exact_state_build(
-    bws = npRmpi:::.np_con_make_kbandwidth_x(bws = bw, xdat = xdat),
-    exdat = exdat,
-    operator = "normal"
-  )
-  num.state <- npRmpi:::.np_ksum_exact_state_build(
-    bws = npRmpi:::.np_con_make_kbandwidth_xy(bws = bw, xdat = xdat, ydat = ydat),
-    exdat = npRmpi:::.np_bind_data_frames_fast(exdat, eydat),
-    operator = c("normal", "normal")
-  )
-
-  sample <- npRmpi:::.np_active_boot_sample_matrix(
-    xmat = data.matrix(xdat),
-    ymat = cbind(data.matrix(xdat), data.matrix(ydat)),
-    counts.col = counts
-  )
-
-  den <- as.numeric(npRmpi:::.np_ksum_eval_exact_state(
-    state = den.state,
-    txdat = sample$xmat,
-    weights = sample$weights
-  )) / sample$n.total
-
-  num <- as.numeric(npRmpi:::.np_ksum_eval_exact_state(
-    state = num.state,
-    txdat = sample$ymat,
-    weights = sample$weights
-  )) / sample$n.total
-
-  expect_equal(
-    num / pmax(den, .Machine$double.eps),
-    npRmpi:::.np_ksum_conditional_eval_exact(
-      xdat = xdat[active, , drop = FALSE],
-      ydat = ydat[active, , drop = FALSE],
-      exdat = exdat,
-      eydat = eydat,
-      kbx = npRmpi:::.np_con_make_kbandwidth_x(bws = bw, xdat = xdat),
-      kbxy = npRmpi:::.np_con_make_kbandwidth_xy(bws = bw, xdat = xdat, ydat = ydat),
-      cdf = FALSE,
-      weights = counts[active],
-      n.total = sum(counts)
-    ),
-    tolerance = 0
-  )
-})
-
 test_that("adaptive conditional exact handles tiny-support resamples consistently", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
 
@@ -270,12 +211,13 @@ test_that("adaptive conditional exact handles tiny-support resamples consistentl
   eydat <- data.frame(y = c(0, 1, 2, 4))
   counts <- matrix(c(0, 2, 1, 0, 3, 0), ncol = 1L)
   storage.mode(counts) <- "double"
+  positive.occurrence <- max(counts) + 1L
 
   bw <- npcdensbw(
     xdat = xdat,
     ydat = ydat,
     bwtype = "adaptive_nn",
-    bws = c(2, 2),
+    bws = rep.int(positive.occurrence, 2L),
     bandwidth.compute = FALSE
   )
 
@@ -321,7 +263,7 @@ test_that("npRmpi nonfixed unconditional exact helper fanout paths complete in s
       "exdat <- data.frame(x = c(0, 2, 5, 9))",
       "counts <- cbind(c(1,0,1,2,0,2), c(0,2,1,0,1,2))",
       "storage.mode(counts) <- 'double'",
-      "bw <- npudensbw(dat = xdat, bws = 1, bwtype = 'generalized_nn', bandwidth.compute = FALSE)",
+      "bw <- npudensbw(dat = xdat, bws = 4, bwtype = 'generalized_nn', bandwidth.compute = FALSE)",
       "fit_counts <- npRmpi:::.np_inid_boot_from_ksum_unconditional_exact(xdat = xdat, exdat = exdat, bws = bw, B = ncol(counts), operator = 'normal', counts = counts)",
       "drawer <- function(start, stop) {",
       "  counts.mat <- matrix(c(1,0,1,2,0,2,0,2,1,0,1,2), nrow = 6L)",

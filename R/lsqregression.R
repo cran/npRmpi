@@ -18,6 +18,12 @@ lsqregressionbandwidth <-
         missing(scale) || missing(xdat) || missing(ydat) || missing(qdat))
       stop("improper invocation of lsqregressionbandwidth constructor")
 
+    reg.spec <- npConditionalRegEngineSpec(
+      reg.bws,
+      where = "lsqregressionbandwidth",
+      ncon.field = "ncon"
+    )
+
     d <- list(
       bw = reg.bws$bw,
       xbw = reg.bws$bw,
@@ -76,6 +82,10 @@ lsqregressionbandwidth <-
       basis = reg.bws$basis,
       degree = reg.bws$degree,
       bernstein.basis = reg.bws$bernstein.basis,
+      regtype.engine = reg.spec$reg.engine,
+      basis.engine = reg.spec$basis.engine,
+      degree.engine = reg.spec$degree.engine,
+      bernstein.basis.engine = reg.spec$bernstein.engine,
       method = "cv.check",
       pmethod = "Check-Loss Cross-Validation",
       fval = objective,
@@ -104,6 +114,7 @@ lsqregression <-
            ntrain,
            trainiseval = FALSE,
            gradients = FALSE,
+           se = !.np_se_output_missing(quanterr),
            residuals = FALSE,
            resid = NA,
            call = NULL,
@@ -113,6 +124,11 @@ lsqregression <-
         missing(tau) || missing(delta) || missing(quantile) ||
         missing(ntrain))
       stop("improper invocation of lsqregression constructor")
+
+    reg.spec <- npConditionalRegEngineSpec(
+      bws,
+      where = "lsqregression"
+    )
 
     d <- list(
       bw = bws$bw,
@@ -152,6 +168,10 @@ lsqregression <-
       basis = bws$basis,
       degree = bws$degree,
       bernstein.basis = bws$bernstein.basis,
+      regtype.engine = reg.spec$reg.engine,
+      basis.engine = reg.spec$basis.engine,
+      degree.engine = reg.spec$degree.engine,
+      bernstein.basis.engine = reg.spec$bernstein.engine,
       xeval = xeval,
       tau = tau,
       delta = delta,
@@ -164,6 +184,7 @@ lsqregression <-
       ntrain = ntrain,
       trainiseval = trainiseval,
       gradients = gradients,
+      se = se,
       gradient.order = gradient.order,
       residuals = residuals,
       resid = resid,
@@ -392,18 +413,51 @@ lsqregression <-
   paste(deparse(stats::formula(formula)[[2L]]), collapse = "")
 }
 
-.nplsqreg_set_response_name <- function(x, response.name) {
+.nplsqreg_retain_formula_terms <- function(bws, formula, terms) {
+  if (inherits(bws, "lsqregression")) {
+    bws$bws <- .nplsqreg_retain_formula_terms(bws$bws, formula, terms)
+    if (!is.null(bws$tau.fits))
+      bws$tau.fits <- lapply(bws$tau.fits, .nplsqreg_retain_formula_terms,
+                             formula = formula, terms = terms)
+    return(bws)
+  }
+  bws$formula <- formula
+  bws$terms <- terms
+  if (!is.null(bws$tau.bws))
+    bws$tau.bws <- lapply(bws$tau.bws, .nplsqreg_retain_formula_terms,
+                          formula = formula, terms = terms)
+  bws
+}
+
+.nplsqreg_set_response_name <- function(x, response.name, predictor.names = NULL) {
   x$ynames <- response.name
+  labels <- list(ynames = response.name)
+  if (!is.null(predictor.names)) {
+    x$xnames <- predictor.names
+    labels$xnames <- predictor.names
+  }
   if (!is.null(x$reg.bws))
-    x$reg.bws$ynames <- response.name
+    x$reg.bws <- updateBwNameMetadata(labels, x$reg.bws)
+  # The mean pilot models this response; the scale pilot models squared
+  # residuals and retains its distinct response description. Retained sample
+  # column names are left intact: they belong to the LSQ reuse identity check.
+  if (!is.null(x$mean.fit)) {
+    x$mean.fit$ynames <- response.name
+    if (!is.null(predictor.names)) x$mean.fit$xnames <- predictor.names
+    x$mean.fit$bws <- updateBwNameMetadata(labels, x$mean.fit$bws)
+  }
+  if (!is.null(predictor.names) && !is.null(x$scale.fit)) {
+    x$scale.fit$xnames <- predictor.names
+    x$scale.fit$bws <- updateBwNameMetadata(list(xnames = predictor.names), x$scale.fit$bws)
+  }
   if (!is.null(x$bws))
-    x$bws <- .nplsqreg_set_response_name(x$bws, response.name)
+    x$bws <- .nplsqreg_set_response_name(x$bws, response.name, predictor.names)
   if (!is.null(x$tau.bws))
     x$tau.bws <- lapply(x$tau.bws, .nplsqreg_set_response_name,
-                        response.name = response.name)
+                        response.name = response.name, predictor.names = predictor.names)
   if (!is.null(x$tau.fits))
     x$tau.fits <- lapply(x$tau.fits, .nplsqreg_set_response_name,
-                         response.name = response.name)
+                         response.name = response.name, predictor.names = predictor.names)
   x
 }
 
@@ -503,7 +557,8 @@ quantile.lsqregression <- function(x, ...) {
 }
 
 se.lsqregression <- function(x) {
-  x$quanterr
+  .np_require_stored_se(x, x[["quanterr", exact = TRUE]], "nplsqreg",
+                       expr = substitute(x))
 }
 
 .nplsqreg_residuals_unavailable <- function(x) {
@@ -532,15 +587,19 @@ residuals.lsqregression <- function(object, ...) {
   object$resid
 }
 
-gradients.lsqregression <- function(x, errors = FALSE,
+gradients.lsqregression <- function(x, se = FALSE,
                                     gradient.order = NULL, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  gout <- if (!errors) x$quantgrad else x$quantgerr
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.lsqregression", suggest = TRUE)
+  npRejectLegacyBooleanErrors(list(...), "gradients.lsqregression")
+  se <- npValidateScalarLogical(se, "se")
+  gout <- if (!se) x$quantgrad else x$quantgerr
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop(if (!errors)
-      "gradients are not available: fit the model with gradients=TRUE"
-    else
-      "gradient standard errors are not available: fit the model with gradients=TRUE")
+    .np_stop_missing_output(
+      substitute(x), "nplsqreg",
+      message = if (!se) "gradients are not available." else
+        "gradient standard errors were not computed.",
+      switches = if (!se) "gradients = TRUE" else "gradients = TRUE, se = TRUE")
   if (!is.null(gradient.order)) {
     fit.list <- if (inherits(x$fit, "npregression")) list(x$fit) else x$fit
     if (!is.list(fit.list) || !length(fit.list) ||
@@ -598,7 +657,7 @@ gradients.lsqregression <- function(x, errors = FALSE,
       }
     }
     invisible(lapply(fit.list, function(fit)
-      gradients(fit, errors = errors, gradient.order = gradient.order)))
+      gradients(fit, se = se, gradient.order = gradient.order)))
   }
   gout
 }
@@ -641,6 +700,7 @@ gradients.lsqregression <- function(x, errors = FALSE,
                                         gradients = FALSE,
                                         need.errors = TRUE,
                                         gradient.order = 1L,
+                                        .np.empty.report = NULL,
                                         ...) {
   .np_plot_activity_run(
     label = if (length(tau) == 1L) {
@@ -657,6 +717,13 @@ gradients.lsqregression <- function(x, errors = FALSE,
       tydat <- as.numeric(toFrame(tydat)[[1L]])
       exdat <- toFrame(exdat)
 
+      empty.state <- new.env(hash = FALSE, parent = emptyenv())
+      empty.state$rows <- NULL
+      capture.rows <- function(flags, labels = NULL) {
+        empty.state$rows <- .npreg_merge_empty_rows(empty.state$rows, flags)
+      }
+      finish <- function(value) .npreg_publish_plot_rows(value, empty.state$rows,
+        report = .np.empty.report, row.labels = row.names(exdat))
       fit.one <- function(one.bws, tau.i) {
         fit <- .np_plot_regression_eval(
           bws = one.bws$reg.bws,
@@ -665,7 +732,8 @@ gradients.lsqregression <- function(x, errors = FALSE,
           exdat = exdat,
           gradients = gradients,
           gradient.order = gradient.order,
-          need.asymptotic = need.errors
+          need.asymptotic = need.errors,
+          .np.empty.report = capture.rows
         )
         lsqregression(
           bws = one.bws,
@@ -680,6 +748,7 @@ gradients.lsqregression <- function(x, errors = FALSE,
           ntrain = nrow(txdat),
           trainiseval = FALSE,
           gradients = gradients,
+          se = need.errors,
           residuals = FALSE,
           resid = NA,
           call = NULL
@@ -692,7 +761,8 @@ gradients.lsqregression <- function(x, errors = FALSE,
         if (is.null(one.bws))
           stop("vector nplsqreg bandwidth object lacks per-tau bandwidth state",
                call. = FALSE)
-        return(fit.one(one.bws, tau))
+        fit <- fit.one(one.bws, tau)
+        return(finish(fit))
       }
 
       idx <- .nplsqreg_match_plot_tau(tau, bws$tau)
@@ -706,85 +776,153 @@ gradients.lsqregression <- function(x, errors = FALSE,
         tau = tau,
         tau.search = if (is.null(bws$tau.search)) "full" else bws$tau.search
       )
-      .nplsqreg_combine_fits(
+      fit <- .nplsqreg_combine_fits(
         fit.list = fit.list,
         tau = tau,
         bws = sub.bws,
         tau.search = if (is.null(bws$tau.search)) "full" else bws$tau.search,
         call = NULL
       )
+      finish(fit)
     }
   )
 }
 
 .nplsqreg_predict_formula_newdata_to_exdat <- function(object, newdata) {
-  tt <- stats::terms(object$bws$formula)
+  tt <- object$bws[["terms", exact = TRUE]]
+  if (is.null(tt))
+    tt <- stats::terms(object$bws$formula)
   rhs <- stats::delete.response(tt)
   npValidateNewdataFormula(newdata, rhs, include.response = FALSE)
-  mf <- stats::model.frame(formula = rhs, data = newdata)
-  mf[, attr(attr(mf, "terms"), "term.labels"), drop = FALSE]
+  mf <- do.call(.np_formula_model_frame, list(formula = rhs, data = newdata),
+                envir = environment(tt))
+  mf <- .np_formula_complete_training_frame(mf)
+  list(exdat = mf[, .np_formula_term_names(attr(attr(mf, "terms"), "term.labels")), drop = FALSE],
+       omit = attr(mf, "na.action"))
 }
 
-predict.lsqregression <- function(object, se.fit = FALSE, ...) {
+predict.lsqregression <- function(object, se.fit = FALSE, ..., tau = NULL) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
+  tau.index <- NULL
+  if (!is.null(tau)) {
+    tau <- .nplsqreg_validate_tau_values(tau)
+    tau.index <- match(tau, object[["tau", exact = TRUE]])
+    if (anyNA(tau.index))
+      stop("requested 'tau' was not fitted; fit the missing quantile with nplsqreg() before predicting",
+           call. = FALSE)
+  }
+  dots <- list(...)
+  # Formula evaluation owns names and transformations; native exdat already
+  # contains model coordinates. Reserve training slots for positional newdata.
+  dots <- if (is.null(object$bws$formula))
+    .np_match_native_args(dots, npreg.rbandwidth, c("txdat", "tydat")) else
+    .np_match_native_args(dots, nplsqreg.formula, "data")
+  defer.empty <- isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]])
+  dots$.np.defer.empty.rows <- NULL
+  npRejectLegacyBooleanErrors(dots, "predict.lsqregression")
+  if ("se" %in% names(dots))
+    stop("predict.lsqregression() uses se.fit=, not se=", call. = FALSE)
+  # Prepare the evaluation sample once, before splitting vector tau. The row
+  # map belongs to this request, never to a previous external fit.
+  retained.evaluation <- is.null(dots$exdat) && is.null(dots$newdata)
+  eval.omit <- NULL
+  if (!is.null(dots$exdat)) {
+    prepared <- .nplsqreg_prepare_eval_data(dots$exdat)
+    dots$exdat <- prepared$exdat
+    eval.omit <- prepared$omit
+    dots$newdata <- NULL
+  } else if (!is.null(dots$newdata)) {
+    prepared <- if (!is.null(object$bws$formula)) {
+      .nplsqreg_predict_formula_newdata_to_exdat(object, dots$newdata)
+    } else {
+      .nplsqreg_prepare_eval_data(.np_native_newdata_parts(
+        dots$newdata, list(exdat = object$bws$xnames), "predict.nplsqreg")$exdat)
+    }
+    dots$exdat <- prepared$exdat
+    eval.omit <- prepared$omit
+    dots$newdata <- NULL
+  } else {
+    eval.omit <- object$bws[["omit", exact = TRUE]]
+  }
+  finish <- function(out, flags = NULL, row.labels = NULL) {
+    if (se.fit) {
+      out$fit <- .nplsqreg_napredict_eval(eval.omit, out$fit)
+      out$se.fit <- .nplsqreg_napredict_eval(eval.omit, out$se.fit)
+    } else {
+      out <- .nplsqreg_napredict_eval(eval.omit, out)
+    }
+    .npreg_finish_empty_rows(out, flags, omitted = eval.omit,
+      defer = defer.empty, owner = "predict.nplsqreg", row.labels = row.labels)
+  }
   if (length(object$tau) > 1L) {
     if (is.null(object$tau.fits) || length(object$tau.fits) != length(object$tau))
       stop("vector nplsqreg object lacks per-tau fit state", call. = FALSE)
     labels <- .nplsqreg_tau_labels(object$tau)
-    pred <- lapply(object$tau.fits, predict.lsqregression,
-                   se.fit = se.fit, ...)
+    prediction.fits <- object$tau.fits
+    if (!is.null(tau.index)) {
+      labels <- labels[tau.index]
+      prediction.fits <- prediction.fits[tau.index]
+    }
+    empty.state <- new.env(hash = FALSE, parent = emptyenv())
+    empty.state$rows <- NULL
+    child.dots <- dots
+    child.dots$.np.defer.empty.rows <- TRUE
+    pred <- lapply(prediction.fits, function(one) {
+      # The parent owns restoration once, including legacy children that did
+      # not retain a training omission map of their own.
+      if (retained.evaluation)
+        one$bws <- .nplsqreg_record_omit(one$bws, NULL)
+      value <- do.call(predict.lsqregression,
+        c(list(object = one, se.fit = se.fit), child.dots))
+      flags <- attr(value, ".np.empty.rows", exact = TRUE)
+      empty.state$rows <- .npreg_merge_empty_rows(empty.state$rows, flags)
+      if(!is.null(flags)) attr(value, ".np.empty.rows") <- NULL
+      value
+    })
+    # Keep formula preparation and row restoration with the vector parent,
+    # even when the request selects just one scalar child.
+    if (!is.null(tau.index) && length(tau.index) == 1L)
+      return(finish(pred[[1L]], empty.state$rows))
     if (se.fit) {
       fit <- do.call(cbind, lapply(pred, `[[`, "fit"))
       se.out <- do.call(cbind, lapply(pred, `[[`, "se.fit"))
       colnames(fit) <- labels
       colnames(se.out) <- labels
-      return(list(fit = fit,
-                  se.fit = se.out,
-                  df = pred[[1L]]$df,
-                  residual.scale = pred[[1L]]$residual.scale))
+      out <- list(fit = fit, se.fit = se.out, df = pred[[1L]]$df,
+                  residual.scale = setNames(vapply(pred, function(one)
+                    one$residual.scale, numeric(1L)), labels))
+      return(finish(out, empty.state$rows))
     }
     out <- do.call(cbind, pred)
     colnames(out) <- labels
-    return(out)
-  }
-  dots <- list(...)
-  has.formula.route <- !is.null(object$bws$formula)
-
-  if (!is.null(dots$exdat) && !is.null(dots$newdata))
-    dots$newdata <- NULL
-
-  if (has.formula.route) {
-    if (is.null(dots$exdat) && !is.null(dots$newdata)) {
-      dots$exdat <- .nplsqreg_predict_formula_newdata_to_exdat(object, dots$newdata)
-      dots$newdata <- NULL
-    }
-  } else {
-    if (is.null(dots$exdat) && !is.null(dots$newdata)) {
-      dots$exdat <- dots$newdata
-      dots$newdata <- NULL
-    }
+    return(finish(out, empty.state$rows))
   }
 
   fit.args <- list(bws = object$reg.bws,
                    txdat = object$bws$xdat,
-                   tydat = object$bws$qdat)
+                   tydat = object$bws$qdat,
+                   se = se.fit)
   if (!is.null(dots$exdat))
     fit.args$exdat <- dots$exdat
   fit.args <- c(fit.args, dots[setdiff(names(dots), c("newdata", "exdat"))])
 
+  fit.args$.np.defer.empty.rows <- TRUE
   tr <- do.call(npreg, fit.args)
-  if (se.fit) {
+  out <- if (se.fit) {
     list(fit = fitted(tr), se.fit = se(tr),
-         df = tr$nobs, residual.scale = tr$MSE)
+         df = tr$nobs, residual.scale = .np_prediction_training_mse(
+           object$fit, tr, dots))
   } else {
     fitted(tr)
   }
+  finish(out, attr(tr, ".np.empty.rows", exact = TRUE),
+         row.labels = row.names(tr$eval))
 }
 
-plot.lsqregression <- function(x, tau = NULL, gradient = FALSE,
-                               gradients = gradient,
-                               plot.data.overlay = NULL,
+plot.lsqregression <- function(x, tau = NULL, gradients = FALSE,
+                               data_overlay = NULL,
                                xlab = NULL, ylab = NULL, ylim = NULL, ...) {
+  plot.data.overlay <- data_overlay
   dots.call <- match.call(expand.dots = FALSE)$...
   .np_plot_validate_public_dots(
     dots.call,
@@ -810,7 +948,7 @@ plot.lsqregression <- function(x, tau = NULL, gradient = FALSE,
   tau <- if (is.null(tau)) {
     x$tau
   } else {
-    .nplsqreg_validate_tau_values(tau, allow.duplicates = TRUE)
+    .nplsqreg_validate_tau_values(tau, allow.duplicates = FALSE)
   }
 
   if (is.null(plot.data.overlay)) {
@@ -840,7 +978,11 @@ plot.lsqregression <- function(x, tau = NULL, gradient = FALSE,
     ),
     dots
   )
-  .np_with_seed(random.seed, do.call(.np_plot_condbandwidth_engine, args))
+  publisher <- .npreg_plot_empty_publisher("plot.nplsqreg")
+  args$.np.empty.report <- publisher$record
+  value <- .npreg_finish_plot_call(
+    .np_with_seed(random.seed, do.call(.np_plot_condbandwidth_engine, args)), publisher)
+  .np_plot_data_finish(value, x$bws, args, .np_plot_condbandwidth_engine, random.seed)
 }
 
 compute.bootstrap.errors.lsqregressionbandwidth <-

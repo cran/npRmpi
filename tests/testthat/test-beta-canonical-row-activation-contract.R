@@ -1,0 +1,1940 @@
+locate_beta_activation_sources <- function() {
+  roots <- unique(c(
+    testthat::test_path("..", ".."),
+    testthat::test_path("..", "..", ".."),
+    Sys.getenv("R_PACKAGE_DIR", ""),
+    Sys.getenv("R_PACKAGE_SOURCE", ""),
+    getwd(),
+    file.path(getwd(), "..")
+  ))
+  roots <- roots[nzchar(roots)]
+  roots <- roots[file.exists(file.path(roots, "src", "jksum.c"))]
+  if (!length(roots))
+    return(NULL)
+  roots[[1L]]
+}
+
+test_that("activated beta absolute rows enter the canonical central engine", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+
+  ingress_start <- regexpr("SEXP C_np_kernelsum(", ingress,
+                           fixed = TRUE)[[1L]]
+  ingress_end <- regexpr("SEXP C_np_kernelsum_power12(", ingress,
+                         fixed = TRUE)[[1L]]
+  expect_gt(ingress_start, 0L)
+  expect_gt(ingress_end, ingress_start)
+  kernelsum_ingress <- substr(ingress, ingress_start, ingress_end - 1L)
+
+  activation_start <- regexpr(
+    "NPContinuousKernelRoute route;",
+    kernelsum_ingress,
+    fixed = TRUE
+  )[[1L]]
+  activation_end <- regexpr(
+    "if(derivative_dimension >= 0 || p_operator == OP_DERIVATIVE)",
+    kernelsum_ingress,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(activation_start, 0L)
+  expect_gt(activation_end, activation_start)
+  activation <- substr(
+    kernelsum_ingress, activation_start, activation_end - 1L
+  )
+
+  expect_match(activation, "NPContinuousKernelDerivativeDiagnostics",
+               fixed = TRUE)
+  expect_match(activation, "kernel_weighted_sum_np_route(", fixed = TRUE)
+  expect_match(activation, "&route", fixed = TRUE)
+  expect_false(grepl(
+    "beta_bandwidth_code == BW_FIXED || !has_overlap",
+    activation,
+    fixed = TRUE
+  ))
+  expect_false(grepl("np_beta_kernelsum(", activation, fixed = TRUE))
+  expect_false(grepl("np_beta_kernelsum_derivative(", activation,
+                     fixed = TRUE))
+  derivative_sidecar_calls <- gregexpr(
+    "np_beta_kernelsum_derivative(", ingress, fixed = TRUE
+  )[[1L]]
+  derivative_sidecar_calls <- derivative_sidecar_calls[
+    derivative_sidecar_calls > 0L
+  ]
+  expect_length(derivative_sidecar_calls, 0L)
+  expect_false(grepl("KWS_DOTREEI", activation, fixed = TRUE))
+
+  route_start <- regexpr("if(kernel_execution_context != NULL && kernel_execution_context->route != NULL)", engine,
+                         fixed = TRUE)[[1L]]
+  legacy_start <- regexpr(
+    "This function takes a vector Y and returns a kernel weighted",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(route_start, 0L)
+  expect_gt(legacy_start, route_start)
+  expect_match(engine, "np_beta_absolute_route(", fixed = TRUE)
+  expect_match(engine, "np_continuous_kernel_beta_factor_row(", fixed = TRUE)
+  expect_match(
+    engine,
+    "np_continuous_kernel_beta_derivative_absolute_rows_validated(",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "np_continuous_kernel_beta_derivative_powered_rows_validated(",
+    fixed = TRUE
+  )
+  expect_match(
+    row_engine,
+    "if(response_columns == 0 && weight_columns == 0)",
+    fixed = TRUE
+  )
+  expect_match(engine, "np_continuous_kernel_signed_log_restore(", fixed = TRUE)
+  expect_match(
+    engine,
+    "np_continuous_kernel_signed_log_power_restore(",
+    fixed = TRUE
+  )
+  expect_match(
+    row_engine,
+    "NPContinuousKernelRowStatus np_continuous_kernel_signed_log_power_restore(",
+    fixed = TRUE
+  )
+  scaled_restore_start <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_scaled_restore(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  signed_restore_start <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_signed_log_restore(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(scaled_restore_start, 0L)
+  expect_gt(signed_restore_start, scaled_restore_start)
+  scaled_restore <- substr(
+    row_engine, scaled_restore_start, signed_restore_start - 1L
+  )
+  expect_match(
+    scaled_restore,
+    "np_continuous_kernel_signed_log_power_restore(",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "log(fabs(scaled_value)) + (double)power * log_scale",
+    scaled_restore,
+    fixed = TRUE
+  ))
+  expect_match(
+    engine,
+    "np_continuous_kernel_beta_dual_power_rows_validated(",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "kernel_weighted_sum_np_route_power12(",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "beta kernels do not support the internal dual-power route",
+    paste(ingress, engine),
+    fixed = TRUE
+  ))
+  expect_match(
+    engine,
+    "(!route_has_convolution || matrix_bw_train != NULL)",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "(!route_has_convolution || matrix_bw_eval != NULL)",
+    fixed = TRUE
+  )
+})
+
+test_that("adaptive beta PDF rows prepare invariant observation state", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  row_header <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.h"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+
+  adaptive_start <- regexpr(
+    paste0(
+      "if(prepared != NULL && prepared->pdf_active &&\n",
+      "       plan->bandwidth_mode == BW_ADAP_NN)"
+    ),
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  scalar_start <- regexpr(
+    "log_absolute[observation] = np_beta_log_abs_pdf_order(",
+    substr(row_engine, adaptive_start + 1L, nchar(row_engine)),
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(adaptive_start, 0L)
+  expect_gt(scalar_start, 0L)
+  adaptive_owner <- substr(
+    row_engine,
+    adaptive_start,
+    adaptive_start + scalar_start - 1L
+  )
+
+  expect_match(
+    adaptive_owner,
+    "np_beta_log_abs_pdf_order_prepared_observation(",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "np_beta_log_abs_pdf_order(", adaptive_owner, fixed = TRUE
+  ))
+  expect_match(
+    row_engine,
+    paste0(
+      "context->pdf_row_component_active =\n",
+      "    plan->bandwidth_mode == BW_FIXED ||\n",
+      "    plan->bandwidth_mode == BW_GEN_NN;"
+    ),
+    fixed = TRUE
+  )
+  expect_match(row_header, "double *pdf_log_abs_coefficient;", fixed = TRUE)
+  expect_match(row_header, "signed char *pdf_coefficient_sign;", fixed = TRUE)
+  expect_false(grepl(
+    paste0(
+      "if(plan->bandwidth_mode != BW_FIXED &&\n",
+      "     plan->bandwidth_mode != BW_GEN_NN)\n",
+      "    return NP_CONTINUOUS_ROW_OK;"
+    ),
+    row_engine,
+    fixed = TRUE
+  ))
+})
+
+test_that("adaptive beta gradient rows reuse prepared observation state", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row_gradient.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+
+  sibling_start <- regexpr(
+    paste0(
+      "np_continuous_kernel_beta_level_derivative_observation_",
+      "adaptive_prepared_bound("
+    ),
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  row_start <- regexpr(
+    "np_continuous_kernel_beta_level_derivative_log_row_validated(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(sibling_start, 0L)
+  expect_gt(row_start, sibling_start)
+  sibling <- substr(row_engine, sibling_start, row_start - 1L)
+
+  expect_match(
+    sibling,
+    "np_beta_log_abs_pdf_derivative_order_prepared_observation(",
+    fixed = TRUE
+  )
+  expect_match(
+    sibling,
+    "np_beta_log_abs_pdf_order_prepared_observation(",
+    fixed = TRUE
+  )
+  expect_match(
+    sibling,
+    "plan->bandwidth_train[coordinate][observation]",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "np_beta_log_abs_pdf_derivative_order(", sibling, fixed = TRUE
+  ))
+  expect_match(
+    sibling,
+    "NP_CONTINUOUS_ROW_GRADIENT_NOINLINE",
+    fixed = TRUE
+  )
+  expect_match(
+    sibling,
+    paste0(
+      "np_continuous_kernel_beta_level_derivative_",
+      "adaptive_prepared_row_bound("
+    ),
+    fixed = TRUE
+  )
+
+  row_owner <- substr(row_engine, row_start, nchar(row_engine))
+  adaptive_start <- regexpr(
+    paste0(
+      "if(plan->bandwidth_mode == BW_ADAP_NN &&\n",
+      "     plan->beta_prepared != NULL"
+    ),
+    row_owner,
+    fixed = TRUE
+  )[[1L]]
+  scalar_start <- regexpr(
+    "np_continuous_kernel_beta_level_derivative_observation_bound(",
+    substr(row_owner, adaptive_start + 1L, nchar(row_owner)),
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(adaptive_start, 0L)
+  expect_gt(scalar_start, 0L)
+  adaptive_owner <- substr(
+    row_owner,
+    adaptive_start,
+    adaptive_start + scalar_start - 1L
+  )
+  expect_match(
+    adaptive_owner,
+    paste0(
+      "np_continuous_kernel_beta_level_derivative_",
+      "adaptive_prepared_row_bound("
+    ),
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "np_continuous_kernel_beta_level_derivative_observation_bound(",
+    adaptive_owner,
+    fixed = TRUE
+  ))
+})
+
+test_that("beta CDF rows reuse observation and fixed concentration state", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  row_header <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.h"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  beta_kernel <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "beta_kernel.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  prepare_start <- regexpr(
+    "np_continuous_kernel_beta_prepared_cdf_context_prepare(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  public_prepare_start <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_beta_prepared_context_prepare(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(prepare_start, 0L)
+  expect_gt(public_prepare_start, prepare_start)
+  cdf_prepare <- substr(
+    row_engine, prepare_start, public_prepare_start - 1L
+  )
+
+  expect_match(
+    cdf_prepare,
+    "plan->operator[coordinate] == OP_INTEGRAL",
+    fixed = TRUE
+  )
+  expect_match(
+    cdf_prepare,
+    "np_beta_cdf_observation_init(",
+    fixed = TRUE
+  )
+  expect_match(
+    cdf_prepare,
+    "np_beta_pdf_component_prepare_coefficient(",
+    fixed = TRUE
+  )
+  expect_match(
+    cdf_prepare,
+    "int concentration_eligible = plan->bandwidth_mode == BW_FIXED;",
+    fixed = TRUE
+  )
+  expect_match(
+    cdf_prepare,
+    paste0(
+      "component_count = (size_t)cdf_coordinate_count *\n",
+      "    NP_BETA_PREPARED_MAX_COMPONENTS;"
+    ),
+    fixed = TRUE
+  )
+  expect_match(
+    cdf_prepare,
+    "np_beta_concentration_prepare(",
+    fixed = TRUE
+  )
+  expect_match(row_header, "int cdf_active;", fixed = TRUE)
+  expect_match(
+    row_header, "int cdf_concentration_active;", fixed = TRUE
+  )
+  expect_match(
+    row_header, "np_beta_cdf_observation *cdf_observation;", fixed = TRUE
+  )
+  expect_match(
+    row_header, "double *cdf_concentration;", fixed = TRUE
+  )
+
+  sibling_start <- regexpr(
+    "np_continuous_kernel_beta_cdf_prepared_segment_log_fill_core(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  next_owner_start <- regexpr(
+    "typedef struct {\n  double other_log;",
+    substr(row_engine, sibling_start + 1L, nchar(row_engine)),
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(sibling_start, 0L)
+  expect_gt(next_owner_start, 0L)
+  sibling <- substr(
+    row_engine,
+    sibling_start,
+    sibling_start + next_owner_start - 1L
+  )
+  expect_match(
+    sibling,
+    "np_beta_log_abs_cdf_order_prepared_observation(",
+    fixed = TRUE
+  )
+  expect_match(
+    sibling,
+    "np_beta_log_abs_cdf_order_prepared_concentration(",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "np_beta_log_abs_cdf_order(", sibling, fixed = TRUE
+  ))
+  expect_match(
+    sibling,
+    "} else {\n        row_status = np_continuous_kernel_beta_log_value(",
+    fixed = TRUE
+  )
+  expect_match(
+    row_engine,
+    paste0(
+      "if(plan->beta_prepared != NULL &&\n",
+      "     plan->beta_prepared->cdf_concentration_active)\n",
+      "    return\n",
+      "      np_continuous_kernel_beta_cdf_prepared_concentration_segment_log_fill("
+    ),
+    fixed = TRUE
+  )
+  expect_match(
+    row_engine,
+    paste0(
+      "if(plan->beta_prepared != NULL && plan->beta_prepared->cdf_active)\n",
+      "    return np_continuous_kernel_beta_cdf_prepared_segment_log_fill("
+    ),
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "integral_operator |=",
+    row_engine,
+    fixed = TRUE
+  ))
+
+  canonical_cdf_calls <- gregexpr(
+    "np_beta_cdf_from_shape(", beta_kernel, fixed = TRUE
+  )[[1L]]
+  canonical_cdf_calls <- canonical_cdf_calls[canonical_cdf_calls > 0L]
+  expect_length(canonical_cdf_calls, 3L)
+  prepared_start <- regexpr(
+    "np_beta_log_abs_cdf_order_prepared_core(",
+    beta_kernel,
+    fixed = TRUE
+  )[[1L]]
+  next_owner_start <- regexpr(
+    "static double np_beta_log_overlap_scale(",
+    substr(beta_kernel, prepared_start + 1L, nchar(beta_kernel)),
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(prepared_start, 0L)
+  expect_gt(next_owner_start, 0L)
+  prepared_cdf <- substr(
+    beta_kernel,
+    prepared_start,
+    prepared_start + next_owner_start - 1L
+  )
+  expect_match(
+    prepared_cdf, "np_beta_cdf_from_shape(", fixed = TRUE
+  )
+  expect_false(grepl("pbeta(", prepared_cdf, fixed = TRUE))
+})
+
+test_that("higher-order beta overlap prepares each distinct side shape once", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  beta_kernel <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "beta_kernel.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  parts_start <- regexpr(
+    "static np_beta_status np_beta_overlap_order_log_parts(",
+    beta_kernel,
+    fixed = TRUE
+  )[[1L]]
+  parts_end <- regexpr(
+    "double np_beta_log_abs_overlap_order(",
+    substr(beta_kernel, parts_start + 1L, nchar(beta_kernel)),
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(parts_start, 0L)
+  expect_gt(parts_end, 0L)
+  parts <- substr(
+    beta_kernel, parts_start, parts_start + parts_end - 1L
+  )
+
+  expect_match(
+    parts,
+    "np_beta_shape shape_one[NP_BETA_ORDER_MAX_COMPONENTS];",
+    fixed = TRUE
+  )
+  expect_match(
+    parts,
+    "np_beta_shape shape_two[NP_BETA_ORDER_MAX_COMPONENTS];",
+    fixed = TRUE
+  )
+  shape_calls <- gregexpr("np_beta_shape_init(", parts, fixed = TRUE)[[1L]]
+  expect_length(shape_calls[shape_calls > 0L], 2L)
+  expect_match(parts, "np_beta_log_overlap_shapes(", fixed = TRUE)
+  expect_false(grepl("np_beta_log_overlap_scale(", parts, fixed = TRUE))
+
+  expect_match(
+    beta_kernel,
+    "return np_beta_log_overlap_shapes(&shape_one, &shape_two, status);",
+    fixed = TRUE
+  )
+})
+
+test_that("legacy callers cannot acquire beta route metadata implicitly", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  expect_match(
+    engine,
+    paste0(
+      "matrix_categorical_vals, matrix_ordered_indices, weighted_sum,\n",
+      "    weighted_permutation_sum, kw, pkw, 0, NULL, NULL);"
+    ),
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "if(!exact_beta_absolute_route)\n      return KWSNP_ERR_BADINVOC;",
+    fixed = TRUE
+  )
+})
+
+test_that("beta density and distribution fits have one canonical ingress", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  ingress_start <- regexpr("SEXP C_np_density(", ingress, fixed = TRUE)[[1L]]
+  ingress_end <- regexpr(
+    "SEXP C_np_conditional_count_levels(", ingress, fixed = TRUE
+  )[[1L]]
+  expect_gt(ingress_start, 0L)
+  expect_gt(ingress_end, ingress_start)
+  density_ingress <- substr(ingress, ingress_start, ingress_end - 1L)
+
+  expect_false(grepl("np_beta_kernelsum(", density_ingress, fixed = TRUE))
+  expect_false(grepl(
+    "if(dens_or_dist == NP_DO_DENS)", density_ingress, fixed = TRUE
+  ))
+  expect_false(grepl(
+    "currently supports continuous variables only",
+    density_ingress,
+    fixed = TRUE
+  ))
+  expect_match(
+    density_ingress,
+    "active_route, active_diagnostics, categorical_compress);",
+    fixed = TRUE
+  )
+
+  engine_start <- regexpr(
+    "void kernel_estimate_dens_dist_categorical_np(", engine, fixed = TRUE
+  )[[1L]]
+  engine_end <- regexpr(
+    "int np_kernel_estimate_con_density_categorical_leave_one_out_cv(",
+    engine, fixed = TRUE
+  )[[1L]]
+  expect_gt(engine_start, 0L)
+  expect_gt(engine_end, engine_start)
+  density_engine <- substr(engine, engine_start, engine_end - 1L)
+
+  expect_match(density_engine, "const int exact_beta_route = kernel_route != NULL;",
+               fixed = TRUE)
+  expect_match(density_engine, "kernel_weighted_sum_np_route_power12(",
+               fixed = TRUE)
+  expect_match(density_engine, "kernel_weighted_sum_np_route_centered_m2(",
+               fixed = TRUE)
+  expect_match(density_engine, "np_progress_fit_loop_step);", fixed = TRUE)
+  expect_match(
+    density_engine,
+    "if(beta_route_status != 0)\n      goto cleanup_density_fit;",
+    fixed = TRUE
+  )
+  expect_match(
+    density_engine,
+    "error(\"canonical beta density/distribution row failed\");",
+    fixed = TRUE
+  )
+})
+
+test_that("scalar beta regression fits enter the canonical row engine", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  public_start <- regexpr("SEXP C_np_regression(", ingress,
+                          fixed = TRUE)[[1L]]
+  public_end <- regexpr("SEXP C_np_density(", ingress,
+                        fixed = TRUE)[[1L]]
+  expect_gt(public_start, 0L)
+  expect_gt(public_end, public_start)
+  public_regression <- substr(ingress, public_start, public_end - 1L)
+
+  route_start <- regexpr(
+    "if(descriptor.family == NP_CKERNEL_FAMILY_BETA)",
+    public_regression,
+    fixed = TRUE
+  )[[1L]]
+  common_call <- regexpr(
+    "  np_regression(REAL(tuno_r)",
+    public_regression,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(route_start, 0L)
+  expect_gt(common_call, route_start)
+  route_ingress <- substr(
+    public_regression, route_start, common_call - 1L
+  )
+  expect_match(route_ingress, "beta_route.segment_count = 1;", fixed = TRUE)
+  expect_match(route_ingress, "active_route = &beta_route;", fixed = TRUE)
+  expect_match(
+    route_ingress, "active_diagnostics = &beta_diagnostics;", fixed = TRUE
+  )
+  expect_match(
+    public_regression,
+    paste0("active_route, active_diagnostics, categorical_compress, empty_rows_ptr,",
+           "[[:space:]]*gradient_request_ptr, &variance_unavailable, &gradient_zero_out, fit_projection_ptr\\);")
+  )
+  expect_match(public_regression,
+               "const NPRegressionGradientRequest *gradient_request_ptr = NULL;",
+               fixed = TRUE)
+  expect_false(grepl("np_beta_regression_lc(", public_regression,
+                     fixed = TRUE))
+  expect_false(grepl("beta_regression.h", ingress, fixed = TRUE))
+  expect_false(file.exists(file.path(root, "src", "beta_regression.c")))
+  expect_false(file.exists(file.path(root, "src", "beta_regression.h")))
+
+  owner_start <- regexpr(
+    "static SEXP np_regression_fitted_execute(",
+    ingress,
+    fixed = TRUE
+  )[[1L]]
+  owner_tail <- substr(ingress, owner_start, nchar(ingress))
+  owner_end <- regexpr("static void np_kernelsum_common(", owner_tail,
+                       fixed = TRUE)[[1L]] + owner_start - 1L
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(ingress, owner_start, owner_end - 1L)
+  expect_match(owner, "const NPContinuousKernelRoute *kernel_route",
+               fixed = TRUE)
+  expect_match(
+    owner,
+    paste0(
+      "&SIGN,\n                                                   kernel_route,\n",
+      "                                                   kernel_route_diagnostics,\n",
+      "                                                   categorical_compress,\n",
+      "                                                   NP_REGRESSION_STDERR_LOCAL_RESIDUAL,\n",
+      "                                                   1,\n",
+      "                                                   NULL,\n",
+      "                                                   &nn_geometry_context,\n",
+      "                                                   ordinary_hc0_active ?\n",
+      "                                                     &ordinary_hc0_context : NULL,\n",
+      "                                                   call->empty_rows, NULL, NULL, NULL, NULL, NULL, call->fit_projection);"
+    ),
+    fixed = TRUE
+  )
+
+  engine_start <- regexpr(
+    "int kernel_estimate_regression_categorical_tree_np(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  engine_end <- regexpr("static int np_conditional_indicator_row_core(",
+                        engine, fixed = TRUE)[[1L]]
+  expect_gt(engine_start, 0L)
+  expect_gt(engine_end, engine_start)
+  regression_engine <- substr(engine, engine_start, engine_end - 1L)
+  sibling_start <- regexpr(
+    "static NP_NOINLINE int np_beta_scalar_regression_fit_canonical(",
+    engine, fixed = TRUE
+  )[[1L]]
+  expect_gt(sibling_start, 0L)
+  expect_lt(sibling_start, engine_start)
+  regression_sibling <- substr(engine, sibling_start, engine_start - 1L)
+  scalar_family_start <- regexpr(
+    "static int np_beta_scalar_regression_fit_error(",
+    engine, fixed = TRUE
+  )[[1L]]
+  expect_gt(scalar_family_start, 0L)
+  scalar_family <- substr(engine, scalar_family_start, engine_start - 1L)
+  expect_match(regression_engine, "if(NP_UNLIKELY(kernel_route != NULL)",
+               fixed = TRUE)
+  expect_match(
+    regression_engine, "np_beta_scalar_regression_fit_canonical(",
+    fixed = TRUE
+  )
+  expect_match(regression_engine, "np_regression_fit_statistics(",
+               fixed = TRUE)
+  expect_match(regression_engine, "return 0;", fixed = TRUE)
+  expect_match(
+    scalar_family,
+    "(do_gerr && (!do_grad || mean_stderr == NULL))",
+    fixed = TRUE
+  )
+  expect_match(
+    regression_sibling, "np_beta_bandwidth_prepare_matrix_ctx(", fixed = TRUE
+  )
+  expect_match(scalar_family, "NPBetaRegressionMomentCtx", fixed = TRUE)
+  expect_match(
+    scalar_family,
+    "static NP_NOINLINE int np_beta_regression_lp_moment_row_canonical(",
+    fixed = TRUE
+  )
+  expect_match(
+    regression_engine, "np_regression_general_lp_fit(&general_lp_call);",
+    fixed = TRUE
+  )
+  expect_match(
+    engine, "np_beta_regression_gradient_rows_validated(",
+    fixed = TRUE
+  )
+  expect_match(
+    scalar_family,
+    ".regression_moment_context = &regression_moment_context,",
+    fixed = TRUE
+  )
+  expect_match(
+    scalar_family, ".route_diagnostics = kernel_route_diagnostics,",
+    fixed = TRUE
+  )
+  expect_match(
+    scalar_family, "NP_REGRESSION_RETURN_FAILURE(NP_REGRESSION_FAILURE_BETA, status, \"canonical beta regression row failed:",
+    fixed = TRUE
+  )
+  expect_false(grepl("NPBetaRegressionMomentCtx", regression_engine,
+                     fixed = TRUE))
+  expect_false(grepl("np_beta_bandwidth_prepare_matrix(", regression_engine,
+                     fixed = TRUE))
+  expect_false(grepl("np_beta_regression_lc(", regression_engine,
+                     fixed = TRUE))
+})
+
+test_that("canonical beta gradient rows separate operator and estimator algebra", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row_gradient.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  estimator_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  observation_start <- regexpr(
+    "np_continuous_kernel_beta_level_derivative_observation_bound(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  row_start <- regexpr(
+    "np_continuous_kernel_beta_level_derivative_log_row_validated(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  row_end <- nchar(row_engine) + 1L
+  expect_gt(observation_start, 0L)
+  expect_gt(row_start, observation_start)
+  expect_gt(row_end, row_start)
+  operator_owner <- substr(
+    row_engine, observation_start, row_start - 1L
+  )
+  row_owner <- substr(row_engine, row_start, row_end - 1L)
+  expect_match(
+    operator_owner, "np_beta_log_abs_pdf_derivative_order(", fixed = TRUE
+  )
+  legacy_level_calls <- gregexpr(
+    "np_beta_log_abs_pdf_order(", operator_owner, fixed = TRUE
+  )[[1L]]
+  expect_identical(sum(legacy_level_calls > 0L), 1L)
+  expect_false(grepl(
+    "np_beta_pdf_derivative_order(", operator_owner, fixed = TRUE
+  ))
+  expect_match(operator_owner, "*common_log_scale = fmax(", fixed = TRUE)
+  expect_match(
+    row_owner,
+    "np_continuous_kernel_beta_level_derivative_observation_bound(",
+    fixed = TRUE
+  )
+  expect_match(
+    row_owner, "provider == NULL && omitted_observation == -1",
+    fixed = TRUE
+  )
+  expect_false(grepl("weighted_response", operator_owner, fixed = TRUE))
+  expect_false(grepl("gradient_stderr", operator_owner, fixed = TRUE))
+  expect_false(grepl("weighted_response", row_owner, fixed = TRUE))
+  expect_false(grepl("gradient_stderr", row_owner, fixed = TRUE))
+
+  consumer_start <- regexpr(
+    "np_beta_regression_gradient_rows_validated(",
+    estimator_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(consumer_start, 0L)
+  consumer <- substr(estimator_engine, consumer_start, nchar(estimator_engine))
+  expect_match(consumer, "weighted_response += w * y;", fixed = TRUE)
+  expect_match(
+    consumer,
+    "(regular_response - side_mean * regular_total) / side_weight;",
+    fixed = TRUE
+  )
+  expect_match(consumer, "derivative_coefficient_square_sum", fixed = TRUE)
+})
+
+test_that("legacy conditional scalar owner retains dormant route plumbing", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  owner_start <- regexpr(
+    "void np_kernel_estimate_con_dens_dist_categorical(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "attribute_hidden int np_fixed_gaussian_density_cvls_pair_dispatch_try(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "const NPContinuousKernelRoute *kernel_route",
+               fixed = TRUE)
+  expect_match(owner, "(void)kernel_route;", fixed = TRUE)
+  expect_match(owner, "(void)kernel_route_diagnostics;", fixed = TRUE)
+  expect_match(owner, "(void)categorical_compress;", fixed = TRUE)
+  expect_false(grepl("NPContinuousKernelExecutionContext", owner,
+                     fixed = TRUE))
+
+  conditional_starts <- gregexpr(
+    "void np_density_conditional(", ingress, fixed = TRUE
+  )[[1L]]
+  conditional_start <- tail(conditional_starts[conditional_starts > 0L], 1L)
+  density_starts <- gregexpr("void np_density(double", ingress,
+                             fixed = TRUE)[[1L]]
+  conditional_end <- tail(density_starts[density_starts > conditional_start],
+                          1L)
+  expect_gt(conditional_start, 0L)
+  expect_gt(conditional_end, conditional_start)
+  conditional <- substr(ingress, conditional_start, conditional_end - 1L)
+  expect_match(
+    gsub("[[:space:]]+", " ", conditional),
+    "pdf_deriv_stderr, &log_likelihood, NULL, NULL, 0, full_fit_nn_geometry_context_ptr, cat_se_mask, 1, &cat_se_status, empty_rows);",
+    fixed = TRUE
+  )
+})
+
+test_that("regression objective owner activates the continuous scalar beta route", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "kernelcv.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  incumbent_start <- regexpr(
+    "double np_kernel_estimate_regression_categorical_ls_aic(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  owner_start <- regexpr(
+    "double np_kernel_estimate_regression_categorical_ls_aic_ctx(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "typedef struct {\n  int nprof_train;",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(incumbent_start, 0L)
+  expect_gt(owner_start, incumbent_start)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "const NPContinuousKernelRoute * const kernel_route",
+               fixed = TRUE)
+  expect_match(
+    owner,
+    "kernel_route == NULL && kernel_route_diagnostics == NULL",
+    fixed = TRUE
+  )
+  expect_match(
+    owner,
+    "return np_kernel_estimate_regression_categorical_ls_aic(",
+    fixed = TRUE
+  )
+  expect_match(owner, "lp_engine != NP_LP_ENGINE_SCALAR", fixed = TRUE)
+  expect_false(grepl("num_reg_unordered != 0", owner, fixed = TRUE))
+  expect_false(grepl("num_reg_ordered != 0", owner, fixed = TRUE))
+  expect_match(
+    owner,
+    "np_regression_cv_scalar_continuous_route(",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "np_regression_cv_scalar_accumulate_scaled_row(",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "np_regression_cv_lp_continuous_route(",
+    fixed = TRUE
+  )
+  expect_match(
+    owner,
+    "lp_engine != NP_LP_ENGINE_GENERAL",
+    fixed = TRUE
+  )
+  expect_match(
+    owner,
+    "if(lp_engine == NP_LP_ENGINE_SCALAR)",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "np_beta_scaled_row_context_fill_omitting(",
+    fixed = TRUE
+  )
+  expect_false(grepl("regression objective kernel route is not activated",
+                     owner, fixed = TRUE))
+
+  callback_hits <- gregexpr(
+    "np_kernel_estimate_regression_categorical_ls_aic_ctx(",
+    ingress,
+    fixed = TRUE
+  )[[1L]]
+  expect_length(callback_hits[callback_hits > 0L], 2L)
+  sidecar_hits <- gregexpr(
+    "np_beta_objective_regression_lc(", ingress, fixed = TRUE
+  )[[1L]]
+  expect_length(sidecar_hits[sidecar_hits > 0L], 0L)
+})
+
+test_that("shared regression bandwidth owner carries categorical compression", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  regression_r <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "R", "np.regression.bw.R"), warn = FALSE),
+    collapse = "\n"
+  )
+  bandwidth_r <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "R", "rbandwidth.R"), warn = FALSE),
+    collapse = "\n"
+  )
+  headers <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "headers.h"), warn = FALSE),
+    collapse = "\n"
+  )
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  callbacks <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "kernelcv.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  option_literal <- "categorical.compress = npStrictLogicalOption("
+  option_hits <- gregexpr(option_literal, regression_r, fixed = TRUE)[[1L]]
+  option_hits <- option_hits[option_hits > 0L]
+  expect_length(option_hits, 3L)
+  expect_match(headers, "#define RBW_CATCOMPI 23", fixed = TRUE)
+  expect_match(
+    ingress,
+    "static void np_regression_bw_kernel_state_configure_or_error(",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "np_regression_bw_categorical_compress_extern = options[RBW_CATCOMPI];",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "np_regression_bw_categorical_compress_extern = 0;",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "error(\"%s: categorical compression must be TRUE or FALSE\", where);",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "np_regression_nomad_shadow",
+    ingress,
+    fixed = TRUE
+  ))
+  expect_match(
+    ingress,
+    "myopti, ckerlb, ckerub, \"C_np_regression_bw\");",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "num_reg_ordered_extern, NP_BETA_BW_ALLOW_CATEGORICAL,",
+    fixed = TRUE
+  )
+  expect_match(
+    bandwidth_r,
+    "allow.categorical = TRUE",
+    fixed = TRUE
+  )
+  expect_match(
+    callbacks,
+    "np_regression_bw_categorical_compress_extern);",
+    fixed = TRUE
+  )
+})
+
+test_that("beta density CVML enters the canonical scaled-row owner", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "kernelcv.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  owner_start <- regexpr(
+    "int np_kernel_estimate_density_categorical_leave_one_out_cv(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "int np_kernel_estimate_density_categorical_convolution_cv(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "const NPContinuousKernelRoute * const kernel_route",
+               fixed = TRUE)
+  expect_match(owner, "const int exact_beta_route = kernel_route != NULL;",
+               fixed = TRUE)
+  expect_match(owner, "np_density_cvml_beta_route(", fixed = TRUE)
+  expect_match(
+    owner,
+    "if(exact_beta_route) {\n      status = 1;\n      goto cleanup_density_leave_one_out_cv;",
+    fixed = TRUE
+  )
+  expect_match(owner, "goto cleanup_density_leave_one_out_cv;",
+               fixed = TRUE)
+  expect_match(
+    engine,
+    "np_beta_scaled_row_context_fill_omitting(",
+    fixed = TRUE
+  )
+  expect_match(engine, "np_guarded_cvml_log_contribution(", fixed = TRUE)
+
+  callback_start <- regexpr(
+    "double np_cv_func_density_categorical_ml(", ingress, fixed = TRUE
+  )[[1L]]
+  callback_end <- regexpr(
+    "double np_cv_func_density_categorical_ls(", ingress, fixed = TRUE
+  )[[1L]]
+  expect_gt(callback_start, 0L)
+  expect_gt(callback_end, callback_start)
+  callback <- substr(ingress, callback_start, callback_end - 1L)
+  expect_match(callback, "if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)",
+               fixed = TRUE)
+  expect_false(grepl("np_beta_objective_density_ml(", callback,
+                     fixed = TRUE))
+  expect_match(callback, "active_route = &beta_route;", fixed = TRUE)
+  expect_match(
+    callback,
+    paste0(
+      "num_categories_extern,\n",
+      "        active_route,\n",
+      "        active_diagnostics,\n",
+      "        np_density_bw_categorical_compress_extern,\n",
+      "        &cv)==1)"
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("beta density CVLS enters canonical quadrature and LOO owners", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "kernelcv.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  owner_start <- regexpr(
+    "int np_kernel_estimate_density_categorical_convolution_cv(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "void kernel_estimate_dens_dist_categorical_np(",
+    engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "const NPContinuousKernelRoute * const kernel_route",
+               fixed = TRUE)
+  expect_match(owner, "const int exact_beta_route = kernel_route != NULL;",
+               fixed = TRUE)
+  expect_match(owner, "np_density_cvls_beta_cross_term(", fixed = TRUE)
+  expect_match(
+    owner,
+    "if(exact_beta_route)\n      goto cleanup_density_convolution_cv;",
+    fixed = TRUE
+  )
+  expect_match(owner, "goto cleanup_density_convolution_cv;", fixed = TRUE)
+  expect_false(grepl("NPContinuousKernelExecutionContext", owner,
+                     fixed = TRUE))
+
+  callback_start <- regexpr(
+    "double np_cv_func_density_categorical_ls(", ingress, fixed = TRUE
+  )[[1L]]
+  callback_end <- regexpr(
+    "double cv_func_distribution_categorical_ls(", ingress, fixed = TRUE
+  )[[1L]]
+  expect_gt(callback_start, 0L)
+  expect_gt(callback_end, callback_start)
+  callback <- substr(ingress, callback_start, callback_end - 1L)
+  expect_match(callback, "if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)",
+               fixed = TRUE)
+  expect_false(grepl("np_beta_objective_density_ls(", callback,
+                     fixed = TRUE))
+  expect_match(callback, "active_route = &beta_route;", fixed = TRUE)
+  expect_match(
+    callback,
+    paste0(
+      "matrix_categorical_vals_extern,\n",
+      "        active_route,\n",
+      "        active_diagnostics,\n",
+      "        np_density_bw_categorical_compress_extern,\n",
+      "        &cv)==1)"
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("beta distribution CVLS enters the canonical row owner", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "kernelcv.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  owner_start <- regexpr(
+    "double np_kernel_estimate_distribution_ls_cv(", engine, fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "typedef enum {\n  NP_CONDITIONAL_PROFILE_CV_SUCCESS", engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "const NPContinuousKernelRoute * const kernel_route",
+               fixed = TRUE)
+  expect_match(owner, "const int exact_beta_route = kernel_route != NULL;",
+               fixed = TRUE)
+  expect_match(owner, "np_distribution_cvls_continuous_route(", fixed = TRUE)
+  expect_match(owner, "np_distribution_cvls_accumulate_row(", fixed = TRUE)
+  expect_match(
+    engine,
+    paste0(
+      "np_continuous_kernel_scaled_restore(\n",
+      "         1.0, common_log_scale, 1, &common_scale)"
+    ),
+    fixed = TRUE
+  )
+  expect_match(engine, "row_sum = scaled_sum*common_scale;", fixed = TRUE)
+  expect_match(engine, "row[observation] *= common_scale;", fixed = TRUE)
+  expect_false(grepl("&row[observation]", engine, fixed = TRUE))
+  expect_match(owner, "goto cleanup_distribution_ls_cv;", fixed = TRUE)
+  expect_false(grepl("NPContinuousKernelExecutionContext", owner,
+                     fixed = TRUE))
+
+  callback_start <- regexpr(
+    "double cv_func_distribution_categorical_ls(", ingress, fixed = TRUE
+  )[[1L]]
+  callback_end <- regexpr(
+    "double func_con_density_quantile(", ingress, fixed = TRUE
+  )[[1L]]
+  expect_gt(callback_start, 0L)
+  expect_gt(callback_end, callback_start)
+  callback <- substr(ingress, callback_start, callback_end - 1L)
+  expect_match(callback, "if(KERNEL_den_extern == NP_CKERNEL_COORDINATE_CODE)",
+               fixed = TRUE)
+  expect_false(grepl("np_beta_objective_distribution_ls(", callback,
+                     fixed = TRUE))
+  expect_match(callback, "active_route = &beta_route;", fixed = TRUE)
+  expect_match(
+    callback,
+    paste0(
+      "matrix_categorical_vals_extern,\n",
+      "                                             active_route,\n",
+      "                                             active_diagnostics,\n",
+      "                                             np_distribution_bw_categorical_compress_extern,\n",
+      "                                             &cv)==1)"
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("distribution bandwidth ingress owns categorical compression state", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  distribution_r <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "R", "np.distribution.bw.R"), warn = FALSE),
+    collapse = "\n"
+  )
+  headers <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "headers.h"), warn = FALSE),
+    collapse = "\n"
+  )
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  option_literal <- "categorical.compress = npStrictLogicalOption("
+  option_hits <- gregexpr(option_literal, distribution_r, fixed = TRUE)[[1L]]
+  option_hits <- option_hits[option_hits > 0L]
+  expect_length(option_hits, 2L)
+  expect_match(headers, "#define DBW_CATCOMPI 24", fixed = TRUE)
+  expect_match(
+    ingress,
+    paste0(
+      "np_distribution_bw_categorical_compress_extern = ",
+      "myopti[DBW_CATCOMPI];"
+    ),
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "np_distribution_bw_categorical_compress_extern = 0;",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "C_np_distribution_bw: categorical compression must be TRUE or FALSE",
+    fixed = TRUE
+  )
+  allow_hits <- gregexpr(
+    "allow.categorical = TRUE", distribution_r, fixed = TRUE
+  )[[1L]]
+  allow_hits <- allow_hits[allow_hits > 0L]
+  expect_length(allow_hits, 1L)
+  expect_match(
+    ingress,
+    paste0(
+      "num_reg_ordered_extern, NP_BETA_BW_ALLOW_CATEGORICAL,\n",
+      "      ckerlb, ckerub,\n",
+      "      \"C_np_distribution_bw\""
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("density bandwidth ingress owns categorical compression state", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  density_r <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "R", "np.density.bw.R"), warn = FALSE),
+    collapse = "\n"
+  )
+  bandwidth_r <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "R", "bandwidth.R"), warn = FALSE),
+    collapse = "\n"
+  )
+  headers <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "headers.h"), warn = FALSE),
+    collapse = "\n"
+  )
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  option_literal <- "categorical.compress = npStrictLogicalOption("
+  option_hits <- gregexpr(option_literal, density_r, fixed = TRUE)[[1L]]
+  option_hits <- option_hits[option_hits > 0L]
+  expect_length(option_hits, 2L)
+  expect_match(headers, "#define BW_CATCOMPI 23", fixed = TRUE)
+  expect_match(
+    ingress,
+    "np_density_bw_categorical_compress_extern = myopti[BW_CATCOMPI];",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "np_density_bw_categorical_compress_extern = 0;",
+    fixed = TRUE
+  )
+  expect_match(
+    ingress,
+    "C_np_density_bw: categorical compression must be TRUE or FALSE",
+    fixed = TRUE
+  )
+  expect_match(bandwidth_r, "allow.categorical = TRUE", fixed = TRUE)
+  allow_hits <- gregexpr(
+    "NP_BETA_BW_ALLOW_CATEGORICAL,", ingress, fixed = TRUE
+  )[[1L]]
+  allow_hits <- allow_hits[allow_hits > 0L]
+  reject_hits <- gregexpr(
+    "NP_BETA_BW_CONTINUOUS_ONLY,", ingress, fixed = TRUE
+  )[[1L]]
+  reject_hits <- reject_hits[reject_hits > 0L]
+  # The prepared conditional-density owner replaces its retired duplicate
+  # ingress.  Seven canonical descriptors remain: unconditional density,
+  # unconditional distribution, regression, prepared conditional-density X/Y,
+  # and conditional-distribution X/Y.
+  expect_length(allow_hits, 7L)
+  expect_length(reject_hits, 0L)
+  contract_hits <- gregexpr(
+    "np_density_bw_integer_contract_or_error(", ingress, fixed = TRUE
+  )[[1L]]
+  contract_hits <- contract_hits[contract_hits > 0L]
+  expect_length(contract_hits, 3L)
+})
+
+test_that("every beta side enters the common conditional regression owner", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  ingress <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  public_start <- regexpr("static SEXP np_density_conditional_call(", ingress,
+                          fixed = TRUE)[[1L]]
+  public_end <- regexpr("SEXP C_np_density_bw(", ingress,
+                        fixed = TRUE)[[1L]]
+  expect_gt(public_start, 0L)
+  expect_gt(public_end, public_start)
+  public_owner <- substr(ingress, public_start, public_end - 1L)
+  # The two incumbent entries explicitly request no plot projection. The third
+  # delegation belongs only to the opt-in projection entry's unwind body.
+  owner_slice <- function(from, to) {
+    first <- regexpr(from, public_owner, fixed = TRUE)[[1L]]
+    last <- regexpr(to, public_owner, fixed = TRUE)[[1L]]
+    expect_gt(first, 0L)
+    expect_gt(last, first)
+    substr(public_owner, first, last - 1L)
+  }
+  ordinary_entry <- owner_slice("SEXP C_np_density_conditional(",
+                                "SEXP C_np_density_conditional_variance(")
+  variance_entry <- owner_slice("SEXP C_np_density_conditional_variance(",
+                                "static SEXP np_conditional_projection_body(")
+  projection_body <- owner_slice("static SEXP np_conditional_projection_body(",
+                                 "static void np_conditional_projection_cleanup(")
+  for (entry in list(ordinary_entry, variance_entry, projection_body))
+    expect_equal(sum(gregexpr("return np_density_conditional_call(",
+                             entry, fixed = TRUE)[[1L]] > 0L), 1L)
+  expect_match(ordinary_entry, "allow_external, 0, R_NilValue);", fixed = TRUE)
+  expect_match(variance_entry, "allow_external, 1, R_NilValue);", fixed = TRUE)
+  expect_match(projection_body,
+               "INTEGER(call->args[35])[1], call->args[35]);", fixed = TRUE)
+  projection_entry <- owner_slice("SEXP C_np_density_conditional_projection(",
+                                  "static SEXP np_regression_lp_apply_conditional_impl(")
+  expect_match(projection_entry,
+               "R_UnwindProtect(np_conditional_projection_body,&call,", fixed = TRUE)
+  expect_match(projection_entry,
+               "np_conditional_projection_cleanup,&call,NULL);", fixed = TRUE)
+  expect_equal(sum(gregexpr("return np_density_conditional_call(",
+                           public_owner, fixed = TRUE)[[1L]] > 0L), 3L)
+  expect_match(
+    public_owner,
+    "x_descriptor.family == NP_CKERNEL_FAMILY_BETA) {",
+    fixed = TRUE
+  )
+  expect_match(public_owner, "active_x_route = &beta_x_route;", fixed = TRUE)
+  expect_match(
+    public_owner,
+    "const NPContinuousKernelRoute *active_y_route = NULL;",
+    fixed = TRUE
+  )
+  expect_match(
+    public_owner,
+    "y_descriptor.family == NP_CKERNEL_FAMILY_BETA) {",
+    fixed = TRUE
+  )
+  expect_match(public_owner, "active_y_route = &beta_y_route;", fixed = TRUE)
+  expect_match(
+    public_owner,
+    "active_y_route, active_y_diagnostics,",
+    fixed = TRUE
+  )
+  expect_match(
+    public_owner,
+    "y_descriptor.family == NP_CKERNEL_FAMILY_BETA",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "x_descriptor.family == NP_CKERNEL_FAMILY_BETA ||\n      y_descriptor.family == NP_CKERNEL_FAMILY_BETA",
+    public_owner,
+    fixed = TRUE
+  ))
+  expect_false(grepl("np_beta_conditional_lc(", public_owner, fixed = TRUE))
+  expect_false(grepl(
+    "np_beta_conditional_lc_gradient(", public_owner, fixed = TRUE
+  ))
+  expect_false(grepl(
+    "beta conditional estimators currently support", public_owner,
+    fixed = TRUE
+  ))
+  expect_match(
+    public_owner,
+    "np_density_conditional(REAL(tyuno_r), REAL(tyord_r), REAL(tycon_r)",
+    fixed = TRUE
+  )
+
+  conditional_starts <- gregexpr(
+    "void np_density_conditional(", ingress, fixed = TRUE
+  )[[1L]]
+  conditional_start <- tail(conditional_starts[conditional_starts > 0L], 1L)
+  density_starts <- gregexpr("void np_density(double", ingress,
+                             fixed = TRUE)[[1L]]
+  conditional_end <- tail(density_starts[density_starts > conditional_start],
+                          1L)
+  conditional <- substr(ingress, conditional_start, conditional_end - 1L)
+  expect_match(conditional, "const int beta_y_active = response_kernel_route != NULL;",
+               fixed = TRUE)
+  expect_match(
+    conditional,
+    "error(\"np_density_conditional: invalid canonical response-kernel route\")",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "kernel_route != NULL || response_kernel_route_diagnostics == NULL",
+    conditional, fixed = TRUE
+  ))
+  expect_false(grepl(
+    "kernel_weighted_sum_np_route(kernel_cy", conditional, fixed = TRUE
+  ))
+  expect_match(
+    conditional,
+    "if(lp_engine_eff == NP_LP_ENGINE_SCALAR && kernel_route == NULL &&\n     response_kernel_route == NULL)",
+    fixed = TRUE
+  )
+  expect_match(
+    conditional,
+    "NP_REGRESSION_STDERR_CONDITIONAL_INFLUENCE",
+    fixed = TRUE
+  )
+  expect_match(
+    gsub("[[:space:]]+", " ", conditional),
+    "kernel_route, kernel_route_diagnostics, categorical_compress",
+    fixed = TRUE
+  )
+  expect_match(
+    conditional,
+    "np_beta_prepared_bandwidth_view_init_or_error(",
+    fixed = TRUE
+  )
+  expect_match(
+    conditional,
+    "prepared_x_bandwidth.evaluation_offset = j;",
+    fixed = TRUE
+  )
+  expect_match(
+    conditional,
+    paste0(
+      "prepared_x_bandwidth_ptr,\n",
+      "                                                                 row_nn_geometry_context_ptr,\n",
+      "                                                                 NULL, empty_rows != NULL ? &row_empty : NULL, first_se_request,\n",
+      "                                                                 variance_metadata != NULL ? &variance_one : NULL,\n",
+      "                                                                 &row_failure, &conditional_design,\n",
+      "                                                                 ann_row, row_projection_ptr);"
+    ),
+    fixed = TRUE
+  )
+  # The same ANN row is prepared once and reused by translation and the fit.
+  expect_match(conditional, paste0(
+    "const double *ann_row = status == 0 && ann_fit_batch != NULL ?\n",
+    "        np_ann_fit_batch_row(ann_fit_batch,j,lp_loop_stop,1) : NULL;"),
+    fixed = TRUE)
+  expect_equal(sum(gregexpr("np_ann_fit_batch_row(", conditional,
+                            fixed = TRUE)[[1L]] > 0L), 1L)
+  # Incumbent entries keep the native row projection NULL; only an explicitly
+  # requested projection may populate it, using canonical donor/evaluation maps.
+  expect_match(conditional,
+               "NPRegressionFitProjection *row_projection_ptr = NULL;", fixed = TRUE)
+  expect_match(conditional, paste0(
+    "if(fit_projection != NULL) {\n",
+    "        row_projection = *fit_projection;\n",
+    "        row_projection.donor_map = ipt_XY;\n",
+    "        row_projection.eval_map = &ipe_XY[j];\n",
+    "        row_projection.emitted = 0;\n",
+    "        row_projection.constant = 0;\n",
+    "        row_projection_ptr = &row_projection;\n",
+    "        plot_capture->row=ipe_XY[j];\n",
+    "        plot_capture->donor_map=ipt_XY;\n",
+    "        for(int ii=0;ii<plot_capture->n;++ii) plot_capture->donor_order[ii]=ipt_XY[ii];\n",
+    "      }"), fixed = TRUE)
+  expect_equal(sum(gregexpr("row_projection_ptr = &row_projection;",
+                           conditional, fixed = TRUE)[[1L]] > 0L), 1L)
+  expect_match(
+    conditional, "np_beta_continuous_bandwidth_prepare_canonical(",
+    fixed = TRUE
+  )
+  expect_match(
+    conditional, "np_beta_scaled_row_context_prepare_conditional_literal(", fixed = TRUE
+  )
+  expect_match(
+    conditional, "np_beta_scaled_row_context_fill(", fixed = TRUE
+  )
+  expect_match(
+    conditional, "np_continuous_kernel_scaled_restore(", fixed = TRUE
+  )
+  expect_false(grepl(
+    "alloc_matd(num_obs_train_extern, num_obs_train_extern)",
+    conditional, fixed = TRUE
+  ))
+
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  expect_match(
+    engine, "np_regression_prepared_bandwidth_copy(", fixed = TRUE
+  )
+  expect_match(
+    engine, "np_regression_conditional_influence_finish(", fixed = TRUE
+  )
+  expect_match(engine, "double *conditional_weights;", fixed = TRUE)
+  expect_match(
+    engine, "double *conditional_permutation_weights;", fixed = TRUE
+  )
+  expect_match(
+    engine, "NPPermutationWeightOutput conditional_pkw_output =",
+    fixed = TRUE
+  )
+  expect_false(grepl("double *conditional_kw = NULL;", engine, fixed = TRUE))
+  expect_false(grepl("double *conditional_pkw = NULL;", engine, fixed = TRUE))
+  expect_match(
+    engine,
+    "size_t pkw_plane = 0;",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "pkw_plane = np_jksum_size_mul_or_die(",
+    fixed = TRUE
+  )
+  expect_match(engine, "(size_t)ii*pkw_plane +", fixed = TRUE)
+  expect_false(grepl(
+    "ii*num_obs_eval*num_xt + j*num_xt + i", engine, fixed = TRUE
+  ))
+  expect_match(
+    engine,
+    paste0(
+      "if(prepared_status < 0) {\n",
+      "      free_tmat(matrix_bandwidth);\n",
+      "      return NP_BETA_SCALAR_REGRESSION_FIT_ERR_PREPARED_BANDWIDTH;"
+    ),
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "if(prepared_status == 0) {\n      const np_beta_bandwidth_prepare_status",
+    fixed = TRUE
+  )
+})
+
+test_that("canonical beta regression moments preserve the sidecar transcript", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+
+  owner_start <- regexpr(
+    "np_continuous_kernel_beta_regression_moment_rows_validated(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  influence_start <- regexpr(
+    "np_continuous_kernel_beta_conditional_influence_stderr(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  conditional_start <- regexpr(
+    "np_continuous_kernel_beta_conditional_moment_rows_validated(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(influence_start, 0L)
+  expect_gt(conditional_start, 0L)
+  expect_lt(owner_start, influence_start)
+  expect_lt(influence_start, conditional_start)
+  owner <- substr(row_engine, owner_start, influence_start - 1L)
+  influence_owner <- substr(
+    row_engine, influence_start, conditional_start - 1L
+  )
+  conditional_owner <- substr(
+    row_engine, conditional_start, nchar(row_engine)
+  )
+
+  expect_match(
+    owner, "np_continuous_kernel_beta_log_factor_row(", fixed = TRUE
+  )
+  expect_match(owner, "if(positive_weights)", fixed = TRUE)
+  expect_match(owner, "const double new_total_weight", fixed = TRUE)
+  expect_match(
+    owner,
+    "weighted_m2 += weight * delta *",
+    fixed = TRUE
+  )
+  expect_match(
+    owner, "(response[observation] - new_mean);", fixed = TRUE
+  )
+  expect_match(owner, "double weighted_response_sum = 0.0;", fixed = TRUE)
+  expect_match(
+    owner, "weighted_mean = weighted_response_sum / total_weight;",
+    fixed = TRUE
+  )
+  expect_match(owner, "squared_weight_sum += weight * weight;", fixed = TRUE)
+  expect_match(
+    owner,
+    "mean_stderr[evaluation] = ordinary_hc0 ?",
+    fixed = TRUE
+  )
+  expect_match(
+    owner,
+    "hc0_residual_scale * sqrt(hc0_moment) / fabs(total_weight) :",
+    fixed = TRUE
+  )
+  expect_match(
+    owner, "(weighted_m2 / total_weight) *", fixed = TRUE
+  )
+  expect_match(
+    owner,
+    "(squared_weight_sum / (total_weight * total_weight)));",
+    fixed = TRUE
+  )
+  expect_false(grepl(
+    "NP_REGRESSION_STDERR_CONDITIONAL_INFLUENCE", owner, fixed = TRUE
+  ))
+  expect_match(
+    influence_owner,
+    "const double residual = response[observation] - weighted_mean;",
+    fixed = TRUE
+  )
+  expect_match(
+    influence_owner,
+    "const double influence = weight * residual;",
+    fixed = TRUE
+  )
+  expect_match(
+    influence_owner,
+    paste0("*mean_stderr = influence_scale * sqrt(influence_sum_squares *\n",
+           "    ((double)variance_count / (double)(variance_count - 1))) /\n",
+           "    fabs(total_weight);"),
+    fixed = TRUE
+  )
+  expect_match(
+    conditional_owner,
+    "np_continuous_kernel_beta_conditional_influence_stderr(",
+    fixed = TRUE
+  )
+  expect_false(grepl("result->row[observation]", owner, fixed = TRUE))
+  expect_false(grepl("result->row[observation]", conditional_owner,
+                     fixed = TRUE))
+})
+
+test_that("signed-log beta rows compose every route segment", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  multi_start <- regexpr(
+    "np_continuous_kernel_beta_log_factor_row_multi_prevalidated(",
+    engine, fixed = TRUE
+  )[[1L]]
+  resident_start <- regexpr(
+    "np_continuous_kernel_beta_factor_row_with_log_factor(",
+    engine, fixed = TRUE
+  )[[1L]]
+  resident_owner_start <- regexpr(
+    "np_continuous_kernel_beta_log_factor_row(", engine, fixed = TRUE
+  )[[1L]]
+  expect_gt(multi_start, 0L)
+  expect_gt(resident_owner_start, multi_start)
+  expect_gt(resident_start, resident_owner_start)
+  multi_owner <- substr(engine, multi_start, resident_owner_start - 1L)
+  resident_owner <- substr(
+    engine, resident_owner_start, resident_start - 1L
+  )
+
+  expect_match(multi_owner, "beta_segment_count", fixed = TRUE)
+  expect_match(
+    multi_owner,
+    "segment_index < plan->route->segment_count",
+    fixed = TRUE
+  )
+  expect_match(
+    multi_owner,
+    "np_continuous_kernel_log_channels_multiply(",
+    fixed = TRUE
+  )
+  expect_match(
+    resident_owner,
+    "return np_continuous_kernel_beta_log_factor_row_multi_prevalidated(",
+    fixed = TRUE
+  )
+})
+
+test_that("canonical centered moments use an online training-order update", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  owner_start <- regexpr(
+    "np_continuous_kernel_beta_centered_moment_rows_validated(",
+    engine, fixed = TRUE
+  )[[1L]]
+  owner_end <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_scaled_restore(",
+    engine, fixed = TRUE
+  )[[1L]]
+  expect_gt(owner_start, 0L)
+  expect_gt(owner_end, owner_start)
+  owner <- substr(engine, owner_start, owner_end - 1L)
+
+  expect_match(owner, "sum[evaluation] += value;", fixed = TRUE)
+  expect_match(owner, "delta = value - running_mean;", fixed = TRUE)
+  expect_match(
+    owner,
+    "running_m2 += delta * (value - running_mean);",
+    fixed = TRUE
+  )
+  expect_match(owner, "centered_m2[evaluation] = running_m2;", fixed = TRUE)
+  expect_false(grepl("second_moment -", owner, fixed = TRUE))
+})
+
+test_that("conditional derivative restoration has one typed extended-real contract", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  row_engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "continuous_kernel_row.c"),
+              warn = FALSE),
+    collapse = "\n"
+  )
+  conditional <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "np.c"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  helper_start <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_scaled_derivative_restore(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  helper_end <- regexpr(
+    "NPContinuousKernelRowStatus np_continuous_kernel_signed_log_restore(",
+    row_engine,
+    fixed = TRUE
+  )[[1L]]
+  expect_gt(helper_start, 0L)
+  expect_gt(helper_end, helper_start)
+  helper <- substr(row_engine, helper_start, helper_end - 1L)
+
+  expect_match(helper, "if(ISNA(scaled_value))", fixed = TRUE)
+  expect_match(helper, "if(ISNAN(scaled_value))", fixed = TRUE)
+  expect_match(helper, "if(log_scale == -INFINITY)", fixed = TRUE)
+  expect_match(
+    helper,
+    "return np_continuous_kernel_scaled_restore(",
+    fixed = TRUE
+  )
+  calls <- gregexpr(
+    "np_continuous_kernel_scaled_derivative_restore(",
+    conditional,
+    fixed = TRUE
+  )[[1L]]
+  # Point gradient, ordinary gradient SE, and separately requested LP first SE.
+  expect_equal(sum(calls > 0L), 3L)
+  expect_match(conditional, "if(first_se_request != NULL)", fixed = TRUE)
+  expect_match(conditional, "if(!first_se_request->se[i])", fixed = TRUE)
+})
+
+test_that("centered moments have one activated fail-closed route boundary", {
+  root <- locate_beta_activation_sources()
+  skip_if(is.null(root), "package sources unavailable")
+  engine <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "jksum.c"), warn = FALSE),
+    collapse = "\n"
+  )
+  header <- paste(
+    np_test_read_incumbent_c_source(file.path(root, "src", "headers.h"), warn = FALSE),
+    collapse = "\n"
+  )
+
+  expect_match(
+    header, "int kernel_weighted_sum_np_route_centered_m2(", fixed = TRUE
+  )
+  expect_match(engine, "} NPCenteredMomentCtx;", fixed = TRUE)
+  expect_match(
+    engine,
+    "(centered_moment_ctx == NULL ||\n       (dual_power_ctx == NULL &&",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "ncol_Y == 0 && ncol_W == 0",
+    fixed = TRUE
+  )
+  expect_match(
+    engine,
+    "&centered_moment_ctx,\n    0,\n    NULL,\n    NULL);",
+    fixed = TRUE
+  )
+  expect_match(engine, "beta_point_request", fixed = TRUE)
+  expect_match(engine,
+    "dual_power_ctx->matrix_Y == NULL && dual_power_ctx->matrix_W == NULL",
+    fixed = TRUE)
+  expect_match(engine,
+    "dual_power_ctx->ncol_Y == 0 && dual_power_ctx->ncol_W == 0",
+    fixed = TRUE)
+  expect_match(engine, "!dual_power_ctx->retain_common_scale", fixed = TRUE)
+  expect_match(engine, "dual_power_ctx->observation_scale == NULL", fixed = TRUE)
+  expect_match(engine, "dual_power_ctx->regression_derivative == NULL", fixed = TRUE)
+  occurrences <- gregexpr(
+    "kernel_weighted_sum_np_route_centered_m2(", engine, fixed = TRUE
+  )[[1L]]
+  expect_length(occurrences[occurrences > 0L], 2L)
+})
+test_that("beta direct kernel-weight owner transports validated compression state", {
+  owner <- paste(deparse(getFromNamespace(
+    ".np_kernel_weights_direct", "npRmpi"
+  )), collapse = "\n")
+  compact <- gsub("[[:space:]]+", " ", owner)
+
+  expect_match(
+    compact,
+    "identical(bws$ckertype, \"beta\") && bws$nuno + bws$nord > 0L",
+    fixed = TRUE
+  )
+  expect_match(
+    compact,
+    paste0("categorical.compress = identical(bws$ckertype, \"beta\") && ",
+           "bws$nuno + bws$nord > 0L && ",
+           "npStrictLogicalOption(\"np.categorical.compress\", TRUE), ",
+           "tree.outer.blas = FALSE"),
+    fixed = TRUE
+  )
+  expect_false(grepl("tryCatch", owner, fixed = TRUE))
+})

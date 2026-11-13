@@ -16,7 +16,7 @@ plregression =
            ntrain, trainiseval = FALSE, residuals = FALSE,
            xtra = double(6),
            timing = NA, total.time = NA,
-           optim.time = NA, fit.time = NA){
+           optim.time = NA, fit.time = NA, se = TRUE){
 
     if (missing(bws) || missing(evalx) || missing(evalz) || missing(mean) || missing(ntrain) || missing(xcoef))
       stop("improper invocation of plregression constructor")
@@ -27,6 +27,7 @@ plregression =
       xcoef = xcoef,
       xcoeferr = xcoeferr,
       xcoefvcov = xcoefvcov,      
+      se = se,
       pregtype = bws$pregtype,
       data.znames = names(evalz),
       data.xnames = names(evalx),
@@ -58,8 +59,11 @@ plregression =
       fit.time = fit.time
       )
 
-    names(d$xcoeferr) <- names(d$xcoef) <- d$data.xnames
-    dimnames(d$xcoefvcov) <- list(d$data.xnames, d$data.xnames)
+    names(d$xcoef) <- d$data.xnames
+    if (length(d$xcoeferr))
+      names(d$xcoeferr) <- d$data.xnames
+    if (length(d$xcoefvcov))
+      dimnames(d$xcoefvcov) <- list(d$data.xnames, d$data.xnames)
     
     class(d) = "plregression"
     
@@ -103,16 +107,26 @@ print.plregression <- function(x, digits=NULL, ...){
   invisible(x)
 }
 
-coef.plregression <- function(object, errors = FALSE, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  if(!errors)
+coef.plregression <- function(object, se = FALSE, ...) {
+  npRejectLegacyBooleanErrors(list(...), "coef.plregression")
+  se <- npValidateScalarLogical(se, "se")
+  if(!se)
     return(object$xcoef)
-  else
-    return(object$xcoeferr)
+  .np_require_stored_se(
+    object, object[["xcoeferr", exact = TRUE]], family = "npplreg",
+    what = "coefficient standard errors", expr = substitute(object),
+    bws.field = if (is.null(object[["bws", exact = TRUE]]) &&
+      inherits(object[["bw", exact = TRUE]], "plbandwidth")) "bw" else "bws"
+  )
 }
 
 vcov.plregression <- function(object,...) {
-  return(object$xcoefvcov)
+  .np_require_stored_se(
+    object, object[["xcoefvcov", exact = TRUE]], family = "npplreg",
+    what = "coefficient covariance estimates", expr = substitute(object),
+    bws.field = if (is.null(object[["bws", exact = TRUE]]) &&
+      inherits(object[["bw", exact = TRUE]], "plbandwidth")) "bw" else "bws"
+  )
 }
 
 fitted.plregression <- function(object, ...){
@@ -134,29 +148,7 @@ residuals.plregression <- function(object, ...) {
 
 .np_plreg_predict_train_data <- function(bws) {
   if (!is.null(bws$formula)) {
-    tt <- terms(bws)
-    tt.xf <- bws$xterms
-
-    m <- match(c("formula", "data", "subset", "na.action"),
-               names(bws$call), nomatch = 0)
-    tmf <- bws$call[c(1, m)]
-    tmf.xf <- bws$call[c(1, m)]
-
-    tmf[[1L]] <- as.name("model.frame")
-    tmf.xf[[1L]] <- as.name("model.frame")
-    tmf[["formula"]] <- tt
-    tmf.xf[["formula"]] <- tt.xf
-
-    mf.args <- as.list(tmf)[-1L]
-    mf.xf.args <- as.list(tmf.xf)[-1L]
-    train.mf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
-    train.xf <- do.call(stats::model.frame, mf.xf.args, envir = environment(tt.xf))
-
-    list(
-      txdat = train.xf,
-      tydat = model.response(train.mf),
-      tzdat = train.mf[, bws$chromoly[[3L]], drop = FALSE]
-    )
+    .np_plreg_formula_training(bws)
   } else {
     list(
       txdat = toFrame(.np_eval_bws_call_arg(bws, "xdat")),
@@ -167,10 +159,12 @@ residuals.plregression <- function(object, ...) {
 }
 
 .np_plreg_predict_se_data <- function(bws, fit) {
-  train <- .np_plreg_predict_train_data(bws)
-  txdat <- toFrame(train$txdat)
-  tydat <- train$tydat
-  tzdat <- toFrame(train$tzdat)
+  # Use this prediction's training arguments, including any data override.
+  # Formula calls already contain the jointly prepared x/y/z roles here.
+  fit.call <- fit[["call", exact = TRUE]]
+  txdat <- toFrame(.np_eval_call_arg(fit.call, "txdat"))
+  tydat <- .np_eval_call_arg(fit.call, "tydat")
+  tzdat <- toFrame(.np_eval_call_arg(fit.call, "tzdat"))
 
   keep.rows <- rep_len(TRUE, nrow(txdat))
   rows.omit <- attr(na.omit(data.frame(txdat, tydat, tzdat)), "na.action")
@@ -192,7 +186,10 @@ residuals.plregression <- function(object, ...) {
 
 .np_plreg_predict_se <- function(bws, fit) {
   dat <- .np_plreg_predict_se_data(bws = bws, fit = fit)
-  train.fit <- npplreg(bws = bws, residuals = TRUE)
+  # Residuals and H must use the same retained training rows; public formula
+  # residuals may be na.exclude-padded and are not an inference row map.
+  train.fit <- npplreg(bws = bws, txdat = dat$txdat, tydat = dat$tydat,
+                      tzdat = dat$tzdat, residuals = TRUE, se = FALSE)
   u <- as.numeric(residuals(train.fit))
   if (length(u) != nrow(dat$txdat))
     stop("internal error: residual length does not match training rows")
@@ -205,7 +202,8 @@ residuals.plregression <- function(object, ...) {
   if (length(keep.eval) != nrow(dat$exdat))
     stop("internal error: evaluation row map does not match evaluation data")
   if (!any(keep.eval))
-    return(rep(NA_real_, nrow(dat$exdat)))
+    return(napredict(fit[["omit", exact = TRUE]],
+                     rep(NA_real_, nrow(dat$exdat))))
 
   exdat.work <- dat$exdat[keep.eval, , drop = FALSE]
   ezdat.work <- dat$ezdat[keep.eval, , drop = FALSE]
@@ -230,7 +228,7 @@ residuals.plregression <- function(object, ...) {
 
   se.fit <- rep(NA_real_, nrow(dat$exdat))
   se.fit[keep.eval] <- se.work
-  se.fit
+  napredict(fit[["omit", exact = TRUE]], se.fit)
 }
 
 predict.plregression <- function(object, se.fit = FALSE, ...) {
@@ -238,16 +236,17 @@ predict.plregression <- function(object, se.fit = FALSE, ...) {
   obj.bws <- .np_plreg_bws(object, where = "predict.plregression")
   dots <- list(...)
   has.formula.route <- !is.null(obj.bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npplreg.plbandwidth,
+                                  c("txdat", "tydat", "tzdat"))
 
   if ((!is.null(dots$exdat) || !is.null(dots$ezdat)) && !is.null(dots$newdata)) {
     dots$newdata <- NULL
   } else if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
-    nd <- toFrame(dots$newdata)
-    need <- c(obj.bws$xnames, obj.bws$znames)
-    if (!all(need %in% names(nd)))
-      stop("'newdata' must include columns: ", paste(need, collapse = ", "))
-    dots$exdat <- nd[, obj.bws$xnames, drop = FALSE]
-    dots$ezdat <- nd[, obj.bws$znames, drop = FALSE]
+    parts <- .np_native_newdata_parts(dots$newdata,
+      list(exdat = obj.bws$xnames, ezdat = obj.bws$znames), "predict.npplreg")
+    dots$exdat <- parts$exdat
+    dots$ezdat <- parts$ezdat
     dots$newdata <- NULL
   }
 

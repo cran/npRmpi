@@ -93,6 +93,59 @@ capture_single_line_output <- function(pkg, bindings, code) {
   readChar(path, nchars = file.info(path)$size, useBytes = TRUE)
 }
 
+test_that("progress presentation retains atomic counters and respects display columns", {
+  fit <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
+  wide <- paste0("[npRmpi] Fitting ", strrep("\\u6e29\\u5ea6", 20L),
+                 " 123/999 (12.3%, elapsed 12.3s, eta 87.7s)")
+  for (width in c(20L, 40L, 60L, 80L, 120L)) {
+    line <- fit(wide, width)
+    expect_lte(nchar(line, type = "width"), width)
+    expect_match(line, "123/999", fixed = TRUE)
+  }
+  line <- fit(paste0("[npRmpi] Plot bootstrap (target 18/42, rep 64/99, ",
+                    "elapsed 15.2s, eta 21.0s)"), 60L)
+  expect_match(line, "18/42.*64/99.*elap.*eta")
+  expect_lte(nchar(line, type = "width"), 60L)
+})
+
+test_that("one-off progress phases retain scope, visibility and the outer owner", {
+  run <- getFromNamespace(".np_progress_activity_run", "npRmpi")
+  runtime <- getFromNamespace(".np_progress_runtime", "npRmpi")
+  registry <- getFromNamespace(".np_progress_registry", "npRmpi")
+  old <- options(np.messages = TRUE)
+  on.exit(options(old), add = TRUE)
+  x <- 0L
+  trace <- capture_progress_shadow_trace({
+    value <- withVisible(run("Outer phase", {
+      owner <- registry$active_id
+      forward <- runtime$fit_forward
+      run("Inner phase", {
+        expect_identical(registry$active_id, owner)
+        expect_identical(runtime$fit_forward, forward)
+        x <- 17L
+      })
+      invisible(9L)
+    }))
+    expect_identical(x, 17L)
+    expect_identical(value, list(value = 9L, visible = FALSE))
+    expect_null(registry$active_id)
+    expect_null(runtime$fit_forward)
+    expect_error(run("Failed phase", stop("retained phase error")),
+                 "retained phase error")
+    expect_null(registry$active_id)
+    expect_null(runtime$fit_forward)
+  }, force_renderer = "single_line")
+  expect_false(any(vapply(trace$trace, function(x)
+    grepl("Inner phase", x$line, fixed = TRUE), TRUE)))
+})
+
+test_that("ANN SE fit surface uses the shared single-line renderer", {
+  renderer <- getFromNamespace(".np_progress_renderer_for_surface", "npRmpi")
+  expect_identical(renderer("fit", list(single_line_viable = TRUE)), "single_line")
+  expect_identical(renderer("fit", list(single_line_viable = FALSE)), "legacy")
+  expect_identical(renderer("general", list(single_line_viable = TRUE)), "legacy")
+})
+
 test_that("progress begin returns disabled state when messages are off", {
   begin <- getFromNamespace(".np_progress_begin", "npRmpi")
 
@@ -495,7 +548,7 @@ test_that("compiled progress bridge feeds unknown-total bandwidth activity updat
 test_that("single-line fit drops detail before truncating", {
   fit <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
 
-  line <- "[npRmpi] Constructing metric entropy by lag 1/2 (50.0%, elapsed 7.2s, eta 7.2s): lag 1"
+  line <- "[npRmpi] Computing entropy statistics by lag 1/2 (50.0%, elapsed 7.2s, eta 7.2s): lag 1"
   fitted <- fit(line, max_width = 78)
 
   expect_lte(nchar(fitted, type = "width"), 78L)
@@ -504,7 +557,7 @@ test_that("single-line fit drops detail before truncating", {
   expect_true(endsWith(fitted, "eta 7.2s)"))
 })
 
-test_that("single-line fit preserves both ends when truncation is still required", {
+test_that("narrow known-total output preserves whole counters before optional ETA", {
   fit <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
 
   line <- "[npRmpi] Bootstrap replications 123/999 (12.3%, elapsed 12.3s, eta 87.7s)"
@@ -512,8 +565,8 @@ test_that("single-line fit preserves both ends when truncation is still required
 
   expect_lte(nchar(fitted, type = "width"), 40L)
   expect_true(startsWith(fitted, "[npRmpi]"))
-  expect_true(endsWith(fitted, "eta 87.7s)"))
-  expect_true(grepl("\\.\\.\\.", fitted))
+  expect_true(grepl("123/999", fitted, fixed = TRUE))
+  expect_false(grepl("...", fitted, fixed = TRUE))
 })
 
 test_that("RStudio capability keeps single-line viable at the boundary", {
@@ -652,14 +705,13 @@ test_that("plot bootstrap lines compact semantically before ellipsizing", {
   fit_line <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
   line <- paste0(
     "[npRmpi] Plot bootstrap (grad index 1/2) 5887/7500 ",
-    "(elapsed 31.0s, 78.5%, eta 8.5s)"
+    "(78.5%, elapsed 31.0s, eta 8.5s)"
   )
 
   fitted <- fit_line(line, max_width = 72L)
 
   expect_true(
-    startsWith(fitted, "[npRmpi] Plot bootstrap (grad idx 1/2)") ||
-      startsWith(fitted, "[npRmpi] Plot boot (grad idx 1/2)")
+    grepl("^\\[npRmpi\\] (Plot bootstrap|Plot boot|Boot) \\(grad (index|idx) 1/2\\)", fitted)
   )
   expect_match(fitted, "5887/7500", fixed = TRUE)
   expect_false(grepl("\\.\\.\\.7/7500", fitted, fixed = TRUE))
@@ -680,14 +732,14 @@ test_that("bootstrap band counters keep the live fraction intact under width pre
 
 test_that("bandwidth lines compact semantically before ellipsizing", {
   fit_line <- getFromNamespace(".np_progress_fit_single_line", "npRmpi")
-  line <- "[npRmpi] Bandwidth selection (multistart 2/2, iteration 32, elapsed 11.2s, 62.3%, eta 6.8s)"
+  line <- "[npRmpi] Bandwidth selection (multistart 2/2, iteration 32, 62.3%, elapsed 11.2s, eta 6.8s)"
 
   fitted <- fit_line(line, max_width = 80L)
 
   expect_lte(nchar(fitted, type = "width"), 80L)
   expect_identical(
     fitted,
-    "[npRmpi] Bandwidth selection (2/2, iter 32, elapsed 11.2s, 62.3%, eta 6.8s)"
+    "[npRmpi] Bandwidth selection (ms 2/2, iter 32, 62.3%, elap 11.2s, eta 6.8s)"
   )
 })
 
@@ -700,6 +752,28 @@ test_that("NOMAD bandwidth lines preserve restart and cumulative iteration", {
   expect_lte(nchar(fitted, type = "width"), 84L)
   expect_identical(
     fitted,
-    "[npRmpi] Bandwidth selection (2/2, iter 32 (188), elapsed 11.2s, deg (1), best (0))"
+    "[npRmpi] Bandwidth selection (ms 2/2, iter 32 (188), elap 11.2s, deg (1), best (0))"
   )
+})
+
+test_that("plot and optimization progress share the canonical default cadence", {
+  plot_interval <- getFromNamespace(".np_plot_progress_interval_sec", "npRmpi")
+  begin <- getFromNamespace(".np_progress_begin", "npRmpi")
+
+  old_opts <- options(
+    np.progress.interval.sec = NULL,
+    np.plot.progress.interval.sec = NULL,
+    np.progress.interval.unknown.sec = NULL,
+    np.progress.interval.known.sec = NULL
+  )
+  on.exit(options(old_opts), add = TRUE)
+
+  expect_identical(plot_interval(), 2.0)
+  expect_identical(begin("Bandwidth selection")$throttle_sec, 2.0)
+  expect_identical(begin("Bootstrap replications", total = 10L)$throttle_sec, 2.0)
+
+  options(np.progress.interval.sec = 1.25)
+  expect_identical(plot_interval(), 1.25)
+  expect_identical(begin("Bandwidth selection")$throttle_sec, 1.25)
+  expect_identical(begin("Bootstrap replications", total = 10L)$throttle_sec, 1.25)
 })

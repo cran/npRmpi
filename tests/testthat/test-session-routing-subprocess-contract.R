@@ -4,7 +4,7 @@ run_rscript_subprocess <- function(lines, timeout = 45L, env = character()) {
   on.exit(unlink(script), add = TRUE)
 
   cmd <- file.path(R.home("bin"), "Rscript")
-  out <- suppressWarnings(system2(cmd,
+  out <- suppressWarnings(npRmpi_test_system2(cmd,
                                   c("--no-save", script),
                                   stdout = TRUE,
                                   stderr = TRUE,
@@ -17,7 +17,7 @@ run_rscript_subprocess <- function(lines, timeout = 45L, env = character()) {
 }
 
 run_cmd_subprocess <- function(cmd, args = character(), timeout = 60L, env = character()) {
-  out <- suppressWarnings(system2(cmd,
+  out <- suppressWarnings(npRmpi_test_system2(cmd,
                                   args,
                                   stdout = TRUE,
                                   stderr = TRUE,
@@ -43,7 +43,7 @@ ensure_subprocess_npRmpi_lib <- local({
       return(lib.path.cache)
 
     pkg.root <- tryCatch(
-      normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
+      npRmpi_namespace_hygiene_root(),
       error = function(e) ""
     )
     if (!nzchar(pkg.root))
@@ -53,7 +53,7 @@ ensure_subprocess_npRmpi_lib <- local({
     dir.create(lib.path.cache, recursive = TRUE, showWarnings = FALSE)
 
     cmd <- file.path(R.home("bin"), "R")
-    out <- suppressWarnings(system2(
+    out <- suppressWarnings(npRmpi_test_system2(
       cmd,
       c("CMD", "INSTALL", "--no-test-load", "-l", lib.path.cache, pkg.root),
       stdout = TRUE,
@@ -130,13 +130,22 @@ test_that("session core trio smoke completes in subprocess", {
       "d2 <- data.frame(x=x, z=z)",
       "dz <- data.frame(z=z)",
       "bw.sc <- npscoefbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1)",
-      "fit.sc <- npscoef(bws=bw.sc, gradients=FALSE)",
+      "fit.sc <- npscoef(bws=bw.sc)",
       "bw.pl <- npplregbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1)",
-      "fit.pl <- npplreg(bws=bw.pl, gradients=FALSE)",
+      "fit.pl <- npplreg(bws=bw.pl, se=TRUE)",
       "bw.si <- npindexbw(xdat=d2, ydat=y, regtype='lc', nmulti=1)",
       "fit.si <- npindex(bws=bw.si, gradients=FALSE)",
       "stopifnot(inherits(fit.sc, 'smoothcoefficient'))",
+      "stopifnot(inherits(fit.sc$bws, 'scbandwidth'))",
+      "stopifnot(length(fit.sc$mean) == NROW(d1))",
+      "stopifnot(identical(dim(fit.sc$grad), c(NROW(d1), NCOL(d1))))",
+      "stopifnot(all(is.finite(fit.sc$mean)), all(is.finite(fit.sc$grad)))",
       "stopifnot(inherits(fit.pl, 'plregression'))",
+      "stopifnot(inherits(fit.pl$bws, 'plbandwidth'))",
+      "stopifnot(length(fit.pl$mean) == NROW(d1))",
+      "stopifnot(length(fit.pl$xcoef) == NCOL(d1))",
+      "stopifnot(length(fit.pl$xcoeferr) == NCOL(d1))",
+      "stopifnot(all(is.finite(fit.pl$mean)), all(is.finite(fit.pl$xcoef)), all(is.finite(fit.pl$xcoeferr)))",
       "stopifnot(inherits(fit.si, 'singleindex'))",
       "cat('SESSION_CORE_TRIO_OK\\n')"
     ),
@@ -238,7 +247,7 @@ test_that("session smooth-coefficient ll coef plot-data route completes in subpr
       "  errors='none'))",
       "stopifnot(is.list(out))",
       "stopifnot(length(out) > 0L)",
-      "stopifnot(all(vapply(out, inherits, logical(1), 'smoothcoefficient')))",
+      "stopifnot(inherits(out, 'np_plot_data') && length(out$panels) > 0L)",
       "cat('SESSION_SCOEF_LL_PLOTDATA_OK\\n')"
     ),
     timeout = 120L,
@@ -250,7 +259,7 @@ test_that("session smooth-coefficient ll coef plot-data route completes in subpr
               info = paste(res$output, collapse = "\n"))
 })
 
-test_that("session npindex ichimura plain plot-data returns gradient-bearing payload", {
+test_that("session npindex ichimura plain plot-data returns an explicit index mean target", {
   skip_on_cran()
   env <- subprocess_env()
   skip_if(is.null(env), "local npRmpi install unavailable for subprocess smoke")
@@ -268,8 +277,8 @@ test_that("session npindex ichimura plain plot-data returns gradient-bearing pay
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='lc', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
       "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', errors='none'))",
-      "stopifnot(length(out) == 1L)",
-      "stopifnot(all(c('index', 'mean', 'grad') %in% names(out[[1]])))",
+      "stopifnot(length(out$panels) == 1L)",
+      "stopifnot(inherits(out, 'np_plot_data') && all(out$targets$quantity == 'mean') && identical(out$panels[[1L]]$variables$role, 'index'))",
       "cat('SESSION_NPINDEX_ICH_PLAIN_PAYLOAD_OK\\n')"
     ),
     timeout = 120L,
@@ -299,9 +308,9 @@ test_that("session npindex ichimura gradient plot-data returns serial payload co
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='ll', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
       "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', gradients=TRUE))",
-      "stopifnot(length(out) == 1L)",
-      "needed <- c('index', 'mean', 'merr', 'grad', 'gerr', 'mean.grad', 'mean.gerr', 'gradients')",
-      "stopifnot(all(needed %in% names(out[[1]])))",
+      "stopifnot(length(out$panels) == 1L)",
+      "needed <- c('estimate', 'bias_corrected', 'std_error', 'status')",
+      "stopifnot(all(needed %in% names(out$panels[[1L]]$values)) && all(out$targets$quantity == 'derivative') && identical(out$targets$variable, c('x1','x2')))",
       "cat('SESSION_NPINDEX_ICH_GRADIENT_PAYLOAD_OK\\n')"
     ),
     timeout = 120L,
@@ -331,9 +340,9 @@ test_that("session npindex ichimura gradient lc fixed plot-data completes locall
       "tx <- data.frame(x1=x1, x2=x2)",
       "bw <- npindexbw(xdat=tx, ydat=y, method='ichimura', regtype='lc', bwtype='fixed', bws=c(1,1,0.85), bandwidth.compute=FALSE)",
       "out <- suppressWarnings(plot(bw, xdat=tx, ydat=y, output = 'data', gradients=TRUE))",
-      "needed <- c('index', 'mean', 'merr', 'grad', 'gerr', 'mean.grad', 'mean.gerr', 'gradients')",
-      "stopifnot(length(out) == 1L)",
-      "stopifnot(all(needed %in% names(out[[1]])))",
+      "needed <- c('estimate', 'bias_corrected', 'std_error', 'status')",
+      "stopifnot(length(out$panels) == 1L)",
+      "stopifnot(all(needed %in% names(out$panels[[1L]]$values)) && all(out$targets$quantity == 'derivative') && identical(out$targets$variable, c('x1','x2')))",
       "cat('SESSION_NPINDEX_ICH_GRADIENT_LC_FIXED_OK\\n')"
     ),
     timeout = 90L,
@@ -369,16 +378,16 @@ test_that("session npplreg plain fixed lc plot-data completes locally", {
       "data.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
       "plot.out <- suppressWarnings(plot(bw.fix, xdat=tx, ydat=y, zdat=tz, output = 'plot-data', perspective=FALSE, errors='none'))",
       "ann.out <- suppressWarnings(plot(bw.ann, xdat=tx, ydat=y, zdat=tz, output = 'data', perspective=FALSE, errors='none'))",
-      "stopifnot(is.list(data.out), length(data.out) == 2L, identical(names(data.out), names(plot.out)))",
-      "for (i in seq_along(data.out)) {",
-      "  stopifnot(inherits(data.out[[i]], 'plregression'))",
-      "  stopifnot(inherits(plot.out[[i]], 'plregression'))",
-      "  stopifnot(isTRUE(all.equal(data.out[[i]]$mean, plot.out[[i]]$mean, check.attributes=FALSE)))",
-      "  stopifnot(isTRUE(all.equal(data.out[[i]]$merr, plot.out[[i]]$merr, check.attributes=FALSE)))",
-      "  stopifnot(all(is.na(data.out[[i]]$merr)))",
+      "stopifnot(inherits(data.out, 'np_plot_data'), length(data.out$panels) == 2L, identical(names(data.out$panels), names(plot.out$panels)))",
+      "for (i in seq_along(data.out$panels)) {",
+      "  stopifnot(identical(data.out$family, 'npplreg'))",
+      "  stopifnot(inherits(plot.out, 'np_plot_data'))",
+      "  stopifnot(isTRUE(all.equal(data.out$panels[[i]]$values, plot.out$panels[[i]]$values, check.attributes=FALSE)))",
+      "  stopifnot(isTRUE(all.equal(data.out$panels[[i]]$intervals, plot.out$panels[[i]]$intervals, check.attributes=FALSE)))",
+      "  stopifnot(nrow(data.out$panels[[i]]$intervals) == 0L)",
       "}",
-      "stopifnot(identical(as.character(data.out[[1L]]$ptype), 'Fixed'))",
-      "stopifnot(identical(as.character(ann.out[[1L]]$ptype), 'Adaptive Nearest Neighbour'))",
+      "stopifnot(identical(data.out$request$errors, 'none') && !any(c('bws','ptype') %in% names(data.out)))",
+      "stopifnot(inherits(ann.out, 'np_plot_data') && identical(names(ann.out$panels), names(data.out$panels)))",
       "cat('SESSION_NPPLREG_PLAIN_FIXED_LC_OK\\n')"
     ),
     timeout = 90L,
@@ -408,7 +417,7 @@ test_that("session npsigtest fast-fail contract completes in installed-build sub
       "y <- rnorm(n)",
       "d <- data.frame(y=y, x1=x1, x2=x2)",
       "bw <- npregbw(y~x1+x2, data=d, bws=c(0.2, 0.4), bandwidth.compute=FALSE)",
-      "err <- try(npsigtest(bws=bw, boot.num=9, random.seed=13, index=0), silent=TRUE)",
+      "err <- try(npsigtest(bws=bw, B=9, random.seed=13, index=0), silent=TRUE)",
       "stopifnot(inherits(err, 'try-error'))",
       "msg <- as.character(err)",
       "stopifnot(any(grepl('invalid index provided', msg, fixed=TRUE)))",
@@ -458,12 +467,12 @@ test_that("session npindex residual and evaluation-error branches complete in in
       "  fit.is <- npindex(bws=bw, txdat=tx, tydat=y, gradients=FALSE, residuals=TRUE)",
       "  stopifnot(length(fit.is$resid) == nrow(tx))",
       "  stopifnot(max(abs(as.vector(fit.is$resid) - (y - as.vector(fit.is$mean)))) < 1e-8)",
-      "  fit.oos <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=FALSE, errors=TRUE, boot.num=9L)",
+      "  fit.oos <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=FALSE, se=TRUE, B=9L)",
       "  stopifnot(length(fit.oos$mean) == nrow(ex))",
       "  stopifnot(length(fit.oos$merr) == nrow(ex))",
       "  stopifnot(all(is.finite(fit.oos$mean)))",
       "  stopifnot(all(is.finite(fit.oos$merr)))",
-      "  fit.grad <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=TRUE, errors=TRUE, boot.num=9L)",
+      "  fit.grad <- npindex(bws=bw, txdat=tx, tydat=y, exdat=ex, eydat=ey, gradients=TRUE, se=TRUE, B=9L)",
       "  stopifnot(identical(dim(fit.grad$grad), c(nrow(ex), ncol(tx))))",
       "  stopifnot(identical(dim(fit.grad$gerr), c(nrow(ex), ncol(tx))))",
       "  stopifnot(all(is.finite(fit.grad$grad)))",
@@ -506,12 +515,20 @@ test_that("session quit/init cycle resets SPMD sequence for LL CV calls", {
       "  invisible(bw)",
       "}",
       "npRmpi.init(nslaves=1, quiet=TRUE)",
-      "runll(100)",
+      "stopifnot(identical(as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')()), 0L))",
+      "bw.first <- runll(100)",
+      "seq.first <- as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')())",
+      "stopifnot(length(seq.first) == 1L, is.finite(seq.first), seq.first > 0L)",
       "npRmpi.quit(mode='spawn', force=TRUE)",
+      "stopifnot(identical(as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')()), 0L))",
       "npRmpi.init(nslaves=1, quiet=TRUE)",
-      "runll(101)",
-      "stopifnot(identical(as.integer(getOption('npRmpi.spmd.seq_id')), 1L))",
+      "stopifnot(identical(as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')()), 0L))",
+      "bw.second <- runll(100)",
+      "seq.second <- as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')())",
+      "stopifnot(identical(seq.second, seq.first))",
+      "stopifnot(isTRUE(all.equal(as.numeric(bw.second$fval), as.numeric(bw.first$fval), tolerance=1e-12)))",
       "npRmpi.quit(mode='spawn', force=TRUE)",
+      "stopifnot(identical(as.integer(getFromNamespace('.npRmpi_spmd_seq_get', 'npRmpi')()), 0L))",
       "cat('SESSION_SEQ_RESET_OK\\n')"
     ),
     timeout = 120L,
@@ -1178,7 +1195,7 @@ test_that("session npindex inid consumer plot preserves bwtype variants in subpr
       "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
-      "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
+      "  stopifnot(inherits(out, 'np_plot_data'), all(c('lower','upper') %in% names(out$panels[[1L]]$intervals)), nrow(out$panels[[1L]]$intervals) > 0L)",
       "  cat(sprintf('SESSION_NPINDEX_BWTYPE_INID_PLOT_OK bwtype=%s\\n', bwtype))",
       "}"
     ),
@@ -1215,7 +1232,7 @@ test_that("session npindex fitted NOMAD object plot recovers formula data in sub
       "stopifnot(!is.null(fit$bws$formula), !is.null(fit$bws$call))",
       "out <- suppressWarnings(plot(fit, output='data'))",
       "stopifnot(is.list(out), length(out) > 0L)",
-      "stopifnot(inherits(out[[1]], 'singleindex'))",
+      "stopifnot(inherits(out, 'np_plot_data'), identical(out$family, 'npindex'))",
       "cat('SESSION_NPINDEX_NOMAD_FIT_PLOT_OK\\n')"
     ),
     timeout = 120L,
@@ -1267,7 +1284,7 @@ test_that("session npindex fixed-block consumer plot preserves bwtype variants i
       "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
-      "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
+      "  stopifnot(inherits(out, 'np_plot_data'), all(c('lower','upper') %in% names(out$panels[[1L]]$intervals)), nrow(out$panels[[1L]]$intervals) > 0L)",
       "  cat(sprintf('SESSION_NPINDEX_BWTYPE_FIXED_PLOT_OK bwtype=%s\\n', bwtype))",
       "}"
     ),
@@ -1324,7 +1341,7 @@ test_that("session npindex geom-block consumer plot preserves bwtype variants in
       "    B=9",
       "  ))",
       "  stopifnot(is.list(out), length(out) > 0L)",
-      "  stopifnot(is.matrix(out[[1]]$merr), ncol(out[[1]]$merr) == 2L)",
+      "  stopifnot(inherits(out, 'np_plot_data'), all(c('lower','upper') %in% names(out$panels[[1L]]$intervals)), nrow(out$panels[[1L]]$intervals) > 0L)",
       "  cat(sprintf('SESSION_NPINDEX_BWTYPE_GEOM_PLOT_OK bwtype=%s\\n', bwtype))",
       "}"
     ),
@@ -1482,9 +1499,9 @@ test_that("manual-broadcast mode smoke completes in subprocess", {
       "mpi.bcast.cmd(bw <- npregbw(y~x, data=d, regtype='lc', bwmethod='cv.ls', nmulti=1), caller.execute=TRUE)",
       "mpi.bcast.cmd(fit <- npreg(bws=bw, gradients=FALSE), caller.execute=TRUE)",
       "mpi.bcast.cmd(bw.sc <- npscoefbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1), caller.execute=TRUE)",
-      "mpi.bcast.cmd(fit.sc <- npscoef(bws=bw.sc, gradients=FALSE), caller.execute=TRUE)",
+      "mpi.bcast.cmd(fit.sc <- npscoef(bws=bw.sc), caller.execute=TRUE)",
       "mpi.bcast.cmd(bw.pl <- npplregbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1), caller.execute=TRUE)",
-      "mpi.bcast.cmd(fit.pl <- npplreg(bws=bw.pl, gradients=FALSE), caller.execute=TRUE)",
+      "mpi.bcast.cmd(fit.pl <- npplreg(bws=bw.pl, se=TRUE), caller.execute=TRUE)",
       "mpi.bcast.cmd(bw.si <- npindexbw(xdat=d2, ydat=y, regtype='lc', nmulti=1), caller.execute=TRUE)",
       "mpi.bcast.cmd(fit.si <- npindex(bws=bw.si, gradients=FALSE), caller.execute=TRUE)",
       "mpi.bcast.cmd(bw.ud <- npudensbw(dat=xd, bws=0.35, bandwidth.compute=FALSE), caller.execute=TRUE)",
@@ -1497,7 +1514,16 @@ test_that("manual-broadcast mode smoke completes in subprocess", {
       "mpi.bcast.cmd(fit.cf <- npcdist(txdat=xd, tydat=yd, bws=bw.cf), caller.execute=TRUE)",
       "stopifnot(inherits(fit, 'npregression'))",
       "stopifnot(inherits(fit.sc, 'smoothcoefficient'))",
+      "stopifnot(inherits(fit.sc$bws, 'scbandwidth'))",
+      "stopifnot(length(fit.sc$mean) == NROW(d1))",
+      "stopifnot(identical(dim(fit.sc$grad), c(NROW(d1), NCOL(d1))))",
+      "stopifnot(all(is.finite(fit.sc$mean)), all(is.finite(fit.sc$grad)))",
       "stopifnot(inherits(fit.pl, 'plregression'))",
+      "stopifnot(inherits(fit.pl$bws, 'plbandwidth'))",
+      "stopifnot(length(fit.pl$mean) == NROW(d1))",
+      "stopifnot(length(fit.pl$xcoef) == NCOL(d1))",
+      "stopifnot(length(fit.pl$xcoeferr) == NCOL(d1))",
+      "stopifnot(all(is.finite(fit.pl$mean)), all(is.finite(fit.pl$xcoef)), all(is.finite(fit.pl$xcoeferr)))",
       "stopifnot(inherits(fit.si, 'singleindex'))",
       "stopifnot(inherits(fit.ud, 'npdensity'))",
       "stopifnot(inherits(fit.uf, 'npdistribution'))",
@@ -1542,9 +1568,9 @@ test_that("attach mode smoke completes under mpiexec when enabled", {
     "  bw <- npregbw(y~x, regtype='lc', bwmethod='cv.ls', nmulti=1)",
     "  fit <- npreg(bws=bw, gradients=FALSE)",
     "  bw.sc <- npscoefbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1)",
-    "  fit.sc <- npscoef(bws=bw.sc, gradients=FALSE)",
+    "  fit.sc <- npscoef(bws=bw.sc)",
     "  bw.pl <- npplregbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1)",
-    "  fit.pl <- npplreg(bws=bw.pl, gradients=FALSE)",
+    "  fit.pl <- npplreg(bws=bw.pl, se=TRUE)",
     "  bw.si <- npindexbw(xdat=d2, ydat=y, regtype='lc', nmulti=1)",
     "  fit.si <- npindex(bws=bw.si, gradients=FALSE)",
     "  bw.ud <- npudensbw(dat=xd, bws=0.35, bandwidth.compute=FALSE)",
@@ -1569,15 +1595,26 @@ test_that("attach mode smoke completes under mpiexec when enabled", {
     "  fit.cm <- npconmode(bws=bw.cm)",
     "  stopifnot(inherits(fit, 'npregression'))",
     "  stopifnot(inherits(fit.sc, 'smoothcoefficient'))",
+    "  stopifnot(inherits(fit.sc$bws, 'scbandwidth'))",
+    "  stopifnot(length(fit.sc$mean) == NROW(d1))",
+    "  stopifnot(identical(dim(fit.sc$grad), c(NROW(d1), NCOL(d1))))",
+    "  stopifnot(all(is.finite(fit.sc$mean)), all(is.finite(fit.sc$grad)))",
     "  stopifnot(inherits(fit.pl, 'plregression'))",
+    "  stopifnot(inherits(fit.pl$bws, 'plbandwidth'))",
+    "  stopifnot(length(fit.pl$mean) == NROW(d1))",
+    "  stopifnot(length(fit.pl$xcoef) == NCOL(d1))",
+    "  stopifnot(length(fit.pl$xcoeferr) == NCOL(d1))",
+    "  stopifnot(all(is.finite(fit.pl$mean)), all(is.finite(fit.pl$xcoef)), all(is.finite(fit.pl$xcoeferr)))",
     "  stopifnot(inherits(fit.si, 'singleindex'))",
     "  stopifnot(inherits(fit.ud, 'npdensity'))",
     "  stopifnot(inherits(fit.uf, 'npdistribution'))",
     "  stopifnot(inherits(fit.cd, 'condensity'))",
     "  stopifnot(inherits(fit.cf, 'condistribution'))",
-    "  stopifnot(inherits(cop, 'data.frame'))",
-    "  stopifnot(nrow(cop) == 9L)",
-    "  stopifnot(all(is.finite(cop$copula)))",
+    "  stopifnot(inherits(cop, 'npcopula'))",
+    "  cop.data <- as.data.frame(cop)",
+    "  stopifnot(inherits(cop.data, 'data.frame'))",
+    "  stopifnot(nrow(cop.data) == 9L)",
+    "  stopifnot(all(is.finite(cop.data$copula)))",
     "  stopifnot(inherits(fit.cm, 'conmode'))",
     "  cat('ATTACH_NPCONMODE_ROUTE_OK\\n')",
     "  cat('ATTACH_NPCOPULA_ROUTE_OK\\n')",
@@ -1956,7 +1993,7 @@ test_that("attach smooth-coefficient ll coef plot-data route completes under mpi
     "    errors='none'))",
     "  stopifnot(is.list(out))",
     "  stopifnot(length(out) > 0L)",
-    "  stopifnot(all(vapply(out, inherits, logical(1), 'smoothcoefficient')))",
+    "  stopifnot(inherits(out, 'np_plot_data') && length(out$panels) > 0L)",
     "  cat('ATTACH_SCOEF_LL_PLOTDATA_OK\\n')",
     "  npRmpi.quit(mode='attach')",
     "}"
@@ -2150,9 +2187,9 @@ test_that("profile mode smoke completes under mpiexec when enabled", {
     "  mpi.bcast.cmd(bw <- npregbw(y~x, data=d, regtype='lc', bwmethod='cv.ls', nmulti=1), caller.execute=TRUE)",
     "  mpi.bcast.cmd(fit <- npreg(bws=bw, data=d, gradients=FALSE), caller.execute=TRUE)",
     "  mpi.bcast.cmd(bw.sc <- npscoefbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1), caller.execute=TRUE)",
-    "  mpi.bcast.cmd(fit.sc <- npscoef(bws=bw.sc, gradients=FALSE), caller.execute=TRUE)",
+    "  mpi.bcast.cmd(fit.sc <- npscoef(bws=bw.sc), caller.execute=TRUE)",
     "  mpi.bcast.cmd(bw.pl <- npplregbw(xdat=d1, ydat=y, zdat=dz, regtype='lc', nmulti=1), caller.execute=TRUE)",
-    "  mpi.bcast.cmd(fit.pl <- npplreg(bws=bw.pl, gradients=FALSE), caller.execute=TRUE)",
+    "  mpi.bcast.cmd(fit.pl <- npplreg(bws=bw.pl, se=TRUE), caller.execute=TRUE)",
     "  mpi.bcast.cmd(bw.si <- npindexbw(xdat=d2, ydat=y, regtype='lc', nmulti=1), caller.execute=TRUE)",
     "  mpi.bcast.cmd(fit.si <- npindex(bws=bw.si, gradients=FALSE), caller.execute=TRUE)",
     "  mpi.bcast.cmd(bw.ud <- npudensbw(dat=xd, bws=0.35, bandwidth.compute=FALSE), caller.execute=TRUE)",
@@ -2169,15 +2206,26 @@ test_that("profile mode smoke completes under mpiexec when enabled", {
     "  mpi.bcast.cmd(fit.cm <- npconmode(bws=bw.cm), caller.execute=TRUE)",
     "  stopifnot(inherits(fit, 'npregression'))",
     "  stopifnot(inherits(fit.sc, 'smoothcoefficient'))",
+    "  stopifnot(inherits(fit.sc$bws, 'scbandwidth'))",
+    "  stopifnot(length(fit.sc$mean) == NROW(d1))",
+    "  stopifnot(identical(dim(fit.sc$grad), c(NROW(d1), NCOL(d1))))",
+    "  stopifnot(all(is.finite(fit.sc$mean)), all(is.finite(fit.sc$grad)))",
     "  stopifnot(inherits(fit.pl, 'plregression'))",
+    "  stopifnot(inherits(fit.pl$bws, 'plbandwidth'))",
+    "  stopifnot(length(fit.pl$mean) == NROW(d1))",
+    "  stopifnot(length(fit.pl$xcoef) == NCOL(d1))",
+    "  stopifnot(length(fit.pl$xcoeferr) == NCOL(d1))",
+    "  stopifnot(all(is.finite(fit.pl$mean)), all(is.finite(fit.pl$xcoef)), all(is.finite(fit.pl$xcoeferr)))",
     "  stopifnot(inherits(fit.si, 'singleindex'))",
     "  stopifnot(inherits(fit.ud, 'npdensity'))",
     "  stopifnot(inherits(fit.uf, 'npdistribution'))",
     "  stopifnot(inherits(fit.cd, 'condensity'))",
     "  stopifnot(inherits(fit.cf, 'condistribution'))",
-    "  stopifnot(inherits(cop, 'data.frame'))",
-    "  stopifnot(nrow(cop) == 9L)",
-    "  stopifnot(all(is.finite(cop$copula)))",
+    "  stopifnot(inherits(cop, 'npcopula'))",
+    "  cop.data <- as.data.frame(cop)",
+    "  stopifnot(inherits(cop.data, 'data.frame'))",
+    "  stopifnot(nrow(cop.data) == 9L)",
+    "  stopifnot(all(is.finite(cop.data$copula)))",
     "  stopifnot(inherits(fit.cm, 'conmode'))",
     "  cat('PROFILE_NPCONMODE_ROUTE_OK\\n')",
     "  cat('PROFILE_NPCOPULA_ROUTE_OK\\n')",
@@ -2202,7 +2250,7 @@ test_that("profile mode smoke completes under mpiexec when enabled", {
     timeout = 90L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),
@@ -2287,7 +2335,7 @@ test_that("profile npindexhat adaptive-nn exact owner route completes under mpie
     timeout = 120L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),
@@ -2378,7 +2426,7 @@ test_that("profile npindexhat adaptive-nn ll owner route stays exact under mpiex
     timeout = 120L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),
@@ -2463,7 +2511,7 @@ test_that("profile npindex adaptive-nn public route preserves bwtype semantics u
     timeout = 120L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),
@@ -2551,7 +2599,7 @@ test_that("profile npindex nearest-neighbor exact route stays green under mpiexe
     timeout = 120L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),
@@ -2637,9 +2685,9 @@ test_that("session conditional density fixed ll cv.ls uses MPI autodispatch rout
       "stopifnot(identical(bw$regtype.engine, 'lp'))",
       "stopifnot(all(as.integer(bw$degree.engine) == 1L))",
       "stopifnot(is.finite(bw$fval))",
-      "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
+      "stopifnot(is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
       "stopifnot(is.list(bw$timing.profile))",
-      "stopifnot(identical(bw$timing.profile$where, 'autodispatch-call'))",
+      "stopifnot(identical(bw$timing.profile$where, 'npcdensbw'))",
       "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
       "cat('SESSION_NPCDENS_LL_CVLS_AUTODISPATCH_OK\\n')"
     ),
@@ -2671,9 +2719,9 @@ test_that("session conditional distribution fixed ll cv.ls uses MPI autodispatch
       "stopifnot(identical(bw$regtype.engine, 'lp'))",
       "stopifnot(all(as.integer(bw$degree.engine) == 1L))",
       "stopifnot(is.finite(bw$fval))",
-      "stopifnot(!is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
+      "stopifnot(is.null(attr(bw, 'npRmpi.autodispatch.remote', exact=TRUE)))",
       "stopifnot(is.list(bw$timing.profile))",
-      "stopifnot(identical(bw$timing.profile$where, 'autodispatch-call'))",
+      "stopifnot(identical(bw$timing.profile$where, 'npcdistbw'))",
       "stopifnot(any(grepl('mpi.bcast.cmd.execute', bw$timing.profile$comm_notes, fixed=TRUE)))",
       "cat('SESSION_NPCDIST_LL_CVLS_AUTODISPATCH_OK\\n')"
     ),

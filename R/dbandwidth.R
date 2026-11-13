@@ -3,7 +3,7 @@ dbandwidth <-
            bwmethod = c("cv.cdf","normal-reference"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           ckertype = c("gaussian","epanechnikov","uniform","beta"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -39,22 +39,21 @@ dbandwidth <-
 
     if(missing(ckerorder))
       ckerorder = 2
-    else if (ckertype == "uniform")
-      .np_warning("ignoring kernel order specified with uniform kernel type")
-    else {
+    else if (ckertype != "uniform") {
       kord = c(2,4,6,8) 
       if (!any(kord == ckerorder))
         stop("ckerorder must be one of ", paste(kord,collapse=" "))
     }
 
+    if (bwmethod == "normal-reference" && identical(ckertype, "beta"))
+      stop("beta distribution estimation does not support normal-reference bandwidth selection; supply a manual bandwidth",
+           call. = FALSE)
+
     if (bwmethod == "normal-reference" && (ckertype != "gaussian" || bwtype != "fixed")){    
-      .np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth")
+      .npRmpi_defer_named_warning(.np_warning("normal-reference bandwidth selection assumes gaussian kernel with fixed bandwidth"))
       bwtype = "fixed"
       ckertype = "gaussian"
     }
-
-    if (ckertype == "truncated gaussian" && ckerorder != 2)
-      .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
 
     ukertype = match.arg(ukertype)
@@ -65,7 +64,22 @@ dbandwidth <-
       kerbound = ckerbound,
       kerlb = ckerlb,
       kerub = ckerub,
-      argprefix = "cker")
+      argprefix = "cker",
+      range.policy = if (identical(ckertype, "beta"))
+        "beta_half_spacing" else "exact")
+    npValidateBetaKernelSpecification(
+      ckertype = ckertype,
+      ckerorder = ckerorder,
+      bwtype = bwtype,
+      ckerbound = cbounds$bound,
+      ckerlb = cbounds$lb,
+      ckerub = cbounds$ub,
+      dati = xdati,
+      bw = bw,
+      bandwidth.compute = bandwidth.compute,
+      where = "beta distribution",
+      allow.categorical = TRUE
+    )
     bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
     if (bwtype != "fixed" &&
         cbounds$bound != "none" &&
@@ -158,6 +172,7 @@ dbandwidth <-
     
 
     class(mybw) = "dbandwidth"
+    mybw <- .np_ordered_bandwidth_contract(mybw)
     if(!any(is.na(mybw$bandwidth)))
     validateBandwidth(mybw)
     mybw

@@ -1,6 +1,11 @@
 npcdist <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npcdist")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat"),
+      call = sys.call(), caller = parent.frame())
 
     if (!missing(bws)){
       if (is.recursive(bws)){
@@ -22,6 +27,12 @@ npcdist <-
 
 npcdist.formula <-
   function(bws, data = NULL, newdata = NULL, ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+    dots <- list(...)
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    dots$formula <- NULL
     tt <- terms(bws)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(bws$call), nomatch = 0)
@@ -29,18 +40,29 @@ npcdist.formula <-
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
     if (!missing(data) && !is.null(data))
-      tmf[["data"]] <- substitute(data)
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    umf <- tmf <- if (is.null(frame.state))
+      .np_bws_formula_model_frame(bws, mf.args,
+        data.override = !missing(data) && !is.null(data), overrides = dots) else
+        .np_formula_frame_take(frame.state)
+    if ("tydat" %in% names(dots)) {
+      umf <- tmf <- .np_formula_replace_response(tmf, bws, dots[["tydat"]],
+                                                 dots, data.override = !is.null(data))
+      dots$tydat <- NULL
+      dots$na.action <- NULL
+    }
+    tt <- attr(tmf, "terms")
+    bws <- .np_bws_retain_fit_frame(bws, tmf)
 
     tydat <- tmf[, bws$variableNames[["response"]], drop = FALSE]
     txdat <- tmf[, bws$variableNames[["terms"]], drop = FALSE]
 
-    has.eval <- !is.null(newdata)
+    has.eval <- !is.null(newdata) && !any(c("exdat", "eydat") %in% names(dots))
     if (has.eval) {
       npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      umf <- do.call(.np_formula_model_frame, umf.args, envir = parent.frame())
       emf <- umf
       
       eydat <- emf[, bws$variableNames[["response"]], drop = FALSE]
@@ -53,26 +75,28 @@ npcdist.formula <-
       cd.args$eydat <- eydat
     }
     cd.args$bws <- bws
-    ev <- do.call(npcdist, c(cd.args, list(...)))
+    ev <- do.call(npcdist, c(cd.args, dots))
 
-    ev$omit <- attr(umf,"na.action")
+    ev$omit <- .np_formula_output_action(ev, umf, has.eval)
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
     train.omit <- as.vector(attr(tmf, "na.action"))
-    eval.omit <- if (has.eval) as.vector(attr(umf, "na.action")) else integer(0)
+    eval.omit <- if (isTRUE(ev$trainiseval)) integer(0) else as.vector(ev$omit)
     ev$train.rows.omit <- if (length(train.omit)) train.omit else NA
     ev$train.nobs.omit <- length(train.omit)
     ev$eval.rows.omit <- if (length(eval.omit)) eval.omit else NA
     ev$eval.nobs.omit <- length(eval.omit)
 
     ev$condist <- napredict(ev$omit, ev$condist)
-    ev$conderr <- napredict(ev$omit, ev$conderr)
+    if (!is.null(ev$conderr))
+      ev$conderr <- napredict(ev$omit, ev$conderr)
     if (!is.null(ev$condist.raw))
       ev$condist.raw <- napredict(ev$omit, ev$condist.raw)
 
     if(ev$gradients){
         ev$congrad <- napredict(ev$omit, ev$congrad)
-        ev$congerr <- napredict(ev$omit, ev$congerr)
+        if (!is.null(ev$congerr))
+          ev$congerr <- napredict(ev$omit, ev$congerr)
     }
 
     return(ev)
@@ -80,9 +104,12 @@ npcdist.formula <-
 
 npcdist.call <-
   function(bws, ...) {
-    npcdist(txdat = .np_eval_bws_call_arg(bws, "xdat"),
-            tydat = .np_eval_bws_call_arg(bws, "ydat"),
-            bws = bws, ...)
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    do.call(npcdist, .np_retained_training_args(
+      bws, c(txdat = "xdat", tydat = "ydat"), list(...), npcdist.condbandwidth))
   }
 
 
@@ -95,9 +122,23 @@ npcdist.condbandwidth <-
            proper = FALSE,
            proper.method = c("isotonic"),
            proper.control = list(),
-           ...){
+           ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
 
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+
+    se <- npValidateScalarLogical(se, "se")
     dots <- list(...)
+    lp.first.se.demand <- .np_conditional_first_se_demand(
+      dots[[".np_lp_first_se_demand", exact = TRUE]], bws$xncon)
+    cat.se.demand <- .np_conditional_cat_se_demand(
+      dots[[".np_conditional_cat_se_demand", exact = TRUE]],
+      bws$xnuno + bws$xnord)
+    dispatch.call <- match.call()
+    dispatch.call$se <- se
+    dispatch.call$.np_lp_first_se_demand <- lp.first.se.demand
+    dispatch.call$.np_conditional_cat_se_demand <- cat.se.demand
     fit.start <- proc.time()[3]
     fit.progress.handoff <- isTRUE(dots$.np_fit_progress_handoff)
     gradients <- npValidateScalarLogical(gradients, "gradients")
@@ -107,6 +148,11 @@ npcdist.condbandwidth <-
       proper.control = proper.control
     )
     .npRmpi_require_active_slave_pool(where = "npcdist()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npcdist()")
     reg.spec.preflight <- npConditionalRegEngineSpec(bws, where = "npcdist")
     glp.gradient.order.preflight <- npConditionalGradientOrder(
@@ -133,7 +179,8 @@ npcdist.condbandwidth <-
         gradient.order = glp.gradient.order.preflight,
         ncon = bws$xncon
       )
-      if (!any(glp.gradient.available.preflight)) {
+      if (!any(glp.gradient.available.preflight) &&
+          (bws$xnuno + bws$xnord == 0L)) {
         stop("npcdist has no available derivative components for the requested gradient.order and fitted polynomial degree",
              call. = FALSE)
       }
@@ -161,10 +208,10 @@ npcdist.condbandwidth <-
     if (.npRmpi_autodispatch_active() &&
         !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)) &&
         !.npRmpi_session_has_active_pool(comm = 1L)) {
-      return(.npRmpi_with_local_cdist_eval(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+      return(.npRmpi_with_local_cdist_eval(.npRmpi_eval_without_dispatch(dispatch.call, parent.frame())))
     }
     if (.npRmpi_autodispatch_active()) {
-      out <- .npRmpi_autodispatch_call(match.call(), parent.frame())
+      out <- .npRmpi_autodispatch_call(dispatch.call, parent.frame(), owner.name = "npcdist.condbandwidth")
       out <- .npRmpi_restore_nomad_fit_bws_metadata(out, bws)
       if (inherits(out, "condistribution") &&
           !is.null(out$proper.requested) &&
@@ -180,17 +227,30 @@ npcdist.condbandwidth <-
       ))
     }
 
+    native.newdata <- dots[["newdata", exact = TRUE]]
+    if (missing(exdat) && missing(eydat) && !is.null(native.newdata)) {
+      native.eval <- .np_native_newdata_parts(
+        native.newdata, list(exdat = bws$xnames, eydat = bws$ynames), "npcdist")
+      exdat <- native.eval$exdat
+      eydat <- native.eval$eydat
+    }
+
     if (xor(missing(exdat),missing(eydat)))
       stop("evaluation data must be supplied for both 'exdat' and 'eydat'")
 
     no.exy = missing(exdat)
+  allow.external <- !no.exy && !isTRUE(dots[[".np.require.complete", exact = TRUE]])
+  defer.empty <- isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]])
 
     txdat = toFrame(txdat)
     tydat = toFrame(tydat)
+    .np_require_paired_rows(txdat, tydat, "txdat", "tydat")
+    bws <- .np_bws_retain_native_training(bws, xdat = txdat, ydat = tydat)
 
     if (!no.exy){
       exdat = toFrame(exdat)
       eydat = toFrame(eydat)
+      .np_require_paired_rows(exdat, eydat, "exdat", "eydat")
 
       if (! txdat %~% exdat )
         stop("'txdat' and 'exdat' are not similar data frames!")
@@ -206,6 +266,9 @@ npcdist.condbandwidth <-
     if (length(bws$ybw) != length(tydat))
       stop("length of bandwidth vector does not match number of columns of 'tydat'")
 
+    beta.kernel <- identical(bws[["cxkertype", exact = TRUE]], "beta") ||
+      identical(bws[["cykertype", exact = TRUE]], "beta")
+    npValidateConditionalBetaBandwidthObject(bws, where = "npcdist")
     if ((any(bws$ixcon) &&
          !all(vapply(txdat[, bws$ixcon, drop = FALSE], inherits, logical(1), c("integer", "numeric")))) ||
         (any(bws$ixord) &&
@@ -267,7 +330,8 @@ npcdist.condbandwidth <-
       npKernelBoundsCheckEval(eydat, bws$iycon, bws$cykerlb, bws$cykerub, argprefix = "cyker")
     }
 
-    proper.slice.context <- list(
+  proper.slice.context <- list(
+    allow.external = allow.external,
       txdat = txdat,
       tydat = tydat,
       exdat = if (no.exy) NULL else exdat,
@@ -351,9 +415,15 @@ npcdist.condbandwidth <-
         gradient.order = glp.gradient.order,
         ncon = bws$xncon
       )
-      if (!any(glp.gradient.available)) {
-        stop("npcdist has no available derivative components for the requested gradient.order and fitted polynomial degree",
-             call. = FALSE)
+      if (!any(glp.gradient.available) && (bws$xnuno + bws$xnord == 0L)) {
+        npStopGlpGradientNoneAvailable(
+          where = "npcdist",
+          action = "compute",
+          degree.engine = degree.engine,
+          gradient.order = glp.gradient.order,
+          available = glp.gradient.available,
+          con.names = colnames(txdat)[bws$ixcon]
+        )
       }
       glp.gradient.partial <- !lp.degree0.lc.gradient &&
         any(!glp.gradient.available)
@@ -367,11 +437,18 @@ npcdist.condbandwidth <-
         )
       }
     }
+    glp.categorical.effects <- npGlpCategoricalEffectsRequired(
+      regtype.engine = reg.engine,
+      degree.engine = degree.engine,
+      ncat = bws$xnuno + bws$xnord,
+      gradients = gradients
+    )
     if (isTRUE(gradients) &&
         identical(reg.engine, "lp") &&
         (bws$xncon > 0L) &&
         !lp.degree0.lc.gradient &&
-        all(degree.engine == 0L)) {
+        all(degree.engine == 0L) &&
+        (bws$xnuno + bws$xnord == 0L)) {
       stop("regtype='lp' with degree=0 does not support derivatives; use gradients=FALSE for fitted/predicted values")
     }
     if (isTRUE(gradients) &&
@@ -398,12 +475,22 @@ npcdist.condbandwidth <-
       integer(0)
     }
     basis.code <- as.integer(npLpBasisCode(basis.engine))
-    do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
+  do.compiled.gradients <- isTRUE(gradients) && !glp.gradient.partial
+  higher.se.request <- .np_conditional_higher_se_request(
+    se, gradients, reg.engine, glp.gradient.order, glp.gradient.available)
+    first.se.request <- if (!se) NULL else .np_conditional_first_se_request(
+      gradients, glp.gradient.partial, degree.engine, glp.gradient.order,
+      glp.gradient.available, lp.first.se.demand)
+    cat.se.request <- if (!se) NULL else .np_conditional_cat_se_request(
+      gradients, glp.gradient.partial, glp.categorical.effects,
+      bws, cat.se.demand)
 
+    native.xbw <- .npcdhat_physical_bandwidth(bws, "x")
+    native.ybw <- .npcdhat_physical_bandwidth(bws, "y")
     myopti <- list(
         num_obs_train = tnrow,
         num_obs_eval = enrow,
-        int_LARGE_SF = (if (bws$scaling) SF_NORMAL else SF_ARB),
+        int_LARGE_SF = SF_ARB,
         BANDWIDTH_den_extern = switch(bws$type,
             fixed = BW_FIXED,
             generalized_nn = BW_GEN_NN,
@@ -413,12 +500,14 @@ npcdist.condbandwidth <-
             gaussian = CKER_GAUSS + bws$cxkerorder/2 - 1,
             epanechnikov = CKER_EPAN + bws$cxkerorder/2 - 1,
             uniform = CKER_UNI,
-            "truncated gaussian" = CKER_TGAUSS),
+            beta = CKER_COORDINATE
+),
         ykerneval = switch(bws$cykertype,
             gaussian = CKER_GAUSS + bws$cykerorder/2 - 1,
             epanechnikov = CKER_EPAN + bws$cykerorder/2 - 1,
             uniform = CKER_UNI,
-            "truncated gaussian" = CKER_TGAUSS),
+            beta = CKER_COORDINATE
+),
         uxkerneval = switch(bws$uxkertype,
             aitchisonaitken = UKER_AIT,
             liracine = UKER_LR),
@@ -444,27 +533,31 @@ npcdist.condbandwidth <-
         ymcv.numRow = attr(bws$ymcv, "num.row"),
         xmcv.numRow = attr(bws$xmcv, "num.row"),
         densOrDist = NP_DO_DIST,
-        int_do_tree = .npcdistbw_tree_code(
+        int_do_tree = if (beta.kernel) DO_TREE_NO else .npcdistbw_tree_code(
           bws = bws,
           ncon = bws$yncon + bws$xncon,
-          ncat = bws$ynuno + bws$ynord + bws$xnuno + bws$xnord))
+          ncat = bws$ynuno + bws$ynord + bws$xnuno + bws$xnord,
+          fit.context = TRUE))
+    myopti <- c(myopti, npConditionalKernelDescriptorOptions(bws),
+                list(gnn.lp.fit.tree = .np_conditional_gnn_lp_fit_tree_eligible(bws) &&
+                       identical(reg.c$code, REGTYPE_LP)))
 
     cxker.bounds.c <- npKernelBoundsMarshal(bws$cxkerlb[bws$ixcon], bws$cxkerub[bws$ixcon])
     cyker.bounds.c <- npKernelBoundsMarshal(bws$cykerlb[bws$iycon], bws$cykerub[bws$iycon])
 
-    myout <- .np_with_compiled_fit_progress(
+    myout <- .np_with_nn_radius_context(.np_with_compiled_fit_progress(
       label = "Fitting conditional distribution",
       total = .np_condensdist_fit_total(bws = bws, tnrow = tnrow, enrow = enrow),
       handoff = fit.progress.handoff,
       handoff.detail = if (fit.progress.handoff) "starting" else NULL,
-      .Call("C_np_density_conditional",
+    .np_conditional_native_call(higher.se.request,
             as.double(tyuno), as.double(tyord), as.double(tycon),
             as.double(txuno), as.double(txord), as.double(txcon),
             as.double(eyuno), as.double(eyord), as.double(eycon),
             as.double(exuno), as.double(exord), as.double(excon),
-            as.double(c(bws$xbw[bws$ixcon], bws$ybw[bws$iycon],
-                        bws$ybw[bws$iyuno], bws$ybw[bws$iyord],
-                        bws$xbw[bws$ixuno], bws$xbw[bws$ixord])),
+            as.double(c(native.xbw[bws$ixcon], native.ybw[bws$iycon],
+                        native.ybw[bws$iyuno], native.ybw[bws$iyord],
+                        native.xbw[bws$ixuno], native.xbw[bws$ixord])),
             as.double(bws$ymcv), as.double(attr(bws$ymcv, "pad.num")),
             as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
             as.double(bws$nconfac), as.double(bws$ncatfac), as.double(bws$sdev),
@@ -479,10 +572,17 @@ npcdist.condbandwidth <-
             as.integer(degree.c),
             as.integer(bernstein.engine),
             basis.code,
-            PACKAGE = "npRmpi")
-    )
+            first.se.request,
+            cat.se.request,
+            se, allow.external)
+    ), continuous.names = c(bws[["xnames", exact = TRUE]][bws[["ixcon", exact = TRUE]]], bws[["ynames", exact = TRUE]][bws[["iycon", exact = TRUE]]]))
     names(myout)[1] <- "condist"
 
+    empty.rows <- attr(myout, ".np.empty.rows", exact = TRUE)
+
+    base.rows <- attr(myout, ".np.empty.base.rows", exact = TRUE)
+
+    first.se.native <- if (is.null(first.se.request)) NULL else myout$congerr
     if(gradients){
       if (!glp.gradient.partial) {
         myout$congrad = matrix(data=myout$congrad, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
@@ -491,11 +591,13 @@ npcdist.condbandwidth <-
         rorder[c(xidx[bws$ixcon], xidx[bws$ixuno], xidx[bws$ixord])] <- xidx
         myout$congrad = myout$congrad[, rorder, drop = FALSE]
 
-        myout$congerr = matrix(data=myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
-        myout$congerr = myout$congerr[, rorder, drop = FALSE]
+        if (se) {
+          myout$congerr = matrix(data=myout$congerr, nrow = enrow, ncol = bws$xndim, byrow = FALSE)
+          myout$congerr = myout$congerr[, rorder, drop = FALSE]
+        }
       } else {
         myout$congrad <- matrix(NA_real_, nrow = enrow, ncol = bws$xndim)
-        myout$congerr <- matrix(NA_real_, nrow = enrow, ncol = bws$xndim)
+        if (se) myout$congerr <- matrix(NA_real_, nrow = enrow, ncol = bws$xndim)
       }
 
       if (identical(reg.engine, "lp") && bws$xncon > 0L && !lp.degree0.lc.gradient) {
@@ -522,17 +624,50 @@ npcdist.condbandwidth <-
               hat.args$exdat <- proper.slice.context$exdat
               hat.args$eydat <- proper.slice.context$eydat
             }
-            myout$congrad[, cont.idx[jj]] <- as.vector(do.call(npcdisthat, hat.args))
-            myout$congerr[, cont.idx[jj]] <- NA_real_
+          if (!is.null(higher.se.request) && higher.se.request[jj]) {
+            higher <- .np_conditional_higher_hat(hat.args, cdf = TRUE,
+              base.rows = base.rows, allow.external = allow.external)
+            myout$congrad[, cont.idx[jj]] <- as.vector(higher$value)
+            myout$congerr[, cont.idx[jj]] <- .np_conditional_higher_se(
+              myout[["variance_metadata", exact = TRUE]], higher$norm, enrow, base.rows)
+          } else {
+            myout$congrad[, cont.idx[jj]] <- as.vector(.np_conditional_higher_hat(hat.args, cdf = TRUE,
+              base.rows = base.rows, allow.external = allow.external, return.norm = FALSE))
+            if (se) myout$congerr[, cont.idx[jj]] <- NA_real_
+          }
           }
         }
       }
+      if ((glp.gradient.partial || glp.categorical.effects) &&
+          (bws$xnuno + bws$xnord > 0L)) {
+        cat.grad <- npConditionalCategoricalFirstDifferences(
+          hat.fun = npcdisthat,
+          bws = bws,
+          txdat = proper.slice.context$txdat,
+          tydat = proper.slice.context$tydat,
+          exdat = proper.slice.context$exdat,
+          eydat = proper.slice.context$eydat,
+          where = "npcdist",
+          allow.external = allow.external, base.rows = base.rows,
+          .np.defer.empty.rows = TRUE,
+          se.demand = if (se) cat.se.demand else FALSE
+        )
+        cat.rows <- attr(cat.grad, ".np.empty.rows", exact = TRUE)
+        if (!is.null(cat.rows))
+          empty.rows <- if (is.null(empty.rows)) cat.rows else pmax(empty.rows, cat.rows)
+        cat.idx <- which(bws$ixuno | bws$ixord)
+        myout$congrad[, cat.idx] <- cat.grad[, cat.idx, drop = FALSE]
+        if (se) myout$congerr[, cat.idx] <- if (any(cat.se.demand))
+          attr(cat.grad, ".np.categorical.se", exact = TRUE)[, cat.idx, drop = FALSE] else NA_real_
+      }
     } else {
       myout$congrad = NA
-      myout$congerr = NA
+      myout$congerr = if (se) NA else NULL
     }
 
 
+    myout <- .np_conditional_merge_first_se(
+      myout, first.se.native, first.se.request, bws, enrow)
     fit.elapsed <- proc.time()[3] - fit.start
     optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
     total.time <- fit.elapsed + (if (is.na(optim.time)) 0.0 else optim.time)
@@ -548,11 +683,13 @@ npcdist.condbandwidth <-
                            train.rows.omit = train.rows.omit,
                            eval.rows.omit = if (no.exy) integer(0) else eval.rows.omit,
                            timing = bws$timing, total.time = total.time,
-                           optim.time = optim.time, fit.time = fit.elapsed)
+                           optim.time = optim.time, fit.time = fit.elapsed, se = se)
+    out <- .np_conditional_policy_stamp(out)
     out$nomad.time <- if (!is.null(bws$nomad.time) && is.finite(bws$nomad.time)) as.double(bws$nomad.time) else NA_real_
     out$powell.time <- if (!is.null(bws$powell.time) && is.finite(bws$powell.time)) as.double(bws$powell.time) else NA_real_
 
-    .np_condist_finalize_proper_object(
+  if (!is.null(base.rows)) attr(out, ".np.empty.base.rows") <- base.rows
+  out <- .np_condist_finalize_proper_object(
       object = out,
       proper = proper.args$proper.requested,
       proper.method = proper.args$proper.method,
@@ -560,14 +697,26 @@ npcdist.condbandwidth <-
       slice.context = proper.slice.context,
       where = "npcdist()"
     )
+  if (!is.null(base.rows)) attr(out, ".np.empty.base.rows") <- base.rows
+  empty.rows <- .npreg_merge_empty_rows(empty.rows,
+    attr(out, ".np.empty.rows", exact = TRUE))
+  .npreg_finish_empty_rows(out, empty.rows,
+    omitted = if (no.exy) integer(0) else eval.rows.omit,
+    defer = defer.empty, owner = "npcdist")
+
 
   }
 
 npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   .npRmpi_require_active_slave_pool(where = "npcdist()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   .npRmpi_guard_no_auto_object_in_manual_bcast(bws, where = "npcdist()")
   nomad <- npValidateNomadControl(nomad, "nomad")
-  sc <- sys.call()
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -583,8 +732,11 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   no.tydat <- missing(tydat)
   has.explicit.bws <- (!no.bws) && isa(bws, "condbandwidth")
   bws.formula <- (!no.bws) && inherits(bws, "formula")
+  if (!missing(txdat) && "data" %in% sc.names)
+    .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
   txdat.formula <- (!no.txdat) && inherits(txdat, "formula")
-  dots <- list(...)
+  dots <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())
   dots.formula <- (length(dots) > 0L && inherits(dots[[1L]], "formula")) ||
     (!is.null(dots$formula) && inherits(dots$formula, "formula"))
   regtype.request <- if (has.explicit.bws) {
@@ -604,19 +756,6 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     as.character(eval(sc$bwtype, parent.frame()))
   } else {
     "fixed"
-  }
-  bwmethod.request <- if (has.explicit.bws) {
-    if (is.null(bws$method)) "cv.ls" else as.character(bws$method)
-  } else if ("bwmethod" %in% sc.names) {
-    as.character(eval(sc$bwmethod, parent.frame()))
-  } else {
-    "cv.ls"
-  }
-  degree.request <- if ("degree" %in% sc.names) eval(sc$degree, parent.frame()) else NULL
-  bernstein.request <- if ("bernstein.basis" %in% sc.names) {
-    isTRUE(eval(sc$bernstein.basis, parent.frame()))
-  } else {
-    FALSE
   }
   uses.nomad.degree.search <- FALSE
   if (!has.explicit.bws && !bws.formula && !txdat.formula && !dots.formula) {
@@ -656,23 +795,15 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
       !.npRmpi_session_has_active_pool(comm = 1L)) {
     return(.npRmpi_with_local_cdist_eval(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
   }
-  keep_local_raw_degree1_cvls <- !has.explicit.bws &&
-    identical(bwmethod.request[1L], "cv.ls") &&
-    identical(bwtype.request[1L], "fixed") &&
-    npIsRawDegreeOneConditionalRequest(
-      regtype = regtype.request[1L],
-      degree = degree.request,
-      bernstein.basis = bernstein.request
-    )
   if (.npRmpi_autodispatch_active() &&
+      (missing(bws) || "bws" %in% names(sc)) &&
       !npNomadControlRequested(nomad) &&
       !uses.nomad.degree.search &&
       !keep_local_cvls_nn &&
-      !keep_local_raw_degree1_cvls &&
       !bws.formula &&
       !txdat.formula &&
       !dots.formula)
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npcdist.default"))
 
   ## autodispatch normalizes calls via match.call(), which can turn an
   ## originally unnamed formula first argument into named bws=... .
@@ -690,11 +821,25 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
-  if(txdat.named)
+  if(txdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(txdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
     txdat <- toFrame(txdat)
+    if (!is.null(original.name)) names(txdat) <- original.name
+  }
 
-  if(tydat.named)
+  if(tydat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(tydat), "tydat", sys.call(), parent.frame(), value = tydat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(tydat)))
+      paste(deparse(.np_formula_dot_expression(substitute(tydat), parent.frame())), collapse = "") else NULL
     tydat <- toFrame(tydat)
+    if (!is.null(original.name)) names(tydat) <- original.name
+  }
 
   if(bws.named && !bws.formula){
     sc.bw$bandwidth.compute <- FALSE
@@ -713,9 +858,20 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   sc.bw$eydat <- NULL
   sc.bw$gradients <- NULL
   sc.bw$gradient.order <- NULL
+  sc.bw$se <- NULL
   sc.bw$proper <- NULL
   sc.bw$proper.method <- NULL
   sc.bw$proper.control <- NULL
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npcdistbw")
+  formula.input <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())[["formula", exact = TRUE]]
+  frame.state <- if (!has.explicit.bws &&
+      (bws.formula || (!no.txdat && inherits(txdat, "formula")) ||
+       inherits(formula.input, "formula"))) new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+  }
     
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
     sc.bw,
@@ -726,19 +882,28 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
     if (use.outer.bandwidth.progress) {
       .np_progress_select_bandwidth_enhanced(
         "Selecting conditional distribution bandwidth",
-        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
       )
     } else {
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
   }
 
   call.args <- list(bws = tbw)
+  if (!is.null(frame.state)) call.args$.np.formula.state <- frame.state
   if (no.bws) {
-    call.args$txdat <- txdat
-    call.args$tydat <- tydat
+    if (is.null(frame.state)) {
+      call.args$txdat <- txdat
+      call.args$tydat <- tydat
+    }
   } else {
     if (txdat.named) call.args$txdat <- txdat
     if (tydat.named) call.args$tydat <- tydat
@@ -748,5 +913,8 @@ npcdist.default <- function(bws, txdat, tydat, nomad = FALSE, ...){
   }
   if (!has.explicit.bws)
     call.args$.np_fit_progress_handoff <- TRUE
-  do.call(npcdist, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  do.call(npcdist, c(call.args, fit.dots))
 }

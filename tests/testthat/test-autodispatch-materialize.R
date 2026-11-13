@@ -16,7 +16,116 @@ test_that("autodispatch materialization preserves explicit argument expressions"
   expect_false(identical(prepared$tmpvals[[bws.ref]], bws))
 })
 
-test_that("autodispatch materialization resolves ..n placeholders by argument name", {
+test_that("formula probing and publication share one argument realization", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  state <- new.env(parent = emptyenv()); state$n <- 0L
+  value <- function() { state$n <- state$n + 1L; .4 }
+  prepared <- materialize(quote(npqreg(bws = value(), txdat = 1:4)), environment())
+  expect_identical(state$n, 1L)
+  expect_identical(prepared$tmpvals[[as.character(prepared$call$bws)]], .4)
+  x <- 1:4; y <- 4:1
+  value <- function() { state$n <- state$n + 1L; y ~ x }
+  for (argument in c("bws", "formula")) {
+    state$n <- 0L
+    mc <- as.call(c(list(quote(npreg)), setNames(list(quote(value())), argument)))
+    prepared <- materialize(mc, environment())
+    expect_identical(state$n, 1L)
+    expect_identical(prepared$tmpvals[[as.character(prepared$call$data)]],
+                     data.frame(y = y, x = x))
+  }
+  state$n <- 0L
+  value <- function() { state$n <- state$n + 1L; NULL }
+  expect_null(materialize(quote(npreg(bws = value())), environment())$call$bws)
+  expect_identical(state$n, 1L)
+  state$n <- 0L
+  value <- function() { state$n <- state$n + 1L; stop("single failure") }
+  expect_error(materialize(quote(npreg(bws = value())), environment()), "single failure")
+  expect_identical(state$n, 1L)
+  state$n <- 0L
+  value <- function() {
+    state$n <- state$n + 1L
+    signalCondition(structure(list(), class = c("interrupt", "condition")))
+  }
+  interrupted <- tryCatch(materialize(quote(npreg(bws = value())), environment()),
+                          interrupt = identity)
+  expect_s3_class(interrupted, "interrupt")
+  expect_identical(state$n, 1L)
+})
+
+test_that("row-purpose controls are values, not escaped caller expressions", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  flags <- c(".np.require.complete", ".np.defer.empty.rows")
+  for (family in c("npcdens", "npcdist", "npreg")) {
+    for (allow in c(FALSE, TRUE)) {
+      owner <- new.env(parent = baseenv())
+      owner$allow.external <- allow
+      owner$defer <- !allow
+      mc <- as.call(c(list(as.name(family)), setNames(
+        list(quote(!allow.external), quote(defer)), flags)))
+      prepared <- materialize(mc, owner)
+      # A receiving frame must not require the originating owner's locals.
+      receiver <- list2env(prepared$tmpvals, parent = baseenv())
+      expect_identical(eval(prepared$call[[flags[1L]]], receiver), !allow)
+      expect_identical(eval(prepared$call[[flags[2L]]], receiver), !allow)
+      expect_length(prepared$prepublish, 0L)
+      expect_length(prepared$lease.bindings, 0L)
+    }
+    omitted <- as.call(list(as.name(family)))
+    expect_identical(materialize(omitted, environment())$call, omitted)
+  }
+  explicit.null <- materialize(
+    quote(npcdens(.np.require.complete = NULL, .np.defer.empty.rows = NULL)),
+    environment())
+  expect_true(all(flags %in% names(explicit.null$call)))
+  expect_null(explicit.null$call[[flags[1L]]])
+  expect_null(explicit.null$call[[flags[2L]]])
+  expect_error(materialize(quote(npcdens(.np.require.complete = absent.policy)),
+                           new.env(parent = baseenv())), "absent.policy")
+})
+
+test_that("row-purpose dots preserve promise ownership and single evaluation", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  owner <- function(...) {
+    .np.require.complete <- FALSE
+    .np.defer.empty.rows <- FALSE
+    mc <- match.call()
+    mc[[1L]] <- as.name("npcdens")
+    materialize(mc, environment())
+  }
+  forward <- function(...) owner(...)
+  state <- new.env(parent = emptyenv())
+  state$count <- 0L
+  prepared <- forward(.np.require.complete = {
+    state$count <- state$count + 1L
+    TRUE
+  }, .np.defer.empty.rows = TRUE)
+  expect_identical(state$count, 1L)
+  receiver <- list2env(prepared$tmpvals, parent = baseenv())
+  expect_true(eval(prepared$call$.np.require.complete, receiver))
+  expect_true(eval(prepared$call$.np.defer.empty.rows, receiver))
+})
+
+test_that("autodispatch remote references are reused only while value-current", {
+  reset <- getFromNamespace(".npRmpi_lease_reset_local", "npRmpi")
+  plan <- getFromNamespace(".npRmpi_lease_publication_plan", "npRmpi")
+  prepare <- getFromNamespace(".npRmpi_lease_prepare_local", "npRmpi")
+  commit <- getFromNamespace(".npRmpi_lease_commit_local", "npRmpi")
+  tag <- getFromNamespace(".npRmpi_autodispatch_tag_result", "npRmpi")
+  current <- getFromNamespace(".npRmpi_autodispatch_ref_is_current", "npRmpi")
+  reset()
+  on.exit(reset(), add = TRUE)
+
+  value <- structure(list(bws = c(1, 2), degree = c(1L, 1L)), class = "rbandwidth")
+  publication <- plan(quote(npregbw(xdat = x, ydat = y)))
+  prepare(value, publication)
+  commit(publication)
+  value <- tag(value, publication = publication)
+  expect_true(current(value))
+  value$bws[[1L]] <- 3
+  expect_false(current(value))
+})
+
+test_that("autodispatch materialization requires an actual dots owner", {
   materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
 
   dat <- c(3, 1, 4)
@@ -28,12 +137,154 @@ test_that("autodispatch materialization resolves ..n placeholders by argument na
     bandwidth.compute = FALSE
   ))
 
-  prepared <- materialize(mc = mc, caller_env = environment(), comm = 1L)
+  expect_error(materialize(mc = mc, caller_env = environment(), comm = 1L),
+               "cannot resolve forwarded argument")
+  owner <- function(...) materialize(mc = mc, caller_env = environment(), comm = 1L)
+  prepared <- owner(dat)
   dat.ref <- as.character(prepared$call$dat)
   bws.ref <- as.character(prepared$call$bws)
 
   expect_identical(prepared$tmpvals[[dat.ref]], dat)
   expect_identical(prepared$tmpvals[[bws.ref]], bw.j)
+})
+
+test_that("autodispatch materializes public bootstrap counts exactly once", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  targets <- getFromNamespace(".npRmpi_autodispatch_target_args", "npRmpi")()
+
+  expect_true("B" %in% targets)
+  expect_true("boot.num" %in% targets)
+
+  requested_B <- 9L
+  prepared <- materialize(
+    quote(npdeptest(B = requested_B)),
+    caller_env = environment(), comm = 1L
+  )
+  B.ref <- as.character(prepared$call$B)
+  expect_identical(prepared$tmpvals[[B.ref]], requested_B)
+  expect_false(identical(prepared$call$B, as.name("requested_B")))
+
+  evaluations <- 0L
+  prepared.computed <- materialize(
+    quote(npdeptest(B = {
+      evaluations <- evaluations + 1L
+      9L
+    })),
+    caller_env = environment(), comm = 1L
+  )
+  computed.ref <- as.character(prepared.computed$call$B)
+  expect_identical(evaluations, 1L)
+  expect_identical(prepared.computed$tmpvals[[computed.ref]], 9L)
+
+  prepared.literal <- materialize(
+    quote(npdeptest(B = 9L)),
+    caller_env = environment(), comm = 1L
+  )
+  literal.ref <- as.character(prepared.literal$call$B)
+  expect_identical(prepared.literal$tmpvals[[literal.ref]], 9L)
+
+  prepared.omitted <- materialize(
+    quote(npdeptest(method = "summation")),
+    caller_env = environment(), comm = 1L
+  )
+  expect_false("B" %in% names(as.list(prepared.omitted$call)))
+
+  private.boot.num <- 13L
+  prepared.private <- materialize(
+    quote(internal.bootstrap(boot.num = private.boot.num)),
+    caller_env = environment(), comm = 1L
+  )
+  private.ref <- as.character(prepared.private$call$boot.num)
+  expect_identical(prepared.private$tmpvals[[private.ref]], private.boot.num)
+
+  leaked_B <- 17L
+  unrelated.frame <- new.env(parent = baseenv())
+  expect_error(
+    materialize(
+      quote(npdeptest(B = leaked_B)),
+      caller_env = unrelated.frame, comm = 1L
+    ),
+    "leaked_B"
+  )
+})
+
+test_that("bootstrap-count ownership survives nested formals and ..n forwarding", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  nested.owner <- function(B) {
+    inner.owner <- function(B) {
+      materialize(
+        quote(npdeptest(B = B)),
+        caller_env = environment(), comm = 1L
+      )
+    }
+    inner.owner(B)
+  }
+
+  B <- 101L
+  nested <- nested.owner(9L)
+  nested.ref <- as.character(nested$call$B)
+  expect_identical(nested$tmpvals[[nested.ref]], 9L)
+
+  owner <- function(B, ...) {
+    mc <- match.call()
+    mc[[1L]] <- as.name("npdeptest")
+    .npRmpi_autodispatch_materialize_call(mc = mc, caller_env = environment(), comm = 1L)
+  }
+  environment(owner) <- asNamespace("npRmpi")
+  forward <- function(...) owner(...)
+
+  requested_B <- 9L
+  forwarded <- forward(B = requested_B)
+  forwarded.ref <- as.character(forwarded$call$B)
+  expect_identical(forwarded$tmpvals[[forwarded.ref]], 9L)
+  expect_false(identical(forwarded$call$B, as.name("..1")))
+})
+
+test_that("autodispatch materializes forwarded formals and named dots from one owner frame", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  owner <- function(dat, bws, ...) {
+    mc <- match.call()
+    mc[[1L]] <- as.name("npudistbw")
+    .npRmpi_autodispatch_materialize_call(mc = mc, caller_env = environment(), comm = 1L)
+  }
+  environment(owner) <- asNamespace("npRmpi")
+  forward <- function(...) owner(...)
+
+  dat.value <- c(2, 7, 1, 8)
+  bw.value <- 0.35
+  nmulti <- 99L
+  nomad.nmulti <- 77L
+  prepared <- forward(
+    dat = dat.value,
+    bws = bw.value,
+    nmulti = 1L,
+    nomad.nmulti = 0L,
+    proper.control = NULL
+  )
+
+  expect_identical(prepared$tmpvals[[as.character(prepared$call$dat)]], dat.value)
+  expect_identical(prepared$tmpvals[[as.character(prepared$call$bws)]], bw.value)
+  expect_identical(prepared$tmpvals[[as.character(prepared$call$nmulti)]], 1L)
+  expect_identical(prepared$tmpvals[[as.character(prepared$call$nomad.nmulti)]], 0L)
+  expect_true("proper.control" %in% names(as.list(prepared$call)))
+  expect_null(prepared$call$proper.control)
+})
+
+test_that("autodispatch does not discover unresolved arguments in dynamic frames", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  leaked.control <- 4L
+  owner <- new.env(parent = baseenv())
+  expect_error(
+    materialize(
+      mc = quote(npudistbw(nmulti = leaked.control)),
+      caller_env = owner,
+      comm = 1L
+    ),
+    "leaked.control"
+  )
 })
 
 test_that("autodispatch materialization evaluates proper arguments eagerly", {
@@ -59,6 +310,204 @@ test_that("autodispatch materialization evaluates proper arguments eagerly", {
   expect_identical(prepared$tmpvals[[proper.ref]], proper.flag)
   expect_identical(prepared$tmpvals[[method.ref]], proper.method)
   expect_identical(prepared$tmpvals[[control.ref]], proper.control)
+})
+
+test_that("autodispatch materialization resolves estimator uncertainty controls", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  bws <- structure(list(tag = "dummy"), class = "lsqregressionbandwidth")
+  gradients <- FALSE
+  residuals <- TRUE
+  se <- FALSE
+
+  mc <- quote(nplsqreg(
+    bws = bws,
+    gradients = gradients,
+    residuals = residuals,
+    se = se
+  ))
+  prepared <- materialize(mc = mc, caller_env = environment(), comm = 1L)
+
+  gradients.ref <- as.character(prepared$call$gradients)
+  residuals.ref <- as.character(prepared$call$residuals)
+  se.ref <- as.character(prepared$call$se)
+
+  expect_identical(prepared$tmpvals[[gradients.ref]], FALSE)
+  expect_identical(prepared$tmpvals[[residuals.ref]], TRUE)
+  expect_identical(prepared$tmpvals[[se.ref]], FALSE)
+  expect_false(identical(prepared$call$se, as.name("se")))
+})
+
+test_that("single-index uncertainty type has one caller-owned transport value", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  owner <- new.env(parent = baseenv())
+  owner$choice <- "bootstrap"
+  owner$evaluations <- 0L
+
+  for (head in c("npindex", "npindex.default", "npindex.formula",
+                 "npindex.sibandwidth")) {
+    for (expr in list("bootstrap", quote(choice),
+                     quote({ evaluations <- evaluations + 1L; choice }))) {
+      call <- as.call(c(list(as.name(head)), list(se.type = expr)))
+      before <- owner$evaluations
+      prepared <- materialize(call, caller_env = owner)
+      ref <- as.character(prepared$call$se.type)
+      expect_identical(prepared$tmpvals[[ref]], "bootstrap", info = head)
+      expect_identical(owner$evaluations - before,
+                       if (is.call(expr)) 1L else 0L, info = head)
+      worker <- list2env(prepared$tmpvals, parent = baseenv())
+      expect_identical(eval(prepared$call$se.type, worker), "bootstrap")
+    }
+  }
+
+  forwarded.owner <- function(...) {
+    materialize(quote(npindex(se.type = ..1)), caller_env = environment())
+  }
+  forwarded <- forwarded.owner(se.type = "asymptotic")
+  ref <- as.character(forwarded$call$se.type)
+  expect_identical(forwarded$tmpvals[[ref]], "asymptotic")
+  omitted <- materialize(quote(npindex(se = FALSE, subset = keep)), owner)
+  expect_false("se.type" %in% names(as.list(omitted$call)))
+  expect_identical(omitted$call$subset, quote(keep))
+  expect_identical(omitted$tmpvals[[as.character(omitted$call$se)]], FALSE)
+})
+
+test_that("registered autodispatch call formals have an explicit transport owner", {
+  ns <- asNamespace("npRmpi")
+  targets <- getFromNamespace(".npRmpi_autodispatch_target_args", "npRmpi")()
+
+  character_constants <- function(expr) {
+    if (is.character(expr))
+      return(expr)
+    if (!is.recursive(expr))
+      return(character(0))
+    unlist(lapply(as.list(expr), character_constants), use.names = FALSE)
+  }
+
+  helper.names <- ls(ns, all.names = TRUE)
+  helper.names <- helper.names[
+    grepl("^\\.npRmpi_autodispatch_is_.*_core$", helper.names)
+  ]
+  call.heads <- unique(unlist(lapply(helper.names, function(nm) {
+    character_constants(body(get(nm, envir = ns, inherits = FALSE)))
+  }), use.names = FALSE))
+  call.heads <- unique(c(
+    call.heads,
+    grep("^np(reg|udens|udist|cdens|cdist|scoef|plreg|index)bw($|\\.)",
+         helper.names, value = TRUE),
+    "npregbw", "npscoefbw", "npplregbw", "npindexbw",
+    "npudensbw", "npudistbw", "npcdensbw", "npcdistbw"
+  ))
+  call.heads <- call.heads[vapply(call.heads, exists, logical(1),
+                                  envir = ns, mode = "function",
+                                  inherits = FALSE)]
+
+  formal.pairs <- do.call(rbind, lapply(sort(call.heads), function(head) {
+    args <- setdiff(names(formals(get(head, envir = ns, inherits = FALSE))), "...")
+    if (!length(args))
+      return(NULL)
+    data.frame(head = rep(head, length(args)), arg = args,
+               stringsAsFactors = FALSE)
+  }))
+
+  # `subset` must remain language for model-frame evaluation.  The internal
+  # formula-method `call` formal is deliberately reconstructed by its owner.
+  language.or.derived <- c("subset", "call")
+  # R37 derives this internal scope from the executing rank/service owner.
+  # Materializing a caller value would not describe coordinator-only phases.
+  # Keep the exception head-specific so new unowned formals still fail.
+  rank.derived <- formal.pairs$head == "npindexbw.sibandwidth" &
+    formal.pairs$arg == ".rng.collective"
+  expect_identical(
+    formals(get("npindexbw.sibandwidth", envir = ns))[[".rng.collective"]],
+    quote(.npRmpi_rng_scope_collective())
+  )
+  unowned <- formal.pairs[
+    !formal.pairs$arg %in% c(targets, language.or.derived) & !rank.derived,
+    , drop = FALSE
+  ]
+
+  expect_equal(unowned, formal.pairs[FALSE, , drop = FALSE],
+               info = paste(capture.output(print(unowned)), collapse = "\n"))
+})
+
+test_that("search control transport preserves owner values without forcing NSE", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  controls <- c("backfit.iterate", "backfit.maxiter", "backfit.tol", "bwsolver",
+                "cfac.dir", "cv.iterate", "cv.num.iterations", "dfac.dir",
+                "dfac.init", "dfc.dir", "eval.only", "hbd.dir", "hbd.init",
+                "initc.dir", "initd.dir", "invalid.penalty", "lbc.dir",
+                "lbd.dir", "lbd.init", "memfac", "penalty.multiplier",
+                "scale.init.categorical.sample", "transform.bounds")
+  owner <- new.env(parent = baseenv())
+  owner$local.control <- 123L
+  for (arg in controls) {
+    mc <- as.call(c(list(as.name("npregbw")),
+                   setNames(list(as.name("local.control")), arg)))
+    prepared <- materialize(mc, caller_env = owner)
+    ref <- as.character(prepared$call[[arg]])
+    expect_identical(prepared$tmpvals[[ref]], 123L, info = arg)
+    mc[[arg]] <- 123L
+    literal <- materialize(mc, caller_env = owner)
+    expect_identical(literal$tmpvals, prepared$tmpvals, info = arg)
+  }
+  evaluations <- 0L
+  prepared <- materialize(quote(npregbw(transform.bounds = {
+    evaluations <- evaluations + 1L
+    TRUE
+  }, subset = nonexistent > 0)), caller_env = environment())
+  expect_identical(evaluations, 1L)
+  expect_identical(prepared$call$subset, quote(nonexistent > 0))
+  expect_false("bwsolver" %in% names(as.list(prepared$call)))
+
+  owner.fun <- function(...) {
+    mc <- match.call()
+    mc[[1L]] <- as.name("npregbw")
+    materialize(mc, caller_env = environment())
+  }
+  forwarded <- (function(...) owner.fun(...))(bwsolver = "mads")
+  expect_identical(forwarded$tmpvals[[as.character(forwarded$call$bwsolver)]], "mads")
+  expect_error(materialize(quote(npregbw(bwsolver = missing.control)),
+                           caller_env = owner), "missing.control")
+})
+
+test_that("ordinary autodispatch controls are evaluated in the caller", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  probabilities <- TRUE
+  level <- "high"
+  pivot <- FALSE
+  bw.x <- 0.25
+  maxiter <- 17L
+  mc <- quote(npconmode(
+    probabilities = probabilities,
+    level = level,
+    pivot = pivot,
+    bw.x = bw.x,
+    maxiter = maxiter
+  ))
+  prepared <- materialize(mc = mc, caller_env = environment(), comm = 1L)
+
+  for (nm in c("probabilities", "level", "pivot", "bw.x", "maxiter")) {
+    ref <- as.character(prepared$call[[nm]])
+    expect_identical(prepared$tmpvals[[ref]], get(nm, inherits = FALSE))
+  }
+})
+
+test_that("npindex certification control is materialized from its owner frame", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+
+  certify.selected <- FALSE
+  mc <- quote(npindexbw.sibandwidth(
+    bandwidth.compute = TRUE,
+    .certify.selected = certify.selected
+  ))
+  prepared <- materialize(mc = mc, caller_env = environment(), comm = 1L)
+
+  transported <- prepared$call[[".certify.selected"]]
+  expect_true(is.symbol(transported))
+  expect_false(identical(transported, as.name("certify.selected")))
+  expect_identical(prepared$tmpvals[[as.character(transported)]], FALSE)
 })
 
 test_that("autodispatch materialization preserves explicit NULL arguments without shifting later args", {
@@ -176,4 +625,35 @@ test_that("autodispatch materialization expands deferred dots before shipping at
 
   expect_identical(prepared$tmpvals[[method.ref]], "kleinspady")
   expect_identical(prepared$tmpvals[[regtype.ref]], "ll")
+})
+test_that("positional and aliased dots use their supplied owner exactly once", {
+  materialize <- getFromNamespace(".npRmpi_autodispatch_materialize_call", "npRmpi")
+  state <- new.env(parent = emptyenv()); state$n <- 0L
+  owner <- function(...) {
+    mc <- quote(npregbw(xdat = ..1, ydat = ..2, bws = .4,
+                       bandwidth.compute = FALSE))
+    materialize(mc, environment())
+  }
+  x <- data.frame(x = 1:4); y <- 4:1
+  # A misleading binding outside the specified owner must not be selected.
+  xdat <- data.frame(x = rep(99, 4))
+  for (named in c(FALSE, TRUE)) {
+    state$n <- 0L
+    prepared <- if (named) owner(txdat = { state$n <- state$n + 1L; x },
+                                tydat = y) else
+      owner({ state$n <- state$n + 1L; x }, y)
+    expect_identical(state$n, 1L)
+    expect_identical(prepared$tmpvals[[as.character(prepared$call$xdat)]], x)
+    expect_identical(prepared$tmpvals[[as.character(prepared$call$ydat)]], y)
+  }
+  state$n <- 0L
+  expect_error(owner({ state$n <- state$n + 1L; stop("owned failure") }, y),
+               "owned failure")
+  expect_identical(state$n, 1L)
+  state$n <- 0L
+  expect_error(owner(xdat = { state$n <- state$n + 1L; stop("named owned failure") },
+                     ydat = y), "named owned failure")
+  expect_identical(state$n, 1L)
+  expect_error(materialize(quote(npregbw(xdat = ..9)), new.env(parent = baseenv())),
+               "cannot resolve forwarded argument")
 })

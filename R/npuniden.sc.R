@@ -80,7 +80,9 @@ npuniden.sc <- function(X=NULL,
         if(is.finite(a) && !is.finite(b)) X.seq <- seq(a,extendrange(X,f=10)[2],length=1000)
         if(!is.finite(a) && is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],b,length=1000)
         if(!is.finite(a) && !is.finite(b)) X.seq <- seq(extendrange(X,f=10)[1],extendrange(X,f=10)[2],length=1000)
-        sapply(seq_along(X), function(i){integrate.trapezoidal(X.seq,h*kernel(X[i],X.seq,h,a,b,deriv=0)^2)[length(X.seq)]})
+        geometry <- .np_quadrature_prepare(X.seq)
+        sapply(seq_along(X), function(i){.np_quadrature_total(X.seq,
+            h*kernel(X[i],X.seq,h,a,b,deriv=0)^2, geometry)})
     }
 
     W.kernel <- function(x,X,h,a=0,b=1,deriv=0) {
@@ -99,6 +101,9 @@ npuniden.sc <- function(X=NULL,
     if(h <= 0) stop("bandwidth h must be positive")
     if(num.grid < 0) stop("num.grid must be a non-negative integer")
     if(constraint=="density" && is.null(lb) && is.null(ub)) stop("you must provide lower and/or upper bounds when constraining the density")
+    if ((!is.null(lb) && (!is.numeric(lb) || length(lb) != 1L)) ||
+        (!is.null(ub) && (!is.numeric(ub) || length(ub) != 1L)))
+        stop("density bounds must be numeric scalars")
     if(!is.null(lb) && anyNA(lb)) stop("lower bound must not contain missing values")
     if(!is.null(lb) && any(lb<0, na.rm = TRUE)) stop("lower bound must be non-negative")
     if(!is.null(ub) && anyNA(ub)) stop("upper bound must not contain missing values")
@@ -121,6 +126,8 @@ npuniden.sc <- function(X=NULL,
 
     A <- W.kernel(X.grid,X,h,a=a,b=b,deriv=0)
     f <- colMeans(A)
+    density.a <- a
+    density.b <- b
 
     ## First or second order derivative needed, place them both in *.deriv
 
@@ -194,8 +201,12 @@ npuniden.sc <- function(X=NULL,
             bvec <- c(0,-f,-sign.deriv*f.deriv)
         } else {
             ## Constrain the density
-            Amat <- cbind(rep(1,n.train),A,-A)
-            bvec <- c(0,lb-f,f-ub)
+            # Assemble once: repeated cbind would copy an additional n-by-grid
+            # matrix. An infinite upper bound is a nonbinding inequality.
+            has.upper <- !is.null(ub) && is.finite(ub)
+            Amat <- cbind(rep(1,n.train), if (!is.null(lb)) A,
+                          if (has.upper) -A)
+            bvec <- c(0, if (!is.null(lb)) lb-f, if (has.upper) f-ub)
         }
         output.QP <- tryCatch(solve.QP(Dmat=Dmat,
                                        dvec=dvec,
@@ -234,10 +245,13 @@ npuniden.sc <- function(X=NULL,
     ## unconstrained estimate
 
     corr.factor <- 1
-    int.f.sc <- integrate.trapezoidal(X.grid,f.sc)[n.grid]
-    int.f <- integrate.trapezoidal(X.grid,f)[n.grid]
+    geometry <- .np_quadrature_prepare(X.grid)
+    int.f.sc <- .np_quadrature_total(X.grid,f.sc,geometry)
+    int.f <- .np_quadrature_total(X.grid,f,geometry)
     if(integral.equal) corr.factor <- int.f.sc/int.f
     f.sc <- f.sc/corr.factor
+    if (!(constraint %in% c("log-concave", "log-convex")))
+        f.sc.deriv <- f.sc.deriv/corr.factor
 
     ## The constraints are imposed on X.grid, but we only want the
     ## constrained estimate at the sample points X (or evaluation
@@ -249,11 +263,28 @@ npuniden.sc <- function(X=NULL,
         index <- seq_along(Y)
     }
 
-    se.f <- sqrt(abs(f*int.kernel.squared(X.grid,h,a,b)/(h*length(f))))[index]
-    se.f.sc <- sqrt(abs(f.sc*int.kernel.squared(X.grid,h,a,b)/(h*length(f.sc))))[index]    
+    se.f <- sqrt(abs(f*int.kernel.squared(X.grid,h,a,b)/(h*n.train)))[index]
+    se.f.sc <- sqrt(abs(f.sc*int.kernel.squared(X.grid,h,a,b)/(h*n.train)))[index]
 
-    F <- integrate.trapezoidal(X.grid[index],f[index])
-    F.sc <- integrate.trapezoidal(X.grid[index],f.sc[index])
+    evaluation <- X.grid[index]
+    log.shape <- constraint %in% c("log-concave","log-convex")
+    if(!is.finite(density.a) && !is.finite(density.b) && !log.shape) {
+        # The retained density is an ordinary weighted Gaussian mixture.
+        F <- vapply(evaluation,function(y) mean(pnorm((y-X)/h)),0.0)
+        F.sc <- vapply(evaluation,function(y)
+            sum(pnorm((y-X)/h)*(1/n.train+output.QP$solution)),0.0)/corr.factor
+    } else {
+        density <- function(y) vapply(y,function(z)
+            mean(kernel(z,X,h,density.a,density.b)),0.0)
+        shape.density <- function(y) vapply(y,function(z) {
+            k <- kernel(z,X,h,density.a,density.b)
+            correction <- sum(k*output.QP$solution)
+            value <- if(log.shape) exp(log(mean(k))+correction) else mean(k)+correction
+            value/corr.factor
+        },0.0)
+        F <- .np_density_integral(density,evaluation,density.a,density.b,X,h)$F
+        F.sc <- .np_density_integral(shape.density,evaluation,density.a,density.b,X,h)$F
+    }
     f <- f[index]
     f.sc <- f.sc[index]
     f.deriv <- f.deriv[index]
@@ -269,8 +300,8 @@ npuniden.sc <- function(X=NULL,
                 f.sc.deriv=f.sc.deriv,
                 F=F,
                 F.sc=F.sc,
-                se.F=sqrt(abs(F*(1-F)/length(F))),
-                se.F.sc=sqrt(abs(F.sc*(1-F.sc)/length(F.sc))),                
+                se.F=sqrt(abs(F*(1-F)/n.train)),
+                se.F.sc=sqrt(abs(F.sc*(1-F.sc)/n.train)),
                 f.integral=int.f,
                 f.sc.integral=int.f.sc,
                 solve.QP=solve.QP.flag,

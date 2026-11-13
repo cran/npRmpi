@@ -15,8 +15,8 @@ test_that("npqreg basic functionality works", {
   expect_type(predict(model), "double")
   expect_equal(length(predict(model)), 50)
   expect_equal(model$tau, 0.5)
-  expect_error(gradients(model), "fit the model with gradients=TRUE", fixed = TRUE)
-  expect_error(gradients(model, errors = TRUE), "fit the model with gradients=TRUE", fixed = TRUE)
+  expect_error(gradients(model), "gradients = TRUE", fixed = TRUE)
+  expect_error(gradients(model, se = TRUE), "gradients = TRUE, se = TRUE", fixed = TRUE)
   
   expect_output(summary(model))
 })
@@ -177,14 +177,14 @@ test_that("npqreg plot preserves NOMAD-selected LP degree metadata", {
   expect_false(is.null(bw$degree.engine))
 
   fit <- npqreg(bws = bw, tau = 0.5)
-  out <- plot(
+  out <- capture_plot_provider(plot(
     fit,
     output = "data",
     perspective = FALSE,
     tau = c(0.25, 0.5),
     errors = "none",
     neval = 5L
-  )
+  ))$provider
 
   expect_true(all(vapply(out, inherits, logical(1), "qregression")))
   expect_true(all(vapply(out, function(xi) identical(xi$bws$regtype.engine, "lp"), logical(1))))
@@ -213,7 +213,7 @@ test_that("npqreg gradients populate qregression objects", {
   )
 
   fit <- npqreg(bws = bw, txdat = xdat, tydat = ydat, exdat = exdat,
-                tau = 0.45, gradients = TRUE, tol = 1e-6, small = 1e-7)
+                tau = 0.45, gradients = TRUE, se = TRUE, tol = 1e-6, small = 1e-7)
   ref <- getFromNamespace(".np_plot_quantile_eval", "npRmpi")(
     bws = bw,
     txdat = xdat,
@@ -235,7 +235,7 @@ test_that("npqreg gradients populate qregression objects", {
   expect_true(all(se(fit) > 0))
   expect_equal(fit$quantgrad, ref$quantgrad, tolerance = 0)
   expect_equal(gradients(fit), fit$quantgrad, tolerance = 0)
-  expect_equal(gradients(fit, errors = TRUE), fit$quantgerr, tolerance = 0)
+  expect_equal(gradients(fit, se = TRUE), fit$quantgerr, tolerance = 0)
 
   qdelta <- getFromNamespace(".npqreg_quantile_delta_from_conditional", "npRmpi")(
     bws = bw,
@@ -295,7 +295,7 @@ test_that("npqreg vector-tau gradient fanout matches local evaluator", {
     txdat = xdat,
     tydat = ydat,
     tau = c(0.25, 0.5, 0.75),
-    gradients = TRUE
+    gradients = TRUE, se = TRUE
   )
 
   options(npRmpi.local.regression.mode = FALSE,
@@ -306,13 +306,13 @@ test_that("npqreg vector-tau gradient fanout matches local evaluator", {
     txdat = xdat,
     tydat = ydat,
     tau = c(0.25, 0.5, 0.75),
-    gradients = TRUE
+    gradients = TRUE, se = TRUE
   )
 
   expect_equal(fitted(fit), fitted(ref), tolerance = 0)
   expect_equal(se(fit), se(ref), tolerance = 0)
   expect_equal(gradients(fit), gradients(ref), tolerance = 0)
-  expect_equal(gradients(fit, errors = TRUE), gradients(ref, errors = TRUE), tolerance = 0)
+  expect_equal(gradients(fit, se = TRUE), gradients(ref, se = TRUE), tolerance = 0)
 })
 
 test_that("npqreg plot vector-tau gradients use the coalesced evaluator", {
@@ -365,7 +365,7 @@ test_that("npqreg plot vector-tau gradients use the coalesced evaluator", {
   expect_equal(fitted(fit), fitted(ref), tolerance = 0)
   expect_equal(se(fit), se(ref), tolerance = 0)
   expect_equal(gradients(fit), gradients(ref), tolerance = 0)
-  expect_equal(gradients(fit, errors = TRUE), gradients(ref, errors = TRUE), tolerance = 0)
+  expect_equal(gradients(fit, se = TRUE), gradients(ref, se = TRUE), tolerance = 0)
 
   plot.data <- plot(
     fit,
@@ -375,7 +375,9 @@ test_that("npqreg plot vector-tau gradients use the coalesced evaluator", {
     errors = "none",
     neval = 12L
   )
-  expect_true(all(vapply(plot.data, inherits, logical(1), "qregression")))
+  expect_s3_class(plot.data, "np_plot_data")
+  expect_true(all(plot.data$targets$order == 1L))
+  expect_setequal(plot.data$targets$tau, c(.25, .5, .75))
 })
 
 test_that("npqreg gradient plots support asymptotic errors", {
@@ -394,7 +396,8 @@ test_that("npqreg gradient plots support asymptotic errors", {
     cxkerbound = "range",
     cykerbound = "range"
   )
-  fit <- npqreg(bws = bw, tau = c(0.25, 0.5, 0.75), gradients = TRUE)
+  fit <- npqreg(bws = bw, tau = c(0.25, 0.5, 0.75), gradients = TRUE,
+               se = TRUE)
 
   out <- plot(
     fit,
@@ -405,9 +408,11 @@ test_that("npqreg gradient plots support asymptotic errors", {
     neval = 8L
   )
 
-  expect_true(all(vapply(out, inherits, logical(1), "qregression")))
+  expect_s3_class(out, "np_plot_data")
+  expect_true(all(out$targets$order == 1L))
+  expect_setequal(out$targets$tau, c(.25, .5, .75))
   grad <- gradients(fit)
-  gerr <- gradients(fit, errors = TRUE)
+  gerr <- gradients(fit, se = TRUE)
   expect_true(any(is.finite(grad)))
   expect_true(any(is.finite(gerr)))
   expect_identical(is.na(gerr), is.na(grad))

@@ -61,39 +61,32 @@
   size <- mpi.comm.size(comm)
   rank <- mpi.comm.rank(comm)
 
-  local.idx <- seq.int(rank + 1L, boot.num, by = size)
+  local.idx <- seq_len(boot.num)
+  local.idx <- local.idx[(local.idx - 1L) %% size == rank]
   .npRmpi_bootstrap_transport_trace(
     what = "npsdeptest",
     event = "fanout.collective.start",
     fields = list(rank = rank, size = size, B = boot.num, local = length(local.idx))
   )
 
-  local.Srho <- matrix(NA_real_, nrow = length(local.idx), ncol = lag.num)
-  local.cumulant <- matrix(NA_real_, nrow = length(local.idx), ncol = lag.num)
-
-  for (jj in seq_along(local.idx)) {
-    b <- local.idx[[jj]]
-    resampled.ts <- as.ts(data[plan[b, ]])
-    Srho.vec.boot <- numeric(lag.num)
-
-    for (k in seq_len(lag.num)) {
-      tmp <- ts.intersect(resampled.ts, lag(resampled.ts, k))
-      y <- as.numeric(tmp[,1])
-      y.lag <- as.numeric(tmp[,2])
-      Srho.vec.boot[k] <- .npRmpi_with_local_regression(
-        Srho.bivar(
-          y,
-          y.lag,
-          bw.y[k],
-          bw.y.lag[k],
-          c(bw.joint.y[k], bw.joint.y.lag[k]),
-          method = method
-        )
-      )
-      local.Srho[jj, k] <- Srho.vec.boot[k]
-      local.cumulant[jj, k] <- sum(Srho.vec.boot[seq_len(k)])
-    }
-  }
+  parts <- .npRmpi_bootstrap_collective_apply(
+    boot.num, 1L, function(ids, pos) {
+      resampled.ts <- as.ts(data[plan[ids, ]])
+      values <- numeric(lag.num)
+      for (k in seq_len(lag.num)) {
+        tmp <- ts.intersect(resampled.ts, lag(resampled.ts, k))
+        values[k] <- .npRmpi_with_local_regression(Srho.bivar(
+          as.numeric(tmp[, 1]), as.numeric(tmp[, 2]),
+          bw.y[k], bw.y.lag[k], c(bw.joint.y[k], bw.joint.y.lag[k]),
+          method = method))
+      }
+      c(values, vapply(seq_len(lag.num),
+        function(k) sum(values[seq_len(k)]), numeric(1)))
+    }, progress = progress, comm = comm)
+  rows <- matrix(unlist(parts, use.names = FALSE), ncol = 2L * lag.num,
+                 byrow = TRUE)
+  local.Srho <- rows[, seq_len(lag.num), drop = FALSE]
+  local.cumulant <- rows[, lag.num + seq_len(lag.num), drop = FALSE]
 
   invisible(gc(FALSE))
 
@@ -127,7 +120,7 @@
     }
 
     if (!is.null(progress))
-      progress <- .np_progress_step(progress, done = boot.num)
+      .np_progress_activity_step(progress, done = boot.num)
     .npRmpi_bootstrap_transport_trace(
       what = "npsdeptest",
       event = "fanout.collective.done",
@@ -153,11 +146,11 @@ npsdeptest <- function(data = NULL,
                        lag.num = 1,
                        method=c("integration","summation"),
                        bootstrap = TRUE,
-                       boot.num = 399,
+                       B = 399,
                        random.seed = 42) {
   .npRmpi_require_active_slave_pool(where = "npsdeptest()")
   if (.npRmpi_autodispatch_active())
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npsdeptest"))
   
   ## Trap fatal errors
 
@@ -165,24 +158,27 @@ npsdeptest <- function(data = NULL,
   if(is.null(data)) stop(" you must enter a data vector")
   if((lag.num < 1) || (lag.num > length(data))) stop(" lag.num must be a positive integer less than the number of observations")
   if(ncol(data.frame(data)) != 1) stop(" data must have one dimension only")
-  if(boot.num < 9) stop(" number of bootstrap replications must be >= 9")
+  if(B < 9) stop(" number of bootstrap replications must be >= 9")
+  if (anyNA(data))
+    stop("npsdeptest requires a complete time series: NA/NaN values cannot be omitted without changing the lags. Supply a contiguous complete segment explicitly.",
+         call. = FALSE)
 
   method <- match.arg(method)
 
   ## Save seed prior to setting
 
-  seed.state <- .np_seed_enter(random.seed)
-  on.exit(.np_seed_exit(seed.state, remove_if_absent = TRUE), add = TRUE)
-  .np_progress_note("Computing bandwidths")
+  seed.state <- .np_rng_scope_capture(collective = .npRmpi_rng_scope_collective(),
+                                      same.kind = TRUE)
+  on.exit(.np_rng_scope_restore(seed.state), add = TRUE)
+  .np_rng_scope_seed(seed.state, random.seed)
 
 
   ## If the variable is a time series convert to type numeric
 
   if(is.ts(data)) data <- as.numeric(data)
 
-  ## Omit NAs
-
-  data <- na.omit(data)
+  ## Keep original time adjacency; missing values were rejected before seed
+  ## entry and bandwidth selection rather than silently compressing time.
 
   ## Define the metric entropy function
 
@@ -200,64 +196,32 @@ npsdeptest <- function(data = NULL,
     if(method=="summation") {
       
       ## Summation version:
-      ## \sum_i(1-sqrt(f(x_i)f(y_i)/f(x_i,y_i)))^2
-      ## We could code this by hand per below, however, there is no
-      ## performance penalty imposed by sum() so no need.
-
-      ## Issue of common support points for evaluation
+      ## \sum_i(1-sqrt(f(x_i)f(y_i)/f(x_i,y_i)))^2. The fixed Gaussian
+      ## marginal and joint sums share one native, constant-workspace
+      ## traversal over their common evaluation points.
       
-      f.x <- fitted(npudens(tdat=x.dat,bws=bw.x))
-      f.y <- fitted(npudens(tdat=y.dat,bws=bw.y))
-      f.xy <- fitted(npudens(tdat=cbind(x.dat,y.dat),bws=bw.joint))
-      summand <- f.x*f.y/f.xy
-
-      ## In summation version we divide densities which can lead to
-      ## numerical instability issues not present in the integrand
-      ## version (which uses differences instead). We check for this
-      ## case, remove offending points, and warn. This traps -Inf,
-      ## Inf, and NaN.
-
-      if(!all(is.finite(summand))) {
-        .np_warning(" non-finite value in summation-based statistic: integration recommended")
-        summand <- summand[is.finite(summand)]
-      }
-
-      return(0.5*mean((1-sqrt(summand))**2))
+      return(.np_entropy_bivariate_gaussian_summation(
+        x.dat, y.dat, bw.x, bw.y, bw.joint
+      ))
       
     } else {
       
       ## Integration version:
       ## \int\int (sqrt(f(x,y))-sqrt(f(x))sqrt(f(y)))^2 dx dy
       
-      lo.default <- c(min(x.dat)-10.0*IQR(x.dat),min(y.dat)-10.0*IQR(y.dat))
-      up.default <- c(max(x.dat)+10.0*IQR(x.dat),max(y.dat)+10.0*IQR(y.dat))
+      domain <- .np_entropy_bivariate_domain(
+        x.dat, y.dat, bw.x, bw.y, bw.joint
+      )
       
-      Srho.integrand <- function(xy) {
-        
-        ## We code this up by hand using a second order gaussian
-        ## kernel. The multidimensional integration routines for some
-        ## reason crawl to almost a halt if we call the functions in the
-        ## np package. Good to have noticed this at this juncture, bad
-        ## to not have general code though could branch at this point?
-        
-        ##      f.x <- fitted(npudens(tdat=x.dat,edat=xy[1],bws=bw.x))
-        ##      f.y <- fitted(npudens(tdat=y.dat,edat=xy[2],bws=bw.y))
-        ##      f.xy <- fitted(npudens(tdat=cbind(x.dat,y.dat),edat=cbind(xy[1],xy[2]),bws=bw.joint))
-
-
-        f.x <- mean(dnorm((xy[1]-x.dat)/bw.x))/bw.x
-        f.y <- mean(dnorm((xy[2]-y.dat)/bw.y))/bw.y
-        f.xy <- mean(dnorm((xy[1]-x.dat)/bw.joint[1])*dnorm((xy[2]-y.dat)/bw.joint[2])
-                    / (bw.joint[1]*bw.joint[2]))
-        
-        return((sqrt(f.xy)-sqrt(f.x)*sqrt(f.y))**2)
-        
-      }
-      
-      return(0.5*adaptIntegrate(Srho.integrand,
-                                lowerLimit=lo.default,
-                                upperLimit=up.default)$integral)
-      
+      return(.np_entropy_bivariate_integral(
+        x.dat = x.dat,
+        y.dat = y.dat,
+        bw.x = bw.x,
+        bw.y = bw.y,
+        bw.joint = bw.joint,
+        lower = domain$lower,
+        upper = domain$upper
+      ))
     }
 
   } ## end of Srho.bivar function
@@ -274,7 +238,9 @@ npsdeptest <- function(data = NULL,
   bw.joint.y.lag <- numeric()      
   
   ## Save the bandwidths for resampling exercise...
-  lag.progress <- .np_progress_begin("Constructing metric entropy by lag", total = lag.num, surface = "lag")
+  lag.progress <- .np_progress_activity_begin(lag.num,
+    "Computing entropy statistics by lag", detail = NULL)
+  on.exit(.np_progress_activity_end(lag.progress), add = TRUE)
   
   for (k in seq_len(lag.num)) {
     ## Create y and y.lag
@@ -287,18 +253,18 @@ npsdeptest <- function(data = NULL,
     ## Compute and save bandwidths (save for bootstrapping if
     ## requested)
 
-    bw.y[k] <- .np_progress_with_legacy_suppressed(npudensbw(~y))$bw
-    bw.y.lag[k] <- .np_progress_with_legacy_suppressed(npudensbw(~y.lag))$bw
-    bw.joint <- .np_progress_with_legacy_suppressed(npudensbw(~y+y.lag))$bw
+    bw.y[k] <- .np_progress_select_bandwidth_enhanced("Computing bandwidths", npudensbw(~y))$bw
+    bw.y.lag[k] <- .np_progress_select_bandwidth_enhanced("Computing bandwidths", npudensbw(~y.lag))$bw
+    bw.joint <- .np_progress_select_bandwidth_enhanced("Computing bandwidths", npudensbw(~y+y.lag))$bw
     bw.joint.y[k] <- bw.joint[1]
     bw.joint.y.lag[k] <- bw.joint[2]
     
     Srho.vec[k] <- Srho.bivar(y,y.lag,bw.y[k],bw.y.lag[k],bw.joint,method=method)
-    lag.progress <- .np_progress_step(lag.progress, done = k, detail = paste("lag", k))
+    .np_progress_activity_step(lag.progress, done = k)
 
   }
 
-  lag.progress <- .np_progress_end(lag.progress, detail = paste("lag", lag.num))
+  .np_progress_activity_end(lag.progress, completed = TRUE)
 
   for (k in seq_len(lag.num)) Srho.cumulant.vec[k] <- sum(Srho.vec[seq_len(k)])
 
@@ -309,10 +275,11 @@ npsdeptest <- function(data = NULL,
 
     ## Matrix for resamples
 
-    progress <- .np_progress_begin("Bootstrap replications", total = boot.num, surface = "bootstrap")
+    progress <- .np_progress_activity_begin(B, "Bootstrap replications", detail = NULL)
+    on.exit(.np_progress_activity_end(progress), add = TRUE)
 
     if (.npRmpi_sdept_collective_context()) {
-      plan <- .npRmpi_sdept_bootstrap_index_plan(length(data), boot.num)
+      plan <- .npRmpi_sdept_bootstrap_index_plan(length(data), B)
       post.boot.seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
       boot.out <- .npRmpi_sdept_collective_bootstrap(
         plan = plan,
@@ -334,10 +301,10 @@ npsdeptest <- function(data = NULL,
       ## `Portmanteau' cumulant of all lags
       Srho.cumulant.vec.boot <- numeric()
 
-      Srho.bootstrap.mat <- matrix(NA,boot.num,(lag.num))
-      Srho.cumulant.bootstrap.mat <- matrix(NA,boot.num,(lag.num))
+      Srho.bootstrap.mat <- matrix(NA,B,(lag.num))
+      Srho.cumulant.bootstrap.mat <- matrix(NA,B,(lag.num))
 
-      for (b in seq_len(boot.num)) {
+      for (b in seq_len(B)) {
 
         ## Resample under the null
 
@@ -354,11 +321,11 @@ npsdeptest <- function(data = NULL,
           Srho.cumulant.bootstrap.mat[b,k] <- Srho.cumulant.vec.boot[k]
         }
 
-        progress <- .np_progress_step(progress, done = b)
+        .np_progress_activity_step(progress, done = b)
       }
     }
 
-    progress <- .np_progress_end(progress)
+    .np_progress_activity_end(progress, completed = TRUE)
 
     ## Compute P-values
 
@@ -366,15 +333,15 @@ npsdeptest <- function(data = NULL,
     P.cumulant.vec <- numeric()
     
     for (k in seq_len(lag.num)) {
-      P.vec[k] <- mean(Srho.bootstrap.mat[,k] > Srho.vec[k])
-      P.cumulant.vec[k] <- mean(Srho.cumulant.bootstrap.mat[,k] > Srho.cumulant.vec[k])
+      P.vec[k] <- .np_bootstrap_upper_tail_pvalue(Srho.bootstrap.mat[,k], Srho.vec[k])
+      P.cumulant.vec[k] <- .np_bootstrap_upper_tail_pvalue(Srho.cumulant.bootstrap.mat[,k], Srho.cumulant.vec[k])
     }
 
   }
 
   ## Restore seed
   
-  .np_seed_exit(seed.state, remove_if_absent = TRUE)
+  .np_rng_scope_restore(seed.state)
   
   if(bootstrap) {
     
@@ -385,7 +352,7 @@ npsdeptest <- function(data = NULL,
              P = P.vec,
              P.cumulant = P.cumulant.vec,
              bootstrap = bootstrap,
-             boot.num = boot.num,
+             boot.num = B,
              lag.num = lag.num,
              bw.y = bw.y,
              bw.y.lag = bw.y.lag,

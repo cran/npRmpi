@@ -1,7 +1,8 @@
 npregression <- 
-    function(bws, eval, mean, merr = NA, grad = NA, gerr = NA,
+    function(bws, eval, mean, merr = NULL, grad = NULL, gerr = NULL,
              resid = NA,
-             ntrain, trainiseval = FALSE, gradients = FALSE, residuals = FALSE,
+             ntrain, trainiseval = FALSE, se = TRUE,
+             gradients = FALSE, residuals = FALSE,
              gradient.order = NULL,
              xtra = rep(NA, 6),
              rows.omit = NA,
@@ -46,6 +47,7 @@ npregression <-
             resid = resid,
             ntrain = ntrain,
             trainiseval = trainiseval,
+            se = se,
             gradients = gradients,
             gradient.order = gradient.order,
             residuals = residuals,
@@ -97,25 +99,35 @@ residuals.npregression <- function(object, ...) {
  if(object$residuals) {
    return(object$resid)
  } else {
-   call.residuals <- function() npreg(bws = object$bws, residuals = TRUE)$resid
-   if (.npRmpi_has_active_slave_pool(comm = 1L)) {
+   call.residuals <- function() npreg(bws = object$bws, se = FALSE,
+                                      residuals = TRUE)$resid
+   if (.npRmpi_has_active_slave_pool(comm = 1L) ||
+       isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
      return(call.residuals())
    }
    return(.npRmpi_with_local_regression(call.residuals()))
  }
 }
-se.npregression <- function(x) { x$merr }
-gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  gout <- if (!errors) x$grad else x$gerr
+se.npregression <- function(x) {
+  if (!isTRUE(x$se) || is.null(x$merr))
+    .np_stop_missing_output(substitute(x), "npreg")
+  x$merr
+}
+gradients.npregression <- function(x, se = FALSE, gradient.order = NULL, ...) {
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.npregression", suggest = TRUE)
+  npRejectLegacyBooleanErrors(list(...), "gradients.npregression")
+  se <- npValidateScalarLogical(se, "se")
+  gout <- if (!se) x$grad else x$gerr
   if (is.null(gout) || (length(gout) == 1L && is.logical(gout) && is.na(gout)))
-    stop(if (!errors)
-      "gradients are not available: fit the model with gradients=TRUE"
-    else
-      "gradient standard errors are not available: fit the model with gradients=TRUE")
+    .np_stop_missing_output(
+      substitute(x), "npreg",
+      message = if (!se) "gradients are not available." else
+        "gradient standard errors were not computed.",
+      switches = if (!se) "gradients = TRUE" else "gradients = TRUE, se = TRUE")
 
-  if (identical(x$bws$regtype, "lc") && !is.null(gradient.order)) {
-    npValidateLcGradientOrder(
+  if (x$bws$regtype %in% c("lc", "ll") && !is.null(gradient.order)) {
+    npValidateFirstDerivativeOrder(
       regtype = x$bws$regtype,
       gradient.order = gradient.order,
       ncon = x$bws$ncon,
@@ -153,9 +165,15 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
     ncon = x$bws$ncon,
     where = "gradients.npregression"
   )
-  if (!any(available)) {
-    stop("gradients.npregression has no available derivative components for the requested gradient.order and fitted polynomial degree",
-         call. = FALSE)
+  if (!any(available) && (x$bws$nuno + x$bws$nord == 0L)) {
+    npStopGlpGradientNoneAvailable(
+      where = "gradients.npregression",
+      action = "return",
+      degree.engine = x$bws$degree,
+      gradient.order = gorder,
+      available = available,
+      con.names = x$bws$xnames[x$bws$icon]
+    )
   }
   if (any(!available)) {
     npWarnGlpGradientPartialAvailability(
@@ -175,39 +193,155 @@ gradients.npregression <- function(x, errors = FALSE, gradient.order = NULL, ...
   }
 
   gout.masked <- gout
-  gout.masked[,] <- NA_real_
   cont.idx <- which(x$bws$icon)
   if (length(cont.idx)) {
-    keep.cont <- available
-    if (any(keep.cont)) {
-      keep.idx <- cont.idx[keep.cont]
-      gout.masked[, keep.idx] <- gout[, keep.idx, drop = FALSE]
-    }
+    drop.idx <- cont.idx[!available]
+    if (length(drop.idx))
+      gout.masked[, drop.idx] <- NA_real_
   }
   gout.masked
 }
+.npreg_explicit_eval_exclude <- function(dots) {
+  if (sum(names(dots) %in% "na.action") != 1L)
+    return(FALSE)
+  action <- dots[["na.action", exact = TRUE]]
+  identical(action, stats::na.exclude) || identical(action, "na.exclude")
+}
+
+.npreg_eval_omit_indices <- function(omit, rows = NULL) {
+  if (is.null(omit) || !length(omit) ||
+      (length(omit) == 1L && is.na(omit)))
+    return(integer(0L))
+  if (!is.numeric(omit) || anyNA(omit) || any(!is.finite(omit)) ||
+      any(omit != trunc(omit)) || any(omit < 1) || anyDuplicated(omit) ||
+      (!is.null(rows) && any(omit > rows)))
+    stop("invalid regression evaluation omission metadata", call. = FALSE)
+  out <- as.integer(omit)
+  names(out) <- names(omit)
+  out[order(out)]
+}
+
+.npreg_compose_eval_omissions <- function(frame.omit, native.omit,
+                                         frame.rows, compact.rows) {
+  native.omit <- .npreg_eval_omit_indices(native.omit, frame.rows)
+  if (length(frame.rows) != 1L || !is.finite(frame.rows) ||
+      frame.rows != compact.rows + length(native.omit))
+    stop("inconsistent regression evaluation row counts", call. = FALSE)
+  frame.omit <- .npreg_eval_omit_indices(frame.omit)
+  full.rows <- frame.rows + length(frame.omit)
+  frame.omit <- .npreg_eval_omit_indices(frame.omit, full.rows)
+  if (!length(frame.omit))
+    return(native.omit)
+  if (!length(native.omit))
+    return(frame.omit)
+  kept <- seq_len(full.rows)[-frame.omit]
+  mapped <- kept[native.omit]
+  names(mapped) <- names(native.omit)
+  omitted <- c(frame.omit, mapped)
+  omitted[order(omitted)]
+}
+
+.npreg_restore_eval_exclude <- function(object, fields = c("mean", "merr")) {
+  omitted <- .npreg_eval_omit_indices(
+    object[["eval.rows.omit", exact = TRUE]])
+  if (!length(omitted))
+    return(object)
+  compact.rows <- object[["nobs", exact = TRUE]]
+  if (length(compact.rows) != 1L || !is.finite(compact.rows) ||
+      compact.rows < 1 || compact.rows != trunc(compact.rows))
+    stop("invalid regression evaluation row count", call. = FALSE)
+  full.rows <- compact.rows + length(omitted)
+  omitted <- .npreg_eval_omit_indices(omitted, full.rows)
+  action <- structure(omitted, class = "exclude")
+  for (field in fields) {
+    value <- object[[field, exact = TRUE]]
+    if (is.null(value) || NROW(value) == full.rows)
+      next
+    if (NROW(value) != compact.rows)
+      stop(sprintf("inconsistent regression evaluation rows in '%s'", field),
+           call. = FALSE)
+    object[[field]] <- stats::napredict(action, value)
+  }
+  # The certificate follows gradient rows, not a mean-only prediction
+  # extraction whose gradients remain compact.
+  if ("grad" %in% fields) {
+    certificate <- attr(object, ".np.gradient.structural.zero", exact = TRUE)
+    if (!is.null(certificate)) {
+      gradient <- object[["grad", exact = TRUE]]
+      if (!is.matrix(certificate) || !is.logical(certificate) ||
+          is.null(gradient) || NCOL(certificate) != NCOL(gradient))
+        stop("invalid regression structural-zero certificate", call. = FALSE)
+      if (NROW(certificate) != full.rows) {
+        if (NROW(certificate) != compact.rows)
+          stop("inconsistent regression evaluation rows in structural-zero certificate",
+               call. = FALSE)
+        attr(object, ".np.gradient.structural.zero") <-
+          stats::napredict(action, certificate)
+      }
+    }
+  }
+  object
+}
+
 predict.npregression <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
+  npRejectLegacyBooleanErrors(dots, "predict.npregression")
+  if ("se" %in% names(dots))
+    stop("predict.npregression uses 'se.fit', not 'se'", call. = FALSE)
   has.formula.route <- !is.null(object$bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npreg.rbandwidth,
+                                  c("txdat", "tydat"))
 
   if (!is.null(dots$exdat) && !is.null(dots$newdata)) {
     dots$newdata <- NULL
   } else if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
-    dots$exdat <- dots$newdata
+    dots$exdat <- .np_native_newdata_parts(
+      dots$newdata, list(exdat = object$bws$xnames), "predict")$exdat
     dots$newdata <- NULL
   }
 
-  call.predict <- function() do.call(npreg, c(list(bws = object$bws), dots))
-  tr <- if (.npRmpi_has_active_slave_pool(comm = 1L)) {
+  call.predict <- function() do.call(
+    npreg,
+    c(list(bws = object$bws, se = se.fit), dots)
+  )
+  tr <- if (.npRmpi_has_active_slave_pool(comm = 1L) ||
+       isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
     call.predict()
   } else {
     .npRmpi_with_local_regression(call.predict())
   }
-  if(se.fit)
-    return(list(fit = fitted(tr), se.fit = se(tr), 
-                df = tr$nobs, residual.scale = tr$MSE))
-  else
+  if (.npreg_explicit_eval_exclude(dots) && !isTRUE(tr$trainiseval))
+    tr <- .npreg_restore_eval_exclude(
+      tr, fields = c("mean", if (se.fit) "merr"))
+  if (se.fit) {
+    # Reuse known training scores only; never add a fit to recover metadata.
+    unnamed.args <- is.null(names(dots)) && length(dots) > 0L ||
+      any(is.na(names(dots)) | !nzchar(names(dots)))
+    alternate.outcomes <- unnamed.args || any(!is.na(pmatch(names(dots), "eydat", duplicates.ok = TRUE)))
+    training.override <- unnamed.args || any(!is.na(pmatch(
+      names(dots), c("data", "txdat", "tydat", "subset", "na.action",
+                     ".np.formula.state"), duplicates.ok = TRUE)))
+    mse.owner <- if (isTRUE(tr[["trainiseval", exact = TRUE]]) && !alternate.outcomes) {
+      tr
+    } else if (!training.override && isTRUE(object[["trainiseval", exact = TRUE]])) {
+      object
+    } else NULL
+    residual.scale <- NA_real_
+    if (!is.null(mse.owner)) {
+      owner.call <- mse.owner[["call", exact = TRUE]]
+      if (is.call(owner.call)) {
+        score.args <- c(names(owner.call), names(owner.call[["..."]]))
+        # trainiseval describes X locations; explicit eydat can still change MSE.
+        score.args <- score.args[!is.na(score.args) & nzchar(score.args)]
+        if (!any(!is.na(pmatch(score.args, "eydat", duplicates.ok = TRUE))))
+          residual.scale <- mse.owner[["MSE", exact = TRUE]]
+      }
+    }
+    return(list(fit = fitted(tr), se.fit = se(tr),
+                df = tr$nobs, residual.scale = residual.scale))
+  } else
     return(fitted(tr))
 }
 

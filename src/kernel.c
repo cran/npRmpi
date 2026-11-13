@@ -25,10 +25,6 @@ extern  MPI_Status status;
 
 #include <R.h>
 
-extern double np_tgauss2_b, np_tgauss2_alpha, np_tgauss2_c0;
-// convolution kernel constants
-extern double np_tgauss2_a0, np_tgauss2_a1, np_tgauss2_a2;
-extern double np_tgauss2_k, np_tgauss2_k2, np_tgauss2_k22, np_tgauss2_km;
 /*
 
 The following kernel functions are supported.
@@ -50,7 +46,7 @@ convergence rate of the bandwidth.
 
 8 = Rectangular kernel
 
-9 = Truncated Gaussian kernel (second order)
+9 = Reserved (unsupported)
 The following techniques are currently supported.
 
 The technique is input via disk files bandwidth_d.ini and bandwidth_r.ini
@@ -166,9 +162,8 @@ double kernel(int KERNEL, double z)
 
 			break;
 
-  case 9:
-    return_value = (fabs(z) > np_tgauss2_b) ? 0.0 : np_tgauss2_alpha*ONE_OVER_SQRT_TWO_PI*exp(-0.5*z*z) - np_tgauss2_c0;
-    break;
+	case 9:
+		error("unsupported continuous kernel code");
 	}
 
 
@@ -330,9 +325,8 @@ double cdf_kernel(int KERNEL, double z)
 
 			break;
 
-  case 9:
-    return_value = (z <= -np_tgauss2_b) ? 0.0 : ((z >= np_tgauss2_b) ? 1.0 : (np_tgauss2_alpha*0.5*erfun(0.7071067810*z)-np_tgauss2_c0*z + 0.5));
-    break;
+	case 9:
+		error("unsupported continuous kernel code");
 	}
 
 	return(return_value);
@@ -341,139 +335,6 @@ double cdf_kernel(int KERNEL, double z)
 
 
 /* This is the derivative of the kernel with respect to Z */
-
-double kernel_deriv(int KERNEL, double z)
-{
-
-/* Evaluate the derivative of the kernel function */
-
-/* Define z_squared used by all kernels */
-
-	double z_squared = z*z;
-	double return_value = 0.0;
-
-	double one_over_sqrt_two_pi = 0.39894228040143267794;
-
-	switch (KERNEL)
-	{
-
-		case 0:
-
-/* Second Order Gaussian */
-
-			return_value = -z*one_over_sqrt_two_pi*exp(-0.5*z_squared);
-
-			break;
-
-		case 1:
-
-/* Fourth Order Gaussian */
-
-			return_value = -one_over_sqrt_two_pi*(2.5*z-0.5*ipow(z,3))*exp(-0.5*z_squared);
-
-			break;
-
-		case 2:
-
-/* Sixth Order Gaussian */
-
-			return_value = -0.049867785050179084743*z*exp(-0.5*z_squared)*(35.0-14.0*z_squared+ipow(z,4));
-
-			break;
-
-		case 3:
-
-/* Eighth Order Gaussian */
-
-			return_value = -one_over_sqrt_two_pi*(6.5625*z-3.9375*ipow(z,3)+0.5625*ipow(z,4)*z-0.02083333333*ipow(z,6)*z)*exp(-0.5*z_squared);
-
-			break;
-
-		case 4:
-
-/* Second Order Epanechnikov */
-
-			if (z_squared < 5.0)
-			{
-				return_value = (double)(-0.13416407864998738178*z);
-			}
-			else
-			{
-				return_value = 0.0;
-			}
-
-			break;
-
-		case 5:
-
-/* Fourth Order Epanechnikov */
-			if (z_squared < 5.0)
-			{
-				return_value = (double)(-.58696784409369479531*z*(1.0-0.2*z_squared)
-					-0.13416407864998738178*(1.875-0.875*z_squared)*z);
-			}
-			else
-			{
-				return_value = 0.0;
-			}
-
-			break;
-
-		case 6:
-
-/* Sixth Order Epanechnikov */
-			if (z_squared < 5.0)
-			{
-				return_value = -1.0022916396047925e-10*z*(z_squared*(2898847705.0*z_squared-18447212816.0)+25621128780.0);
-			}
-			else
-			{
-				return_value = 0.0;
-			}
-
-			break;
-
-		case 7:
-
-/* Eighth Order Epanechnikov */
-			if (z_squared < 5.0)
-			{
-				return_value = (double)(-5.7779647152973081413*z
-					+ 7.6269134241924467465 *ipow(z,3)
-					- 2.8328535575571945058 *ipow(z,5)
-					+ 0.31476150639524383398 *ipow(z,7));
-			}
-			else
-			{
-				return_value = 0.0;
-			}
-
-			break;
-
-		case 8:
-
-/* Rectangular kernel added 4/27/99 */
-/* Derivative always zero except at +-1 where it is undefined. */
-
-			return_value = 0.0;
-
-			break;
-
-  case 9:
-    return_value = (fabs(z) > np_tgauss2_b) ? 0.0 : np_tgauss2_alpha*(-z*ONE_OVER_SQRT_TWO_PI*exp(-0.5*z*z));
-    break;
-	}
-
-	return(return_value);
-
-}
-
-
-/* Completed 11/25/97 */
-
-/* Revisited for two days 5/19/99 - 5/20/99 for grades data set. */
-/* No bugs at all - data has numerous ties!!! (Not continuous). */
-/* However, beefed up by using 20 decimals for all kernels. */
 
 double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2)
 {
@@ -600,19 +461,8 @@ double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2)
 
 				break;
 
-    case 9:
-      if(fabs(z) > 2*np_tgauss2_b)
-        return_value = 0.0;
-      else {
-        if(z < 0)
-          return_value = (np_tgauss2_a0*erfun(0.5*z + np_tgauss2_b)*exp(-0.25*z*z) + np_tgauss2_a1*z + 
-                          np_tgauss2_a2*erfun(0.7071067810*(z + np_tgauss2_b)) - np_tgauss2_c0);
-        else
-          return_value = (-np_tgauss2_a0*erfun(0.5*z - np_tgauss2_b)*exp(-0.25*z*z) - np_tgauss2_a1*z -
-                          np_tgauss2_a2*erfun(0.7071067810*(z - np_tgauss2_b)) - np_tgauss2_c0);
-        
-      }
-      break;
+		case 9:
+			error("unsupported continuous kernel code");
 
 		}
 
@@ -868,8 +718,8 @@ double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2)
 				}
 
 				break;
-    case 9:
-      error("adaptive bandwidths not supported with truncation gaussian."); break;
+			case 9:
+				error("unsupported continuous kernel code");
       
 		}
 
@@ -991,14 +841,8 @@ double *DIFF_KER_PPM)
 
 			break;
 
-    case 9:
-
-			*INT_KERNEL_P = np_tgauss2_k;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_reg_continuous);
-			*INT_KERNEL_PM_HALF = np_tgauss2_km;
-			*DIFF_KER_PPM = 2.0* (*K_INT_KERNEL_P/ *INT_KERNEL_P) * (np_tgauss2_k - np_tgauss2_km);
-
-      break;
+		case 9:
+			error("unsupported continuous kernel code");
 
 	}
 
@@ -1007,110 +851,184 @@ double *DIFF_KER_PPM)
 }
 
 
-int initialize_kernel_density_asymptotic_constants(
-int KERNEL,
-int num_var_continuous,
-double *INT_KERNEL_P,
-double *K_INT_KERNEL_P)
+/* Canonical finite-support RLY arithmetic. Never fill gaps in retained
+ * support, and never substitute the infinite-lattice normalized LR kernel.
+ * Numeric distances retain their original units, including real gaps. */
+double np_ordered_rly_denom(const double train, const double lambda,
+                            const double *cats, const int ncat)
 {
-
-/* Initialize constants for various kernels required for asymptotic standard errors */
-
-	switch(KERNEL)
-	{
-
-		case 0:
-
-/* Second-order Gaussian */
-
-			*INT_KERNEL_P = 0.28209479177387814348;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 1:
-
-/* Fourth-order Gaussian */
-
-			*INT_KERNEL_P = 0.47603496111841936711;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 2:
-
-/* Sixth-order Gaussian */
-
-			*INT_KERNEL_P = 0.62396943688265038571;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 3:
-
-/* Eighth-order Gaussian */
-
-			*INT_KERNEL_P = 0.74785078617543927990;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 4:
-
-/* Second-order Epanechnikov */
-
-			*INT_KERNEL_P = 0.26832815729997476357;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 5:
-
-/* Fourth-order Epanechnikov */
-
-			*INT_KERNEL_P = 0.55901699437494742410;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 6:
-
-/* Sixth-order Epanechnikov */
-
-			*INT_KERNEL_P = 0.84658823667359826246;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 7:
-
-/* Eighth-order Epanechnikov */
-
-			*INT_KERNEL_P = 1.1329342579014329689;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-		case 8:
-
-			*INT_KERNEL_P = 0.5;
-			*K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-
-			break;
-
-  case 9:
-    *INT_KERNEL_P = np_tgauss2_k;
-    *K_INT_KERNEL_P = ipow(*INT_KERNEL_P, num_var_continuous);
-    break;
-
-	}
-
-	return(0);
-
+  double den = 0.0;
+  if(cats == NULL || ncat <= 0)
+    error("Racine-Li-Yan kernel requires retained ordered support");
+  for(int i = 0; i < ncat; ++i)
+    den += np_ordered_metric_power_between(lambda,train,cats[i]);
+  return den;
 }
 
+static double np_ordered_rly_normal(const double train, const double eval,
+                                    const double lambda, const double denominator)
+{
+  return np_ordered_metric_power_between(lambda,train,eval)/denominator;
+}
 
-double kernel_ordered(int KERNEL, double x, double y, double lambda)
+static double np_ordered_rly_denom_score(const double train, const double lambda,
+                                        const double *cats, const int ncat)
+{
+  double derivative = 0.0;
+  for(int i = 0; i < ncat; ++i) {
+    const double d = np_ordered_metric_distance(train,cats[i]);
+    derivative += np_ordered_metric_score(lambda,d);
+  }
+  return derivative;
+}
+
+/* Keep the new, heavier score bodies out of the ordinary kernel dispatcher
+ * so normal-value/score callers do not inherit their register-save frame. */
+static double
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+np_ordered_rly_operator_score(const int op, const double train,
+    const double eval, const double lambda, const double *cats,
+    const int ncat, const double den)
+{
+  const double dden = np_ordered_rly_denom_score(train,lambda,cats,ncat);
+  const double den2 = op == 4 ? np_ordered_rly_denom(eval,lambda,cats,ncat) : 1.0;
+  const double dden2 = op == 4 ? np_ordered_rly_denom_score(eval,lambda,cats,ncat) : 0.0;
+  double total = 0.0, derivative = 0.0;
+  for(int i = 0; i < ncat; ++i) {
+    if(op == 5 && cats[i] > eval) continue;
+    const double da = np_ordered_metric_distance(train,cats[i]);
+    const double a = np_ordered_metric_power(lambda,da);
+    const double ap = np_ordered_metric_score(lambda,da);
+    const double db = op == 4 ? np_ordered_metric_distance(eval,cats[i]) : 0;
+    const double b = np_ordered_metric_power(lambda,db);
+    const double bp = np_ordered_metric_score(lambda,db);
+    total += a*b;
+    derivative += ap*b+a*bp;
+  }
+  const double divisor = den*den2;
+  return (derivative*divisor-total*(dden*den2+den*dden2))/(divisor*divisor);
+}
+
+double np_ordered_rly(const int op, const double train, const double eval,
+                      const double lambda, const double *cats, const int ncat)
+{
+  const double den = np_ordered_rly_denom(train, lambda, cats, ncat);
+  if(!(den > 0.0)) return 0.0;
+  if(op == 0)
+    return np_ordered_rly_normal(train,eval,lambda,den);
+  if(op == 1) {
+    const double den2 = np_ordered_rly_denom(eval, lambda, cats, ncat);
+    double total = 0.0;
+    if(!(den2 > 0.0)) return 0.0;
+    for(int i = 0; i < ncat; ++i)
+      total += np_ordered_metric_power_between(lambda,train,cats[i]) *
+               np_ordered_metric_power_between(lambda,eval,cats[i]);
+    return total/(den*den2);
+  }
+  if(op == 2) {
+    const double d = np_ordered_metric_distance(train,eval);
+    const double num = np_ordered_metric_power(lambda,d);
+    const double dnum = np_ordered_metric_score(lambda,d);
+    const double dden = np_ordered_rly_denom_score(train,lambda,cats,ncat);
+    return (dnum*den-num*dden)/(den*den);
+  }
+  if(op == 3) {
+    double total = 0.0;
+    for(int i = 0; i < ncat; ++i)
+      if(cats[i] <= eval)
+        total += np_ordered_metric_power_between(lambda,train,cats[i]);
+    return total/den;
+  }
+  /* Scores differentiate the requested retained-support operator, including
+   * both normalizers in a convolution. No finite differences or new support. */
+  if(op == 4 || op == 5)
+    return np_ordered_rly_operator_score(op,train,eval,lambda,cats,ncat,den);
+  error("unsupported Racine-Li-Yan operator");
+  return 0.0;
+}
+
+static int np_ordered_rly_support_contains(const double value,
+                                          const double *cats, const int ncat)
+{
+  int lo=0,hi=ncat;
+  if(!R_FINITE(value)) return 0;
+  while(lo<hi) {
+    const int mid=lo+(hi-lo)/2;
+    if(cats[mid]<value) lo=mid+1; else hi=mid;
+  }
+  return lo<ncat && cats[lo]==value;
+}
+
+/* Noncollective bridge for R profile consumers. The result is eval x donor;
+ * all inputs are borrowed and each donor normalizer is computed only once. */
+SEXP C_np_ordered_rly_matrix(SEXP train, SEXP evaluation, SEXP bandwidth,
+                            SEXP support)
+{
+  if(TYPEOF(train)!=REALSXP || TYPEOF(evaluation)!=REALSXP ||
+     TYPEOF(bandwidth)!=REALSXP || XLENGTH(bandwidth)!=1 ||
+     TYPEOF(support)!=REALSXP || XLENGTH(support)<1 ||
+     XLENGTH(train)>INT_MAX || XLENGTH(evaluation)>INT_MAX ||
+     XLENGTH(support)>INT_MAX)
+    error("invalid RLY profile matrix layout");
+  const int n=(int)XLENGTH(train),m=(int)XLENGTH(evaluation),nc=(int)XLENGTH(support);
+  const double lambda=REAL(bandwidth)[0];
+  const double *cats=REAL(support);
+  if(!R_FINITE(lambda) || lambda<0.0 || lambda>1.0 ||
+     (n>0 && (R_xlen_t)m>R_XLEN_T_MAX/n))
+    error("invalid RLY profile matrix bandwidth or dimensions");
+  for(int i=0;i<nc;++i) {
+    const double offset = cats[i]-cats[0];
+    if(!R_FINITE(cats[i]) || !R_FINITE(offset) ||
+       (i>0 && !(cats[i]>cats[i-1])))
+      error("RLY profile support must have finite increasing numeric levels");
+  }
+  for(int i=0;i<n;++i)
+    if(!np_ordered_rly_support_contains(REAL(train)[i],cats,nc))
+      error("RLY profile donor is outside retained support");
+  for(int j=0;j<m;++j)
+    if(!np_ordered_rly_support_contains(REAL(evaluation)[j],cats,nc))
+      error("RLY profile evaluation is outside retained support");
+  SEXP result=PROTECT(allocMatrix(REALSXP,m,n));
+  for(int i=0;i<n;++i) {
+    const double donor=REAL(train)[i];
+    const double den=np_ordered_rly_denom(donor,lambda,cats,nc);
+    for(int j=0;j<m;++j)
+      REAL(result)[j+(R_xlen_t)m*i]=np_ordered_rly_normal(donor,REAL(evaluation)[j],lambda,den);
+  }
+  UNPROTECT(1);
+  return result;
+}
+
+void np_ordered_rly_range(const int op, const double lambda,
+                          const double *cats, const int ncat,
+                          double *lower, double *upper)
+{
+  if(cats == NULL || ncat <= 0)
+    error("Racine-Li-Yan kernel requires retained ordered support");
+  *lower = DBL_MAX;
+  *upper = -DBL_MAX;
+  for(int i = 0; i < ncat; ++i) {
+    if(op == 0) {
+      const double den = np_ordered_rly_denom(cats[i],lambda,cats,ncat);
+      const double left = np_ordered_metric_distance(cats[i],cats[0]);
+      const double right = np_ordered_metric_distance(cats[i],cats[ncat-1]);
+      const double distance = left > right ? left : right;
+      *lower = fmin(*lower,np_ordered_metric_power(lambda,distance)/den);
+      *upper = fmax(*upper,1.0/den);
+    } else {
+      for(int j = 0; j < ncat; ++j) {
+        const double value = np_ordered_rly(op,cats[i],cats[j],lambda,cats,ncat);
+        *lower = fmin(*lower,value);
+        *upper = fmax(*upper,value);
+      }
+    }
+  }
+}
+
+double kernel_ordered(int KERNEL, double x, double y, double lambda,
+                      int c, double *categorical_vals)
 {
 
 	double return_value = 0.0;
@@ -1129,7 +1047,7 @@ double kernel_ordered(int KERNEL, double x, double y, double lambda)
 			}
 			else
 			{
-				return_value = ipow(lambda,(int)fabs(x-y))*(1.0-lambda)*0.5;
+				return_value = ipow(lambda,np_ordered_lattice_distance(x,y))*(1.0-lambda)*0.5;
 			}
 
 			break;
@@ -1144,7 +1062,7 @@ double kernel_ordered(int KERNEL, double x, double y, double lambda)
 			}
 			else
 			{
-				return_value = ipow(lambda,(int)fabs(x-y));
+				return_value = np_ordered_metric_power_between(lambda,x,y);
 			}
 
 			break;
@@ -1152,17 +1070,13 @@ double kernel_ordered(int KERNEL, double x, double y, double lambda)
 		case 2:
 
 			/* Normalized Li-Racine on infinite integer support */
-			return_value = ipow(lambda,(int)fabs(x-y))*(1.0-lambda)/(1.0+lambda);
+			return_value = ipow(lambda,np_ordered_lattice_distance(x,y))*(1.0-lambda)/(1.0+lambda);
 
 			break;
 
 		case 3:
 
-			/*
-			  Racine-Li-Yan requires empirical support for exact normalization.
-			  This fallback is used where support is unavailable in this API.
-			*/
-			return_value = ipow(lambda,(int)fabs(x-y))*(1.0-lambda)/(1.0+lambda);
+			return_value = np_ordered_rly(0,y,x,lambda,categorical_vals,c);
 
 			break;
 
@@ -1176,6 +1090,52 @@ double kernel_ordered(int KERNEL, double x, double y, double lambda)
 /* Cumulative version of Aitchenson and Aitken's beautiful categorical
 kernel. */
 
+/* This budget only detects ambiguous support, never admits/rounds a lattice.
+ * Normal weights, convolution and RLY do not call this guard. Vector cumulative
+ * owners validate once. A clearly fractional offset settles support immediately. */
+void np_ordered_lr_cumulative_contract(const double *cats, const int ncat)
+{
+  if(cats == NULL || ncat <= 0)
+    error("Li-Racine cumulative kernel requires retained ordered support");
+  int ambiguous = 0;
+  for(int i = 1; i < ncat; ++i) {
+    const double d = cats[i]-cats[0];
+    const double residual = fabs(d-round(d));
+    const double tolerance = 8.0*DBL_EPSILON*fmax(1.0,fabs(d));
+    const double uncertainty = DBL_EPSILON*fabs(cats[i]) +
+      DBL_EPSILON*fabs(cats[0]) + DBL_EPSILON*fabs(d);
+    if(residual > fmax(tolerance,uncertainty)) return;
+    if(residual > tolerance) ambiguous = 1;
+  }
+  if(ambiguous)
+    error("raw Li-Racine cumulative support is numerically ambiguous between a unit lattice and retained fractional levels; use Racine-Li-Yan (okertype='racineliyan') for an explicit retained-support cumulative operator");
+}
+
+/* Nonlattice LR has no intervening integer points: its unnormalized
+ * cumulative operator sums the retained counting support, in original units. */
+double np_ordered_lr_finite_cumulative_prepared(const int score, const double train,
+    const double eval, const double lambda, const double *cats, const int ncat)
+{
+  double total = 0.0;
+  if(cats == NULL || ncat <= 0)
+    error("Li-Racine cumulative kernel requires retained ordered support");
+  for(int i = 0; i < ncat; ++i) {
+    if(cats[i] > eval) break;
+    const double d = np_ordered_metric_distance(train,cats[i]);
+    total += score ? np_ordered_metric_score(lambda,d) :
+      np_ordered_metric_power(lambda,d);
+  }
+  return total;
+}
+
+/* Scalar callers validate here; vector owners validate once before their loop. */
+double np_ordered_lr_finite_cumulative(const int score, const double train,
+    const double eval, const double lambda, const double *cats, const int ncat)
+{
+  np_ordered_lr_cumulative_contract(cats,ncat);
+  return np_ordered_lr_finite_cumulative_prepared(score,train,eval,lambda,cats,ncat);
+}
+
 double cdf_kernel_ordered(int KERNEL, double x, double y, double lambda, int c, double *categorical_vals)
 {
 
@@ -1188,18 +1148,19 @@ double cdf_kernel_ordered(int KERNEL, double x, double y, double lambda, int c, 
 /* Now going from -max to max in steps of 1 - Ahmad & Cerrito claim that this must */
 /* integrate to onc from -infty to infty - using sample analog */
 
-	if(KERNEL == 3)
+	if(KERNEL == 1 && np_ordered_lattice_span(categorical_vals,c) < 0)
 	{
-		double den = 0.0;
-		int i;
-		for(i = 0; i < c; i++)
-			den += ipow(lambda,(int)fabs(y-categorical_vals[i]));
-		if(den > 0.0)
-		{
-			for(i = 0; i < c; i++)
-				if(categorical_vals[i] <= x)
-					return_value += ipow(lambda,(int)fabs(y-categorical_vals[i]))/den;
-		}
+		return_value = np_ordered_lr_finite_cumulative(0,y,x,lambda,categorical_vals,c);
+	}
+	else if(KERNEL == 1 && !np_ordered_pair_on_lattice(y,x,categorical_vals[0]))
+	{
+		/* Retain this scalar owner's incumbent interval, also off its lattice. */
+		const double lo = categorical_vals[0]-fabs(categorical_vals[0]-categorical_vals[c-1]);
+		return_value = np_ordered_lr_interval_cumulative(0,y,x,lambda,lo,categorical_vals[c-1]);
+	}
+	else if(KERNEL == 3)
+	{
+		return_value = np_ordered_rly(3,y,x,lambda,categorical_vals,c);
 	}
 	else
 	{
@@ -1207,7 +1168,7 @@ double cdf_kernel_ordered(int KERNEL, double x, double y, double lambda, int c, 
 		{
 			if(l <= x)
 			{
-				return_value += kernel_ordered(KERNEL, l, y, lambda);
+				return_value += kernel_ordered(KERNEL, l, y, lambda,c,categorical_vals);
 			}
 		}
 	}
@@ -1229,25 +1190,13 @@ double kernel_ordered_convolution(int KERNEL, double x, double y, double lambda,
 
 	if(KERNEL == 3)
 	{
-		double denx = 0.0;
-		double deny = 0.0;
-		for(i=0; i < c; i++)
-		{
-			denx += ipow(lambda,(int)fabs(x-c_vals[i]));
-			deny += ipow(lambda,(int)fabs(y-c_vals[i]));
-		}
-		if(denx > 0.0 && deny > 0.0)
-		{
-			for(i=0; i < c; i++)
-				return_value += (ipow(lambda,(int)fabs(x-c_vals[i]))/denx)*
-					(ipow(lambda,(int)fabs(y-c_vals[i]))/deny);
-		}
+		return_value = np_ordered_rly(1,x,y,lambda,c_vals,c);
 	}
 	else
 	{
 		for(i=0; i < c; i++)
 		{
-			return_value += kernel_ordered(KERNEL, x, *pc_vals, lambda)*kernel_ordered(KERNEL, y, *pc_vals, lambda);
+			return_value += kernel_ordered(KERNEL, x, *pc_vals, lambda,c,c_vals)*kernel_ordered(KERNEL, y, *pc_vals, lambda,c,c_vals);
 			pc_vals++;
 		}
 	}
@@ -1309,42 +1258,6 @@ double kernel_unordered(int KERNEL, double x, double y, double lambda, int c)
    ratios of kernel sums, such as regressions and conditional densities.
    The kernels return 1 outside of their support.
  */
-
-double kernel_unordered_ratio(int KERNEL, double x, double y, double lambda, int c){
-
-	double return_value = 1.0;
-  const double dc = (double) c;
-
-	if(c < 2){
-		return (x == y) ? 1.0 : 0.0;
-	}
-
-	switch(KERNEL)	{
-
-  case 0: /* Aitchenson and Aitken */
-    if(x != y){
-      if(x <= c){
-				return_value = lambda/(dc - 1.0);
-      }
-    } else {
-      return_value = 1.0 - lambda;
-    }
-    
-    break;
-  case 1: /* Li and Racine */
-    if((x <= c) && (x != y))
-      return_value = lambda;
-          
-    break;
-	}
-
-	return(return_value);
-
-}
-
-
-/* Cumulative version of Aitchenson and Aitken's beautiful categorical
-kernel. */
 
 double cdf_kernel_unordered(int KERNEL, double x, double y, double lambda, int c, double *categorical_vals)
 {

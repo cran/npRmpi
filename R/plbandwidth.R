@@ -35,7 +35,7 @@ plbandwidth <-
            bwmethod = c("cv.ls","cv.aic"),
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           ckertype = c("gaussian","epanechnikov","uniform"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -81,9 +81,6 @@ plbandwidth <-
         stop("ckerorder must be one of ", paste(kord,collapse=" "))
     }
 
-    if (ckertype == "truncated gaussian" && ckerorder != 2)
-      .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
-
     ukertype = match.arg(ukertype)
     okertype = match.arg(okertype)
     cbounds <- npKernelBoundsResolve(
@@ -97,16 +94,13 @@ plbandwidth <-
     if (bwtype != "fixed" && cbounds$bound != "none" && !bounded_nonfixed_supported)
       stop("finite continuous kernel bounds require bwtype = \"fixed\"")
     ncon <- sum(zdati$icon)
-    if (identical(spec$regtype.engine, "lp") && ncon > 0L && is.finite(nobs)) {
-      lp.dim <- dim_basis(basis = spec$basis.engine,
-                          kernel = TRUE,
-                          degree = spec$degree.engine,
-                          segments = rep.int(1L, ncon))
-      if (is.finite(lp.dim) && lp.dim > (nobs - 1.0))
-        stop(sprintf("LP basis dimension (%s) exceeds nobs - 1 (%s); reduce degree",
-                     format(lp.dim, trim = TRUE, scientific = FALSE),
-                     format(nobs - 1.0, trim = TRUE, scientific = FALSE)))
-    }
+    if (identical(spec$regtype.engine, "lp") && ncon > 0L && is.finite(nobs))
+      npValidateLpBasisAdmission(
+        basis = spec$basis.engine,
+        degree = spec$degree.engine,
+        nobs = nobs,
+        where = "plbandwidth"
+      )
 
     porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order",
       "Eighth-Order" )
@@ -200,7 +194,12 @@ plbandwidth <-
     if(!bandwidth.compute)
       mybw$pmethod <- "Manual"
 
+    # Child descriptions follow the same declared response roles as the
+    # outer object. This does not change their retained samples or bandwidths.
+    for (i in seq_along(mybw$bw))
+      mybw$bw[[i]] <- updateBwNameMetadata(list(ynames = c(ynames, xnames)[[i]]), mybw$bw[[i]])
     class(mybw) = "plbandwidth"
+    mybw <- .np_ordered_bandwidth_contract(mybw)
     if(!any(is.na(mybw$bandwidth)))
       validateBandwidth(mybw)
     mybw

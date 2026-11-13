@@ -640,9 +640,9 @@ ac_includes_default="\
 ac_header_c_list=
 ac_subst_vars='LTLIBOBJS
 LIBOBJS
+NP_ACCELERATE_CPPFLAGS
 PKG_LIBS
 PKG_CPPFLAGS
-NP_ACCELERATE_CPPFLAGS
 PRTED
 ORTED
 PKG_CONFIG
@@ -4147,6 +4147,50 @@ case "$MPITYPE" in
     ;;
 esac
 
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for MPI_Info_get_string" >&5
+printf %s "checking for MPI_Info_get_string... " >&6; }
+np_saved_CPPFLAGS="$CPPFLAGS"
+np_saved_LIBS="$LIBS"
+CPPFLAGS="$CPPFLAGS $PKG_CPPFLAGS"
+LIBS="$PKG_LIBS $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <mpi.h>
+int
+main (void)
+{
+
+  int buflen = 1, flag;
+  char value[1];
+  int (*get_string)(MPI_Info, const char *, int *, char *, int *) =
+    MPI_Info_get_string;
+  /* Link only: avoid unrelated predefined-handle data symbols. */
+  return get_string((MPI_Info)0, "key", &buflen, value, &flag);
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+
+
+printf "%s\n" "#define HAVE_MPI_INFO_GET_STRING 1" >>confdefs.h
+
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; } ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+CPPFLAGS="$np_saved_CPPFLAGS"
+LIBS="$np_saved_LIBS"
+
+
 
 
 
@@ -5302,3 +5346,6 @@ if test -n "$ac_unrecognized_opts" && test "$enable_option_checking" != no; then
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: unrecognized options: $ac_unrecognized_opts" >&5
 printf "%s\n" "$as_me: WARNING: unrecognized options: $ac_unrecognized_opts" >&2;}
 fi
+
+# Bind the lazy-load data and every native object to these source inputs.
+"${R_HOME}/bin/Rscript" --vanilla tools/worker-identity.R || exit 1

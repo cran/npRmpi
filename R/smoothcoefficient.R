@@ -1,8 +1,8 @@
 smoothcoefficient <- 
-  function(bws, eval, mean, merr = NA, beta = NA,
-           grad = NA, gerr = NA, resid = NA,
+  function(bws, eval, mean, merr = NULL, beta = NA,
+           grad = NA, gerr = NULL, resid = NA,
            ntrain, trainiseval = FALSE, residuals = FALSE,
-           betas = FALSE,
+           betas = FALSE, se = TRUE,
            xtra = rep(NA, 6),
            timing = NA, total.time = NA,
            optim.time = NA, fit.time = NA){
@@ -31,6 +31,7 @@ smoothcoefficient <-
       merr = merr,
       ntrain = ntrain,
       trainiseval = trainiseval,
+      se = se,
       residuals = residuals,
       betas = betas,
       beta = beta,
@@ -85,36 +86,52 @@ fitted.smoothcoefficient <- function(object, ...){
  object$mean 
 }
 residuals.smoothcoefficient <- function(object, ...) {
- if(object$residuals) { return(object$resid) } else { return(npscoef(bws = object$bws, residuals =TRUE)$resid) } 
+  if (object$residuals) return(object$resid)
+  do.call(npscoef, c(list(bws = object$bws, residuals = TRUE),
+                    .np_scoef_replay_controls(object, list())))$resid
 }
-se.smoothcoefficient <- function(x){ x$merr }
+
+.np_scoef_replay_controls <- function(object, dots) {
+  controls <- object[["fit.controls", exact = TRUE]]
+  allowed <- c("iterate", "maxiter", "tol", "leave.one.out")
+  for (name in intersect(names(controls), allowed))
+    if (!(name %in% names(dots))) dots[[name]] <- controls[[name]]
+  dots
+}
+se.smoothcoefficient <- function(x){
+  .np_require_stored_se(x, x[["merr", exact = TRUE]], "npscoef",
+                       expr = substitute(x))
+}
 predict.smoothcoefficient <- function(object, se.fit = FALSE, ...) {
   se.fit <- npValidateScalarLogical(se.fit, "se.fit")
   dots <- list(...)
+  npRejectLegacyBooleanErrors(dots, "predict.smoothcoefficient")
+  if ("se" %in% names(dots))
+    stop("predict.smoothcoefficient uses 'se.fit', not 'se'", call. = FALSE)
   has.formula.route <- !is.null(object$bws$formula)
+  if (!has.formula.route)
+    dots <- .np_match_native_args(dots, npscoef.scbandwidth,
+                                  c("txdat", "tydat", "tzdat"))
 
   if ((!is.null(dots$exdat) || !is.null(dots$ezdat)) && !is.null(dots$newdata)) {
     dots$newdata <- NULL
   } else if (!has.formula.route && is.null(dots$exdat) && !is.null(dots$newdata)) {
-    nd <- toFrame(dots$newdata)
-    if (!is.null(object$bws$znames)) {
-      need <- c(object$bws$xnames, object$bws$znames)
-      if (!all(need %in% names(nd)))
-        stop("'newdata' must include columns: ", paste(need, collapse = ", "))
-      dots$exdat <- nd[, object$bws$xnames, drop = FALSE]
-      dots$ezdat <- nd[, object$bws$znames, drop = FALSE]
-    } else {
-      if (!all(object$bws$xnames %in% names(nd)))
-        stop("'newdata' must include columns: ", paste(object$bws$xnames, collapse = ", "))
-      dots$exdat <- nd[, object$bws$xnames, drop = FALSE]
-    }
+    groups <- list(exdat = object$bws$xnames)
+    if (!is.null(object$bws$znames)) groups$ezdat <- object$bws$znames
+    parts <- .np_native_newdata_parts(dots$newdata, groups, "predict.npscoef")
+    dots$exdat <- parts$exdat
+    if (!is.null(parts$ezdat)) dots$ezdat <- parts$ezdat
     dots$newdata <- NULL
   }
 
-  tr <- do.call(npscoef, c(list(bws = object$bws), dots))
+  score.dots <- dots
+  dots <- .np_scoef_replay_controls(object, dots)
+  tr <- do.call(npscoef, c(list(bws = object$bws, se = se.fit), dots))
   if(se.fit)
     return(list(fit = fitted(tr), se.fit = se(tr), 
-                df = tr$nobs, residual.scale = tr$MSE))
+                df = tr$nobs, residual.scale = .np_prediction_training_mse(
+                  object, tr, score.dots,
+                  controls = c("iterate", "maxiter", "tol", "leave.one.out"))))
   else
     return(fitted(tr))
 }

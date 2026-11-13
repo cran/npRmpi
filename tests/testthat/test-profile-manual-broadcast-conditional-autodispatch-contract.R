@@ -1,5 +1,5 @@
 run_cmd_subprocess <- function(cmd, args = character(), timeout = 60L, env = character()) {
-  out <- suppressWarnings(system2(cmd,
+  out <- suppressWarnings(npRmpi_test_system2(cmd,
                                   args,
                                   stdout = TRUE,
                                   stderr = TRUE,
@@ -25,7 +25,7 @@ ensure_subprocess_npRmpi_lib <- local({
       return(lib.path.cache)
 
     pkg.root <- tryCatch(
-      normalizePath(testthat::test_path("..", ".."), mustWork = TRUE),
+      npRmpi_namespace_hygiene_root(),
       error = function(e) ""
     )
     if (!nzchar(pkg.root))
@@ -35,7 +35,7 @@ ensure_subprocess_npRmpi_lib <- local({
     dir.create(lib.path.cache, recursive = TRUE, showWarnings = FALSE)
 
     cmd <- file.path(R.home("bin"), "R")
-    out <- suppressWarnings(system2(
+    out <- suppressWarnings(npRmpi_test_system2(
       cmd,
       c("CMD", "INSTALL", "--no-test-load", "-l", lib.path.cache, pkg.root),
       stdout = TRUE,
@@ -120,7 +120,7 @@ test_that("profile manual-broadcast user-style conditional fixed-bandwidth route
     timeout = 90L,
     env = env_profile
   )
-  if (res$status != 0L) {
+  if (res$status != 0L && .is_mpi_init_env_failure(res$output)) {
     env_profile_fallback <- c(
       env_common,
       sprintf("R_PROFILE_USER=%s", profile.path),

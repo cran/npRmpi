@@ -16,8 +16,9 @@
   and Racine (1997).
 }
 \usage{
-npsigtest(bws, 
-          \dots)
+npsigtest(bws,
+          \dots,
+          B = 399)
 
 \method{npsigtest}{formula}(bws, 
           data = NULL, 
@@ -34,7 +35,7 @@ npsigtest(bws,
 \method{npsigtest}{rbandwidth}(bws,
           xdat = stop("data xdat missing"),
           ydat = stop("data ydat missing"),
-          boot.num = 399,
+          B = 399,
           boot.method = c("iid","wild","wild-rademacher","pairwise"),
           boot.type = c("I","II"),
           pivot=TRUE,
@@ -64,6 +65,13 @@ These arguments identify the bandwidth object, formula/data interface, and expli
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object coercible to
     a data frame by \code{\link{as.data.frame}}) containing the
     variables in the model. If not found in data, the variables are
@@ -100,7 +108,7 @@ These arguments control bootstrap execution, tested effects, and reproducibility
   }
 
 
-  \item{boot.num}{
+  \item{B}{
     an integer value specifying the number of bootstrap replications to
     use. Defaults to \code{399}.
   }
@@ -136,14 +144,18 @@ These arguments control bootstrap execution, tested effects, and reproducibility
 
 
   \item{pivot}{
-    a logical value which specifies whether to bootstrap a pivotal
-    statistic or not (pivoting is achieved by dividing gradient
-    estimates by their asymptotic standard errors). Defaults to
-    \code{TRUE}.
+    a logical value specifying whether to studentize the statistic.
+    The default, \code{TRUE}, divides continuous derivatives and
+    categorical finite differences by their asymptotic standard errors.
+    This applies to individual and joint tests. \code{FALSE} requests
+    the unstandardized statistic for every tested predictor.
+    \code{NULL} is no longer accepted.
   }
 
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
@@ -166,11 +178,106 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
 
   \code{npsigtest} implements a variety of methods for computing the
   null distribution of the test statistic and allows the user to
-  investigate the impact of a variety of default settings including
-  whether or not to pivot the statistic (\code{pivot}), whether pairwise
+  investigate the impact of a variety of settings including whether or
+  not to pivot the statistic (\code{pivot}), whether pairwise
   or residual resampling is to be used (\code{boot.method}), and whether
   or not to recompute the bandwidths for the variables being tested
   (\code{boot.type}), among others.
+
+  Eligible individual tests with fixed bandwidths, IID residual resampling,
+  and a supported local-polynomial or categorical-only local-constant engine
+  evaluate bootstrap statistics in bounded native tiles. This is an internal
+  computational optimization: it preserves bootstrap draws, random-number
+  state, statistics, and P-values across the serial and MPI paths. Joint tests
+  and configurations outside the qualified set continue through the incumbent
+  bootstrap loop.
+
+  The categorical statistic of Racine, Hart, and Li (2006) is the
+  unstandardized mean of squared finite-difference estimates, available
+  with \code{pivot=FALSE}. The default extends this construction by
+  studentizing categorical effects as well as continuous derivatives.
+  For a joint test, the statistic is the mean of squared componentwise
+  studentized effects over observations and tested predictors; it is not
+  an inverse-covariance Wald statistic.
+
+  Studentized statistics use the residual-normalized gradient sandwich
+  described in \code{\link{npreg}}, including its Ruppert et al. (1997)
+  residual correction. Each bootstrap response supplies its own normalized
+  training residuals; original-response errors are not held fixed across
+  replications. Categorical errors use paired endpoint influence
+  differences and retain endpoint covariance. Observed and bootstrap
+  calculations use the same producer and information-availability rules.
+  Eligible streamed calculations use the equivalent shared influence
+  calculation without retaining a full influence matrix. This does not
+  account for bandwidth or degree-selection uncertainty, or guarantee size
+  calibration for every sample and configuration.
+
+  Studentization can reduce size distortion, but does not uniformly improve
+  finite-sample calibration or power. In sparse designs it can be
+  conservative and have lower power than the unstandardized statistic;
+  rejection frequencies from an oversized unstandardized test are not
+  size-adjusted power comparisons. The choice of pivot does not replace
+  assessment of the fitted model and available local information.
+
+  Identical categorical endpoints contribute zero without changing the
+  number of observations in the statistic's denominator. A native
+  certificate of identically zero paired influence has the same
+  interpretation; unavailable donor variance alone is not such a
+  certificate. Unordered
+  first-level reference rows have this property; ordered first-level rows
+  instead use a forward difference. An entire finite observed effect vector
+  that is exactly zero has statistic zero under the degenerate-zero
+  convention. Because bootstrap statistics are nonnegative, the inclusive
+  upper-tail P-value is one, without bootstrap fitting or bandwidth
+  reselection. The bootstrap statistics need not also be zero. This applies
+  to an individual test, or a joint test only when every tested observed
+  effect vanishes. A zero component of a mixed joint test stays in the
+  original denominator; it does not suppress the other components.
+  The test has no separate bandwidth-based full-smoothing detector. However,
+  the regression estimator's existing large-categorical-bandwidth
+  approximation can make a categorical contrast exactly zero near the
+  kernel's upper bandwidth bound, thereby triggering this convention.
+  This can produce a discontinuity in the P-value at that approximation's
+  cutoff; it is not evidence that the unapproximated contrast has vanished.
+  The test respects the estimator option \code{np.largelambda}, including
+  when the caller explicitly disables the approximation. Random draws are
+  advanced to preserve later tests' random-number streams.
+
+  Otherwise a required zero, negative, non-finite or unavailable standard
+  error does not define studentization. An isolated zero effect with zero
+  standard error within a nonzero effect vector is not covered by the
+  degenerate-zero convention unless its influence is separately certified
+  as identically zero. The test stops with an informative diagnostic;
+  it does not insert
+  a variance floor, discard rows or failed replications, or substitute an
+  unstandardized statistic. This rule applies equally to continuous and
+  categorical effects and to observed and bootstrap responses.
+
+  When the supplied bandwidth object has \code{regtype="lp"}, every
+  tested continuous coordinate must have polynomial degree at least one.
+  A degree-zero local polynomial does not identify the derivative used by
+  this significance test, so the function stops before fitting or
+  bootstrap work and names the affected coordinate(s). If the degree was
+  selected by NOMAD, refit the bandwidth object with
+  \code{degree.min=1}. This restriction does not apply to an ordinary
+  \code{regtype="lc"} bandwidth object.
+
+  With nearest-neighbor bandwidths, repeated continuous values can give a
+  required radius of zero. In this case the test stops with the shared
+  nearest-neighbor diagnostic, identifying the affected variable and the
+  failing stage. This can occur during bootstrap-geometry preflight, the
+  unrestricted gradient, or null-model evaluation, before bootstrap
+  replications. It is not a blanket restriction on repeated values. Refit
+  using \code{bwtype="fixed"} (the
+  default) to avoid this nearest-neighbor radius limitation; see
+  \code{\link{np.kernels}}.
+
+  The empirical upper-tail P-value counts bootstrap statistics equal to
+  the observed statistic, that is,
+  \eqn{P=B^{-1}\sum_{b=1}^B 1\{I_b^*\ge I\}}. Thus equality with the
+  bootstrap critical value is non-rejection. In particular, when
+  smoothing makes both the observed statistic and every bootstrap
+  statistic exactly zero, the returned P-value is one rather than zero.
 
   Defaults are chosen so as to provide reasonable behaviour in a broad
   range of settings and this involves a trade-off between computational
@@ -195,6 +302,13 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
 
 }
 
+\section{Bootstrap P-Values}{
+  The bootstrap upper-tail p-value is the proportion of bootstrap statistics
+  greater than or equal to the observed statistic. Ties count as at least as
+  extreme, giving the conservative tie convention for discrete statistics.
+  This is the ordinary bootstrap proportion, without an add-one correction;
+  a reported zero is possible with a finite number of replications.
+}
 \value{
   \code{npsigtest} returns an object of type
   \code{sigtest}. \code{\link{summary}} supports \code{sigtest} objects. It
@@ -202,14 +316,26 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
   following components:
 
   \item{In}{ the vector of statistics \code{In} }
-  \item{P}{ the vector of P-values for each statistic in \code{In}}
+  \item{P}{ the vector of empirical upper-tail P-values for each statistic
+    in \code{In}; bootstrap values equal to the observed statistic are
+    included in the upper tail.}
   \item{In.bootstrap}{ contains a matrix of the bootstrap
     replications of the vector \code{In}, each column corresponding to
     replications associated with explanatory variables in \code{xdat}
     indexed by \code{index} (e.g., if you selected \code{index = c(1,4)}
     then In.bootstrap will have two columns, the first being the
     bootstrap replications of \code{In} associated with variable
-    \code{1}, the second with variable \code{4}).}
+    \code{1}, the second with variable \code{4}). An analytically skipped
+    test has an \code{NA} column, not manufactured bootstrap draws.}
+  \item{pivot}{the requested logical pivot mode, \code{TRUE} or \code{FALSE}.}
+  \item{pivot.effective}{a named logical vector recording the statistic
+    actually used for each tested predictor. For a joint test all entries
+    are identical.}
+  \item{bootstrap.executed}{the number of bootstrap statistics actually
+    computed for each test (zero for analytic non-rejection).}
+  \item{bootstrap.reason}{the structural reason for skipping bootstrap
+    computation, or \code{NA} when it was performed. The requested
+    number of replications remains in \code{boot.num}.}
 
 }
 \section{Book And Method Pointers}{
@@ -252,25 +378,51 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
 
 \section{Usage Issues}{
 
+  In \pkg{npRmpi}, the distributed bootstrap planner is not qualified for
+  user-supplied uniform RNG replay and refuses such saved bootstrap plans
+  before replaying a task. This does not certify restoration of opaque caller
+  state by a temporary seed scope. Explicitly select
+  a built-in uniform generator, for example
+  \code{RNGkind(kind="Mersenne-Twister")}, and set the desired seed before
+  distributed bootstrap use. See \code{\link{npRmpi.init}} for the current
+  RNG and state-replay limitations. This does not change the selected
+  \code{boot.method}.
+
   If you are using data of mixed types, then it is advisable to use the
   \code{\link{data.frame}} function to construct your input data and not
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work
   as intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
+
+  Resampling can repeat continuous observations. With nearest-neighbor
+  bandwidths, an inherited count can then give a zero literal radius, even
+  when it was feasible in the preceding sample. Such a candidate is refused;
+  the resulting error is propagated, not converted to a successful replicate
+  or a different bootstrap method. Inspect ties and nearest-neighbor counts, or
+  explicitly select fixed bandwidths (\code{bwtype="fixed"}) when this occurs.
 
   Caution: bootstrap methods are, by their nature, \emph{computationally
   intensive}. This can be frustrating for users possessing large
   datasets. For exploratory purposes, you may wish to override the
   default number of bootstrap replications, say, setting them to
-  \code{boot.num=99}. A version of this package using the \code{Rmpi}
+  \code{B=99}. A version of this package using the \code{Rmpi}
   wrapper is under development that allows one to deploy this software
   in a clustered computing environment to facilitate computation
   involving large datasets.
@@ -321,7 +473,7 @@ model <- npreg(y~z+x1+x2,
                regtype="ll",
                bwmethod="cv.aic")
 
-output <- npsigtest(model,boot.num=29)
+output <- npsigtest(model,B=29)
 
 summary(output)
 

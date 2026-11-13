@@ -24,12 +24,14 @@
 \usage{
 nplsqreg(bws, \dots)
 
+\method{predict}{lsqregression}(object, se.fit = FALSE, \dots, tau = NULL)
+
 \method{nplsqreg}{formula}(bws, data = NULL, newdata = NULL, tau = 0.5,
        gradients = FALSE, residuals = FALSE, subset, na.action,
-       gradient.order = 1L, \dots)
+       gradient.order = 1L, se = FALSE, \dots)
 
 \method{nplsqreg}{lsqregressionbandwidth}(bws, txdat = NULL, tydat = NULL,
-       tau = bws$tau, \dots)
+       tau = bws$tau, se = FALSE, \dots)
 
 \method{nplsqreg}{default}(bws,
        txdat = stop("training data 'txdat' missing"),
@@ -39,9 +41,14 @@ nplsqreg(bws, \dots)
        gradients = FALSE,
        residuals = FALSE,
        gradient.order = 1L,
+       se = FALSE,
        \dots)
 }
 \arguments{
+  \item{object}{a fitted \code{lsqregression} object.}
+  \item{se.fit}{logical; whether prediction standard errors are returned.
+    Defaults to \code{FALSE}.}
+
 \subsection{Data, Bandwidth Inputs And Formula Interface}{
 These arguments identify the bandwidth specification, formula/data interface,
 and training data.
@@ -53,9 +60,20 @@ and training data.
     bandwidth vector, or omitted for automatic bandwidth selection.
     Exact nplsqreg reuse is through the fitted object's \code{$bws}
     component; \code{$reg.bws} is internal regression state.
+    A formula-based \code{rbandwidth} retains its training sample and
+    bandwidth specification; supplying \code{data} explicitly replaces the
+    training sample. With \code{bandwidth.compute = FALSE}, its bandwidths
+    are held fixed in the quantile fit.
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment containing the variables
     in the model. If not found in \code{data}, the variables are taken
     from \code{environment(bws)}.
@@ -63,7 +81,11 @@ and training data.
 
   \item{subset}{
     an optional vector specifying a subset of observations to be used by
-    the formula method.
+    the formula method. When using a formula-based regression bandwidth
+    object as a starting bandwidth, a row-changing subset requires explicit
+    \code{data}; \code{NULL} and \code{TRUE} reuse all retained rows.
+    A stored LSQ bandwidth object cannot be resubsetted; rebuild it with
+    \code{nplsqregbw()} for another training sample.
   }
 
   \item{na.action}{
@@ -103,6 +125,12 @@ fitted quantities are returned.
     should be computed and returned. Defaults to \code{FALSE}.
   }
 
+  \item{se}{
+    a logical value indicating whether asymptotic standard errors should be
+    computed and retained. Defaults to \code{FALSE}. Request
+    \code{se=TRUE} when \code{se()} or gradient standard errors will be used.
+  }
+
   \item{gradient.order}{
     for a final \code{regtype="lp"} fit with \code{gradients=TRUE}, a
     positive integer scalar or one positive integer per continuous
@@ -125,6 +153,10 @@ selection, prediction, or plotting route.
   \item{tau}{
     a numeric scalar or vector specifying the quantile probability or
     probabilities \eqn{\tau}{tau}. Values must lie strictly in \eqn{(0,1)}.
+    For \code{predict()}, omit \code{tau} or use \code{NULL} to predict
+    all stored quantiles. Otherwise supply distinct, exactly matching stored
+    values in the desired order. Unfitted values are an error; prediction
+    does not select bandwidths or recalibrate a new quantile.
   }
 
   \item{\dots}{
@@ -136,9 +168,63 @@ selection, prediction, or plotting route.
     \code{nomad}, \code{search.engine}, \code{tau.search},
     \code{delta}, \code{scale}, \code{regtype.pilot},
     \code{nomad.pilot}, and \code{pilot.args}.
+    The primary \code{nomad} control accepts \code{FALSE}, \code{TRUE}, or
+    \code{"auto"}; AUTO uses exhaustive/cell degree search with one
+    continuous smoothing dimension and NOMAD/Powell with two or more.
   }
 }
 \details{
+  The \code{tau} prediction argument must be named. Selecting one stored
+  quantile returns the ordinary scalar prediction vector (or the scalar
+  prediction list when \code{se.fit = TRUE}). Selecting several returns
+  prediction and standard-error matrices with columns in the requested order,
+  preserving the stored quantile labels and aligning \code{residual.scale}.
+  Omitting \code{tau}, or supplying \code{NULL}, preserves the fitted
+  object's original scalar or matrix output shape.
+
+  Prediction with \code{se.fit = TRUE} reports known training mean squared
+  error in \code{residual.scale}, retaining MSE units, or \code{NA} when
+  training provenance is unavailable. Evaluation outcomes do not replace this
+  training score. No additional fit is performed to recover it.
+  This score concerns the regression on the transformed quantile response.
+  For vector \code{tau}, \code{residual.scale} is a named vector with one
+  training MSE for each requested quantile, matching the prediction columns.
+
+  A stored \code{lsqregressionbandwidth} object retains its training
+  sample, pilots and transformed response. Replacement \code{data}, a
+  row-changing \code{subset}, or a new \code{na.action} is an error:
+  use \code{nplsqregbw()} to construct bandwidth state on the new sample.
+  Use \code{newdata} or \code{exdat} for prediction instead.
+
+  Formula fits retain trained terms and prediction expressions, so
+  data-dependent transformations are reused for \code{newdata} rather than
+  recalculated on each prediction grid. The same terms are retained by the
+  scalar children of vector-\code{tau} fits. Native \code{exdat} already
+  contains model coordinates and is not transformed again. An unnamed
+  evaluation argument in \code{...} follows \code{newdata} for formula
+  predictions and \code{exdat} for native predictions; name \code{se.fit}
+  explicitly when using this positional form. Older saved
+  objects without trained terms retain their formula-based fallback.
+
+  Omitted training rows are restored as \code{NA} in fitted values and
+  residuals, including fits obtained from a retained bandwidth object and
+  multiple quantile probabilities. Prediction restores omitted evaluation
+  rows in both estimates and standard errors. Explicit training inputs own
+  their row positions; a complete-case replacement is not padded using an
+  older bandwidth object's omissions.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
   The estimator follows the locally weighted quantile-kernel approach of
   Racine and Li (2017). Given a conditional scale pilot
   \eqn{\hat\sigma(X_i)}, define
@@ -176,21 +262,68 @@ selection, prediction, or plotting route.
   follow the corresponding mixed-data regression semantics. For a
   local-polynomial fit, \code{gradient.order} is applied coordinate by
   coordinate to continuous predictors. Availability follows \code{npreg}:
-  when at least one requested continuous derivative is available, components
-  whose order exceeds their fitted polynomial degree are returned as \code{NA}
-  with a warning; a request with no available continuous derivative component
-  is rejected. No mixed partials, Hessians, derivative tensors, or multiple
+  Apart from the established all-degree-zero first-derivative compatibility
+  route, components whose order exceeds their fitted polynomial degree are returned
+  as \code{NA} with a warning whenever another continuous derivative or
+  categorical first-difference effect is available; plots retain those
+  components as empty panels. A request with no available component is
+  rejected. No mixed partials, Hessians, derivative tensors, or multiple
   derivative orders are stored. With vector \code{tau}, the
   existing evaluation-by-coordinate-by-\code{tau} array layout is retained.
   The \code{\link{gradients}} method extracts exactly the stored order and
   rejects any different requested order; it does not recompute derivatives
   after fitting.
 
+  A scalar quantile can be displayed as a surface by explicitly supplying
+  \code{perspective=TRUE} when there are two continuous or numeric-labelled
+  ordered conditioning variables. Omitting \code{perspective}, or supplying
+  \code{perspective=FALSE}, retains the usual slice layout. Vector quantiles
+  and gradient plots also retain their slice layout. Surface uncertainty is
+  calibrated over the complete displayed grid for that one \code{tau}.
+  Both the base renderer and \code{renderer="rgl", view="fixed"} support
+  level surfaces and their interval meshes. Returned evaluation rows retain
+  the trained predictor names and ordered-factor support; numeric axis
+  coordinates are used only for drawing. The data overlay can be disabled
+  with \code{data.overlay=FALSE}.
+
+  Asymptotic \code{plot(..., band="simultaneous")} and \code{band="all"}
+  use the accepted local regression response maps for each fitted
+  transformed-response curve. Level, continuous-derivative and paired
+  categorical-effect factors retain common observation columns, the selected
+  local-constant or local-polynomial specification, and the actual native
+  moment/ridge convention. Residual normalization uses the training fit map;
+  reconstruction checks reject numerically unidentifiable maps instead of
+  changing the fitted estimator. The fixed-regression fitting and bandwidth
+  selection algorithms are unchanged.
+
+  Calibration is over the retained finite grid within one panel and one
+  \code{tau}; it is not joint over taus or panels. \code{gaussian.draws}
+  controls the Gaussian maximum simulation, and \code{random.seed} controls
+  reproducibility. The temporary seed scope restores the visible
+  \code{.Random.seed} binding (or its absence), but not hidden generator state,
+  including a pending Box--Muller normal or custom state absent from that binding.
+  Subsequent caller draws can therefore differ. This is separate from replay
+  within the current band calculation. These are
+  variability bands under the frozen transformation convention below; they
+  do not add uncertainty from transformation selection or remove smoothing
+  bias, and do not cover points between the declared grid. Coverage requires
+  a valid joint Gaussian approximation and consistent local marginal scales;
+  arbitrary growing or data-dependent grids do not carry a uniform-coverage
+  guarantee. Unavailable marginal errors, unidentified influences or resource
+  limits produce a specific unavailable joint-band notice.
+
   Standard errors are the asymptotic standard errors from that final
   transformed-response regression, conditional on the selected
-  bandwidths, pilot scale, and \eqn{\delta}{delta}. For vector
-  \code{tau}, per-quantile fits are independent, so estimated quantile
-  curves are not monotonized and may cross in finite samples.
+  bandwidths, pilot scale, and \eqn{\delta}{delta}. They inherit the
+  residual normalization described under Standard Errors in
+  \code{\link{npreg}} (Ruppert et al., 1997), applied to the transformed
+  response. This does not add uncertainty from estimating the pilot scale
+  or transformation. Local-polynomial fits inherit the numerical-ridging
+  policy documented there. For vector
+  \code{tau}, quantiles are fitted separately, so estimated quantile
+  curves are not monotonized and may cross in finite samples. Separate
+  fits on the same observations do not imply zero cross-quantile
+  sampling covariance.
 }
 \value{
   \code{nplsqreg} returns an object of class \code{lsqregression}. The
@@ -227,13 +360,28 @@ selection, prediction, or plotting route.
   \code{\link{cbind}}, since \code{\link{cbind}} will typically not work as
   intended on mixed data types and will coerce the data to the same type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
+  When converting a formula-based \code{rbandwidth} without replacement
+  \code{data}, an explicitly supplied \code{scale} vector must follow the
+  retained complete training sample in its stored order. With replacement
+  \code{data}, scale follows the formula's ordinary subset and missing-data
+  handling.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
 }
 \seealso{
   \code{\link{nplsqregbw}}, \code{\link{npreg}}, \code{\link{npqreg}},
@@ -249,7 +397,7 @@ plot(model.q)
 
 model.med <- nplsqreg(gdp ~ ordered(year), data = Italy, tau = 0.50)
 model.q2 <- nplsqreg(bws = model.med$bws, tau = 0.50)
-plot(model.med, gradient = TRUE)
+plot(model.med, gradients = TRUE)
 }
 }
 \keyword{nonparametric}

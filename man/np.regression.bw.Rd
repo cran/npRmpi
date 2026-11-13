@@ -131,6 +131,8 @@ These arguments identify the data and whether bandwidths are supplied or compute
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
     \code{xdat}.
+    Factors and ordered factors are not supported. Select a numeric outcome
+    scale explicitly; categorical predictors remain supported.
   }
 
   \item{bws}{
@@ -150,7 +152,8 @@ These arguments identify the data and whether bandwidths are supplied or compute
     a logical value which specifies whether to do a numerical search for
     bandwidths or not. If set to \code{FALSE}, a \code{rbandwidth} object
     will be returned with bandwidths set to those specified
-    in \code{bws}. Defaults to \code{TRUE}.
+    in \code{bws}. Defaults to \code{TRUE}. The beta associated-kernel route
+    supports both automatic cross-validation and explicit bandwidth objects.
   }
 
 \subsection{Local-Polynomial And NOMAD Controls}{
@@ -167,7 +170,8 @@ These arguments control regression type, local-polynomial specification, and opt
     \code{degree.select != "manual"}. \code{ll} and positive-degree
     \code{lp} require at least one continuous predictor; for
     categorical-only predictors use \code{lc} or \code{lp} with
-    \code{degree=0}. Defaults to \code{lc}.
+    \code{degree=0}. The beta associated-kernel route supports
+    \code{lc}, \code{ll}, and \code{lp}. Defaults to \code{lc}.
   }
 
   \item{basis}{
@@ -187,8 +191,22 @@ These arguments control regression type, local-polynomial specification, and opt
   \item{bernstein.basis}{
     logical flag relevant only when \code{regtype="lp"}. If
     \code{FALSE} (default), the GLP basis uses raw local-polynomial
-    powers (stable for extrapolation). If \code{TRUE}, a Bernstein
-    (B-spline) basis is used for continuous predictors. For
+    powers (allowing extrapolation). Raw powers can be numerically unstable,
+    particularly above degree one or when predictor offsets are large relative
+    to their spread. The option \code{bernstein.basis=TRUE} is provided to
+    improve numerical conditioning; it does not remedy genuine collinearity.
+    Centring/scaling continuous predictors is another explicit user choice.
+    The conditioning diagnostic assesses the selected basis, so numerical rank
+    deficiency need not imply genuinely redundant predictors. The package does
+    not silently switch the selected basis.
+    For \code{basis="glp"}, the historical
+    selector \code{TRUE} uses the degree-graded, orthonormal shifted-Legendre
+    construction described in
+    \code{\link{npreg}}; it has exactly the same complete, coordinate-capped
+    total-degree polynomial span as the raw GLP representation and is an exact
+    deterministic linear transformation of Bernstein polynomial spaces.
+    Additive and tensor bases retain their fixed-coordinate-degree Bernstein
+    representation. For
     \code{bernstein.basis=TRUE}, prediction/evaluation points must lie
     within the training support of each continuous predictor. For
     automatic degree search, if \code{bernstein.basis} is not
@@ -208,7 +226,8 @@ These arguments control regression type, local-polynomial specification, and opt
     continuous predictors (exactly one degree per continuous predictor),
     relevant only when \code{regtype="lp"}. When
     \code{degree.select="manual"}, this must be supplied explicitly.
-    Entries must be non-negative integers in \code{[0,12]}.
+    Entries must be non-negative integers in \code{[0,100]}; values above 25
+    trigger a numerical-stability warning.
     With no continuous predictors, \code{regtype="lp"} is only
     admissible when \code{degree=0}, the local-constant equivalent.
     Bandwidth optimization treats this vector as fixed input and
@@ -384,7 +403,8 @@ These controls set numerical search starts, kernel choices, and support bounds.
   \item{ckerbound}{
     character string controlling continuous-kernel support handling.
     Can be set as \code{none} (default kernel on full support),
-    \code{range} (use sample min/max), or \code{fixed} (use
+    \code{range} (use sample min/max, except that beta kernels use the
+    outer half-spacing rule in \code{\link{np.kernels}}), or \code{fixed} (use
     \code{ckerlb}/\code{ckerub}). The bounded-kernel route reuses the selected continuous kernel and renormalizes it on the chosen support; see \code{\link{np.kernels}}.
   }
 
@@ -403,8 +423,9 @@ These controls set numerical search starts, kernel choices, and support bounds.
 
   \item{ckertype}{
     character string used to specify the continuous kernel type.
-    Can be set as \code{gaussian}, \code{epanechnikov}, or
-    \code{uniform}. Defaults to \code{gaussian}.
+    Can be set as \code{gaussian}, \code{epanechnikov}, \code{uniform}, or
+    \code{beta}; see Details for the finite-support beta
+    contract. Defaults to \code{gaussian}.
   }
 
   \item{ckerub}{
@@ -439,9 +460,11 @@ These controls set numerical search starts, kernel choices, and support bounds.
 
   \item{invalid.penalty}{ a character string specifying the penalty
     used when the optimizer encounters invalid bandwidths.
-    \code{"baseline"} returns a finite penalty based on a baseline
-    objective; \code{"dbmax"} returns \code{DBL\_MAX}. Defaults to
-    \code{"baseline"}.}
+    \code{"baseline"} returns finite guidance derived from the exact
+    criterion-specific constant null; \code{"dbmax"} returns
+    \code{DBL\_MAX}. Terminal invalidity is preserved until finalization,
+    and an automatically selected point is checked once against the raw
+    criterion before it is accepted. Defaults to \code{"baseline"}.}
 
   \item{itmax}{
     integer number of iterations before failure in the numerical
@@ -477,7 +500,7 @@ These controls set numerical search starts, kernel choices, and support bounds.
 
   \item{penalty.multiplier}{ a numeric multiplier applied to the
     baseline penalty when \code{invalid.penalty="baseline"}.
-    Defaults to \code{10}.}
+    It must be finite and strictly greater than one. Defaults to \code{10}.}
 
   \item{powell.remin}{
     logical flag controlling Powell restart-from-minimum behavior. For
@@ -553,6 +576,13 @@ These arguments are used by the formula method and are normally supplied by the 
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -588,6 +618,36 @@ These arguments collect remaining controls passed through S3 methods.
   }
 }
 \details{
+  Seeded temporary operations follow \link{np_rng_scope}.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state. The resolved
+NA policy is retained rather than re-read from later option settings. With
+explicit replacement training data, an explicitly supplied \code{na.action}
+overrides that policy, including \code{NULL}. Any remaining incomplete native
+training rows are omitted and recorded; this does not make incomplete rows
+valid estimator inputs. Character NA policies use the lookup owner of
+\code{stats::model.frame}; pass a custom function object explicitly.
+
+Retaining samples increases object size, and derived models can contain
+separate retained samples in their child bandwidth objects. User formula and
+custom-function environments are not generally pruned. They can retain
+unrelated caller objects, so serialized file size may be much larger than
+\code{object.size()} suggests. Sample ownership does not guarantee compact
+serialization of arbitrary user environments.
+
+MPI materialization can also retain concrete training values in an object's
+stored call, in addition to its retained sample. This can increase both in-memory
+and serialized size; retained-data ownership is not a promise of one physical copy.
+
 
 The \code{scale.factor.*} controls are dimensionless search controls. The package converts scale factors to bandwidths using the estimator-specific scaling already encoded in the bandwidth object, including the kernel order and the number of continuous variables relevant for that estimator. Users should not pre-multiply these controls by sample-size or standard-deviation factors. \code{scale.factor.init} controls the deterministic first search start, \code{scale.factor.init.lower} and \code{scale.factor.init.upper} control the random multistart interval, and \code{scale.factor.search.lower} is the lower admissibility bound for continuous fixed-bandwidth search candidates. Categorical search-start controls such as \code{dfac.init}, \code{lbd.init}, and \code{hbd.init} have separate semantics and are not affected by \code{scale.factor.search.lower}.
 
@@ -636,6 +696,10 @@ The \code{scale.factor.*} controls are dimensionless search controls. The packag
   with the point at which the density is estimated, \eqn{x}. Fixed bandwidths
   are constant over the support of \eqn{x}.
 
+  Exact ties can make the literal \eqn{k}th continuous nearest-neighbor
+  radius zero. Such a bandwidth is undefined and is rejected; see
+  \code{\link{np.kernels}} for the precise contract and remedies.
+
   \code{npregbw} may be invoked \emph{either} with a formula-like
   symbolic
   description of variables on which bandwidth selection is to be
@@ -665,10 +729,22 @@ The \code{scale.factor.*} controls are dimensionless search controls. The packag
 
   A variety of kernels may be specified by the user. Kernels implemented
   for continuous data types include the second, fourth, sixth, and eighth
-  order Gaussian and Epanechnikov kernels, and the uniform
-  kernel. Unordered discrete data types use a variation on Aitchison and
+  order Gaussian and Epanechnikov kernels, and the uniform kernel. Beta
+  associated kernels of orders 2, 4, 6, and 8 are additionally available for
+  local-constant, local-linear and local-polynomial bandwidth objects. Unordered discrete data types use a variation on Aitchison and
   Aitken's (1976) kernel, while ordered data types use a variation of the
   Wang and van Ryzin (1981) kernel.
+
+  The beta contract requires \code{ckertype="beta"}, \code{ckerorder} in
+  \code{c(2,4,6,8)} and finite \code{ckerbound="fixed"} bounds or
+  \code{ckerbound="range"} for each continuous predictor. Local-constant,
+  local-linear and local-polynomial regression support mixed continuous and
+  categorical predictors. Explicit bandwidth objects and automatic
+  \code{cv.ls}/\code{cv.aic} search support fixed, generalized-NN, and
+  adaptive-NN modes. Normal-reference selection is unsupported. Gradient
+  and standard-error support is described in \code{\link{npreg}}. See
+  \code{\link{npreg}} and \code{\link{np.kernels}} for the exact beta weight,
+  bandwidth convention, ratio estimator, and standard-error definition.
 
   When \code{regtype="lp"} and \code{degree.select != "manual"},
   \code{npregbw} can jointly determine the continuous-predictor degree
@@ -780,11 +856,29 @@ The \code{scale.factor.*} controls are dimensionless search controls. The packag
   element \eqn{i} corresponding to column \eqn{i} of input data
   \code{xdat}.
 
-  The functions \code{\link{predict}}, \code{\link{summary}}, and \code{\link{plot}} support
-  objects of this class.
+  Prediction follows a two-stage contract. Calling \code{predict(bw)}
+  on the returned bandwidth object is a convenience forwarder for
+  \code{npreg(bws = bw)} and returns a fitted \code{npregression}
+  object; it does not return a numeric vector of predictions. Call
+  \code{fitted(fit)}, \code{residuals(fit)}, or
+  \code{predict(fit, newdata = ...)} on that fitted object to obtain
+  numeric results. The canonical workflow is
+  \preformatted{
+    bw <- npregbw(y ~ x, data = mydata)
+    fit <- predict(bw)             # equivalent to npreg(bws = bw)
+    fitted(fit)
+    residuals(fit)
+    predict(fit, newdata = newdata)
+  }
+  The functions \code{\link{summary}} and \code{\link{plot}} also
+  support \code{rbandwidth} objects.
 }
 
 \section{Book And Method Pointers}{
+  Local-polynomial search uses the numerical-ridging policies described in
+  \code{\link{npreg}} (Seifert and Gasser, 2000). This is solve
+  stabilization, not the fitted-residual uncertainty correction.
+
   \code{npregbw} selects bandwidths and, when requested, local-polynomial
   degree/search metadata for estimating the conditional mean
   \eqn{m(x)=E[Y\mid X=x]}. For the estimator target and local-polynomial

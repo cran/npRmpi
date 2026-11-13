@@ -25,8 +25,9 @@ test_that("npreg formula bandwidth honors explicit data override", {
     bw <- npRmpi::npregbw(y ~ x, data = d1, bws = 0.35, bandwidth.compute = FALSE)
     d1$y <- 100 + d1$x
 
-    fit <- npRmpi::npreg(bws = bw, data = d2)
-    direct <- npRmpi::npreg(txdat = d2["x"], tydat = d2$y, bws = bw)
+    fit <- npRmpi::npreg(bws = bw, data = d2, se = TRUE)
+    direct <- npRmpi::npreg(txdat = d2["x"], tydat = d2$y, bws = bw,
+                            se = TRUE)
 
     expect_identical(fit$ntrain, nrow(d2))
     expect_equal(fit$mean, direct$mean, tolerance = 1e-12)
@@ -102,7 +103,7 @@ test_that("npreg residuals reuse the training fit result for training-data fits"
     expect_equal(fit$resid, y - fit$mean, tolerance = 1e-12)
     expect_equal(fit$mean, nores$mean, tolerance = 1e-12)
 
-    fn.body <- paste(deparse(body(getFromNamespace("npreg.rbandwidth", "npRmpi")),
+    fn.body <- paste(deparse(body(getFromNamespace(".npreg_fit_impl", "npRmpi")),
                              width.cutoff = 500L), collapse = " ")
     expect_match(fn.body, "compute\\.resid\\.from\\.fit")
     expect_match(fn.body, "resid <- as\\.double\\(resid\\.response\\) - myout\\$mean")
@@ -111,7 +112,7 @@ test_that("npreg residuals reuse the training fit result for training-data fits"
   })
 })
 
-test_that("npreg factor response and external-evaluation GOF sentinels remain stable", {
+test_that("npreg rejects categorical outcomes and retains external-evaluation GOF", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
 
   local_npreg_quiet({
@@ -119,16 +120,13 @@ test_that("npreg factor response and external-evaluation GOF sentinels remain st
     ty <- factor(rep(c("a", "b", "c"), length.out = 36))
     ex <- data.frame(x = seq(0.05, 0.95, length.out = 9))
     ey <- factor(rep(c("c", "a", "b"), length.out = 9), levels = levels(ty))
-    bw.factor <- npRmpi::npregbw(xdat = tx, ydat = ty, bws = 0.4, bandwidth.compute = FALSE)
-    fit.factor <- npRmpi::npreg(bws = bw.factor, txdat = tx, tydat = ty, exdat = ex, eydat = ey)
-    expect_equal(length(fit.factor$mean), nrow(ex))
-    expect_equal(length(fit.factor$merr), nrow(ex))
-    expect_null(fit.factor$xtra)
-    expect_true(all(is.finite(fit.factor$mean)))
+    expect_error(npRmpi::npregbw(xdat = tx, ydat = ty, bws = 0.4,
+                               bandwidth.compute = FALSE), "must be a numeric")
 
     y <- 1 + tx$x + rnorm(nrow(tx), sd = 0.01)
     bw.numeric <- npRmpi::npregbw(xdat = tx, ydat = y, bws = 0.35, bandwidth.compute = FALSE)
-    fit.no.ey <- npRmpi::npreg(bws = bw.numeric, txdat = tx, tydat = y, exdat = ex)
+    fit.no.ey <- npRmpi::npreg(bws = bw.numeric, txdat = tx, tydat = y,
+                               exdat = ex, se = TRUE)
     expect_equal(length(fit.no.ey$mean), nrow(ex))
     expect_equal(length(fit.no.ey$merr), nrow(ex))
     expect_null(fit.no.ey$xtra)
@@ -137,7 +135,7 @@ test_that("npreg factor response and external-evaluation GOF sentinels remain st
   })
 })
 
-test_that("npreg compact kernels remain finite for far external evaluation", {
+test_that("npreg compact kernels expose undefined far external rows", {
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
 
   local_npreg_quiet({
@@ -151,12 +149,14 @@ test_that("npreg compact kernels remain finite for far external evaluation", {
       bandwidth.compute = FALSE,
       ckertype = "uniform"
     )
-    mean.fit <- npRmpi::npreg(bws = bw, txdat = tx, tydat = ty, exdat = ex)
-    grad.fit <- npRmpi::npreg(bws = bw, txdat = tx, tydat = ty, exdat = ex, gradients = TRUE)
+    mean.fit <- npRmpi::npreg(bws = bw, txdat = tx, tydat = ty, exdat = ex,
+                              se = TRUE)
+    grad.fit <- npRmpi::npreg(bws = bw, txdat = tx, tydat = ty, exdat = ex,
+                              gradients = TRUE, se = TRUE)
 
-    expect_true(all(is.finite(mean.fit$mean)))
-    expect_true(all(is.finite(mean.fit$merr)))
-    expect_true(all(is.finite(grad.fit$grad)))
-    expect_true(all(is.finite(grad.fit$gerr)))
+    expect_true(all(is.na(mean.fit$mean)))
+    expect_true(all(is.na(mean.fit$merr)))
+    expect_true(all(is.na(grad.fit$grad)))
+    expect_true(all(is.na(grad.fit$gerr)))
   })
 })

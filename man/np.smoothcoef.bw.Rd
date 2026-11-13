@@ -53,7 +53,7 @@ npscoefbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-            degree.min = NULL,
+          degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -140,6 +140,13 @@ These arguments identify the smooth-coefficient data, formula interface, and whe
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -443,8 +450,11 @@ These arguments control the local-polynomial estimator, basis, and fixed degree 
   }
 
   \item{bernstein.basis}{
-    for \code{regtype="lp"}, logical flag selecting Bernstein-basis
-    representation where supported. When automatic degree search is
+    for \code{regtype="lp"}, logical flag selecting a stabilized
+    representation. For \code{basis="glp"}, \code{TRUE} selects the complete
+    degree-graded, orthonormal shifted-Legendre definition given in
+    \code{\link{npreg}}; additive and
+    tensor bases retain their fixed-coordinate-degree representation. When automatic degree search is
     requested and \code{bernstein.basis} is not explicitly supplied,
     the search route defaults to \code{TRUE} for numerical stability.
     Explicit \code{bernstein.basis=FALSE} is honored, but raw-polynomial
@@ -612,6 +622,8 @@ These arguments control outer optimization behavior for the semiparametric searc
   }
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This ensures
     replicability of the numerical search. Defaults to 42.
   }
@@ -630,6 +642,23 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  The primary response must be a one-dimensional numeric (integer or double)
+  vector. Factors and ordered factors are not accepted as primary responses,
+  including retained responses used in a new fit or bandwidth search.
+  Categorical predictors retain their existing support. Internal auxiliary
+  responses used to represent predictors retain their established encoding.
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -779,6 +808,11 @@ or standard-deviation factors.
 }
 
 \section{Book And Method Pointers}{
+  The smooth-coefficient moment solves use their own bounded additive
+  numerical-ridge policy. For the Seifert--Gasser motivation for ridging,
+  see \code{\link{npreg}}; this does not impose its ordinary-regression
+  uncertainty formula on smooth-coefficient estimation.
+
   \code{npscoefbw} selects bandwidths for the smooth-coefficient model
   \eqn{Y=X^\prime\beta(Z)+\epsilon}. The selected bandwidths control
   the mixed-data smoothing over \eqn{Z} used to estimate the coefficient
@@ -911,7 +945,7 @@ bw <- npscoefbw(y~x|z)
 
 summary(bw)
 
-model <- npscoef(bws=bw, gradients=TRUE)
+model <- npscoef(bws=bw)
 
 summary(model)
 

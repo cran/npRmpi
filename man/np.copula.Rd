@@ -16,6 +16,8 @@
   copula density. It can be called with an existing unconditional
   distribution/density bandwidth object, or with a one-sided formula in
   which case the appropriate bandwidth object is selected internally.
+  Continuous marginal kernel bounds retain their original variable identity
+  when continuous and categorical columns are mixed or reordered.
 }
 
 \usage{
@@ -29,7 +31,7 @@ npcopula(bws, \dots)
          neval = 30,
          n.quasi.inv = 1000,
          er.quasi.inv = 1,
-         \dots)
+         \dots, se = FALSE)
 
 \method{npcopula}{default}(bws,
          data,
@@ -39,7 +41,7 @@ npcopula(bws, \dots)
          neval = 30,
          n.quasi.inv = 1000,
          er.quasi.inv = 1,
-         \dots)
+         \dots, se = FALSE)
 
 \method{predict}{npcopula}(object,
         newdata = NULL,
@@ -58,10 +60,10 @@ npcopula(bws, \dots)
               "simultaneous", "all"),
      alpha = 0.05,
      bootstrap = c("inid", "fixed", "geom"),
-     B = 1999,
+     B = 9999,
      center = c("estimate", "bias-corrected"),
      boot_control = np_boot_control(),
-     output = c("plot", "data", "plot-data", "both"),
+     output = c("plot", "data", "plot-data"),
      legend = TRUE,
      theta = 0.0,
      phi = 20.0,
@@ -72,6 +74,8 @@ npcopula(bws, \dots)
      col = NULL,
      border = .np_plot_color("surface_border"),
      zlim = NULL,
+     gaussian_draws = 9999L,
+     random_seed = 42L,
      \dots)
 }
 
@@ -136,6 +140,8 @@ estimated and where it is evaluated.
     number of probability values per margin in the automatically
     generated two-dimensional grid used when \code{bws} is a formula,
     \code{evaluation="grid"}, and \code{u} is omitted.
+    This is a constructor argument; \code{plot} uses the object's stored
+    probability coordinates and rejects plot-level \code{neval}.
   }
 
   \item{target}{
@@ -154,7 +160,15 @@ estimated and where it is evaluated.
     \code{expand.grid(u)}. For two-dimensional displays, the clearest
     spelling is often \code{data.frame(u1 = u1.seq, u2 = u2.seq)};
     names matching the original variables are also accepted here because
-    \code{u} explicitly denotes probability coordinates. If omitted with a formula route and
+    \code{u} explicitly denotes probability coordinates. Repeated axis values
+    retain all original evaluation rows. Asymptotic simultaneous bands
+    evaluate and calibrate each identical target once, then repeat its limits
+    at the original rows; pointwise and Bonferroni intervals are unchanged. A surface draws one representative of each repeated coordinate
+    only when the corresponding points and drawn interval endpoints agree
+    exactly, including missingness; conflicting duplicates are rejected
+    rather than averaged. Surface drawing requires at least two distinct
+    values on each axis, whereas \code{output="data"} also retains
+    singleton-axis grids. If omitted with a formula route and
     \code{evaluation="grid"}, a two-dimensional grid is generated
     automatically.
   }
@@ -163,9 +177,18 @@ estimated and where it is evaluated.
     an object of class \code{"npcopula"} returned by \code{npcopula}.
   }
 
+  \item{se}{
+    logical value; default \code{FALSE}. Compute and retain asymptotic
+    standard errors only when \code{TRUE}. This is a named fitting
+    control, not a bandwidth-selection option.
+  }
+
   \item{se.fit}{
-    logical value. If \code{TRUE}, \code{predict.npcopula} returns a
-    list with fitted values and the stored standard-error slot.
+    logical value. With vector output, \code{TRUE} returns a list of
+    fitted values and standard errors. New evaluation requests compute
+    the required errors; prediction without new evaluation arguments
+    reads the stored results and requires a fit made with \code{se=TRUE}.
+    Object and data output retain their existing return shapes.
   }
 
 \subsection{Plot Display Controls}{
@@ -200,10 +223,9 @@ displayed.
 
   \item{output}{
     return mode. For \code{plot.npcopula}, \code{"plot"} draws the
-    plot, \code{"data"} returns the plotted data with interval columns
-    when requested, and \code{"plot-data"} draws and returns the
-    plotted data. \code{"both"} is accepted as an alias for
-    \code{"plot-data"}. For \code{predict.npcopula}, \code{"vector"}
+    plot, \code{"data"} returns an \code{\link{np_plot_data}} object
+    with absolute endpoints when requested, and \code{"plot-data"}
+    draws and returns the same object. For \code{predict.npcopula}, \code{"vector"}
     returns fitted copula values, \code{"object"} returns the evaluated
     \code{"npcopula"} object, and \code{"data"} returns
     \code{as.data.frame()} on that object.
@@ -229,7 +251,8 @@ displayed.
     plotting renderer for surface displays. \code{"base"} uses
     \code{\link{persp}}. \code{"rgl"} uses the shared interactive
     \pkg{rgl} surface renderer when the suggested package \pkg{rgl} is
-    installed.
+    installed. Both renderers use the package-wide viridis surface palette
+    and neutral-gray three-face reference grid.
   }
 
   \item{view}{
@@ -291,6 +314,18 @@ surface plots.
     bootstrap bias-correction combinations fail clearly.
   }
 
+  \item{gaussian_draws, random_seed}{
+    Gaussian maximum simulation count and reproducible seed for asymptotic
+    \code{band="simultaneous"} or \code{band="all"}. Before changing the
+    seed, the temporary seed scope refuses Box--Muller and uncertifiable
+    user-supplied generator state that cannot be restored from the seed
+    representation. Admitted built-in states retain caller continuation and
+    the original \code{.Random.seed} binding (including its absence).
+    The package does not silently change generators. This admission is
+    separate from replay within the current band calculation. These controls
+    do not change bootstrap replication counts.
+  }
+
   \item{errors}{
     interval route for \code{plot.npcopula}: \code{"none"},
     \code{"asymptotic"}, or \code{"bootstrap"}. Intervals are available
@@ -323,6 +358,11 @@ prediction/evaluation route, or graphics renderer as appropriate.
 }
 
 \details{
+  Formula variables of class \code{ts}, including lagged variables, are
+  aligned on their common time support before fitting. Other variables
+  must already have the length of that intersection. Supply explicitly
+  aligned rows when using native data arguments instead of a formula.
+
   Documentation guide: see \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, and \code{\link{plot}}
   for plotting options.
@@ -362,7 +402,8 @@ prediction/evaluation route, or graphics renderer as appropriate.
   The \sQuote{quasi-inverse} is computed via Definition 2.3.6 from
   Nelsen (2006). An equi-quantile grid on the data range of length
   \code{n.quasi.inv/2} is combined with an equi-spaced grid on the data
-  range extended by \code{er.quasi.inv}; the sorted union forms the
+  range extended by \code{er.quasi.inv} and intersected with the fitted
+  marginal kernel's bounds; the sorted union forms the
   grid used for marginal inversion. If requested probability values lie
   outside the attainable estimated marginal distribution range, they
   are reset to the nearest attainable endpoint. Inspect the returned
@@ -373,7 +414,18 @@ prediction/evaluation route, or graphics renderer as appropriate.
 
   The \code{plot.npcopula} method supports base \code{\link{persp}},
   \code{\link{contour}}, and \code{\link{image}} displays for
-  two-dimensional grid output. Surface plots use the package-wide
+  two-dimensional grid output. Central and uncertainty surfaces share one
+  coordinate ordering: probability axes
+  are sorted for display, while fitted values and returned plot data keep
+  their supplied-grid order. Duplicate display coordinates are collapsed only
+  when their fitted values and interval endpoints agree; conflicting duplicates
+  are rejected. Asymptotic simultaneous calibration uses the unique targets
+  after exact agreement of their fitted values, physical coordinates and
+  marginal standard errors. Repeating a target does not change the maximum
+  of its Gaussian process. Calibration metadata records the unique grid size
+  and, when duplicates occur, the original row count and target mapping.
+  All supplied rows remain in returned plot data; existing pointwise and
+  Bonferroni intervals retain their original calibration. Surface plots use the package-wide
   viridis default palette, detailed perspective ticks, and the same
   default viewing angles and base-graphics rotation cadence as the
   other surface plot methods. \code{renderer="rgl"} requests the shared
@@ -386,16 +438,72 @@ prediction/evaluation route, or graphics renderer as appropriate.
   \code{"empirical"} view plots empirical copula coordinates, and
   \code{"all"} gives a base-graphics four-panel diagnostic display.
 
+  Standard-error extraction with \code{se(object)} only reads stored
+  results; it does not silently refit the model. To add errors without
+  repeating bandwidth selection, use
+  \code{npcopula(bws=object$bws, data=object$data, u=object$u.input, se=TRUE,
+  n.quasi.inv=object$n.quasi.inv, er.quasi.inv=object$er.quasi.inv)}.
+  The default skips uncertainty-only work. Explicit asymptotic plot
+  requests obtain their needed errors even if the original fit omitted them.
+
   For grid surfaces, \code{plot.npcopula} can add asymptotic or
   bootstrap intervals. Distribution-copula asymptotic intervals use the
   joint distribution standard error evaluated at the marginal
-  quasi-inverse grid. Density-copula asymptotic intervals use the
-  plug-in delta-method denominator correction corresponding to
-  \eqn{c(u)=f(x_u)/\prod_j f_j(x_{u,j})}. Bootstrap intervals resample
+  quasi-inverse grid. For fixed bandwidths, density-copula standard errors
+  use the centered empirical influence of
+  \eqn{c(u)=f(x_u)/\prod_j f_j(x_{u,j})}, including the same-sample
+  covariance of the joint density and all marginal densities. Query
+  coordinates and selected bandwidths are held fixed. A zero marginal
+  density or nonfinite influence produces an unavailable row standard
+  error (\code{NA}) and a notice. Nearest-neighbor density-copula pointwise
+  errors also combine the joint and all marginal influences before squaring,
+  including their same-sample covariances. Generalized-neighbor errors hold
+  query radii fixed; adaptive-neighbor errors retain the existing donor-radius
+  and uniform support-face terms. Purely categorical margins use the same
+  normalization as their joint influence. The one-dimensional defined ratio
+  has exactly zero standard error. These calculations use external-query
+  uncertainty geometry even for sample evaluations, whose point estimates
+  retain their existing training-identity convention. No extra generalized-
+  neighbor radius, estimated-coordinate, selection or bias term is added.
+  Unsupported adaptive-neighbor pointwise domains remain unavailable.
+  Bootstrap intervals resample
   rows and recompute the plotted copula surface on the same probability
   grid. These interval conventions do not fully propagate uncertainty
-  from the marginal quasi-inverse transform; \code{band="all"} overlays transparent pointwise,
-  simultaneous, and Bonferroni wireframes.
+  from the marginal quasi-inverse transform. \code{band="simultaneous"}
+  calibrates a joint Gaussian maximum over the declared grid. Distribution
+  copulas use the selected joint-CDF influence. Fixed-bandwidth density
+  copulas use the complete same-sample ratio influence.
+  Nearest-neighbor density simultaneous bands also combine the joint-density
+  and all estimated marginal-density influences on the same observations,
+  including their covariance in the density ratio. Generalized-neighbor
+  factors retain the selected query radii as fixed; adaptive-neighbor factors
+  include the existing random-radius contributions in both joint and marginal
+  densities. The fitted inverse coordinates remain fixed for these working
+  targets. A one-dimensional density ratio has exactly zero simultaneous
+  variability when its positive numerator and sole marginal are the same
+  canonical primitive. The simultaneous influence and calibration owners
+  are unchanged by the pointwise full-ratio correction; their broader support
+  domain remains separate from pointwise availability.
+
+  These are finite-grid selected-smoothing variability bands, not
+  bias-corrected population or continuum confidence bands. Unavailable
+  incumbent uncertainty, nonregular support/radius geometry and memory-limited
+  grids retain NA simultaneous limits with a specific notice. Adaptive-neighbor
+  density and distribution bands include regular finite-bound and beta-kernel
+  routes through a separate simultaneous influence scale. The existing
+  pointwise domain is not extended by those simultaneous routes: \code{se()},
+  pointwise and Bonferroni values remain \code{NA} where the required pointwise
+  influences are not implemented. Thus
+  \code{band="all"} may contain finite simultaneous limits together with
+  unavailable marginal limits. Ordinary fractional neighbor counts use the
+  point estimator's canonical rounding. Extended maximum-radius counts require
+  a separate endpoint or tail law and remain unavailable for these bands.
+  Numerical precision checks can also make a requested band unavailable;
+  they never replace the fitted point estimates. Beta checks compare the same
+  shape with an independent PDF implementation and propagate the discrepancy;
+  this is a numerical agreement check, not a rigorous special-function bound.
+  \code{band="all"} retains pointwise and Bonferroni intervals and adds the
+  qualified simultaneous wireframe.
 }
 
 \value{
@@ -427,9 +535,10 @@ prediction/evaluation route, or graphics renderer as appropriate.
   }
 
   \item{copulaerr}{
-    asymptotic or bootstrap standard-error slot. The fitted object stores
-    \code{NA} unless an interval-producing plotting route constructs
-    evaluation-specific intervals.
+    stored asymptotic standard errors when \code{se=TRUE}; absent when
+    they were not requested. Requested unavailable values retain their
+    existing \code{NA} representation. The separate logical \code{se}
+    component records the fitting request.
   }
 
   The source data, target, evaluation route, grid dimensions, and timing
@@ -473,6 +582,23 @@ prediction/evaluation route, or graphics renderer as appropriate.
   Use a \code{\link{data.frame}} rather than \code{\link{cbind}} for
   mixed data so that ordered variables remain ordered. Unordered
   factors are not valid for copula estimation in this implementation.
+}
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{

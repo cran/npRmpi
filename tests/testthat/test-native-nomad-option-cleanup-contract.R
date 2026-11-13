@@ -5,7 +5,7 @@ test_that("native NOMAD option builders reject cache-off solves before solver en
   builders <- list(
     npRmpi:::.np_nomad_native_option_vectors,
     npRmpi:::.npudensbw_nomad_native_option_vectors,
-    npRmpi:::.npcdensbw_nomad_shadow_native_option_vectors,
+    npRmpi:::.npcdensbw_prepared_native_option_vectors,
     npRmpi:::.npcdistbw_nomad_native_option_vectors,
     npRmpi:::.npregbw_nomad_native_option_vectors
   )
@@ -22,6 +22,25 @@ test_that("native NOMAD option builders reject cache-off solves before solver en
       fixed = TRUE
     )
     expect_no_error(builder(list(EVAL_USE_CACHE = TRUE, MAX_BB_EVAL = 1)))
+  }
+})
+
+test_that("native estimator callbacks reject parallel evaluation explicitly", {
+  builders <- list(
+    npRmpi:::.np_nomad_native_option_vectors,
+    npRmpi:::.npudensbw_nomad_native_option_vectors,
+    npRmpi:::.npcdensbw_prepared_native_option_vectors,
+    npRmpi:::.npcdistbw_nomad_native_option_vectors,
+    npRmpi:::.npregbw_nomad_native_option_vectors
+  )
+
+  for (builder in builders) {
+    expect_error(
+      builder(list(NB_THREADS_PARALLEL_EVAL = 2L)),
+      "requires NB_THREADS_PARALLEL_EVAL = 1",
+      fixed = TRUE
+    )
+    expect_no_error(builder(list(NB_THREADS_PARALLEL_EVAL = 1L)))
   }
 })
 
@@ -90,6 +109,34 @@ test_that("native npreg solver option failure does not poison the next MPI solve
       "stopifnot(!is.null(attr(fit, 'native.nomad.diagnostics')))",
       "quit_status <- tryCatch({ npRmpi.quit(); 0L }, error = function(e) 1L)",
       "stopifnot(identical(quit_status, 0L))",
+      "quit(save = 'no', status = 0L, runLast = FALSE)"
+    ),
+    timeout = 60L,
+    env = env
+  )
+
+  expect_equal(out$status, 0L, info = paste(out$output, collapse = "\n"))
+})
+
+test_that("resident npudens state is released after an MPI solver option failure", {
+  env <- npRmpi_subprocess_env("NP_RMPI_NO_REUSE_SLAVES=1")
+  skip_if(is.null(env))
+
+  out <- npRmpi_run_rscript_subprocess(
+    c(
+      "library(npRmpi)",
+      "options(np.messages = FALSE, np.tree = TRUE)",
+      "npRmpi.init(nslaves = 1L, quiet = TRUE)",
+      "set.seed(20260805)",
+      "dat <- data.frame(x = runif(40L))",
+      "err <- tryCatch(suppressWarnings(npudensbw(dat = dat, bwsolver = 'mads', nmulti = 1L, nomad.opts = list(MAX_BB_EVAL = 'invalid'))), error = function(e) e)",
+      "stopifnot(inherits(err, 'error'))",
+      "stopifnot(grepl('NOMAD route failed', conditionMessage(err), fixed = TRUE))",
+      "first <- npudensbw(dat = dat, bwsolver = 'mads', nmulti = 1L, nomad.opts = list(MAX_BB_EVAL = 12L))",
+      "second <- npudensbw(dat = dat, bwsolver = 'mads', nmulti = 1L, nomad.opts = list(MAX_BB_EVAL = 12L))",
+      "stopifnot(identical(first$bw, second$bw))",
+      "stopifnot(identical(first$fval, second$fval))",
+      "npRmpi.quit()",
       "quit(save = 'no', status = 0L, runLast = FALSE)"
     ),
     timeout = 60L,

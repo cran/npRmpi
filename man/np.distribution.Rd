@@ -25,14 +25,19 @@ npudist(bws, \dots)
 \method{npudist}{dbandwidth}(bws,
         tdat = stop("invoked without training data 'tdat'"),
         edat,
-        \dots)
+        \dots,
+        se = FALSE)
 
 \method{npudist}{default}(bws, 
         tdat, 
-        \dots)
+        \dots,
+        se = FALSE)
 }
 
 \arguments{
+  \item{se}{Logical; compute and retain asymptotic standard errors when
+    \code{TRUE}. The default \code{FALSE} skips uncertainty-only computation
+    without changing the point estimates.}
 \subsection{Data, Bandwidth Inputs And Formula Interface}{
 These arguments identify the bandwidth specification, formula/data interface, and training data.
 }
@@ -50,6 +55,13 @@ These arguments identify the bandwidth specification, formula/data interface, an
 
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -101,6 +113,57 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   }
 }
 \details{
+  With generalized nearest-neighbor bandwidths, query identity matters when
+  selecting a radius: a training observation excludes its own occurrence,
+  whereas explicit evaluation data remain external queries even if their
+  values equal training observations. Consequently,
+  \code{predict(fit, newdata = training.data)} can differ from
+  \code{fitted(fit)}. This does not omit the training contribution from the
+  fitted estimator. See \code{\link{np.kernels}} for the radius convention.
+
+  For native (non-formula) objects, named \code{newdata} columns are matched
+  to the retained variable names and reordered as needed. Extra columns are
+  ignored; missing, duplicate or ambiguous names are errors. An unnamed
+  matrix or vector remains positional for a single evaluation role.
+  Explicit native evaluation arguments retain their positional contract and
+  take precedence over \code{newdata}.
+
+  For a native bandwidth object, \code{newdata} supplies \code{edat};
+  explicitly supplied native evaluation arguments take precedence. This
+  evaluates at the requested rows without repeating bandwidth selection.
+
+  With \code{bwtype="adaptive_nn"} and \code{se=TRUE}, standard errors
+  include the same-sample influence of each donor-centred nearest-neighbour
+  radius. A two-sided rank-spacing pilot estimates the marginal density sum
+  at the radius endpoints. Cross-coordinate and categorical-kernel covariance
+  are retained in the joint observation influence. The selected NN ranks
+  are treated as fixed; bandwidth-selection uncertainty is not included.
+  This calculation supports Gaussian and Epanechnikov kernels of orders
+  2, 4, 6 and 8, and uniform kernels, without finite kernel bounds.
+  Uniform density errors additionally include moving-support boundary
+  influences with joint other-coordinate and categorical kernel marks.
+  These use type-7 sample-quantile endpoints and deterministic two-sided
+  rank-spacing pilots whose interior window grows as the two-thirds power
+  of sample size. A strictly absent support face contributes zero; an exact
+  probability endpoint or undefined finite-face pilot is unavailable.
+  Finite kernel bounds (including beta kernels), extended or saturated NN
+  ranks, and degenerate pilot spacings are not
+  currently qualified: point estimates are retained and standard errors
+  are \code{NA}, with one availability notice. No additional uncertainty
+  computation is performed for \code{se=FALSE}. Requested adaptive-NN
+  standard errors can take several times as long as the point fit because
+  they include the donor-radius influence calculation; this cost is incurred
+  only when standard errors are requested.
+
+  For ordinary kernels with mixed continuous and ordered categorical data,
+  fixed and generalized-nearest-neighbour standard errors retain the leading
+  continuous-indicator approximation and the squared integrated categorical
+  kernel product. The continuous integrated kernel remains to power one in
+  that second moment; this is not a finite-smoothing sample-contribution
+  variance. Purely continuous and purely categorical conventions are unchanged.
+  Generalized-NN errors condition on the current query radii. The separate
+  adaptive-NN influence calculation is described above.
+
   Documentation guide: see \code{\link{npudistbw}} for bandwidth
   selection and search controls, \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, \code{\link{plot}},
@@ -121,6 +184,45 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   \code{\link{np.kernels}}. It is exactly zero and one at the declared
   lower and upper endpoints and has the linear uniform-CDF limit as the
   bandwidth diverges.
+
+  The beta associated CDF is available at orders 2, 4, 6, and 8 with manual
+  or cross-validated metric bandwidths. Fixed, generalized-NN, and adaptive-NN
+  modes are supported. Set \code{ckertype="beta"} and use either
+  \code{ckerbound="fixed"} with finite \code{ckerlb}/\code{ckerub}, or
+  \code{ckerbound="range"} for beta outer half-spacing sample bounds. The data must
+  be continuous and all training and evaluation values must lie within the
+  resulting supports. Categorical products and normal-reference selection are
+  not supported.
+
+  For observation \eqn{x_i}, target \eqn{x}, support \eqn{[a,b]},
+  \eqn{L=b-a}, \eqn{z_i=(x_i-a)/L}, \eqn{t=(x-a)/L}, and
+  \eqn{\tau=(L/h)^2}, the contribution is
+  \deqn{I_t(1+z_i\tau,1+(1-z_i)\tau).}
+  The returned estimate is the sample mean of these contributions; its
+  reported standard error is the sample standard deviation of the
+  multivariate contribution divided by \eqn{\sqrt{n}}. The implementation
+  accumulates this variance in centered form to avoid cancellation near zero
+  or one. This beta CDF is observation-centered and is not the target-variable
+  integral of Chen's evaluation-centered beta density kernel. See
+  \code{\link{np.kernels}} for the design rationale and references.
+
+  Fixed and adaptive order-2 beta CDF estimates are proper CDFs on the
+  declared support. A generalized-NN order-2 curve retains exact endpoints
+  and contribution-wise range but may be locally nonmonotone because its
+  bandwidth changes with the target. Orders 4, 6, and 8 are signed and may
+  overshoot \eqn{[0,1]} or be locally nonmonotone in any bandwidth mode.
+  Returned values are not silently clipped or monotonized.
+
+  For purely ordered data, let \eqn{Z_i(x)} be the complete multivariate CDF
+  contribution and \eqn{\bar Z(x)=n^{-1}\sum_i Z_i(x)}. Standard errors use
+  the empirical-population variance of these contributions divided by
+  sample size,
+  \deqn{\widehat{\mathrm{se}}\{\hat F(x)\}=
+    \frac{1}{n}\sqrt{\sum_{i=1}^n\{Z_i(x)-\bar Z(x)\}^2}.}
+  At zero smoothing this retains the usual
+  \eqn{\sqrt{\hat F(x)(1-\hat F(x))/n}}. At finite smoothing a contribution
+  need not be an indicator, so the Bernoulli expression does not generally
+  apply. Profile compression retains original observation multiplicities.
 
   Argument groups for bandwidth selection are documented on
   \code{\link{npudistbw}}. The most common workflow is to choose data
@@ -210,6 +312,13 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
 
 }
 \value{
+  Standard errors are retained only when \code{se = TRUE}. They can be added
+  later without repeating bandwidth selection, for example
+  \code{npudist(bws = object$bws, se = TRUE)}. Supply the original training
+  and evaluation data as needed if they cannot be recovered from the bandwidth
+  object's call. The \code{se()} extractor never recomputes results and gives
+  this refit guidance when errors were not retained.
+  Prediction with \code{se.fit = TRUE} requests the required computation.
 
   \code{\link{npudist}} returns a \code{npdistribution} object. The
   generic accessor functions \code{\link{fitted}} and \code{\link{se}}
@@ -221,7 +330,9 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
 
   \item{eval}{ the evaluation points. }
   \item{dist}{ estimate of the cumulative distribution at the evaluation points }
-  \item{derr}{ standard errors of the cumulative distribution estimates }
+  \item{derr}{Standard errors of the cumulative distribution estimates when
+    \code{se = TRUE}, otherwise an empty numeric vector.}
+  \item{se}{Whether standard errors were requested for this fit.}
 
 }
 \section{Book And Method Pointers}{
@@ -257,6 +368,21 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   Distribution/Survivor Functions,} Econometric Reviews, \bold{36},
   970-987.
 
+  Chen, S.X. (1999), \dQuote{Beta kernel estimators for density functions,}
+  Computational Statistics & Data Analysis, 31(2), 131--145.
+  doi:10.1016/S0167-9473(99)00010-9.
+
+  Igarashi, G. and Kakizawa, Y. (2020), \dQuote{Higher-order bias corrections
+  for asymmetric kernel density estimators,} Journal of Nonparametric
+  Statistics, 32(3), 716--752. doi:10.1080/10485252.2020.1770754.
+
+  Mansouri, B., Rastin, A., and Allah Mombeni, H. (2024),
+  \dQuote{Beta Kernel Estimator for a Cumulative Distribution Function with
+  Bounded Support,} Journal of Sciences, Islamic Republic of Iran,
+  \bold{34}(4), 349--361 (volume dated 2023; accepted and DOI registered in
+  2024).
+  doi:10.22059/jsciences.2024.367933.1007836.
+
   Ouyang, D. and Q. Li and J.S. Racine (2006), \dQuote{Cross-validation
     and the estimation of probability distributions with categorical
     data,} Journal of Nonparametric Statistics, 18, 69-100.
@@ -285,13 +411,40 @@ Further arguments are passed to \code{\link{npudistbw}} when bandwidths are comp
   intended on mixed data types and will coerce the data to the same
   type.
 
+  For formula fits, character-valued missing-data policies are resolved
+  through the \code{stats} model-frame owner; pass a caller-local policy as
+  a function object rather than its name. With replacement training data,
+  an explicit \code{na.action}, including \code{NULL}, takes precedence
+  over the saved policy. Native fitting still requires complete rows, so
+  a permissive policy does not guarantee the same retained sample as
+  \code{stats::model.frame}.
+
   When reusing a bandwidth object without explicit training or evaluation
-  data, the required data are recovered from object-retained state or
-  from the stored call environment when available. This is a convenience
-  for ordinary same-session use, not a guarantee that a saved object is
-  self-contained. For reproducible replay after \code{saveRDS()} and
-  \code{readRDS()} in a fresh R session, supply the required data
-  arguments explicitly.
+  data, newly constructed bandwidth objects use retained training values.
+  A fit with explicit replacement training data retains that sample in its
+  returned bandwidth object; evaluation grids do not replace training data.
+  Older objects without retained samples use their stored call environment
+  when available and may require explicit training inputs after
+  \code{saveRDS()} and \code{readRDS()}. Custom formula transformations used
+  on new evaluation data must still be available.
+}
+
+
+\section{Experimental status of bias-corrected inference}{
+\strong{All bias-corrected confidence intervals and bands are experimental
+(pre-beta research), incomplete, and not recommended for general-purpose
+inference.} This status remains in effect unless the documentation explicitly
+states otherwise for a particular method and scope. It applies wherever
+bias-corrected bounds are available: asymptotic and bootstrap constructions,
+including legacy methods, pointwise intervals, Bonferroni intervals and
+simultaneous bands, for levels and supported derivatives.
+
+These methods form an ongoing research project. Implementation support,
+numerical checks and favorable simulation results in selected settings do not
+establish generally valid coverage. Coverage can fail outside the studied
+settings, and available options do not constitute a general solution to
+bias-corrected inference. Method-specific assumptions, restrictions and known
+failures must be considered when experimenting with these bounds.
 }
 
 \seealso{

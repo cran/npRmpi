@@ -1,0 +1,198 @@
+test_that("second-order beta npksum matches its associated-kernel formula", {
+  training <- data.frame(x = c(0, 0.03, 0.2, 0.55, 0.91, 1))
+  evaluation <- data.frame(x = c(0, 0.08, 0.5, 0.96, 1))
+  h <- 0.14
+  tau <- (1 / h)^2
+
+  fit <- npksum(
+    bws = h,
+    txdat = training,
+    exdat = evaluation,
+    ckertype = "beta",
+    ckerorder = 2,
+    ckerbound = "fixed",
+    ckerlb = 0,
+    ckerub = 1,
+    return.kernel.weights = TRUE
+  )
+  expected <- vapply(evaluation$x, function(target) {
+    dbeta(training$x,
+          shape1 = 1 + target * tau,
+          shape2 = 1 + (1 - target) * tau)
+  }, numeric(nrow(training)))
+
+  expect_equal(fit$kw, expected, tolerance = 2e-12)
+  expect_equal(as.double(fit$ksum), colSums(expected), tolerance = 2e-12)
+  expect_true(all(fit$kw >= 0))
+})
+
+test_that("beta npksum carries full support scaling and composes in products", {
+  training <- data.frame(
+    x1 = c(0, 0.11, 0.43, 0.82, 1),
+    x2 = c(-3, -1, 2, 5, 7)
+  )
+  evaluation <- data.frame(x1 = c(0, 0.5, 1), x2 = c(-3, 2, 7))
+
+  fit <- npksum(
+    bws = c(0.12, 1.2), txdat = training, exdat = evaluation,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = c(0, -3), ckerub = c(1, 7),
+    return.kernel.weights = TRUE
+  )
+  unit_shifted <- data.frame(x1 = training$x1, x2 = (training$x2 + 3) / 10)
+  eval_shifted <- data.frame(x1 = evaluation$x1,
+                             x2 = (evaluation$x2 + 3) / 10)
+  fit_unit <- npksum(
+    bws = c(0.12, 0.12), txdat = unit_shifted, exdat = eval_shifted,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = c(0, 0), ckerub = c(1, 1),
+    return.kernel.weights = TRUE
+  )
+
+  expect_equal(fit_unit$kw, 10 * fit$kw, tolerance = 2e-12)
+  expect_equal(as.double(fit_unit$ksum),
+               10 * as.double(fit$ksum), tolerance = 2e-12)
+})
+
+test_that("beta npksum supports weighting and leave-one-out", {
+  training <- data.frame(x = seq(0, 1, length.out = 9))
+  response <- cbind(y1 = seq_len(9), y2 = cos(seq_len(9)))
+  case_weights <- cbind(w1 = 1, w2 = seq(0.5, 1.3, length.out = 9))
+  args <- list(
+    bws = 0.11, txdat = training,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+
+  loo <- do.call(npksum, c(args, list(
+    tydat = response,
+    weights = case_weights,
+    leave.one.out = TRUE,
+    return.kernel.weights = TRUE
+  )))
+  expect_true(all(diag(loo$kw) == 0))
+  for (j in seq_len(nrow(training)))
+    for (y in seq_len(ncol(response)))
+      for (w in seq_len(ncol(case_weights)))
+        expect_equal(
+          loo$ksum[w, y, j],
+          sum(loo$kw[, j] * response[, y] * case_weights[, w]),
+          tolerance = 2e-12
+        )
+})
+
+test_that("beta bandwidth division uses complete-unit semantics", {
+  training <- data.frame(
+    x = c(.017, .08, .21, .47, .73, .94, .989),
+    z = c(.9, .18, .67, .31, .79, .42, .06)
+  )
+  evaluation <- data.frame(x = c(.11, .37, .82), z = c(.2, .7, .44))
+
+  for (mode in c("fixed", "generalized_nn", "adaptive_nn")) {
+    bandwidth <- if (identical(mode, "fixed")) c(.14, .18) else c(4, 4)
+    for (operators in list(
+      c("normal", "integral"),
+      c("normal", "convolution"),
+      c("derivative", "normal")
+    )) {
+      arguments <- list(
+        bws = bandwidth, txdat = training, exdat = evaluation,
+        bwtype = mode, operator = operators,
+        return.kernel.weights = TRUE,
+        ckertype = "beta", ckerorder = 8,
+        ckerbound = "fixed", ckerlb = c(0, 0), ckerub = c(1, 1)
+      )
+      undivided <- do.call(npksum, c(arguments, list(
+        bandwidth.divide = FALSE
+      )))
+      divided <- do.call(npksum, c(arguments, list(
+        bandwidth.divide = TRUE
+      )))
+      expect_identical(divided$ksum, undivided$ksum)
+      expect_identical(divided$kw, undivided$kw)
+    }
+  }
+})
+
+test_that("ordinary beta kernel powers match raw-weight oracles", {
+  training <- data.frame(x = c(.08, .16, .27, .43, .61, .76, .89))
+  evaluation <- data.frame(x = c(.12, .31, .52, .81))
+  arguments <- list(
+    bws = .18, txdat = training, exdat = evaluation,
+    return.kernel.weights = TRUE, bandwidth.divide = TRUE,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+  raw <- do.call(npksum, arguments)
+
+  for (power in c(-2L, -1L, 0L, 1L, 2L, 3L)) {
+    powered <- do.call(npksum, c(arguments, list(kernel.pow = power)))
+    expected_weights <- ifelse(raw$kw == 0, 0, raw$kw^power)
+    expect_equal(as.double(powered$ksum), colSums(expected_weights),
+                 tolerance = 3e-11)
+    expect_identical(powered$kw, raw$kw)
+  }
+})
+
+test_that("powered beta rows preserve topology, operators, and deletion", {
+  training <- data.frame(
+    x = c(.017, .08, .21, .47, .73, .94, .989),
+    z = c(.9, .18, .67, .31, .79, .42, .06)
+  )
+  response <- cbind(y1 = seq_len(nrow(training)), y2 = cos(seq_len(nrow(training))))
+  case_weights <- cbind(w1 = 1, w2 = seq(.6, 1.2, length.out = nrow(training)))
+
+  for (mode in c("fixed", "generalized_nn", "adaptive_nn")) {
+    bandwidth <- if (identical(mode, "fixed")) c(.14, .18) else c(4, 4)
+    for (operators in list(
+      c("normal", "integral"),
+      c("normal", "convolution")
+    )) {
+      arguments <- list(
+        bws = bandwidth, txdat = training, tydat = response,
+        weights = case_weights, bwtype = mode, operator = operators,
+        leave.one.out = TRUE, return.kernel.weights = TRUE,
+        bandwidth.divide = TRUE,
+        ckertype = "beta", ckerorder = 8,
+        ckerbound = "fixed", ckerlb = c(0, 0), ckerub = c(1, 1)
+      )
+      raw <- do.call(npksum, arguments)
+      expect_true(all(diag(raw$kw) == 0))
+
+      for (power in c(0L, 2L, 3L)) {
+        powered <- do.call(npksum, c(arguments, list(kernel.pow = power)))
+        powered_weights <- ifelse(raw$kw == 0, 0, raw$kw^power)
+        for (evaluation in seq_len(nrow(training)))
+          for (response_column in seq_len(ncol(response)))
+            for (weight_column in seq_len(ncol(case_weights)))
+              expect_equal(
+                powered$ksum[weight_column, response_column, evaluation],
+                sum(powered_weights[, evaluation] *
+                    response[, response_column] *
+                    case_weights[, weight_column]),
+                tolerance = 5e-10
+              )
+        expect_identical(powered$kw, raw$kw)
+      }
+    }
+  }
+})
+
+test_that("unsupported beta npksum surfaces fail explicitly", {
+  args <- list(
+    bws = 0.1,
+    txdat = data.frame(x = c(0, 0.5, 1)),
+    ckertype = "beta",
+    ckerorder = 2,
+    ckerbound = "fixed",
+    ckerlb = 0,
+    ckerub = 1
+  )
+
+  expect_error(do.call(npksum, c(args, list(permutation.operator = "normal"))),
+               "only derivative permutation operators",
+               fixed = TRUE)
+  expect_error(npksum(0.1, args$txdat, ckertype = "beta",
+                     ckerbound = "none"),
+               "require ckerbound = \"fixed\" or \"range\"", fixed = TRUE)
+})

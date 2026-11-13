@@ -7,9 +7,286 @@
 #include <float.h>
 #include <time.h>
 #include <stdint.h>
+#include <math.h>
 #include <Rinternals.h>
 
 #include "tree.h"
+#include "kernel_registry.h"
+#include "regression_contract.h"
+#include "jksum_lp_solve.h"
+
+/* Bounded plot replay of the accepted ordinary-regression HC0 projection. */
+void np_regression_inference_projection_apply(int n, int p, int m,
+  const double *basis, const double *projection, const double *kernel, double *out);
+
+/* Numeric ordered labels lie on a validated integer lattice. Round the
+ * difference so decimal offsets cannot reduce an integer distance by one.
+ * Cache indices and scalar/retained-support kernels share this conversion. */
+static inline int np_ordered_lattice_distance(const double x, const double y)
+{
+  const double distance = fabs(x-y), lattice = round(distance);
+  if(distance == lattice && lattice < INT_MAX) return (int)lattice;
+  if(!R_FINITE(distance) || lattice >= INT_MAX ||
+     fabs(distance-lattice) > 8.0*DBL_EPSILON*fmax(1.0,distance))
+    Rf_error("ordered unit-lattice kernel requires integer distances within the native index range; a unit lattice cannot be established reliably from these numeric levels. Decimal labels at large magnitudes can lose precision; use Racine-Li-Yan (okertype='racineliyan') for retained-support smoothing");
+  return (int)lattice;
+}
+
+/* Preserve the incumbent decimal-offset integer convention, but never round
+ * a genuine real distance into an integer index or collapse distinct levels. */
+static inline double np_ordered_metric_distance(const double x, const double y)
+{
+  const double distance = fabs(x-y), lattice = round(distance);
+  if(distance == lattice) return distance;
+  return (lattice > 0.0 &&
+          fabs(distance-lattice) <= 8.0*DBL_EPSILON*fmax(1.0,distance)) ?
+    lattice : distance;
+}
+
+/* A lattice support does not imply that a newly supplied evaluation value
+ * lies on that lattice. Only cumulative LR needs this pair-level distinction. */
+static inline int np_ordered_pair_on_lattice(const double train,
+    const double eval, const double origin)
+{
+  const double dt = np_ordered_metric_distance(train,origin);
+  const double de = np_ordered_metric_distance(eval,origin);
+  return R_FINITE(dt) && R_FINITE(de) && dt < INT_MAX && de < INT_MAX &&
+    dt == floor(dt) && de == floor(de);
+}
+
+/* -1 denotes non-indexed support, not an unsupported statistical kernel. */
+static inline int np_ordered_lattice_span(const double *cats, const int ncat)
+{
+  if(cats == NULL || ncat <= 0) return -1;
+  double previous = -1.0;
+  for(int i = 0; i < ncat; ++i) {
+    const double d = np_ordered_metric_distance(cats[i],cats[0]);
+    if(!R_FINITE(d) || d >= INT_MAX || d != floor(d) || d <= previous)
+      return -1;
+    previous = d;
+  }
+  return (int)previous;
+}
+
+typedef struct NPContinuousKernelDerivativeDiagnostics
+  NPContinuousKernelDerivativeDiagnostics;
+
+typedef enum {
+  NP_NN_GEOMETRY_OK = 0,
+  NP_NN_GEOMETRY_INVALID_ARGUMENT = 1,
+  NP_NN_GEOMETRY_ALLOCATION_FAILURE = 2,
+  NP_NN_GEOMETRY_INVALID_EXCLUSION = 3,
+  NP_NN_GEOMETRY_ZERO_RADIUS = 4,
+  NP_NN_GEOMETRY_NONFINITE_RADIUS = 5,
+  NP_NN_GEOMETRY_INVALID_SCALE = 6
+} NPNNGeometryStatus;
+
+typedef enum {
+  NP_NN_QUERY_EXTERNAL = 0,
+  NP_NN_QUERY_TRAINING_IDENTITY = 1,
+  NP_NN_QUERY_TRAINING_MAP = 2,
+  NP_NN_QUERY_ADAPTIVE_FOLD_PREPARE = 3,
+  /* Bandwidth-preparation-only modes: use the deleted donor count, then
+   * normalize to ordinary identity/map before cache or distance queries. */
+  NP_NN_QUERY_DELETE_ONE_IDENTITY = 4,
+  NP_NN_QUERY_DELETE_ONE_MAP = 5
+} NPNNQueryMode;
+
+typedef struct {
+  NPNNQueryMode mode;
+  const int *eval_to_train;
+  double **adaptive_successor;
+  double *adaptive_fold_scale;
+  double **adaptive_full;
+} NPNNGeometryContext;
+
+/* Borrowed, call-local geometry for raw delete-one estimator weights. The
+ * public zero-diagonal kernel-sum primitive does not create this context. */
+typedef struct {
+  int num_train;
+  int num_eval;
+  int num_continuous;
+  const int *eval_to_train;
+  double **train;
+  double **primary;
+  double **successor;
+  double **selected;
+  double *scale;
+} NPNNKernelFold;
+
+#include "nn_radius_error.h"
+
+typedef enum {
+  NP_REGRESSION_LP_MATRIX_OK = 0,
+  NP_REGRESSION_LP_MATRIX_ERROR = 1,
+  NP_REGRESSION_LP_MATRIX_ZERO_RADIUS = 2,
+  NP_REGRESSION_LP_MATRIX_ZERO_MASS = 3
+} NPRegressionLPMatrixStatus;
+
+/* Invocation-owned, R-protected row flags; NULL keeps strict consumers strict. */
+typedef struct {
+  int *flags;
+  int count;
+  const int *row_map; /* optional internal-to-caller evaluation order */
+  int *base_flags; /* optional base-X support; flags also includes contrasts */
+  int *component_flags; /* optional one-row categorical output causes */
+} NPRegressionLPEmptyRows;
+
+/* Opt-in plot output, owned by the enclosing .Call. No solver state escapes. */
+typedef struct {
+  int ntrain, neval, width, emitted, constant;
+  double *basis, *projection;
+  /* Opt-in ordinary-regression inference capture; NULL preserves old owners. */
+  double *inference_gradient, *inference_residual, *inference_ridge, *inference_gate;
+  double *precision_policy; /* neval by 2: accepted ridge, positive anchor for QR replay */
+  int inference_ncon;
+  const int *donor_map, *eval_map;
+} NPRegressionFitProjection;
+
+/* Request-owned conditional inference only. Never installed by regression. */
+typedef struct {
+  int n, m, width, slots, row, failed;
+  const int *donor_map;
+  double *weights, *directions, *adjoints, *responses, *response_logscale;
+  double *scratch_weights, *scratch_moments;
+  double **scratch_columns;
+  int *captured, *coordinate, *order, *donor_order;
+} NPConditionalPlotCapture;
+NPConditionalPlotCapture *np_conditional_plot_capture_swap(NPConditionalPlotCapture *);
+void np_plot_validate_basis_request(int, const int *, int, int);
+
+
+
+static inline void np_regression_empty_row_mark(
+  NPRegressionLPEmptyRows *rows, int row, int categorical)
+{
+  const int target = rows->row_map != NULL ? rows->row_map[row] : row;
+  if(!rows->flags[target]) {
+    rows->flags[target] = 1;
+    ++rows->count;
+  }
+  if(!categorical && rows->base_flags != NULL)
+    rows->base_flags[target] = 1;
+}
+
+/* Borrowed, invocation-local partial conditional-LP first-SE supplement. */
+typedef struct {
+  int ncon;
+  const int *order;
+  const int *se;
+} NPConditionalLPFirstSERequest;
+
+typedef enum {
+  NP_REGRESSION_FIT_OK = 0,
+  NP_REGRESSION_FIT_ERR_ALLOC = -1,
+  NP_REGRESSION_FIT_ERR_BANDWIDTH = -2,
+  NP_REGRESSION_FIT_ERR_HASH_CREATE = -3,
+  NP_REGRESSION_FIT_ERR_HASH_INSERT = -4,
+  NP_REGRESSION_FIT_ERR_HASH_LOOKUP = -5,
+  NP_REGRESSION_FIT_ERR_ZERO_NN_RADIUS = -6,
+  NP_REGRESSION_FIT_ERR_DEFERRED = -7
+} NPRegressionFitStatus;
+
+/* Copied invocation-owned failure, never a borrowed owner or R object.
+ * Ordinary callers pass NULL and retain their incumbent strict publisher. */
+typedef enum {
+  NP_REGRESSION_FAILURE_NONE = 0,
+  NP_REGRESSION_FAILURE_VALIDATION = 1,
+  NP_REGRESSION_FAILURE_FIT = 2,
+  NP_REGRESSION_FAILURE_SCALAR = 3,
+  NP_REGRESSION_FAILURE_GENERAL = 4,
+  NP_REGRESSION_FAILURE_BETA = 5,
+  NP_REGRESSION_FAILURE_CONDITIONAL = 6,
+  NP_REGRESSION_FAILURE_ZERO_RADIUS = 7
+} NPRegressionFailureFamily;
+
+typedef struct {
+  int family;
+  int code;
+  int nn_bandwidth_type;
+  int nn_coordinate;
+  int nn_lookup_k;
+  int nn_matching_donors;
+  int nn_excluded;
+  double nn_query_value;
+  double nn_index;
+  char message[256];
+} NPRegressionFailure;
+
+void np_regression_failure_message(NPRegressionFailure *failure,
+                                  int family, int code,
+                                  const char *format, ...);
+void np_regression_failure_publish(const NPRegressionFailure *failure);
+void np_regression_failure_zero_radius(NPRegressionFailure *failure,
+                                      const NPNNZeroRadiusInfo *info);
+
+typedef struct {
+  const NPContinuousKernelRoute *x_route;
+  NPContinuousKernelDerivativeDiagnostics *x_diagnostics;
+  const NPContinuousKernelRoute *y_route;
+  NPContinuousKernelDerivativeDiagnostics *y_diagnostics;
+  int categorical_compress;
+} NPConditionalKernelExecutionContext;
+
+/*
+ * Family-neutral width-one conditional count consumer.  Kernel rows and
+ * realized bandwidths are caller-owned immutable views; the executor streams
+ * one evaluation row and never retains an observation-by-evaluation matrix.
+ */
+typedef struct {
+  int bandwidth_mode;
+  int do_distribution;
+  int categorical_compress;
+  int num_train;
+  int num_eval;
+  int num_x_continuous;
+  int num_x_unordered;
+  int num_x_ordered;
+  int num_y_continuous;
+  int num_y_unordered;
+  int num_y_ordered;
+  int num_replicates;
+  double **train_x;
+  double **train_y;
+  double **eval_x;
+  double **eval_y;
+  double **train_x_unordered;
+  double **train_x_ordered;
+  double **eval_x_unordered;
+  double **eval_x_ordered;
+  double **train_y_unordered;
+  double **train_y_ordered;
+  double **eval_y_unordered;
+  double **eval_y_ordered;
+  double **bandwidth_eval_x;
+  double **bandwidth_train_x;
+  double **bandwidth_eval_y;
+  double **bandwidth_train_y;
+  const double *lower_x;
+  const double *upper_x;
+  const double *lower_y;
+  const double *upper_y;
+  const int *operator_x;
+  const int *operator_y;
+  const int *kernel_x_unordered;
+  const int *kernel_x_ordered;
+  const int *kernel_y_unordered;
+  const int *kernel_y_ordered;
+  const double *lambda_x;
+  const double *lambda_y;
+  const int *num_categories_x;
+  const int *num_categories_y;
+  double **category_values_x;
+  double **category_values_y;
+  np_continuous_kernel_descriptor descriptor_x;
+  np_continuous_kernel_descriptor descriptor_y;
+  const NPContinuousKernelRoute *route_x;
+  NPContinuousKernelDerivativeDiagnostics *diagnostics_x;
+  const NPContinuousKernelRoute *route_y;
+  NPContinuousKernelDerivativeDiagnostics *diagnostics_y;
+  const double *counts;
+  double *levels;
+} NPConditionalCountPlan;
 
 #define MAX_OBS INT_MAX
 #define MAX_REG 100                               /* Allows flexibility while trapping error... */
@@ -48,12 +325,31 @@ void np_guarded_cvml_hits_reset(void);
 void np_guarded_cvml_hit(void);
 double np_guarded_cvml_hits_get(void);
 static inline double np_guarded_cvml_contribution(const double fit){
-  if(fit > DBL_MIN)
+  if(fit > 0.0)
     return -log(fit);
   np_guarded_cvml_hit();
   if(fit < -DBL_MIN)
     return log(-fit) - 2.0*log(DBL_MIN);
   return -log(DBL_MIN);
+}
+static inline double np_guarded_cvml_log_contribution(
+  const double log_absolute_sum,
+  const int sign,
+  const int denominator){
+  const double log_dbl_min = log(DBL_MIN);
+  const double log_fit = log_absolute_sum - log((double)denominator);
+
+  if(sign > 0 && log_fit > -INFINITY)
+    return -log_fit;
+  np_guarded_cvml_hit();
+  if(sign < 0 && log_fit > log_dbl_min)
+    return log_fit - 2.0*log_dbl_min;
+  return -log_dbl_min;
+}
+static inline double np_fitted_log_likelihood_contribution(const double fit){
+  if(fit > 0.0 || ISNAN(fit))
+    return log(fit);
+  return log(DBL_MIN);
 }
 void np_fastcv_alllarge_hits_reset(void);
 double np_fastcv_alllarge_hits_get(void);
@@ -63,9 +359,27 @@ SEXP C_np_progress_fit_begin(SEXP total);
 SEXP C_np_progress_fit_end(void);
 void np_progress_fit_set_offset(const int offset);
 void np_progress_fit_step(const int done);
+void np_progress_fit_heartbeat(void);
 void np_progress_fit_loop_step(const int done, const int natural_total);
+typedef void (*NPProgressUnwindCleanup)(void *, Rboolean);
+typedef struct {
+  int active, total, offset, last_eval, base, display_total;
+  clock_t last_clock;
+} NPConditionalSEProgressScope;
+void np_progress_conditional_se_begin(NPConditionalSEProgressScope *scope,
+                                      const int additional);
+void np_progress_conditional_se_offset(const NPConditionalSEProgressScope *scope,
+                                       const int done);
+void np_progress_conditional_se_end(NPConditionalSEProgressScope *scope);
+void np_progress_fit_loop_step_owned(
+  const int done,
+  const int natural_total,
+  NPProgressUnwindCleanup cleanup,
+  void *cleanup_data);
 int np_progress_fit_is_active(void);
+int np_progress_bandwidth_is_active(void);
 void np_progress_bandwidth_loop_step(void);
+int np_mseries_accelerate_enabled(void);
 
 double **alloc_matd(int nrows, int ncols);
 double **alloc_tmatd(int nrows, int ncols);
@@ -77,11 +391,6 @@ double cdf_kernel(int KERNEL, double z);
 double cdf_kernel_unordered(int KERNEL, double x, double y, double lambda, int c, double *categorical_vals);
 double cdf_kernel_ordered(int KERNEL, double x, double y, double lambda, int c, double *categorical_vals);
 double cv_func_binary_choice(double *scale_factor);
-double cv_func_con_density_categorical_ls(double *vector_scale_factor);
-double cv_func_con_density_categorical_ml(double *vector_scale_factor);
-double cv_func_density_categorical_ls(double *vector_scale_factor);
-double cv_func_density_categorical_ml(double *vector_scale_factor);
-
 double np_cv_func_density_categorical_ml(double *vector_scale_factor);
 double np_cv_func_density_categorical_ls(double *vector_scale_factor);
 
@@ -105,12 +414,19 @@ double fGoodness_of_Fit(int iNum_Obs, double *fvector_Y, double *fkernel_fit);
 
 double kernel(int KERNEL, double z);
 double kernel_unordered(int KERNEL, double x, double y, double lambda, int c);
-double kernel_unordered_ratio(int KERNEL, double x, double y, double lambda, int c);
-double kernel_ordered(int KERNEL, double x, double y, double lambda);
+/* RLY uses retained support, with the first argument denoting the donor.
+ * Operators: 0 normal, 1 overlap, 2 bandwidth score, 3 cumulative. */
+double np_ordered_rly(int op, double train, double eval, double lambda,
+                      const double *cats, int ncat);
+double np_ordered_rly_denom(double train, double lambda,
+                            const double *cats, int ncat);
+void np_ordered_rly_range(int op, double lambda, const double *cats, int ncat,
+                          double *lower, double *upper);
+double kernel_ordered(int KERNEL, double x, double y, double lambda,
+                      int c, double *categorical_vals);
 double kernel_unordered_convolution(int KERNEL, double x, double y, double lambda, int c, double *c_vals);
 double kernel_ordered_convolution(int KERNEL, double x, double y, double lambda, int c, double *c_vals);
 double kernel_convol(int KERNEL, int BANDWIDTH, double z, double h1, double h2);
-double kernel_deriv(int KERNEL, double z);
 double meand(int n, double *vector);
 
 double ran3(int *idum);
@@ -122,83 +438,144 @@ double standerrd(int n, double *vector);
 
 int compute_nn_distance(int num_obs, int suppress_parallel, double *vector_data, int int_k_nn, double *nn_distance);
 int compute_nn_distance_train_eval(int num_obs_train, int num_obs_eval, int suppress_parallel, double *vector_data_train, double *vector_data_eval, int int_k_nn, double *nn_distance);
+NPNNGeometryStatus compute_nn_distance_status(int num_obs, int suppress_parallel, double *vector_data, int int_k_nn, double *nn_distance);
+NPNNGeometryStatus compute_nn_distance_train_eval_status(int num_obs_train, int num_obs_eval, int suppress_parallel, double *vector_data_train, double *vector_data_eval, int int_k_nn, double *nn_distance);
+NPNNGeometryStatus compute_nn_distance_train_eval_ctx(int num_obs_train, int num_obs_eval, int suppress_parallel, const double *vector_data_train, const double *vector_data_eval, int int_k_nn, const NPNNGeometryContext *geometry_context, double *nn_distance);
+NPNNGeometryStatus compute_nn_adaptive_distance_pair(int num_obs, const double *vector_data, int int_k_nn, double *primary_distance, double *successor_distance);
+NPNNGeometryStatus np_nn_adaptive_fold_select_row(int num_obs, int num_cont, double **matrix_train, double **primary_bandwidth, double **successor_bandwidth, const double *fold_scale, int held_out, double **selected_bandwidth);
+int np_nn_lookup_from_scale(int num_obs_train, int allow_extended, double scale_factor, int *lookup_k, double *distance_scale, int *is_extended);
 
 int determine_categorical_vals(int num_obs, int num_var_unordered, int num_var_ordered, int num_reg_unordered, int num_reg_ordered, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_X_unordered, double **matrix_X_ordered, int *num_categories, double **matrix_categorical_vals);
 
 int np_fround(double x);
+int np_nn_two_slot_radius_select(double primary_radius,
+                                 double successor_radius,
+                                 double base_distance,
+                                 int distinct_base_exclusion,
+                                 double *radius);
+int np_nn_two_slot_exclusion_intervals_scaled(
+  const double *primary_radius, const double *successor_radius,
+  const double *training_values, int num_train, double distance_scale,
+  const int *occurrence_to_position, int *sorted_occurrences,
+  int *interval_start, int *interval_end);
+int np_nn_two_slot_exclusion_intervals(
+  const double *primary_radius,
+  const double *successor_radius,
+  const double *training_values,
+  int num_train,
+  const int *occurrence_to_position,
+  int *sorted_occurrences,
+  int *interval_start,
+  int *interval_end);
 
-int initialize_kernel_density_asymptotic_constants(int KERNEL, int num_var_continuous, double *INT_KERNEL_P, double *K_INT_KERNEL_P);  
 int initialize_kernel_regression_asymptotic_constants(int KERNEL, int num_reg_continuous, double *INT_KERNEL_P, double *K_INT_KERNEL_P, double *INT_KERNEL_PM_HALF, double *DIFF_KER_PPM); 
 
 int initialize_nr_directions(int BANDWIDTH,int num_obs,int num_reg_continuous,int num_reg_unordered,int num_reg_ordered,int num_var_continuous,int num_var_unordered,int num_var_ordered,double * vector_scale_factor,int * num_categories,double **matrix_y,int random,int seed,double lbc_dir,int dfc_dir,double c_dir,double initc_dir,double lbd_dir,double hbd_dir,double d_dir, double initd_dir, double ** matrix_x_continuous,double ** matrix_y_continuous);
 
 int kernel_bandwidth(int KERNEL, int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_var_cont, int num_var_un, int num_var_or, int num_reg_cont, int num_reg_un, int num_reg_or, double *vector_scale_factor, double **matrix_Y_train, double **matrix_Y_eval, double **matrix_X_train, double **matrix_X_eval, double **matrix_bandwidth_Y, double **matrix_bandwidth_X, double *vector_lambda, double **matrix_bandwidth_deriv);
+int kernel_bandwidth_ctx(int KERNEL, int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_var_cont, int num_var_un, int num_var_or, int num_reg_cont, int num_reg_un, int num_reg_or, double *vector_scale_factor, double **matrix_Y_train, double **matrix_Y_eval, double **matrix_X_train, double **matrix_X_eval, double **matrix_bandwidth_Y, double **matrix_bandwidth_X, double *vector_lambda, double **matrix_bandwidth_deriv, const NPNNGeometryContext *x_geometry_context, const NPNNGeometryContext *y_geometry_context, NPNNGeometryStatus *geometry_status);
+
+int np_kernel_bandwidth_continuous_nn(int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_cont, int suppress_parallel, double *vector_scale_factor, double **matrix_train, double **matrix_eval, double **matrix_bandwidth, NPNNGeometryStatus *geometry_status);
+int np_kernel_bandwidth_continuous_nn_ctx(int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_cont, int suppress_parallel, double *vector_scale_factor, double **matrix_train, double **matrix_eval, double **matrix_bandwidth, const NPNNGeometryContext *geometry_context, NPNNGeometryStatus *geometry_status);
+int np_conditional_cdf_translation_safe(
+  int kernel, int bandwidth_mode, int ntrain,
+  int ncontinuous, int nunordered, int nordered,
+  double *scale_factors, double **x_train);
+
 int kernel_bandwidth_mean(int KERNEL, int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_var_cont, int num_var_un, int num_var_or, int num_reg_cont, int num_reg_un, int num_reg_or, int suppress_parallel, double *vector_scale_factor, double **matrix_Y_train, double **matrix_Y_eval, double **matrix_X_train, double **matrix_X_eval, double **matrix_bandwidth_Y, double **matrix_bandwidth_X, double *vector_lambda);
-
-int kernel_estimate_categorical_gradient_ocg_fast(int int_COMPUTE, int *var_index_int, int num_var_test_int, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int int_ll, int int_ordered_categorical_gradient, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double *vector_Y, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double **matrix_bandwidth, double **matrix_bandwidth_deriv, double *lambda, int *num_categories, double **matrix_categorical_vals, double *mean, double **gradient_categorical);
-
-int kernel_estimate_con_density_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double *pdf, double *pdf_stderr, double *log_likelihood);
-
-int kernel_estimate_con_density_categorical_convolution_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_Y_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cv);
-
-int kernel_estimate_con_density_categorical_gradient(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double *pdf, double *pdf_stderr, double **pdf_deriv, double **pdf_deriv_stderr, double *log_likelihood);
-
-int kernel_estimate_con_density_categorical_gradient_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, int int_ordered_categorical_gradient, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, double **matrix_categorical_vals, int *num_categories, double *pdf, double **pdf_deriv, double **pdf_deriv_stderr);
-
-int kernel_estimate_con_density_categorical_leave_one_out_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_Y_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double *cv);
+int kernel_bandwidth_mean_ctx(int KERNEL, int BANDWIDTH, int num_obs_train, int num_obs_eval, int num_var_cont, int num_var_un, int num_var_or, int num_reg_cont, int num_reg_un, int num_reg_or, int suppress_parallel, double *vector_scale_factor, double **matrix_Y_train, double **matrix_Y_eval, double **matrix_X_train, double **matrix_X_eval, double **matrix_bandwidth_Y, double **matrix_bandwidth_X, double *vector_lambda, const NPNNGeometryContext *x_geometry_context, const NPNNGeometryContext *y_geometry_context, NPNNGeometryStatus *geometry_status);
 
 int np_kernel_estimate_con_density_categorical_leave_one_out_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_Y_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double **matrix_XY_unordered, double **matrix_XY_ordered, double **matrix_XY_continuous, double *vector_scale_factor, int *num_categories, double *cv);
+int np_kernel_estimate_con_density_categorical_leave_one_out_cv_ctx(
+  int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den,
+  int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg,
+  int BANDWIDTH_den, int num_obs,
+  int num_var_unordered, int num_var_ordered, int num_var_continuous,
+  int num_reg_unordered, int num_reg_ordered, int num_reg_continuous,
+  double **matrix_Y_unordered, double **matrix_Y_ordered,
+  double **matrix_Y_continuous,
+  double **matrix_X_unordered, double **matrix_X_ordered,
+  double **matrix_X_continuous,
+  double **matrix_XY_unordered, double **matrix_XY_ordered,
+  double **matrix_XY_continuous,
+  double *vector_scale_factor, int *num_categories,
+  const NPConditionalKernelExecutionContext *execution_context,
+  double *cv);
 
-int kernel_estimate_con_distribution_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cdf, double *cdf_stderr, double small, int itmax);
-
-int kernel_estimate_con_distribution_categorical_leave_one_out(int KERNEL_den,int KERNEL_unordered_den,int KERNEL_ordered_den,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int num_obs_train,int num_obs_eval,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_Y_unordered_eval,double **matrix_Y_ordered_eval,double **matrix_Y_continuous_eval,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cdf,double small,int itmax);
-
-int indfunc(double a);
-double cv_func_con_distribution_categorical_ccdf(double *vector_scale_factor);
-
-int kernel_estimate_con_distribution_categorical_leave_one_out_ccdf(int KERNEL_den,int KERNEL_unordered_den,int KERNEL_ordered_den,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int num_obs_train,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv,double small,int itmax);
+int np_conditional_count_levels(const NPConditionalCountPlan *plan,
+                                int *bad_evaluation,
+                                int *bad_replicate,
+                                int *bad_dimension);
 
 int kernel_estimate_con_distribution_categorical_no_mpi(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cdf, double *cdf_stderr, double small, int itmax);
 
-int kernel_estimate_con_distribution_categorical_gradient(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cdf, double *cdf_stderr, double **cdf_deriv, double **cdf_deriv_stderr, double small, int itmax);
+void kernel_estimate_dens_dist_categorical_np(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, int dop, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double ** matrix_categorical_vals, double *pdf, double *pdf_stderr, double *log_likelihood, const NPContinuousKernelRoute *kernel_route, NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics, int categorical_compress, const NPNNGeometryContext *nn_geometry_context);
 
-int kernel_estimate_con_distribution_categorical_gradient_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, int int_ordered_categorical_gradient, double **matrix_Y_unordered_train, double **matrix_Y_ordered_train, double **matrix_Y_continuous_train, double **matrix_Y_unordered_eval, double **matrix_Y_ordered_eval, double **matrix_Y_continuous_eval, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, double **matrix_categorical_vals, int *num_categories, double *cdf, double **cdf_deriv, double **cdf_deriv_stderr, double small, int itmax);
+int np_kernel_estimate_density_categorical_convolution_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, const NPContinuousKernelRoute *kernel_route, NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics, int categorical_compress, double *cv);
 
-int kernel_estimate_density_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double *pdf, double *pdf_stderr, double *log_likelihood);
+int np_kernel_estimate_density_categorical_leave_one_out_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, const NPContinuousKernelRoute *kernel_route, NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics, int categorical_compress, double *cv);
 
-void kernel_estimate_dens_dist_categorical_np(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, int dop, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double ** matrix_categorical_vals, double *pdf, double *pdf_stderr, double *log_likelihood);
-
-
-int kernel_estimate_density_categorical_convolution_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cv);
-
-int np_kernel_estimate_density_categorical_convolution_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cv);
-
-int kernel_estimate_density_categorical_leave_one_out_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double *cv);
-
-int np_kernel_estimate_density_categorical_leave_one_out_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double *cv);
-
-int kernel_estimate_distribution_categorical(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int BANDWIDTH_den, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double *vector_scale_factor, int *num_categories, double **matrix_categorical_vals, double *cdf, double *cdf_stderr, double small, int itmax);
-
-int kernel_estimate_regression_categorical_leave_one_out(int int_ll, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories, double *mean);
-double np_kernel_estimate_regression_categorical_ls_aic(int int_ll, int bwm, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories);
-int np_glp_cv_prepare_extern(const int int_ll, const int num_obs, const int ncon, double **matrix_X_continuous_train);
+double np_kernel_estimate_regression_categorical_ls_aic(int lp_engine, int bwm, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories);
+double np_kernel_estimate_regression_categorical_ls_aic_ctx(int lp_engine, int bwm, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_Y, double *vector_scale_factor, int *num_categories, const NPContinuousKernelRoute *kernel_route, NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics, int categorical_compress);
+int np_glp_cv_prepare_extern(const int lp_engine, const int num_obs, const int ncon, double **matrix_X_continuous_train);
+int np_glp_cv_prepare_original_order_extern(const int *ipt);
 void np_glp_cv_clear_extern(void);
+void np_conditional_profile_index_cache_clear_extern(void);
 int np_glp_cv_degree_admissible_extern(const int num_obs, const int ncon, const int *degree, const int basis_mode);
 void np_reg_cv_core_clear_extern(void);
-int np_shadow_cv_con_density_ml(double *vector_scale_factor, double *cv);
-int np_shadow_cv_con_density_ls(double *vector_scale_factor, double *cv);
-int np_shadow_cv_con_distribution_ls(double *vector_scale_factor, double *cv);
-int np_shadow_proof_conditional_x_weight_row_stream(double *vector_scale_factor, int eval_idx, double *row_out);
-int np_regression_lp_apply_matrix(double *vector_scale_factor, double **rhs_cols, int n_rhs, double *fitted_out);
+int np_regression_lp_hat_matrix(
+  double *vector_scale_factor, int deriv_var, int deriv_order,
+  double *weights_out, double *ridge_used_out,
+  const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+  int categorical_compress,
+  const NPNNGeometryContext *nn_geometry_context,
+  NPRegressionLPEmptyRows *empty_rows);
+int np_regression_lp_apply_matrix(
+  double *vector_scale_factor, double **rhs_cols, int n_rhs,
+  double *fitted_out, const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+  int categorical_compress,
+  const NPNNGeometryContext *nn_geometry_context,
+  NPRegressionLPEmptyRows *empty_rows);
+int np_regression_lp_sigtest_iid(
+  double *vector_scale_factor, const double *donor_index, int n_rhs,
+  const double *null_mean, const double *residual_pool,
+  int statistic_mode, int statistic_coordinate, int response_ready,
+  int pivotal,
+  double *statistic_out);
+int np_regression_lp_leave_one_out_influence(
+  double *vector_scale_factor, double **rhs_cols, int n_rhs,
+  double *weights_out, double *fitted_out, double *ridge_used_out);
 int np_bounded_cvls_conditional_quad_context_prepare_extern(void);
 void np_bounded_cvls_conditional_quad_context_clear_extern(void);
+int np_bounded_cvls_build_conditional_grid_1d_extern(
+  const double *train_y,
+  int num_obs,
+  double lower,
+  double upper,
+  int target_points,
+  double *grid,
+  double *weights,
+  int *actual_points);
+void np_bounded_cvls_conditional_effective_integration_bounds_extern(
+  int num_continuous,
+  double **train_continuous,
+  int num_obs,
+  const double *support_lower,
+  const double *support_upper,
+  double *quadrature_lower,
+  double *quadrature_upper);
+int np_conditional_density_cvml_lp_stream(double *vector_scale_factor, double *cv);
+int np_conditional_density_cvls_lp_stream(double *vector_scale_factor, double *cv);
+void np_conditional_gnn_notice_reset(void);
+void np_conditional_gnn_notice_emit(void);
+int np_conditional_distribution_cvls_lp_stream(double *vector_scale_factor, double *cv);
+int np_conditional_lp_stream_engine_supported(void);
+int np_conditional_density_cvml_stream_engine_supported(void);
 void np_bwm_set_deferred_error(const char *msg);
 const char *np_bwm_get_deferred_error(void);
 void np_bwm_clear_deferred_error(void);
-double cv_func_regression_categorical_ls_nn(double *vector_scale_factor);
-
-int kernel_estimate_regression_categorical_no_stderr(int int_compute_gradient, int int_ll, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int int_WEIGHTS, int *var_index_int, int num_var_test_int, double **matrix_weights_K, double ***matrix_weights_K_deriv, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double **matrix_bandwidth, double **matrix_bandwidth_deriv, double *vector_Y, double *lambda, int *num_categories, double *mean, double **gradient);
-
 int kernel_weighted_sum(int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_Y,double *vector_scale_factor,int *num_categories,double *kernel_sum);
 
 int *alloc_vecu(int nobs);
@@ -221,17 +598,32 @@ void powell(int RESTRICT, int INTEGER, double *p_restrict, double *p, double **x
 void sort(int n, double ra[]);
 
 
-int compute_continuous_stddev(int int_LARGE, int num_obs, int num_var_continuous, int num_reg_continuous, double **matrix_Y_continuous, double **matrix_X_continuous, double *vector_continuous_stddev);
 
 void initialize_nr_vector_scale_factor(int BANDWIDTH,int RANDOM,int seed,int int_large,int num_obs,int num_var_continuous,int num_var_unordered,int num_var_ordered,int num_reg_continuous,int num_reg_unordered,int num_reg_ordered,int kernel_yu,int kernel_xu,int int_use_starting_values,int scale_cat,double init_continuous,double nconfac,double ncatfac,int *num_categories,double *vector_continuous_stddev,double *vector_scale_factor,double lbc_init,double hbc_init,double c_init,double lbd_init,double hbd_init,double d_init,double ** matrix_x_continuous,double ** matrix_y_continuous);
 
-int kernel_weights_conditional_convolution_cv(int int_WEIGHTS, int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_Y_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *lambda, double **matrix_bandwidth_var, double **matrix_bandwidth_reg, int *num_categories, double **matrix_categorical_vals, double **matrix_weights_K_x, double **matrix_weights_K_xy, double **matrix_weights_K_convol_y);
 
-int check_valid_scale_factor_cv(int KERNEL, int KERNEL_unordered_liracine, int BANDWIDTH, int BANDWIDTH_den_ml, int REGRESSION_ML, int num_obs, int num_var_continuous, int num_var_unordered, int num_var_ordered, int num_reg_continuous, int num_reg_unordered, int num_reg_ordered, int *num_categories, double *vector_scale_factor);
+int check_valid_scale_factor_cv(int KERNEL, int KERNEL_var_unordered_liracine, int KERNEL_reg_unordered_liracine, int BANDWIDTH, int BANDWIDTH_den_ml, int REGRESSION_ML, int num_obs, int num_var_continuous, int num_var_unordered, int num_var_ordered, int num_reg_continuous, int num_reg_unordered, int num_reg_ordered, int *num_categories, double *vector_scale_factor);
 
-int kernel_estimate_regression_categorical(int int_ll, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_reg, int num_obs_train, int num_obs_eval, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_X_unordered_train, double **matrix_X_ordered_train, double **matrix_X_continuous_train, double **matrix_X_unordered_eval, double **matrix_X_ordered_eval, double **matrix_X_continuous_eval, double **matrix_X_continuous_bandwidth, double *vector_Y, double *vector_Y_eval, double *vector_scale_factor, int *num_categories, double *mean, double **gradient, double *mean_stderr, double **gradient_stderr, double *R_squared, double *MSE, double *MAE, double *MAPE, double *CORR, double *SIGN);
+/* Conditional-only complete-support response translation scratch. */
+typedef struct NPConditionalCDFAnchor NPConditionalCDFAnchor;
+NPConditionalCDFAnchor *np_conditional_cdf_anchor_prepare(
+  int kernel_c, int kernel_u, int kernel_o, int bandwidth_mode,
+  int n, int nu, int no, int nc,
+  double **train_u, double **train_o, double **train_c,
+  double *scale_factors, int *num_categories, double **categorical_values,
+  const NPContinuousPreparedBandwidthView *prepared, double *prepared_lambda,
+  int use_prepared_ann);
+int np_conditional_cdf_anchor_fill(NPConditionalCDFAnchor *ctx,
+  double **eval_u, double **eval_o, double **eval_c,
+  const double *prepared_ann_continuous, const double *response,
+  double *anchor);
 
-int kernel_estimate_regression_categorical_tree_np(int int_ll,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_Y,double *vector_Y_eval,double *vector_scale_factor,int *num_categories, double ** matrix_categorical_vals, double *mean,double **gradient,double *mean_stderr,double **gradient_stderr,double *R_squared,double *MSE,double *MAE,double *MAPE,double *CORR,double *SIGN);
+typedef struct NPANNFitBatch NPANNFitBatch;
+NPANNFitBatch *np_ann_fit_batch_create(int kernel, int n, int m, int p,
+  double **train, double **evaluation, double **radius);
+const double *np_ann_fit_batch_row(NPANNFitBatch *batch, int row, int stop, int stride);
+
+int kernel_estimate_regression_categorical_tree_np(int lp_engine,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_Y,double *vector_Y_eval,double *vector_scale_factor,int *num_categories, double ** matrix_categorical_vals, double *mean,double **gradient,double *mean_stderr,double **gradient_stderr,double *R_squared,double *MSE,double *MAE,double *MAPE,double *CORR,double *SIGN,const NPContinuousKernelRoute *kernel_route,NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,int categorical_compress,NPRegressionStandardErrorMode standard_error_mode,int ordinary_response,const NPContinuousPreparedBandwidthView *prepared_bandwidth,const NPNNGeometryContext *nn_geometry_context,const NPRegressionHC0Context *hc0_context, NPRegressionLPEmptyRows *empty_rows, const NPConditionalLPFirstSERequest *first_se_request, double *conditional_variance,NPRegressionFailure *failure,NPLPDesignSupport *prepared_design, const double *prepared_ann_row, NPRegressionFitProjection *fit_projection);
 
 double func_con_density_quantile(double *quantile);
 
@@ -239,17 +631,176 @@ int kernel_estimate_quantile(int gradient_compute, int KERNEL_den, int KERNEL_un
 
 double ipow(double x, int n);
 
-double kernel_estimate_regression_categorical_aic_c(int int_ll,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered,double **matrix_X_ordered,double **matrix_X_continuous,double *vector_Y,double *vector_scale_factor,int *num_categories);
+/* Common integer data keep the incumbent ipow operation without traversing
+ * the real-distance tolerance and exponent classifiers for every support
+ * term. This is arithmetic selection, not a support or bandwidth change. */
+static inline double np_ordered_metric_power_between(const double lambda,
+                                                      const double x,
+                                                      const double y)
+{
+  double distance = fabs(x-y);
+  const double lattice = round(distance);
+  if(distance == lattice)
+    return distance < INT_MAX ? ipow(lambda,(int)distance) : pow(lambda,distance);
+  if(lattice > 0.0 &&
+     fabs(distance-lattice) <= 8.0*DBL_EPSILON*fmax(1.0,distance))
+    return lattice < INT_MAX ? ipow(lambda,(int)lattice) : pow(lambda,lattice);
+  return pow(lambda,distance);
+}
+
+static inline double np_ordered_metric_power(const double lambda, const double d)
+{
+  if(d < INT_MAX && d == floor(d)) return ipow(lambda,(int)d);
+  return pow(lambda,d);
+}
+
+static inline double np_ordered_metric_score(const double lambda, const double d)
+{
+  if(d == 0.0) return 0.0;
+  if(lambda == 0.0 && d < 1.0)
+    Rf_error("ordered bandwidth score at lambda = 0 is not finite for distances below 1; use an interior bandwidth for scores");
+  return d*np_ordered_metric_power(lambda,d-1.0);
+}
+
+void np_ordered_lr_cumulative_contract(const double *cats, int ncat);
+double np_ordered_lr_finite_cumulative_prepared(int score, double train,
+  double eval, double lambda, const double *cats, int ncat);
+double np_ordered_lr_interval_cumulative(int score, double train, double eval,
+    double lambda, double lower, double upper);
+double np_ordered_lr_finite_cumulative(int score, double train, double eval,
+                                      double lambda, const double *cats, int ncat);
 
 double cv_func_regression_categorical_aic_c(double *vector_scale_factor);
 
 int simple_unique(int n, double * vector);
 int unique(int num_obs, double *x);
-void spinner(int num);
 
 int kernel_weighted_sum_np(int * KERNEL_reg, int * KERNEL_unordered_reg, int * KERNEL_ordered_reg, const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval, const int num_reg_unordered, const int num_reg_ordered, const int num_reg_continuous, const int leave_one_out, const int leave_one_out_offset, const int kernel_pow, const int bandwidth_divide, const int bandwidth_divide_weights, const int symmetric, const int gather_scatter, const int drop_one_train, const int drop_which_train, const int * const operator, const int permutation_operator, int do_score, int do_ocg, int * bpso, const int suppress_parallel, const int ncol_Y, const int ncol_W, const int int_TREE, const int do_partial_tree, KDT * const kdt, NL * const inl, int * const nld, int * const idx, double ** matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double ** matrix_Y, double ** matrix_W, double * sgn, double *vector_scale_factor,int bandwidth_provided,double ** matrix_bw_train,double ** matrix_bw_eval,double * lambda_pre,int *num_categories,double ** matrix_categorical_vals, int ** matrix_ordered_indices, double * const restrict weighted_sum,  double * const restrict weighted_permutation_sum, double * const restrict kw, double * const restrict pkw);
 
-int kernel_convolution_weighted_sum(int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_reg,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_X_unordered_eval,double **matrix_X_ordered_eval,double **matrix_X_continuous_eval,double *vector_Y,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *kernel_sum);
+int kernel_weighted_sum_np_route(
+  int *KERNEL_reg, int *KERNEL_unordered_reg, int *KERNEL_ordered_reg,
+  const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval,
+  const int num_reg_unordered, const int num_reg_ordered,
+  const int num_reg_continuous, const int leave_one_out,
+  const int leave_one_out_offset, const int kernel_pow,
+  const int bandwidth_divide, const int bandwidth_divide_weights,
+  const int symmetric, const int gather_scatter,
+  const int drop_one_train, const int drop_which_train,
+  const int * const operator, const int permutation_operator,
+  int do_score, int do_ocg, int *bpso, const int suppress_parallel,
+  const int ncol_Y, const int ncol_W, const int int_TREE,
+  const int do_partial_tree, KDT * const kdt, NL * const inl,
+  int * const nld, int * const idx, double **matrix_X_unordered_train,
+  double **matrix_X_ordered_train, double **matrix_X_continuous_train,
+  double **matrix_X_unordered_eval, double **matrix_X_ordered_eval,
+  double **matrix_X_continuous_eval, double **matrix_Y,
+  double **matrix_W, double *sgn, double *vector_scale_factor,
+  int bandwidth_provided, double **matrix_bw_train,
+  double **matrix_bw_eval, double *lambda_pre, int *num_categories,
+  double **matrix_categorical_vals, int **matrix_ordered_indices,
+  double * const restrict weighted_sum,
+  double * const restrict weighted_permutation_sum,
+  double * const restrict kw, double * const restrict pkw,
+  const int categorical_compress,
+  const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics);
+
+int kernel_weighted_sum_np_fold_route(
+  int *KERNEL_reg, int *KERNEL_unordered_reg, int *KERNEL_ordered_reg,
+  const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval,
+  const int num_reg_unordered, const int num_reg_ordered,
+  const int num_reg_continuous, const int leave_one_out,
+  const int leave_one_out_offset, const int kernel_pow,
+  const int bandwidth_divide, const int bandwidth_divide_weights,
+  const int symmetric, const int gather_scatter,
+  const int drop_one_train, const int drop_which_train,
+  const int * const operator, const int permutation_operator,
+  int do_score, int do_ocg, int *bpso, const int suppress_parallel,
+  const int ncol_Y, const int ncol_W, const int int_TREE,
+  const int do_partial_tree, KDT * const kdt, NL * const inl,
+  int * const nld, int * const idx, double **matrix_X_unordered_train,
+  double **matrix_X_ordered_train, double **matrix_X_continuous_train,
+  double **matrix_X_unordered_eval, double **matrix_X_ordered_eval,
+  double **matrix_X_continuous_eval, double **matrix_Y,
+  double **matrix_W, double *sgn, double *vector_scale_factor,
+  int bandwidth_provided, double **matrix_bw_train,
+  double **matrix_bw_eval, double *lambda_pre, int *num_categories,
+  double **matrix_categorical_vals, int **matrix_ordered_indices,
+  double * const restrict weighted_sum,
+  double * const restrict weighted_permutation_sum,
+  double * const restrict kw, double * const restrict pkw,
+  const int categorical_compress,
+  const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+  const NPNNKernelFold *fold);
+
+int kernel_weighted_sum_np_route_power12(
+  int *KERNEL_reg, int *KERNEL_unordered_reg, int *KERNEL_ordered_reg,
+  const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval,
+  const int num_reg_unordered, const int num_reg_ordered,
+  const int num_reg_continuous, const int leave_one_out,
+  const int leave_one_out_offset, const int bandwidth_divide,
+  const int bandwidth_divide_weights, const int * const operator,
+  const int ncol_Y, const int ncol_W,
+  double **matrix_X_unordered_train, double **matrix_X_ordered_train,
+  double **matrix_X_continuous_train,
+  double **matrix_X_unordered_eval, double **matrix_X_ordered_eval,
+  double **matrix_X_continuous_eval,
+  double **matrix_Y, double **matrix_W, double *vector_scale_factor,
+  int bandwidth_provided, double **matrix_bw_train,
+  double **matrix_bw_eval, double *lambda_pre, int *num_categories,
+  double **matrix_categorical_vals, const int categorical_compress,
+  double * const restrict weighted_sum,
+  double * const restrict weighted_sum_power2,
+  const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+  NPContinuousKernelProgressFunction progress);
+
+int kernel_weighted_sum_np_route_centered_m2(
+  int *KERNEL_reg, int *KERNEL_unordered_reg, int *KERNEL_ordered_reg,
+  const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval,
+  const int num_reg_unordered, const int num_reg_ordered,
+  const int num_reg_continuous, const int leave_one_out,
+  const int leave_one_out_offset, const int bandwidth_divide,
+  const int bandwidth_divide_weights, const int * const operator,
+  double **matrix_X_unordered_train, double **matrix_X_ordered_train,
+  double **matrix_X_continuous_train,
+  double **matrix_X_unordered_eval, double **matrix_X_ordered_eval,
+  double **matrix_X_continuous_eval, double *vector_scale_factor,
+  int bandwidth_provided, double **matrix_bw_train,
+  double **matrix_bw_eval, double *lambda_pre, int *num_categories,
+  double **matrix_categorical_vals, const int categorical_compress,
+  double * const restrict weighted_sum,
+  double * const restrict centered_m2,
+  const NPContinuousKernelRoute *kernel_route,
+  NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,
+  NPContinuousKernelProgressFunction progress);
+
+int kernel_weighted_sum_np_power12(
+  int *KERNEL_reg, int *KERNEL_unordered_reg, int *KERNEL_ordered_reg,
+  const int BANDWIDTH_reg, const int num_obs_train, const int num_obs_eval,
+  const int num_reg_unordered, const int num_reg_ordered,
+  const int num_reg_continuous, const int leave_one_out,
+  const int leave_one_out_offset, const int bandwidth_divide,
+  const int bandwidth_divide_weights, const int symmetric,
+  const int gather_scatter, const int drop_one_train,
+  const int drop_which_train, const int * const operator,
+  const int permutation_operator, int do_score, int do_ocg, int *bpso,
+  const int suppress_parallel, const int ncol_Y, const int ncol_W,
+  const int int_TREE, const int do_partial_tree, KDT * const kdt,
+  NL * const inl, int * const nld, int * const idx,
+  double **matrix_X_unordered_train, double **matrix_X_ordered_train,
+  double **matrix_X_continuous_train, double **matrix_X_unordered_eval,
+  double **matrix_X_ordered_eval, double **matrix_X_continuous_eval,
+  double **matrix_Y, double **matrix_W, double *sgn,
+  double *vector_scale_factor, int bandwidth_provided,
+  double **matrix_bw_train, double **matrix_bw_eval, double *lambda_pre,
+  int *num_categories, double **matrix_categorical_vals,
+  int **matrix_ordered_indices, double * const restrict weighted_sum,
+  double * const restrict weighted_sum_power2,
+  double * const restrict weighted_permutation_sum,
+  double * const restrict kw, double * const restrict pkw);
+
 
 /*
 int np_cuokernelv_loo_mlcv(int KERNEL, int uKERNEL, int oKERNEL,
@@ -264,21 +815,27 @@ int np_cuokernelv_loo_mlcv(int KERNEL, int uKERNEL, int oKERNEL,
                            double * const cv);
 */
 
-int np_kernel_estimate_con_density_categorical_convolution_cv(int KERNEL_den, int KERNEL_unordered_den, int KERNEL_ordered_den, int KERNEL_reg, int KERNEL_unordered_reg, int KERNEL_ordered_reg, int BANDWIDTH_den, int num_obs, int num_var_unordered, int num_var_ordered, int num_var_continuous, int num_reg_unordered, int num_reg_ordered, int num_reg_continuous, double **matrix_Y_unordered, double **matrix_Y_ordered, double **matrix_Y_continuous, double **matrix_X_unordered, double **matrix_X_ordered, double **matrix_X_continuous, double *vector_scale_factor, int *num_categories, double ** matrix_categorical_vals, double *cv);
-double np_cv_func_con_density_categorical_ls(double *vector_scale_factor);
 double np_cv_func_con_density_categorical_ml(double *vector_scale_factor);
 double np_cv_func_con_density_categorical_ls_npksum(double *vector_scale_factor);
 
-double np_kernel_estimate_distribution_ls_cv(int KERNEL_den,int KERNEL_den_unordered,int KERNEL_den_ordered,int BANDWIDTH_den,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,int cdfontrain, double memfac,double ** matrix_X_unordered_train,double ** matrix_X_ordered_train,double ** matrix_X_continuous_train,double ** matrix_X_unordered_eval,double ** matrix_X_ordered_eval,double ** matrix_X_continuous_eval,double * vsf,int * num_categories,double ** matrix_categorical_vals,double * cv);
+double np_kernel_estimate_distribution_ls_cv(int KERNEL_den,int KERNEL_den_unordered,int KERNEL_den_ordered,int BANDWIDTH_den,int num_obs_train,int num_obs_eval,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,int cdfontrain, double memfac,double ** matrix_X_unordered_train,double ** matrix_X_ordered_train,double ** matrix_X_continuous_train,double ** matrix_X_unordered_eval,double ** matrix_X_ordered_eval,double ** matrix_X_continuous_eval,double * vsf,int * num_categories,double ** matrix_categorical_vals,const NPContinuousKernelRoute *kernel_route,NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,int categorical_compress,double * cv);
 
 int np_kernel_estimate_con_distribution_categorical_leave_one_out_ls_cv(int KERNEL_den,int KERNEL_unordered_den,int KERNEL_ordered_den,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int64_t num_obs_train,int64_t num_obs_eval,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,int cdfontrain, double memfac, double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_Y_unordered_eval,double **matrix_Y_ordered_eval,double **matrix_Y_continuous_eval,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv);
 
 int np_kernel_estimate_con_density_categorical_leave_one_out_ls_cv(int KERNEL_var,int KERNEL_unordered_var,int KERNEL_ordered_var,int KERNEL_reg,int KERNEL_unordered_reg,int KERNEL_ordered_reg,int BANDWIDTH_den,int64_t num_obs_train,int num_var_unordered,int num_var_ordered,int num_var_continuous,int num_reg_unordered,int num_reg_ordered,int num_reg_continuous,double memfac,double **matrix_Y_unordered_train,double **matrix_Y_ordered_train,double **matrix_Y_continuous_train,double **matrix_X_unordered_train,double **matrix_X_ordered_train,double **matrix_X_continuous_train,double **matrix_XY_unordered_train,double **matrix_XY_ordered_train,double **matrix_XY_continuous_train,double *vector_scale_factor,int *num_categories,double **matrix_categorical_vals,double *cv);
+int np_conditional_density_cvls_lp_stream_ctx(
+  double *vector_scale_factor,
+  const NPConditionalKernelExecutionContext *execution_context,
+  double *cv);
+int np_conditional_distribution_cvls_lp_stream_ctx(
+  double *vector_scale_factor,
+  const NPConditionalKernelExecutionContext *execution_context,
+  double *cv);
 
 
-void np_kernel_estimate_con_dens_dist_categorical(int KERNEL_Y,int KERNEL_unordered_Y,int KERNEL_ordered_Y,int KERNEL_X,int KERNEL_unordered_X,int KERNEL_ordered_X,int BANDWIDTH_den,int yop,int num_obs_train,int num_obs_eval,int num_Y_unordered,int num_Y_ordered,int num_Y_continuous,int num_X_unordered,int num_X_ordered,int num_X_continuous,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_XY_unordered_eval, double **matrix_XY_ordered_eval, double **matrix_XY_continuous_eval, double *vector_scale_factor,int *num_categories,int *num_categories_XY, double ** matrix_categorical_vals, double ** matrix_categorical_vals_XY, double * kdf,double * kdf_stderr,double ** kdf_deriv,double ** kdf_deriv_stderr,double * log_likelihood);
+void np_kernel_estimate_con_dens_dist_categorical(int KERNEL_Y,int KERNEL_unordered_Y,int KERNEL_ordered_Y,int KERNEL_X,int KERNEL_unordered_X,int KERNEL_ordered_X,int BANDWIDTH_den,int yop,int num_obs_train,int num_obs_eval,int num_Y_unordered,int num_Y_ordered,int num_Y_continuous,int num_X_unordered,int num_X_ordered,int num_X_continuous,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_XY_unordered_eval, double **matrix_XY_ordered_eval, double **matrix_XY_continuous_eval, double *vector_scale_factor,int *num_categories,int *num_categories_XY, double ** matrix_categorical_vals, double ** matrix_categorical_vals_XY, double * kdf,double * kdf_stderr,double ** kdf_deriv,double ** kdf_deriv_stderr,double * log_likelihood,const NPContinuousKernelRoute *kernel_route,NPContinuousKernelDerivativeDiagnostics *kernel_route_diagnostics,int categorical_compress,const NPNNGeometryContext *nn_geometry_context, const int *cat_se_mask, int cat_se_distributed, int *cat_se_status, NPRegressionLPEmptyRows *empty_rows);
 
-int np_kernel_estimate_con_dens_dist_categorical_owner_blocks(int KERNEL_Y,int KERNEL_unordered_Y,int KERNEL_ordered_Y,int KERNEL_X,int KERNEL_unordered_X,int KERNEL_ordered_X,int BANDWIDTH_den,int yop,int num_obs_train,int num_obs_eval,int num_Y_unordered,int num_Y_ordered,int num_Y_continuous,int num_X_unordered,int num_X_ordered,int num_X_continuous,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_XY_unordered_eval, double **matrix_XY_ordered_eval, double **matrix_XY_continuous_eval, double *vector_scale_factor,int *num_categories,int *num_categories_XY, double ** matrix_categorical_vals, double ** matrix_categorical_vals_XY, double * kdf,double * kdf_stderr,double ** kdf_deriv,double ** kdf_deriv_stderr,double * log_likelihood);
+int np_kernel_estimate_con_dens_dist_categorical_owner_blocks(int KERNEL_Y,int KERNEL_unordered_Y,int KERNEL_ordered_Y,int KERNEL_X,int KERNEL_unordered_X,int KERNEL_ordered_X,int BANDWIDTH_den,int yop,int num_obs_train,int num_obs_eval,int num_Y_unordered,int num_Y_ordered,int num_Y_continuous,int num_X_unordered,int num_X_ordered,int num_X_continuous,double **matrix_XY_unordered_train, double **matrix_XY_ordered_train, double **matrix_XY_continuous_train, double **matrix_XY_unordered_eval, double **matrix_XY_ordered_eval, double **matrix_XY_continuous_eval, double *vector_scale_factor,int *num_categories,int *num_categories_XY, double ** matrix_categorical_vals, double ** matrix_categorical_vals_XY, double * kdf,double * kdf_stderr,double ** kdf_deriv,double ** kdf_deriv_stderr,double * log_likelihood, const int *cat_se_mask, NPRegressionLPEmptyRows *empty_rows);
 
 void np_splitxy_vsf_mcv_nc(const int num_var_unordered, const int num_var_ordered, const int num_var_continuous, const int num_reg_unordered, const int num_reg_ordered, const int num_reg_continuous, const double * const vector_scale_factor, const int * const num_categories, double ** matrix_categorical_vals, double * vsf_x, double * vsf_y, double * vsf_xy, int * nc_x, int * nc_y, int * nc_xy, double ** mcv_x, double ** mcv_y, double ** mcv_xy);
 
@@ -311,12 +868,9 @@ double max_unordered_bw(int num_categories,
 #define IO_MIN_TRUE  1
 #define IO_MIN_FALSE 0
 
-/* Regression type codes: lc (0), ll (1), lp (2). */
-#define LL_LC  0
-#define LL_LL  1
-#define LL_LP  2
-/* Legacy alias retained for internal compatibility. */
-#define LL_GLP LL_LP
+/* Canonical local-polynomial compute engines. */
+#define NP_LP_ENGINE_SCALAR  0
+#define NP_LP_ENGINE_GENERAL  2
 
 #define OCG_UNO 0
 #define OCG_ORD 1
@@ -357,7 +911,11 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define CK_EPAN6 6
 #define CK_EPAN8 7
 #define CK_UNIF 8
-#define CK_TGAUSS2 9
+#define CK_RESERVED 9
+
+#if CK_GAUSS2 != 0 || CK_GAUSS8 != 3 || CK_EPAN2 != 4 || CK_EPAN8 != 7 || CK_UNIF != 8 || CK_RESERVED != 9
+# error "continuous kernel code layout changed"
+#endif
 
 #define ONE_OVER_SQRT_TWO_PI 0.39894228040143267794
 #define SQRT_5 2.236067978
@@ -388,6 +946,11 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define RBW_SCATI 18
 #define RBW_DFC_DIRI 19
 #define RBW_TBNDI 20
+#define RBW_CKFAMILYI 21
+#define RBW_CKORDERI 22
+#define RBW_CATCOMPI 23
+#define RBW_NNMINI 24
+#define RBW_OPTIONS_COUNT (RBW_NNMINI + 1)
 
 #define RBW_FTOLD  0
 #define RBW_TOLD   1
@@ -428,11 +991,14 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define BW_NUNOI 13
 #define BW_NORDI 14
 #define BW_NCONI 15
-#define BW_OLDBW 16
+#define BW_RESERVED_LEGACYI 16
 #define BW_DOTREEI 17
 #define BW_SCATI 18
 #define BW_DFC_DIRI 19
 #define BW_TBNDI 20
+#define BW_CKFAMILYI 21
+#define BW_CKORDERI 22
+#define BW_CATCOMPI 23
 
 #define BW_FTOLD  0
 #define BW_TOLD   1
@@ -478,6 +1044,9 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define DBW_SCATI 19
 #define DBW_DFC_DIRI 20
 #define DBW_TBNDI 21
+#define DBW_CKFAMILYI 22
+#define DBW_CKORDERI 23
+#define DBW_CATCOMPI 24
 
 #define DBW_FTOLD  0
 #define DBW_TOLD   1
@@ -523,13 +1092,19 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define CBW_UNUNOI 19
 #define CBW_UNORDI 20
 #define CBW_UNCONI 21
-#define CBW_OLDI 22
+#define CBW_RESERVED_LEGACYI 22
 #define CBW_TREEI 23
 #define CBW_SCATI 24
 #define CBW_DFC_DIRI 25
 #define CBW_TBNDI 26
 #define CBW_CVLS_QUAD_GRIDI 27
 #define CBW_CVLS_QUAD_POINTSI 28
+#define CBW_CXFAMILYI 29
+#define CBW_CXORDERI 30
+#define CBW_CYFAMILYI 31
+#define CBW_CYORDERI 32
+#define CBW_DEGREE_SEARCHI 33
+#define CBW_CATCOMPI 34
 
 #define CBW_FTOLD  0
 #define CBW_TOLD   1
@@ -559,7 +1134,6 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 
 #define CBWM_CVML 0
 #define CBWM_CVLS 1
-#define CBWM_NPLS 2
 #define CBWM_CCDF 3
 
 #define CBW_MINOBS 1024
@@ -593,6 +1167,11 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define CDBW_SCATI 25
 #define CDBW_DFC_DIRI 26
 #define CDBW_TBNDI 27
+#define CDBW_CXFAMILYI 28
+#define CDBW_CXORDERI 29
+#define CDBW_CYFAMILYI 30
+#define CDBW_CYORDERI 31
+#define CDBW_CATCOMPI 32
 
 #define CDBW_FTOLD  0
 #define CDBW_TOLD   1
@@ -641,6 +1220,12 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define CD_XMLEVI 20
 #define CD_DODENI 21
 #define CD_TREEI 22
+#define CD_CXFAMILYI 23
+#define CD_CXORDERI 24
+#define CD_CYFAMILYI 25
+#define CD_CYORDERI 26
+#define CD_CATCOMPI 27
+#define CD_GNNLPFIT_TREEI 28
 
 #define DEN_TNOBSI   0
 #define DEN_ENOBSI   1
@@ -656,8 +1241,11 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define DEN_TISEI 11
 #define DEN_MLEVI 12
 #define DEN_DODENI 13
-#define DEN_OLDI 14
+#define DEN_RESERVED_LEGACYI 14
 #define DEN_TREEI 15
+#define DEN_CKFAMILYI 16
+#define DEN_CKORDERI 17
+#define DEN_CATCOMPI 18
 
 #define REG_TNOBSI   0
 #define REG_ENOBSI   1
@@ -676,7 +1264,9 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define REG_TISEI 14
 #define REG_MLEVI 15
 #define REG_DOTREEI 16
-#define REG_OLDREGI 17
+#define REG_CATCOMPI 17
+#define REG_CKFAMILYI 18
+#define REG_CKORDERI 19
 
 #define KWS_TNOBSI   0
 #define KWS_ENOBSI 1
@@ -701,6 +1291,12 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define KWS_PSCOREI 20
 #define KWS_POCGI 21
 #define KWS_SPARI 22
+#define KWS_CKFAMILYI 23
+#define KWS_CKORDERI 24
+#define KWS_BDIVWI 25
+#define KWS_CCOMPRESSI 26
+#define KWS_TREEBLASI 27
+#define KWS_OPTIONS_COUNT (KWS_TREEBLASI + 1)
 
 #define CQ_TNOBSI 0
 #define CQ_ENOBSI   1
@@ -737,22 +1333,14 @@ static const int OP_OFUN_OFFSETS[4] = { 0, 4, 8, 12 };
 #define CQ_D_DIRD 8
 #define CQ_INITD_DIRD 9
 
-#define TG2_B     0
-#define TG2_ALPHA 1
-#define TG2_C0    2
-#define TG2_A0    3
-#define TG2_A1    4
-#define TG2_A2    5
-#define TG2_K     6
-#define TG2_K2    7
-#define TG2_K22   8
-#define TG2_KM    9
-
 #define KWSNP_ERR_NOEVAL 1
 #define KWSNP_ERR_BADBW 2
 #define KWSNP_ERR_BADINVOC 3
+#define KWSNP_ERR_ZERO_NN_RADIUS 4
 
 #define UKERNEL_UAA 0
 #define UKERNEL_ULIR 1
+
+void np_check_user_interrupt(void);
 
 #endif // _NP__

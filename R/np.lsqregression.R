@@ -1,6 +1,20 @@
+.nplsqreg_formula_dispatch_args <- function(method, expressions, promise.frame) {
+  .np_formula_dispatch_args(method, expressions, promise.frame)
+}
+
 nplsqreg <-
   function(bws, ...) {
-    args <- list(...)
+    .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                    "nplsqreg", suggest = TRUE)
+    args <- if (!missing(bws) &&
+        (inherits(bws, "formula") ||
+         inherits(bws, "rbandwidth") && !is.null(bws$formula)))
+      .nplsqreg_formula_dispatch_args(
+        nplsqreg.formula, substitute(list(...))[-1L], environment())
+    else .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat"), call = sys.call(), caller = parent.frame(),
+      omit.subset = FALSE)
 
     if (!missing(bws)) {
       if (isa(bws, "lsqregressionbandwidth"))
@@ -24,7 +38,16 @@ nplsqreg <-
 
 nplsqregbw <-
   function(bws, ...) {
-    args <- list(...)
+    args <- if (!missing(bws) && inherits(bws, "formula"))
+      .nplsqreg_formula_dispatch_args(
+        nplsqregbw.formula, substitute(list(...))[-1L], environment())
+    else .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("xdat", "ydat"), call = sys.call(), caller = parent.frame(),
+      omit.subset = FALSE)
+    if ("penalty.multiplier" %in% names(args))
+      args$penalty.multiplier <-
+        npValidateRegressionPenaltyMultiplier(args$penalty.multiplier)
 
     if (!missing(bws)) {
       if (isa(bws, "lsqregressionbandwidth"))
@@ -55,6 +78,77 @@ nplsqregbw <-
     !isTRUE(.npRmpi_autodispatch_called_from_bcast()) &&
     !inherits(call.name, "try-error") &&
     !identical(call.name, "autodispatch-call")
+}
+
+.npRmpi_nplsqreg_should_coordinate_cell <- function(nomad, tau, xdat,
+                                                     bandwidth.compute) {
+  if (!identical(nomad, "auto") || !isTRUE(bandwidth.compute) ||
+      isTRUE(.npRmpi_autodispatch_in_context()) ||
+      isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+    return(FALSE)
+
+  tau.probe <- try(.nplsqreg_validate_tau_values(tau), silent = TRUE)
+  if (inherits(tau.probe, "try-error") || length(tau.probe) != 1L)
+    return(FALSE)
+
+  xframe <- try(toFrame(xdat), silent = TRUE)
+  if (inherits(xframe, "try-error"))
+    return(FALSE)
+  xtype <- try(untangle(xframe), silent = TRUE)
+  !inherits(xtype, "try-error") && identical(sum(xtype$icon), 1L)
+}
+
+.npRmpi_nplsqreg_fixed_cell_controls <- function(opt.args) {
+  core.names <- c(
+    "nmulti", "itmax", "ftol", "tol", "small", "powell.remin",
+    "scale.init.categorical.sample", "transform.bounds",
+    "penalty.multiplier", "invalid.penalty", "scale.factor.search.lower",
+    "scale.factor.init.lower", "scale.factor.init.upper",
+    "scale.factor.init", "dfc.dir", "lbc.dir", "cfac.dir", "initc.dir",
+    "lbd.dir", "hbd.dir", "dfac.dir", "initd.dir", "lbd.init",
+    "hbd.init", "dfac.init"
+  )
+  opt.args[intersect(names(opt.args), core.names)]
+}
+
+.npRmpi_nplsqreg_fixed_cell <- function(xdat, ydat, scale, tau, bws,
+                                        delta, delta.bounds, opt.args) {
+  fixed.args <- c(
+    list(
+      bws = as.numeric(bws$bw),
+      xdat = xdat,
+      ydat = ydat,
+      tau = tau,
+      tau.search = "full",
+      delta = delta,
+      scale = scale,
+      regtype = "lp",
+      basis = bws$basis,
+      degree = as.integer(bws$degree),
+      bernstein.basis = isTRUE(bws$bernstein.basis),
+      bwtype = bws$type,
+      bwscaling = isTRUE(bws$scaling),
+      ckertype = bws$ckertype,
+      ckerorder = bws$ckerorder,
+      ckerbound = bws$ckerbound,
+      ckerlb = bws$ckerlb,
+      ckerub = bws$ckerub,
+      ukertype = bws$ukertype,
+      okertype = bws$okertype,
+      nomad = FALSE,
+      nomad.pilot = FALSE,
+      bandwidth.compute = TRUE,
+      delta.bounds = delta.bounds
+    ),
+    .npRmpi_nplsqreg_fixed_cell_controls(opt.args)
+  )
+  selected <- do.call(nplsqregbw, fixed.args)
+  candidate <- selected$optim
+  if (!is.list(candidate) || !is.list(selected$reg.bws))
+    stop("internal error: nplsqreg fixed-cell transaction returned an invalid payload",
+         call. = FALSE)
+  candidate$bws <- selected$reg.bws
+  candidate
 }
 
 .nplsqreg_validate_tau_values <- function(tau, allow.duplicates = FALSE) {
@@ -134,8 +228,7 @@ nplsqregbw <-
     stop("'ydat' must be a vector")
   if (nrow(xdat) != length(ydat))
     stop("number of explanatory data and response data do not match")
-  if (is.factor(ydat))
-    stop("nplsqreg requires a numeric dependent variable", call. = FALSE)
+  .np_require_numeric_response(ydat, "nplsqreg", "ydat")
   ydat <- as.numeric(ydat)
 
   rows.omit <- attr(na.omit(data.frame(xdat, .nplsqreg_y = ydat)),
@@ -155,7 +248,7 @@ nplsqregbw <-
 
 .nplsqreg_prepare_eval_data <- function(exdat) {
   exdat <- toFrame(exdat)
-  rows.omit <- attr(na.omit(exdat), "na.action")
+  rows.omit <- .np_current_rows_omit(exdat)
   if (.nplsqreg_omit_length(rows.omit)) {
     keep.rows <- rep(TRUE, nrow(exdat))
     keep.rows[as.integer(rows.omit)] <- FALSE
@@ -185,6 +278,7 @@ nplsqregbw <-
     obj$rows.omit <- as.vector(omit)
     obj$nobs.omit <- length(omit)
   } else {
+    obj$omit <- NULL
     obj$rows.omit <- NA_integer_
     obj$nobs.omit <- 0L
   }
@@ -202,6 +296,20 @@ nplsqregbw <-
   }
   out$xeval <- .nplsqreg_napredict_eval(omit, out$xeval)
   out$nobs <- nrow(out$xeval)
+  if (!is.null(out$tau.fits))
+    out$tau.fits <- lapply(out$tau.fits, .nplsqreg_pad_fit_outputs, omit = omit)
+  out
+}
+
+.nplsqreg_restore_training_rows <- function(out, omit) {
+  if (!.nplsqreg_omit_length(omit))
+    return(out)
+  out <- .nplsqreg_record_omit(out, omit)
+  out$bws <- .nplsqreg_record_omit(out$bws, omit)
+  if (isTRUE(out$residuals))
+    out$resid <- .nplsqreg_napredict_eval(omit, out$resid)
+  if (!is.null(out$tau.fits))
+    out$tau.fits <- lapply(out$tau.fits, .nplsqreg_restore_training_rows, omit = omit)
   out
 }
 
@@ -237,10 +345,6 @@ nplsqregbw <-
   match.arg(tau.search, c("full", "refined"))
 }
 
-.nplsqreg_check_loss <- function(u, tau) {
-  mean(u * (tau - (u < 0)), na.rm = TRUE)
-}
-
 .nplsqreg_validate_scale <- function(scale, n) {
   if (!is.numeric(scale) || length(scale) != n ||
       any(!is.finite(scale)) || any(scale <= 0))
@@ -249,17 +353,77 @@ nplsqregbw <-
   as.numeric(scale)
 }
 
+.nplsqreg_finalize_scale_pilot <- function(variance.hat, residuals) {
+  variance.hat <- as.numeric(variance.hat)
+  residuals <- as.numeric(residuals)
+  if (!length(variance.hat) || length(variance.hat) != length(residuals))
+    stop("internal error: nplsqreg scale pilot returned an invalid length",
+         call. = FALSE)
+  if (any(!is.finite(variance.hat)))
+    stop("automatic nplsqreg scale pilot produced a nonfinite fitted variance",
+         call. = FALSE)
+
+  nonpositive <- variance.hat <= 0
+  if (!any(nonpositive))
+    return(sqrt(variance.hat))
+
+  residual.reference <- max(abs(residuals))
+  if (!is.finite(residual.reference) || residual.reference <= 0)
+    stop("automatic nplsqreg scale pilot has no positive residual scale",
+         call. = FALSE)
+  residual.rms <- residual.reference *
+    sqrt(mean((residuals / residual.reference)^2))
+  scale.floor <- residual.rms * sqrt(.Machine$double.eps)
+  if (!is.finite(scale.floor) || scale.floor <= 0)
+    stop("automatic nplsqreg scale pilot has no representable positive scale",
+         call. = FALSE)
+
+  scale <- numeric(length(variance.hat))
+  scale[!nonpositive] <- sqrt(variance.hat[!nonpositive])
+  scale[nonpositive] <- scale.floor
+  if (any(!is.finite(scale)) || any(scale <= 0))
+    stop("automatic nplsqreg scale pilot produced an invalid scale",
+         call. = FALSE)
+  scale
+}
+
+.nplsqreg_describe_call <- function(call, owner) {
+  # do.call on these internal methods can store the closure as the call head.
+  # Keep a portable descriptive public call, not the package function itself.
+  if (identical(call[[1L]], nplsqregbw.default) ||
+      identical(call[[1L]], as.name("nplsqregbw.default")))
+    call[[1L]] <- as.name("nplsqregbw")
+  else if (identical(call[[1L]], nplsqreg.default) ||
+           identical(call[[1L]], as.name("nplsqreg.default")))
+    call[[1L]] <- as.name("nplsqreg")
+  environment(call) <- .np_call_owner_environment(owner)
+  call
+}
+
+.nplsqreg_retain_native_fit <- function(fit, xdat, ydat) {
+  fit$bws <- .np_bws_retain_native_training(fit$bws, xdat, ydat)
+  # These fits are produced internally with explicit native samples. A literal
+  # bandwidth embedded by do.call must describe the same retained child.
+  if (inherits(fit$call[["bws"]], "rbandwidth"))
+    fit$call[["bws"]] <- fit$bws
+  environment(fit$call) <- NULL
+  fit
+}
+
 .nplsqreg_scale_pilot_fit <- function(xdat, ydat, pilot.dots,
                                       regtype.pilot, nomad.pilot) {
-  mean.bw <- do.call(npregbw, c(list(xdat = xdat, ydat = ydat), pilot.dots))
+  # Use local bindings for already-prepared values, preserving compact labels.
+  mean.bw <- do.call(npregbw, c(alist(xdat = xdat, ydat = ydat), pilot.dots),
+                     envir = environment())
   mean.fit <- npreg(bws = mean.bw, txdat = xdat, tydat = ydat)
   res <- as.numeric(ydat) - as.numeric(fitted(mean.fit))
   scale.fit <- npreg(bws = mean.fit$bws, txdat = xdat, tydat = res^2)
+  scale.fit$ynames <- "res^2"
+  scale.fit$bws <- updateBwNameMetadata(list(ynames = "res^2"), scale.fit$bws)
   variance.hat <- as.numeric(fitted(scale.fit))
-  floor <- .Machine$double.eps
-  variance.hat <- pmax(floor, variance.hat)
-  variance.hat[!is.finite(variance.hat)] <- floor
-  scale <- sqrt(variance.hat)
+  scale <- .nplsqreg_finalize_scale_pilot(variance.hat, res)
+  mean.fit <- .nplsqreg_retain_native_fit(mean.fit, xdat, ydat)
+  scale.fit <- .nplsqreg_retain_native_fit(scale.fit, xdat, res^2)
   list(scale = scale, mean.fit = mean.fit, scale.fit = scale.fit,
        regtype.pilot = regtype.pilot, nomad.pilot = nomad.pilot)
 }
@@ -304,7 +468,7 @@ nplsqregbw <-
       mpi.size > 1L) {
     rank <- tryCatch(as.integer(mpi.comm.rank(1L)), error = function(e) 0L)
     if (isTRUE(rank == 0L)) {
-      out <- .npRmpi_with_local_regression(
+      out <- .npRmpi_capture_local_work(.npRmpi_with_local_regression(
         .nplsqreg_scale_pilot_fit(
           xdat = xdat,
           ydat = ydat,
@@ -312,11 +476,14 @@ nplsqregbw <-
           regtype.pilot = regtype.pilot,
           nomad.pilot = nomad.pilot
         )
-      )
+      ))
       mpi.bcast.Robj(out, rank = 0L, comm = 1L)
-      return(out)
+    } else {
+      out <- mpi.bcast.Robj(rank = 0L, comm = 1L)
     }
-    return(mpi.bcast.Robj(rank = 0L, comm = 1L))
+    if (inherits(out, "npRmpi_local_failure"))
+      .npRmpi_raise_completed_failure(out)
+    return(out)
   }
 
   .nplsqreg_scale_pilot_fit(
@@ -338,7 +505,7 @@ nplsqregbw <-
                               bandwidth.compute = FALSE)
     out$fval <- fval
     out$num.feval <- num.feval
-    out
+    .np_bws_retain_native_training(out, xdat, ydat)
   } else {
   out <- rbandwidth(
     bw = as.numeric(bw),
@@ -469,6 +636,23 @@ nplsqregbw <-
   dots
 }
 
+.nplsqreg_canonical_lp_template <- function(template,
+                                            degree,
+                                            bernstein.basis) {
+  spec <- npCanonicalConditionalRegSpec(
+    regtype = "lp",
+    basis = template$basis,
+    degree = as.integer(degree),
+    bernstein.basis = bernstein.basis,
+    ncon = template$ncon,
+    where = "nplsqregbw"
+  )
+  for (field in names(spec))
+    template[[field]] <- spec[[field]]
+  template$pregtype <- "Local-Polynomial"
+  template
+}
+
 .nplsqreg_call_fixed_degree_core <- function(xdat, ydat, scale, tau, bws,
                                              delta, delta.bounds, opt.args,
                                              bandwidth.compute) {
@@ -500,8 +684,7 @@ nplsqregbw <-
   tol <- npValidatePositiveFiniteNumeric(opt.value("tol", 1.490116e-04), "tol")
   small <- npValidatePositiveFiniteNumeric(opt.value("small", 1.490116e-05), "small")
   penalty.multiplier <-
-    npValidatePositiveFiniteNumeric(opt.value("penalty.multiplier", 10),
-                                    "penalty.multiplier")
+    npValidateRegressionPenaltyMultiplier(opt.value("penalty.multiplier", 10))
   invalid.penalty <- match.arg(opt.value("invalid.penalty", "baseline"),
                                c("baseline", "dbmax"))
   penalty.mode <- if (invalid.penalty == "baseline") 1L else 0L
@@ -522,13 +705,10 @@ nplsqregbw <-
   nconfac <- nrow^(-1.0 / (2.0 * bws$ckerorder + bws$ncon))
   ncatfac <- nrow^(-2.0 / (2.0 * bws$ckerorder + bws$ncon))
 
-  reg.spec <- npCanonicalConditionalRegSpec(
-    regtype = bws$regtype,
-    basis = bws$basis,
-    degree = bws$degree,
-    bernstein.basis = bws$bernstein.basis,
-    ncon = bws$ncon,
-    where = "nplsqregbw"
+  reg.spec <- npValidatedConditionalRegSpec(
+    bws,
+    where = "nplsqregbw",
+    ncon.field = "ncon"
   )
   reg.c <- npRegtypeToC(regtype = reg.spec$regtype.engine,
                         degree = reg.spec$degree.engine,
@@ -569,8 +749,8 @@ nplsqregbw <-
     kerneval = switch(bws$ckertype,
       gaussian = CKER_GAUSS + bws$ckerorder / 2 - 1,
       epanechnikov = CKER_EPAN + bws$ckerorder / 2 - 1,
-      uniform = CKER_UNI,
-      "truncated gaussian" = CKER_TGAUSS),
+      uniform = CKER_UNI
+),
     ukerneval = switch(bws$ukertype,
       aitchisonaitken = UKER_AIT,
       liracine = UKER_LR),
@@ -582,12 +762,29 @@ nplsqregbw <-
     nord = bws$nord,
     ncon = bws$ncon,
     regtype = reg.c$code,
-    int_do_tree = .npregbw_tree_code(bws, ncon = bws$ncon,
-                                     ncat = bws$nuno + bws$nord),
+    int_do_tree = .npregbw_tree_code(
+      bws,
+      ncon = bws$ncon,
+      ncat = bws$nuno + bws$nord,
+      regtype.engine = reg.spec$regtype.engine
+    ),
     scale.init.categorical.sample = scale.init.categorical.sample,
     dfc.dir = opt.value("dfc.dir", 3),
     transform.bounds = transform.bounds
   )
+  myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
+  myopti <- c(
+    myopti,
+    categorical.compress = npStrictLogicalOption("np.categorical.compress", TRUE),
+    nn.minimum = npRegressionNnLowerBound(bws, owner = "lsq")
+  )
+  if (!isTRUE(bandwidth.compute)) {
+    npValidateRegressionNnLowerBound(
+      bws,
+      where = "nplsqregbw",
+      owner = "lsq"
+    )
+  }
   myoptd <- list(
     ftol = ftol,
     tol = tol,
@@ -625,6 +822,7 @@ nplsqregbw <-
       as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
       as.integer(npLpBasisCode(reg.spec$basis.engine)),
       as.double(cker.bounds.c$lb), as.double(cker.bounds.c$ub),
+      .np_native_categorical_support(bws),
       PACKAGE = "npRmpi"
     )
   } else {
@@ -641,6 +839,7 @@ nplsqregbw <-
       as.integer(isTRUE(reg.spec$bernstein.basis.engine)),
       as.integer(npLpBasisCode(reg.spec$basis.engine)),
       as.double(cker.bounds.c$lb), as.double(cker.bounds.c$ub),
+      .np_native_categorical_support(bws),
       PACKAGE = "npRmpi"
     )
   }
@@ -662,6 +861,44 @@ nplsqregbw <-
   )
 }
 
+.nplsqreg_raw_objective_valid <- function(value) {
+  value <- as.numeric(value)
+  length(value) == 1L && !is.na(value) && is.finite(value) &&
+    !identical(value, .Machine$double.xmax)
+}
+
+.nplsqreg_nomad_select_payload <- function(direct,
+                                            hot = NULL,
+                                            powell.time = NA_real_) {
+  direct.objective <- as.numeric(direct$objective[1L])
+  direct.valid <- .nplsqreg_raw_objective_valid(direct.objective)
+  hot.objective <- if (is.null(hot)) NA_real_ else
+    as.numeric(hot$objective[1L])
+  hot.valid <- !is.null(hot) &&
+    .nplsqreg_raw_objective_valid(hot.objective)
+
+  if (hot.valid &&
+      (!direct.valid ||
+       .np_degree_better(hot.objective, direct.objective, direction = "min"))) {
+    return(list(
+      payload = hot,
+      objective = hot.objective,
+      powell.time = powell.time
+    ))
+  }
+  if (direct.valid) {
+    return(list(
+      payload = direct,
+      objective = direct.objective,
+      powell.time = powell.time
+    ))
+  }
+  stop(
+    "nplsqregbw NOMAD route did not return a raw-valid solution",
+    call. = FALSE
+  )
+}
+
 .nplsqreg_nomad_search <- function(xdat, ydat, scale, tau, template,
                                    delta, delta.bounds, opt.args,
                                    degree.search,
@@ -672,9 +909,11 @@ nplsqregbw <-
     stop("nplsqregbw nomad=TRUE does not support degree.verify=TRUE",
          call. = FALSE)
 
-  template$regtype <- "lp"
-  template$degree <- as.integer(degree.search$start.degree)
-  template$bernstein.basis <- degree.search$bernstein.basis
+  template <- .nplsqreg_canonical_lp_template(
+    template = template,
+    degree = degree.search$start.degree,
+    bernstein.basis = degree.search$bernstein.basis
+  )
   if (!(template$type %in% c("fixed", "generalized_nn", "adaptive_nn")))
     stop("nplsqregbw nomad=TRUE requires bwtype='fixed', 'generalized_nn', or 'adaptive_nn'",
          call. = FALSE)
@@ -690,7 +929,11 @@ nplsqregbw <-
   opt.value <- function(name, default) {
     if (is.null(opt.args[[name]])) default else opt.args[[name]]
   }
-  bw.bounds <- .npregbw_nomad_bw_bounds(template = template, setup = setup)
+  bw.bounds <- .npregbw_nomad_bw_bounds(
+    template = template,
+    setup = setup,
+    owner = "lsq"
+  )
   bw.start.bounds <- .np_nomad_bw_restart_start_bounds(
     bounds = bw.bounds,
     setup = setup,
@@ -731,9 +974,11 @@ nplsqregbw <-
                                          setup = setup)
     tbw <- template
     tbw$bw <- bw.vec
-    tbw$regtype <- "lp"
-    tbw$degree <- degree
-    tbw$bernstein.basis <- degree.search$bernstein.basis
+    tbw <- .nplsqreg_canonical_lp_template(
+      template = tbw,
+      degree = degree,
+      bernstein.basis = degree.search$bernstein.basis
+    )
     out <- .nplsqreg_call_fixed_degree_core(
       xdat = xdat,
       ydat = ydat,
@@ -760,9 +1005,11 @@ nplsqregbw <-
                                          setup = setup)
     tbw <- template
     tbw$bw <- bw.vec
-    tbw$regtype <- "lp"
-    tbw$degree <- degree
-    tbw$bernstein.basis <- degree.search$bernstein.basis
+    tbw <- .nplsqreg_canonical_lp_template(
+      template = tbw,
+      degree = degree,
+      bernstein.basis = degree.search$bernstein.basis
+    )
     direct <- .nplsqreg_call_fixed_degree_core(
       xdat = xdat,
       ydat = ydat,
@@ -771,18 +1018,25 @@ nplsqregbw <-
       bws = tbw,
       delta = point[delta.idx],
       delta.bounds = delta.bounds,
-      opt.args = utils::modifyList(opt.args, list(nmulti = 1L)),
+      opt.args = utils::modifyList(
+        opt.args,
+        list(nmulti = 1L, invalid.penalty = "dbmax")
+      ),
       bandwidth.compute = FALSE
     )
-    direct$num.feval <- as.numeric(nomad.num.feval.total)
-    direct$num.feval.fast <- as.numeric(nomad.num.feval.fast.total)
+    direct$num.feval <- as.numeric(nomad.num.feval.total) +
+      as.numeric(direct$num.feval[1L])
+    direct$num.feval.fast <- as.numeric(nomad.num.feval.fast.total) +
+      as.numeric(direct$num.feval.fast[1L])
     direct$bws <- tbw
     direct$bws$bw <- direct$bw
-    direct$bws$degree <- degree
-    direct$bws$regtype <- "lp"
-    direct$bws$bernstein.basis <- degree.search$bernstein.basis
-    direct.objective <- as.numeric(direct$objective[1L])
+    direct$bws <- .nplsqreg_canonical_lp_template(
+      template = direct$bws,
+      degree = degree,
+      bernstein.basis = degree.search$bernstein.basis
+    )
     powell.elapsed <- NA_real_
+    hot <- NULL
 
     if (identical(degree.search$engine, "nomad+powell")) {
       hot.opt.args <- .np_nomad_powell_hotstart_opt_args(
@@ -791,7 +1045,10 @@ nplsqregbw <-
         remin = isTRUE(opt.args$powell.remin)
       )
       powell.start <- proc.time()[3L]
-      hot <- .npregbw_with_powell_refinement_progress(degree, local({
+      hot <- .np_nomad_with_powell_progress(
+        degree = degree,
+        best_record = best_record,
+        expr = local({
         .nplsqreg_call_fixed_degree_core(
           xdat = xdat,
           ydat = ydat,
@@ -807,19 +1064,21 @@ nplsqregbw <-
       powell.elapsed <- proc.time()[3L] - powell.start
       hot$bws <- direct$bws
       hot$bws$bw <- hot$bw
-      hot$bws$degree <- degree
-      hot$bws$regtype <- "lp"
-      hot$bws$bernstein.basis <- degree.search$bernstein.basis
-      hot$num.feval <- as.numeric(direct$num.feval[1L]) + as.numeric(hot$num.feval[1L])
-      hot$num.feval.fast <- as.numeric(direct$num.feval.fast[1L]) + as.numeric(hot$num.feval.fast[1L])
-      if (is.finite(hot$objective) &&
-          .np_degree_better(hot$objective, direct.objective, direction = "min")) {
-        return(list(payload = hot, objective = hot$objective,
-                    powell.time = powell.elapsed))
-      }
+      hot$bws <- .nplsqreg_canonical_lp_template(
+        template = hot$bws,
+        degree = degree,
+        bernstein.basis = degree.search$bernstein.basis
+      )
+      hot$num.feval <- as.numeric(direct$num.feval[1L]) +
+        as.numeric(hot$num.feval[1L])
+      hot$num.feval.fast <- as.numeric(direct$num.feval.fast[1L]) +
+        as.numeric(hot$num.feval.fast[1L])
     }
-    list(payload = direct, objective = direct.objective,
-         powell.time = powell.elapsed)
+    .nplsqreg_nomad_select_payload(
+      direct = direct,
+      hot = hot,
+      powell.time = powell.elapsed
+    )
   }
 
   search.engine.used <- if (identical(degree.search$engine, "nomad+powell")) {
@@ -862,6 +1121,76 @@ nplsqregbw <-
   if (!identical(search.engine.used, degree.search$engine))
     result$method <- degree.search$engine
   result
+}
+
+.nplsqreg_cell_search <- function(xdat, ydat, scale, tau, template,
+                                  delta, delta.bounds, opt.args,
+                                  degree.search) {
+  eval_fun <- function(degree) {
+    candidate.bws <- .nplsqreg_canonical_lp_template(
+      template = template,
+      degree = degree,
+      bernstein.basis = degree.search$bernstein.basis
+    )
+    candidate <- if (.npRmpi_autodispatch_active() &&
+                     !isTRUE(.npRmpi_autodispatch_in_context()) &&
+                     !isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
+      .npRmpi_nplsqreg_fixed_cell(
+        xdat = xdat,
+        ydat = ydat,
+        scale = scale,
+        tau = tau,
+        bws = candidate.bws,
+        delta = delta,
+        delta.bounds = delta.bounds,
+        opt.args = opt.args
+      )
+    } else {
+      .nplsqreg_call_fixed_degree_core(
+        xdat = xdat,
+        ydat = ydat,
+        scale = scale,
+        tau = tau,
+        bws = candidate.bws,
+        delta = delta,
+        delta.bounds = delta.bounds,
+        opt.args = opt.args,
+        bandwidth.compute = TRUE
+      )
+    }
+    candidate$bws <- candidate.bws
+    candidate$bws$bw <- candidate$bw
+    candidate$bws <- .nplsqreg_canonical_lp_template(
+      template = candidate$bws,
+      degree = degree,
+      bernstein.basis = degree.search$bernstein.basis
+    )
+    list(
+      objective = as.numeric(candidate$objective[1L]),
+      payload = candidate,
+      num.feval = if (is.null(candidate$num.feval)) NA_real_ else
+        as.numeric(candidate$num.feval[1L]),
+      num.feval.fast = if (is.null(candidate$num.feval.fast)) NA_real_ else
+        as.numeric(candidate$num.feval.fast[1L]),
+      nn.cache = candidate$nn.cache
+    )
+  }
+
+  .np_degree_search(
+    method = degree.search$method,
+    candidates = degree.search$candidates,
+    baseline_degree = degree.search$baseline.degree,
+    start_degree = degree.search$start.degree,
+    restarts = degree.search$restarts,
+    max_cycles = degree.search$max.cycles,
+    verify = degree.search$verify,
+    eval_fun = eval_fun,
+    direction = "min",
+    trace_level = "full",
+    source = degree.search$source,
+    reason = degree.search$reason,
+    objective_name = "fval"
+  )
 }
 
 .nplsqreg_combine_bandwidths <- function(bw.list, tau, tau.search = "full",
@@ -924,7 +1253,9 @@ nplsqregbw <-
   first <- fit.list[[1L]]
   out <- first
   out$bw <- bws$bw
-  out$bws <- bws
+  # The scalar fits own the actual training row map; bws may describe an older
+  # original sample when the caller explicitly supplied compact replacements.
+  out$bws <- .nplsqreg_record_omit(bws, first[["omit", exact = TRUE]])
   out$reg.bws <- stats::setNames(lapply(fit.list, `[[`, "reg.bws"), labels)
   out$fit <- stats::setNames(lapply(fit.list, `[[`, "fit"), labels)
   out$tau <- tau
@@ -932,20 +1263,31 @@ nplsqregbw <-
   out$delta <- bws$delta
   out$quantile <- do.call(cbind, lapply(fit.list, `[[`, "quantile"))
   colnames(out$quantile) <- labels
-  out$quanterr <- do.call(cbind, lapply(fit.list, `[[`, "quanterr"))
-  colnames(out$quanterr) <- labels
+  has.se <- all(vapply(fit.list, function(fit) isTRUE(fit$se), logical(1L)))
+  out$quanterr <- if (has.se) {
+    value <- do.call(cbind, lapply(fit.list, `[[`, "quanterr"))
+    colnames(value) <- labels
+    value
+  } else {
+    NA
+  }
   if (isTRUE(first$gradients)) {
     p <- ncol(fit.list[[1L]]$quantgrad)
     grad.names <- colnames(fit.list[[1L]]$quantgrad)
     out$quantgrad <- array(NA_real_,
                            dim = c(nrow(fit.list[[1L]]$quantgrad), p, length(tau)),
                            dimnames = list(NULL, grad.names, labels))
-    out$quantgerr <- array(NA_real_,
-                           dim = c(nrow(fit.list[[1L]]$quantgerr), p, length(tau)),
-                           dimnames = list(NULL, grad.names, labels))
+    out$quantgerr <- if (has.se) {
+      array(NA_real_,
+            dim = c(nrow(fit.list[[1L]]$quantgerr), p, length(tau)),
+            dimnames = list(NULL, grad.names, labels))
+    } else {
+      NA
+    }
     for (j in seq_along(tau)) {
       out$quantgrad[, , j] <- fit.list[[j]]$quantgrad
-      out$quantgerr[, , j] <- fit.list[[j]]$quantgerr
+      if (has.se)
+        out$quantgerr[, , j] <- fit.list[[j]]$quantgerr
     }
   } else {
     out$quantgrad <- NA
@@ -977,9 +1319,10 @@ nplsqregbw <-
 
 nplsqregbw.formula <-
   function(bws, data = NULL, tau = 0.5, subset, na.action, ...) {
+    dots <- list(...)
     .npRmpi_require_active_slave_pool(where = "nplsqregbw()")
 
-    tt <- terms(bws)
+    tt <- .np_formula_aligned_terms(terms(bws))
     mc <- match.call(expand.dots = FALSE)
     m <- match(c("bws", "data", "subset", "na.action"),
                names(mc), nomatch = 0)
@@ -988,22 +1331,49 @@ nplsqregbw.formula <-
       names(tmf)[names(tmf) == "bws"] <- "formula"
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
-    mf.args <- as.list(tmf)[-1L]
-    mf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    if (!missing(data) && !is.null(data))
+      tmf[["data"]] <- data
+    mf.args <- .np_formula_frame_promises(as.list(tmf)[-1L], environment())
+    if (!is.null(dots[["scale"]])) mf.args$.np.auxiliary <- list(scale = dots[["scale"]])
+    mf <- do.call(.np_formula_model_frame, mf.args, envir = environment(tt))
+    if (!is.null(dots[["scale"]])) dots[["scale"]] <- mf[["(scale)"]]
     train.omit <- attr(mf, "na.action")
     ydat <- model.response(mf)
-    xdat <- mf[, attr(attr(mf, "terms"), "term.labels"), drop = FALSE]
-    out <- nplsqregbw(xdat = xdat, ydat = ydat, tau = tau, ...)
-    out <- .nplsqreg_record_omit(out, attr(mf, "na.action"))
-    out$formula <- bws
-    out <- .nplsqreg_set_response_name(
-      out, .nplsqreg_formula_response_name(bws))
-    out$call <- match.call(expand.dots = FALSE)
-    environment(out$call) <- parent.frame()
-    out
+    xdat <- mf[, .np_formula_term_names(attr(attr(mf, "terms"), "term.labels")), drop = FALSE]
+    .npRmpi.bw.metadata <- .npRmpi_bw_formula_plan(
+      "nplsqregbw", match.call(expand.dots = FALSE), parent.frame(),
+      bws, mf, NULL, ynames = .nplsqreg_formula_response_name(bws),
+      scalar.children = length(tau) > 1L)
+    out <- do.call(nplsqregbw, c(list(xdat = xdat, ydat = ydat, tau = tau), dots))
+    .npRmpi_bw_formula_finish(out, .npRmpi.bw.metadata)
   }
 
+.nplsqreg_stored_training_error <- function(controls) {
+  stop(paste0("nplsqreg(): a stored LSQ bandwidth object retains its training sample; ",
+              "do not supply ", paste(shQuote(controls), collapse = ", "),
+              ". Rebuild it with nplsqregbw() for another training sample, ",
+              "or use newdata/exdat for prediction."), call. = FALSE)
+}
+
+# Stored formula-bearing LSQ objects own a frozen training sample, not the
+# ordinary native data policy. Their established NULL data is a no-op; real
+# replacement data must rebuild the pseudo responses. Read only that promise.
+.nplsqreg_check_reuse_data <- function(bws, dots) {
+  at <- which(names(dots) == "data")
+  if (!length(at)) return(invisible(NULL))
+  if (missing(bws) || !inherits(bws, "lsqregressionbandwidth") ||
+      !inherits(bws[["formula", exact = TRUE]], "formula"))
+    .np_native_data_error()
+  if (length(at) != 1L)
+    stop("formal argument 'data' matched by multiple actual arguments", call. = FALSE)
+  if (!is.null(eval(as.name(paste0("..", at)), envir = parent.frame())))
+    .nplsqreg_stored_training_error("data")
+  invisible(NULL)
+}
+
 nplsqregbw.lsqregressionbandwidth <- function(bws, tau = bws$tau, ...) {
+  .nplsqreg_check_reuse_data(bws, substitute(list(...))[-1L])
+
   tau <- .nplsqreg_validate_tau_values(tau)
   if (length(tau) != length(bws$tau) || !isTRUE(all.equal(tau, bws$tau)))
     stop("cross-tau nplsqreg bandwidth-object reuse is not supported",
@@ -1012,7 +1382,32 @@ nplsqregbw.lsqregressionbandwidth <- function(bws, tau = bws$tau, ...) {
 }
 
 nplsqregbw.NULL <- function(...) {
+  .np_reject_native_data(substitute(list(...))[-1L])
+
   nplsqregbw.default(...)
+}
+
+# Re-enter or dispatch only arguments owned by this invocation. Formal
+# promises cache their original evaluation; looking up their expressions again
+# can capture a method local, a global binding, or a second random draw.
+.nplsqreg_owned_call <- function(call, owner, materialize = FALSE) {
+  parts <- as.list(call)
+  parts[["..."]] <- NULL
+  for (name in names(parts)[-1L]) {
+    value <- if (materialize) get(name, envir = owner, inherits = FALSE) else
+      as.name(name)
+    parts[name] <- list(if (materialize && is.language(value))
+      substitute(quote(VALUE), list(VALUE = value)) else value)
+  }
+  if (materialize) {
+    dots <- lapply(eval(quote(list(...)), owner), function(value) {
+      if (is.language(value)) substitute(quote(VALUE), list(VALUE = value)) else value
+    })
+    parts <- c(parts, dots)
+  } else {
+    parts <- c(parts, list(quote(...)))
+  }
+  as.call(parts)
 }
 
 nplsqregbw.default <-
@@ -1033,32 +1428,50 @@ nplsqregbw.default <-
            optim.control = list(maxit = 50L),
            ...,
            nomad.opts = list()) {
+  .np_reject_native_data(substitute(list(...))[-1L])
+
 
     nomad.opts <- .np_nomad_normalize_user_opts(nomad.opts, "nplsqregbw")
     .npRmpi_require_active_slave_pool(where = "nplsqregbw()")
     mc.dispatch <- match.call()
     tau.dispatch <- try(.nplsqreg_validate_tau_values(tau),
                         silent = TRUE)
+    coordinate.cell <- .npRmpi_nplsqreg_should_coordinate_cell(
+      nomad = nomad,
+      tau = tau,
+      xdat = xdat,
+      bandwidth.compute = bandwidth.compute
+    )
     if (.npRmpi_nplsqreg_should_autodispatch(mc.dispatch) &&
         !inherits(tau.dispatch, "try-error") &&
-        length(tau.dispatch) == 1L)
-      return(.npRmpi_autodispatch_call(mc.dispatch, environment()))
+        length(tau.dispatch) == 1L &&
+        !isTRUE(coordinate.cell)) {
+      mc.dispatch <- .nplsqreg_owned_call(
+        match.call(expand.dots = FALSE), environment(), materialize = TRUE)
+      return(.npRmpi_autodispatch_call(mc.dispatch, environment(), owner.name = "nplsqregbw.default"))
+    }
 
     elapsed.start <- proc.time()[3]
     progress.wrapped <- isTRUE(.np_progress_runtime$nplsqreg_bw_wrapped)
     if (isTRUE(bandwidth.compute) &&
         !progress.wrapped &&
         !.np_progress_bandwidth_active()) {
-      mc <- match.call(expand.dots = TRUE)
+      public.call <- match.call(expand.dots = FALSE)
+      mc <- .nplsqreg_owned_call(public.call, environment())
+      mc[[1L]] <- as.name("nplsqregbw.default")
       old.progress.wrapped <- .np_progress_runtime$nplsqreg_bw_wrapped
       .np_progress_runtime$nplsqreg_bw_wrapped <- TRUE
       on.exit({
         .np_progress_runtime$nplsqreg_bw_wrapped <- old.progress.wrapped
       }, add = TRUE)
-      return(.np_progress_select_bandwidth_enhanced(
+      result <- .np_progress_select_bandwidth_enhanced(
         "Selecting least-squares quantile regression bandwidth",
-        eval.parent(mc)
-      ))
+        eval(mc, envir = environment())
+      )
+      # Re-entry changes only evaluation ownership, not the public call.
+      # This also keeps rank-local progress wrappers publication-equivalent.
+      result$call <- .nplsqreg_describe_call(public.call, parent.frame())
+      return(result)
     }
 
     tau.raw <- .nplsqreg_validate_tau_values(tau)
@@ -1157,18 +1570,49 @@ nplsqregbw.default <-
         warm.start.degree = warm.start.degree,
         tau.search.controls = tau.search.controls,
         call = match.call(expand.dots = FALSE))
-      environment(out$call) <- parent.frame()
+      out$call <- .nplsqreg_describe_call(out$call, parent.frame())
       return(out)
     }
     tau <- .nplsqreg_validate_tau(tau.raw)
     regtype.pilot <- match.arg(regtype.pilot)
-    nomad <- npValidateScalarLogical(nomad, "nomad")
+    nomad <- npValidateNomadControl(nomad, "nomad")
     nomad.pilot <- npValidateScalarLogical(nomad.pilot, "nomad.pilot")
     bandwidth.compute <- npValidateScalarLogical(bandwidth.compute,
                                                  "bandwidth.compute")
     dots <- .nplsqreg_normalize_dots(
       c(list(...), if (length(nomad.opts)) list(nomad.opts = nomad.opts) else list()),
       where = "nplsqregbw")
+    scalar.mc <- match.call(expand.dots = FALSE)
+    scalar.mc.names <- names(scalar.mc)
+    dot.names <- names(dots)
+    dot.value <- function(name) dots[[name, exact = TRUE]]
+    nomad.shortcut <- .np_prepare_nomad_shortcut(
+      nomad = nomad,
+      call_names = unique(c(scalar.mc.names, dot.names)),
+      preset = list(
+        regtype = "lp",
+        search.engine = "nomad+powell",
+        degree.select = "coordinate",
+        bernstein.basis = TRUE,
+        degree.min = 0L,
+        degree.max = 3L,
+        degree.verify = FALSE,
+        bwtype = "fixed"
+      ),
+      values = list(
+        regtype = if (regtype.supplied) regtype else NULL,
+        search.engine = dot.value("search.engine"),
+        degree.select = dot.value("degree.select"),
+        bernstein.basis = dot.value("bernstein.basis"),
+        degree.min = dot.value("degree.min"),
+        degree.max = dot.value("degree.max"),
+        degree.verify = dot.value("degree.verify"),
+        bwtype = dot.value("bwtype"),
+        degree = dot.value("degree")
+      ),
+      where = "nplsqregbw"
+    )
+    nomad.enabled <- isTRUE(nomad.shortcut$enabled)
     controls <- .nplsqreg_optimizer_controls(dots, optim.control)
     prepared <- .nplsqreg_prepare_train_data(xdat, ydat, scale = scale)
     xdat <- prepared$xdat
@@ -1181,16 +1625,33 @@ nplsqregbw.default <-
       stop("'delta.bounds' must be a two-value numeric interval inside (0, 1)",
            call. = FALSE)
 
-    if (isTRUE(nomad) && !isTRUE(bandwidth.compute))
-      stop("nplsqregbw nomad=TRUE requires bandwidth.compute=TRUE",
+    if (nomad.enabled && !isTRUE(bandwidth.compute))
+      stop("nplsqregbw nomad=TRUE or \"auto\" requires bandwidth.compute=TRUE",
            call. = FALSE)
-    if (isTRUE(nomad) && regtype.supplied && !identical(regtype, "lp"))
-      stop("nplsqregbw nomad=TRUE requires regtype='lp' when regtype is supplied",
+    if (nomad.enabled && regtype.supplied &&
+        !identical(as.character(match.arg(regtype, c("lc", "ll", "lp")))[1L], "lp"))
+      stop("nplsqregbw nomad=TRUE or \"auto\" requires regtype='lp' when regtype is supplied",
+           call. = FALSE)
+    if (nomad.enabled && !is.null(dot.value("degree")))
+      stop("nomad=TRUE or \"auto\" does not support an explicit degree; remove degree or set nomad=FALSE",
+           call. = FALSE)
+    if (nomad.enabled && !is.null(dot.value("basis")) &&
+        !identical(as.character(match.arg(dot.value("basis"),
+                                         c("glp", "additive", "tensor")))[1L], "glp"))
+      stop("nplsqregbw nomad=TRUE or \"auto\" currently requires basis='glp'",
+           call. = FALSE)
+    if (nomad.enabled &&
+        !identical(nomad.shortcut$metadata$source, "auto") &&
+        !is.null(dot.value("search.engine")) &&
+        !(as.character(match.arg(dot.value("search.engine"),
+                                 c("nomad+powell", "cell", "nomad")))[1L] %in%
+          c("nomad", "nomad+powell")))
+      stop("nomad=TRUE requires search.engine='nomad' or 'nomad+powell'",
            call. = FALSE)
     reg.dots <- .nplsqreg_strip_optimizer_dots(dots)
     if (regtype.supplied)
       reg.dots$regtype <- regtype
-    if (isTRUE(nomad)) {
+    if (nomad.enabled) {
       reg.dots$regtype <- NULL
       reg.dots$degree <- NULL
       reg.dots$basis <- NULL
@@ -1248,24 +1709,36 @@ nplsqregbw.default <-
            call. = FALSE)
 
     search.result <- NULL
-    if (isTRUE(nomad)) {
+    if (nomad.enabled) {
       degree.search <- .npregbw_degree_search_controls(
         regtype = "lp",
         regtype.named = TRUE,
         ncon = start.bws$ncon,
         nobs = nrow(xdat),
-        basis = if (is.null(dots$basis)) start.bws$basis else dots$basis,
-        degree.select = if (is.null(dots$degree.select)) "coordinate" else dots$degree.select,
-        search.engine = if (is.null(dots$search.engine)) "nomad+powell" else dots$search.engine,
-        degree.min = dots$degree.min,
-        degree.max = dots$degree.max,
-        degree.start = dots$degree.start,
-        degree.restarts = if (is.null(dots$degree.restarts)) 0L else dots$degree.restarts,
-        degree.max.cycles = if (is.null(dots$degree.max.cycles)) 25L else dots$degree.max.cycles,
-        degree.verify = if (is.null(dots$degree.verify)) FALSE else dots$degree.verify,
-        bernstein.basis = if (is.null(dots$bernstein.basis)) TRUE else dots$bernstein.basis,
-        bernstein.named = !is.null(dots$bernstein.basis)
+        basis = if (is.null(dot.value("basis"))) start.bws$basis else dot.value("basis"),
+        degree.select = nomad.shortcut$values$degree.select,
+        search.engine = nomad.shortcut$values$search.engine,
+        degree.min = nomad.shortcut$values$degree.min,
+        degree.max = nomad.shortcut$values$degree.max,
+        degree.start = dot.value("degree.start"),
+        degree.restarts = if (is.null(dot.value("degree.restarts"))) 0L else dot.value("degree.restarts"),
+        degree.max.cycles = if (is.null(dot.value("degree.max.cycles"))) 25L else dot.value("degree.max.cycles"),
+        degree.verify = nomad.shortcut$values$degree.verify,
+        bernstein.basis = nomad.shortcut$values$bernstein.basis,
+        bernstein.named = TRUE,
+        nomad.source = nomad.shortcut$metadata$source,
+        nomad.auto.filled = nomad.shortcut$metadata$auto.filled
       )
+      nomad.inner.named <- !is.null(dot.value("nomad.nmulti"))
+      nomad.inner.nmulti <- if (nomad.inner.named) {
+        npValidateNonNegativeInteger(dot.value("nomad.nmulti"), "nomad.nmulti")
+      } else {
+        0L
+      }
+      if (nomad.inner.named && nomad.inner.nmulti > 0L &&
+          !(degree.search$engine %in% c("nomad", "nomad+powell")))
+        stop("positive nomad.nmulti is only supported when search.engine is 'nomad' or 'nomad+powell'",
+             call. = FALSE)
       if (isTRUE(degree.search$singleton)) {
         fixed.reg.dots <- reg.dots
         fixed.reg.dots$regtype <- "lp"
@@ -1273,25 +1746,44 @@ nplsqregbw.default <-
         fixed.reg.dots$bernstein.basis <- degree.search$bernstein.basis
         fixed.bws <- do.call(npregbw, c(list(xdat = xdat, ydat = ydat),
                                         fixed.reg.dots))
-        fixed.bws$regtype <- "lp"
-        fixed.bws$degree <- as.integer(degree.search$fixed.degree)
-        fixed.bws$bernstein.basis <- degree.search$bernstein.basis
-        fixed.core <- .nplsqreg_call_fixed_degree_core(
-          xdat = xdat,
-          ydat = ydat,
-          scale = scale,
-          tau = tau,
-          bws = fixed.bws,
-          delta = delta,
-          delta.bounds = delta.bounds,
-          opt.args = opt.args,
-          bandwidth.compute = bandwidth.compute
+        fixed.bws <- .nplsqreg_canonical_lp_template(
+          template = fixed.bws,
+          degree = degree.search$fixed.degree,
+          bernstein.basis = degree.search$bernstein.basis
         )
+        fixed.core <- if (.npRmpi_autodispatch_active() &&
+                          !isTRUE(.npRmpi_autodispatch_in_context()) &&
+                          !isTRUE(.npRmpi_autodispatch_called_from_bcast())) {
+          .npRmpi_nplsqreg_fixed_cell(
+            xdat = xdat,
+            ydat = ydat,
+            scale = scale,
+            tau = tau,
+            bws = fixed.bws,
+            delta = delta,
+            delta.bounds = delta.bounds,
+            opt.args = opt.args
+          )
+        } else {
+          .nplsqreg_call_fixed_degree_core(
+            xdat = xdat,
+            ydat = ydat,
+            scale = scale,
+            tau = tau,
+            bws = fixed.bws,
+            delta = delta,
+            delta.bounds = delta.bounds,
+            opt.args = opt.args,
+            bandwidth.compute = bandwidth.compute
+          )
+        }
         fixed.core$bws <- fixed.bws
         fixed.core$bws$bw <- fixed.core$bw
-        fixed.core$bws$degree <- as.integer(degree.search$fixed.degree)
-        fixed.core$bws$regtype <- "lp"
-        fixed.core$bws$bernstein.basis <- degree.search$bernstein.basis
+        fixed.core$bws <- .nplsqreg_canonical_lp_template(
+          template = fixed.core$bws,
+          degree = degree.search$fixed.degree,
+          bernstein.basis = degree.search$bernstein.basis
+        )
         search.result <- .np_degree_singleton_search_result(
           degree.search = degree.search,
           eval_result = list(
@@ -1301,6 +1793,18 @@ nplsqregbw.default <-
           ),
           direction = "min",
           objective_name = "fval"
+        )
+      } else if (identical(degree.search$engine, "cell")) {
+        search.result <- .nplsqreg_cell_search(
+          xdat = xdat,
+          ydat = ydat,
+          scale = scale,
+          tau = tau,
+          template = start.bws,
+          delta = delta,
+          delta.bounds = delta.bounds,
+          opt.args = opt.args,
+          degree.search = degree.search
         )
       } else {
         search.result <- .nplsqreg_nomad_search(
@@ -1313,9 +1817,9 @@ nplsqregbw.default <-
           delta.bounds = delta.bounds,
           opt.args = opt.args,
           degree.search = degree.search,
-          nomad.inner.nmulti = if (is.null(dots$nomad.nmulti)) 0L else dots$nomad.nmulti,
-          random.seed = if (is.null(dots$random.seed)) 42L else dots$random.seed,
-          nomad.opts = if (is.null(dots$nomad.opts)) list() else dots$nomad.opts
+          nomad.inner.nmulti = nomad.inner.nmulti,
+          random.seed = if (is.null(dot.value("random.seed"))) 42L else dot.value("random.seed"),
+          nomad.opts = if (is.null(dot.value("nomad.opts"))) list() else dot.value("nomad.opts")
         )
       }
       core <- search.result$best_payload
@@ -1358,7 +1862,7 @@ nplsqregbw.default <-
     reg.bws$nobs.omit <- .nplsqreg_omit_length(rows.omit)
     if (!is.null(search.result)) {
       reg.bws <- .npregbw_attach_degree_search(reg.bws, search.result)
-      reg.bws$nomad.shortcut <- list(enabled = TRUE, preset = "lp_nomad")
+      reg.bws <- .np_attach_nomad_shortcut(reg.bws, nomad.shortcut$metadata)
     }
 
     out <- lsqregressionbandwidth(
@@ -1381,53 +1885,89 @@ nplsqregbw.default <-
       out,
       .nplsqreg_native_diagnostics_from_search(search.result)
     )
-    environment(out$call) <- parent.frame()
+    out$call <- .nplsqreg_describe_call(out$call, parent.frame())
     out
   }
 
 nplsqreg.formula <-
   function(bws, data = NULL, newdata = NULL, tau = 0.5,
            gradients = FALSE, residuals = FALSE, subset, na.action,
-           gradient.order = 1L, ...) {
+           gradient.order = 1L, se = FALSE, ...) {
 
     .npRmpi_require_active_slave_pool(where = "nplsqreg()")
 
-    tt <- terms(bws)
+    supplied.bws <- inherits(bws, "rbandwidth")
+    if (supplied.bws && !missing(subset) && is.null(data) &&
+        !is.null(bws[[".np.formula.training", exact = TRUE]]) &&
+        !is.null(subset) && !isTRUE(subset))
+      stop("nplsqreg(): supply explicit 'data' when applying a new 'subset' to a retained bandwidth object",
+           call. = FALSE)
+    model.formula <- stats::formula(bws)
+    tt <- .np_formula_aligned_terms(terms(bws))
     dots <- list(...)
     response.name <- .nplsqreg_formula_response_name(bws)
     native.exdat <- dots$exdat
     dots$exdat <- NULL
     mc <- match.call(expand.dots = FALSE)
-    m <- match(c("bws", "data", "subset", "na.action"),
-               names(mc), nomatch = 0)
-    tmf <- mc[c(1, m)]
+    frame.call <- if (supplied.bws && !is.null(bws$call)) bws$call else mc
+    m <- match(c(if (supplied.bws) "formula" else "bws",
+                 "data", "subset", "na.action"),
+               names(frame.call), nomatch = 0)
+    tmf <- frame.call[c(1, m)]
+    if ("subset" %in% names(mc) && is.symbol(mc[["subset"]]) &&
+        grepl("^\\.\\.[0-9]+$", as.character(mc[["subset"]])))
+      mc["subset"] <- .np_formula_subset_inputs(
+        data, mc[["subset"]], parent.frame())["subset"]
+    for (name in intersect(c("subset", "na.action"), names(mc)))
+      tmf[name] <- list(mc[[name]])
     if ("bws" %in% names(tmf))
       names(tmf)[names(tmf) == "bws"] <- "formula"
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
+    if (!missing(data) && !is.null(data))
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    mf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    if (!is.null(dots[["scale"]])) mf.args$.np.auxiliary <- list(scale = dots[["scale"]])
+    if (supplied.bws) {
+      overrides <- list()
+      if (!missing(na.action)) overrides["na.action"] <- list(na.action)
+      frame.bws <- bws
+      if (!is.null(data) && "subset" %in% names(mc) &&
+          !is.null(frame.bws[[".np.formula.training", exact = TRUE]])) {
+        # This explicit refit owns its subset. Keep the original bandwidth
+        # intact for later reuse; only frame preparation drops the old owner.
+        frame.bws[[".np.formula.training"]][["subset"]] <- NULL
+      }
+      mf <- .np_bws_formula_model_frame(frame.bws, mf.args,
+        data.override = !is.null(data), overrides = overrides)
+      # A retained frame has already selected its rows. Its scale is supplied
+      # in retained-sample order; never replay the constructor to align it.
+      if (!is.null(dots[["scale"]]) && "(scale)" %in% names(mf))
+        dots[["scale"]] <- mf[["(scale)"]]
+      dots$bws <- bws
+    } else {
+      mf.args <- .np_formula_frame_promises(mf.args, environment())
+      mf <- do.call(.np_formula_model_frame, mf.args, envir = environment(tt))
+      if (!is.null(dots[["scale"]])) dots[["scale"]] <- mf[["(scale)"]]
+    }
     train.omit <- attr(mf, "na.action")
     ydat <- model.response(mf)
-    xdat <- mf[, attr(attr(mf, "terms"), "term.labels"), drop = FALSE]
+    xdat <- mf[, .np_formula_term_names(attr(attr(mf, "terms"), "term.labels")), drop = FALSE]
 
+    tt <- attr(mf, "terms")
     has.eval <- !is.null(native.exdat) || !is.null(newdata)
     if (!is.null(native.exdat)) {
-      npValidateNewdataFormula(native.exdat, delete.response(tt),
-                               include.response = FALSE)
-      emf <- do.call(stats::model.frame,
-                     list(formula = delete.response(tt), data = native.exdat),
-                     envir = parent.frame())
-      eval.omit <- attr(emf, "na.action")
-      exdat <- emf[, attr(attr(emf, "terms"), "term.labels"), drop = FALSE]
+      prepared <- .nplsqreg_prepare_eval_data(native.exdat)
+      eval.omit <- prepared$omit
+      exdat <- prepared$exdat
     } else if (has.eval) {
       npValidateNewdataFormula(newdata, delete.response(tt),
                                include.response = FALSE)
-      emf <- do.call(stats::model.frame,
+      emf <- do.call(.np_formula_model_frame,
                      list(formula = delete.response(tt), data = newdata),
                      envir = parent.frame())
       eval.omit <- attr(emf, "na.action")
-      exdat <- emf[, attr(attr(emf, "terms"), "term.labels"), drop = FALSE]
+      exdat <- emf[, .np_formula_term_names(attr(attr(emf, "terms"), "term.labels")), drop = FALSE]
     } else {
       eval.omit <- NULL
     }
@@ -1437,42 +1977,47 @@ nplsqreg.formula <-
               c(list(txdat = xdat, tydat = ydat, tau = tau,
                      exdat = exdat, gradients = gradients,
                      residuals = residuals,
-                     gradient.order = gradient.order),
+                     gradient.order = gradient.order, se = se),
                 dots))
     } else {
       do.call(nplsqreg.default,
               c(list(txdat = xdat, tydat = ydat, tau = tau,
                      gradients = gradients, residuals = residuals,
-                     gradient.order = gradient.order),
+                     gradient.order = gradient.order, se = se),
                 dots))
     }
     out$call <- match.call(expand.dots = FALSE)
-    environment(out$call) <- parent.frame()
-    out$bws$formula <- bws
+    out$call <- .nplsqreg_describe_call(out$call, parent.frame())
+    out <- .nplsqreg_retain_formula_terms(out, model.formula, tt)
     out <- .nplsqreg_set_response_name(out, response.name)
     out <- .nplsqreg_record_omit(out, train.omit)
     out$bws <- .nplsqreg_record_omit(out$bws, train.omit)
     if (!has.eval)
       out <- .nplsqreg_pad_fit_outputs(out, train.omit)
-    if (isTRUE(residuals) && .nplsqreg_omit_length(train.omit))
-      out$resid <- .nplsqreg_napredict_eval(train.omit, out$resid)
+    out <- .nplsqreg_restore_training_rows(out, train.omit)
     if (has.eval && .nplsqreg_omit_length(eval.omit)) {
       out$eval.omit <- eval.omit
       out$eval.rows.omit <- as.vector(eval.omit)
       out$eval.nobs.omit <- length(eval.omit)
       out <- .nplsqreg_pad_fit_outputs(out, eval.omit)
     }
-    if (!is.null(out$bws$tau.bws))
-      for (j in seq_along(out$bws$tau.bws))
-        out$bws$tau.bws[[j]]$formula <- bws
-    if (!is.null(out$tau.fits))
-      for (j in seq_along(out$tau.fits))
-        out$tau.fits[[j]]$bws$formula <- bws
     out
   }
 
 nplsqreg.lsqregressionbandwidth <-
-  function(bws, txdat = NULL, tydat = NULL, tau = bws$tau, ...) {
+  function(bws, txdat = NULL, tydat = NULL, tau = bws$tau,
+           se = FALSE, ...) {
+  .nplsqreg_check_reuse_data(bws, substitute(list(...))[-1L])
+
+    retained.training <- is.null(txdat) && is.null(tydat)
+    restore <- function(out) {
+      # The retained arrays are complete cases; only the owning bandwidth
+      # object knows their original positions. Explicit data owns its own map.
+      omit <- if (retained.training) bws[["omit", exact = TRUE]] else NULL
+      if (isTRUE(out$trainiseval))
+        out <- .nplsqreg_pad_fit_outputs(out, omit)
+      .nplsqreg_restore_training_rows(out, omit)
+    }
     tau <- .nplsqreg_validate_tau_values(tau)
     if (length(tau) != length(bws$tau) || !isTRUE(all.equal(tau, bws$tau)))
       stop("cross-tau nplsqreg bandwidth-object reuse is not supported",
@@ -1485,14 +2030,23 @@ nplsqreg.lsqregressionbandwidth <-
       if (is.null(bws$tau.bws) || length(bws$tau.bws) != length(tau))
         stop("vector nplsqreg bandwidth object lacks per-tau bandwidth state",
              call. = FALSE)
+      fit.dots <- list(...)
+      defer.empty <- isTRUE(fit.dots[[".np.defer.empty.rows", exact = TRUE]])
+      fit.dots$.np.defer.empty.rows <- TRUE
+      empty.state <- new.env(hash = FALSE, parent = emptyenv())
+      empty.state$rows <- NULL
       fit.list <- lapply(seq_along(tau), function(j) {
         one.bws <- bws$tau.bws[[j]]
         one.bws$formula <- bws$formula
-        nplsqreg.default(bws = one.bws,
-                         txdat = txdat,
-                         tydat = tydat,
-                         tau = tau[[j]],
-                         ...)
+        fit <- do.call(nplsqreg.default, c(list(bws = one.bws,
+                         txdat = txdat, tydat = tydat,
+                         tau = tau[[j]], se = se), fit.dots))
+        flags <- attr(fit, ".np.empty.rows", exact = TRUE)
+        empty.state$rows <- .npreg_merge_empty_rows(empty.state$rows, flags)
+        if(!is.null(flags)) attr(fit, ".np.empty.rows") <- NULL
+        # This per-tau call belongs to the internal lapply activation.
+        environment(fit$call) <- NULL
+        fit
       })
       out <- .nplsqreg_combine_fits(
         fit.list = fit.list,
@@ -1500,13 +2054,18 @@ nplsqreg.lsqregressionbandwidth <-
         bws = bws,
         tau.search = if (is.null(bws$tau.search)) "full" else bws$tau.search,
         call = match.call(expand.dots = FALSE))
-      environment(out$call) <- parent.frame()
-      return(out)
+      out$call <- .nplsqreg_describe_call(out$call, parent.frame())
+      out <- .npreg_finish_empty_rows(out, empty.state$rows, defer = defer.empty,
+        owner = "nplsqreg", row.labels = row.names(out$xeval))
+      return(restore(out))
     }
-    nplsqreg.default(bws = bws, txdat = txdat, tydat = tydat, tau = tau, ...)
+    restore(nplsqreg.default(bws = bws, txdat = txdat, tydat = tydat, tau = tau,
+                             se = se, ...))
   }
 
 nplsqreg.NULL <- function(...) {
+  .np_reject_native_data(substitute(list(...))[-1L])
+
   nplsqreg.default(...)
 }
 
@@ -1519,46 +2078,72 @@ nplsqreg.default <-
            gradients = FALSE,
            residuals = FALSE,
            gradient.order = 1L,
+           se = FALSE,
            ...) {
+  .nplsqreg_check_reuse_data(bws, substitute(list(...))[-1L])
 
-    .npRmpi_require_active_slave_pool(where = "nplsqreg()")
+
     dots.dispatch <- list(...)
-    if (length(dots.dispatch)) {
-      dot.names <- names(dots.dispatch)
-      if (!is.null(dot.names))
-        # Make S3 `..n` placeholders resolvable by the MPI call materializer.
-        for (nm in dot.names[!is.na(dot.names) & nzchar(dot.names)])
-          if (!exists(nm, envir = environment(), inherits = FALSE))
-            assign(nm, dots.dispatch[[nm]], envir = environment())
-    }
+    npRejectLegacyBooleanErrors(dots.dispatch, "nplsqreg")
+    .npRmpi_require_active_slave_pool(where = "nplsqreg()")
     mc.dispatch <- match.call()
     tau.dispatch <- try(.nplsqreg_validate_tau_values(tau),
                         silent = TRUE)
     if (.npRmpi_nplsqreg_should_autodispatch(mc.dispatch) &&
         !inherits(tau.dispatch, "try-error") &&
-        length(tau.dispatch) == 1L)
-      return(.npRmpi_autodispatch_call(mc.dispatch, environment()))
+        length(tau.dispatch) == 1L) {
+      mc.dispatch <- .nplsqreg_owned_call(
+        match.call(expand.dots = FALSE), environment(), materialize = TRUE)
+      mc.dispatch$.np.defer.empty.rows <- TRUE
+      result <- .npRmpi_autodispatch_call(mc.dispatch, environment(), owner.name = "nplsqreg.default")
+      return(.npreg_finish_empty_rows(result,
+        defer = isTRUE(dots.dispatch[[".np.defer.empty.rows", exact = TRUE]]), owner = "nplsqreg"))
+    }
 
     tau.raw <- .nplsqreg_validate_tau_values(tau)
     gradients <- npValidateScalarLogical(gradients, "gradients")
     residuals <- npValidateScalarLogical(residuals, "residuals")
+    se <- npValidateScalarLogical(se, "se")
     dots <- dots.dispatch
+    # The LSQ owner has consumed the permitted NULL. It is not an argument to
+    # the native regression leaf that fits the retained pseudo responses.
+    dots$data <- NULL
+    defer.empty <- isTRUE(dots[[".np.defer.empty.rows", exact = TRUE]])
+    dots$.np.defer.empty.rows <- NULL
+    if (!missing(bws) && inherits(bws, "lsqregressionbandwidth")) {
+      controls <- intersect(c("data", "subset", "na.action"), names(dots))
+      controls <- controls[vapply(controls, function(name)
+        if (name == "na.action") TRUE else
+          !is.null(dots[[name]]) && !(name == "subset" && isTRUE(dots[[name]])),
+        logical(1L))]
+      if (length(controls))
+        .nplsqreg_stored_training_error(controls)
+      # This owner has consumed the accepted NULL/TRUE no-op subset.
+      dots$subset <- NULL
+    }
     native.newdata <- dots$newdata
     dots$newdata <- NULL
     dots$exdat <- NULL
 
     if (missing(bws) || !isa(bws, "lsqregressionbandwidth")) {
+      predictor.name <- if (is.null(dim(txdat))) paste(deparse(
+        .np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
       bw.args <- list(xdat = txdat, ydat = tydat, tau = tau.raw)
       if (!missing(bws))
         bw.args$bws <- bws
       bw <- do.call("nplsqregbw", c(bw.args, dots))
+      bw <- .nplsqreg_set_response_name(bw, paste(deparse(
+        .np_formula_dot_expression(substitute(tydat), parent.frame())), collapse = ""),
+        predictor.names = predictor.name)
       fit.args <- list(bws = bw, txdat = txdat, tydat = tydat,
                        gradients = gradients, residuals = residuals,
-                       gradient.order = gradient.order)
+                       gradient.order = gradient.order, se = se)
       if (!missing(exdat))
         fit.args$exdat <- exdat
       else if (!is.null(native.newdata))
-        fit.args$exdat <- native.newdata
+        fit.args$exdat <- .np_native_newdata_parts(
+          native.newdata, list(exdat = bw$xnames), "nplsqreg")$exdat
+      fit.args$.np.defer.empty.rows <- defer.empty
       return(do.call("nplsqreg.lsqregressionbandwidth", fit.args))
     }
 
@@ -1569,11 +2154,13 @@ nplsqreg.default <-
                          tau = tau.raw,
                          gradients = gradients,
                          residuals = residuals,
-                         gradient.order = gradient.order)
+                         gradient.order = gradient.order,
+                         se = se)
       if (!missing(exdat))
         reuse.args$exdat <- exdat
       else if (!is.null(native.newdata))
         reuse.args$newdata <- native.newdata
+      reuse.args$.np.defer.empty.rows <- defer.empty
       return(do.call(nplsqreg.lsqregressionbandwidth,
                      c(reuse.args, dots)))
     }
@@ -1591,7 +2178,8 @@ nplsqreg.default <-
 
     fit.args <- list(bws = bws$reg.bws, txdat = txdat, tydat = bws$qdat,
                      gradients = gradients,
-                     gradient.order = gradient.order)
+                     gradient.order = gradient.order,
+                     se = se)
     eval.present <- !missing(exdat) || !is.null(native.newdata)
     eval.omit <- NULL
     if (!missing(exdat)) {
@@ -1599,16 +2187,21 @@ nplsqreg.default <-
       fit.args$exdat <- eval.prepared$exdat
       eval.omit <- eval.prepared$omit
     } else if (!is.null(native.newdata)) {
-      eval.prepared <- .nplsqreg_prepare_eval_data(native.newdata)
+      eval.prepared <- .nplsqreg_prepare_eval_data(.np_native_newdata_parts(
+        native.newdata, list(exdat = bws$xnames), "nplsqreg")$exdat)
       fit.args$exdat <- eval.prepared$exdat
       eval.omit <- eval.prepared$omit
     }
+    fit.args$.np.defer.empty.rows <- TRUE
     fit <- do.call(npreg, c(fit.args, dots))
+    empty.rows <- attr(fit, ".np.empty.rows", exact = TRUE)
+    if(!is.null(empty.rows)) attr(fit, ".np.empty.rows") <- NULL
+    fit <- .nplsqreg_retain_native_fit(fit, txdat, bws$qdat)
 
     quant <- fitted(fit)
-    qerr <- se(fit)
+    qerr <- if (se) se(fit) else NA
     qgrad <- if (gradients) gradients(fit) else NA
-    qgerr <- if (gradients) gradients(fit, errors = TRUE) else NA
+    qgerr <- if (gradients && se) gradients(fit, se = TRUE) else NA
     resid.out <- if (residuals) {
       if (eval.present) {
         tydat - fitted(npreg(bws = bws$reg.bws,
@@ -1634,6 +2227,7 @@ nplsqreg.default <-
       ntrain = nrow(txdat),
       trainiseval = !eval.present,
       gradients = gradients,
+      se = se,
       residuals = residuals,
       resid = resid.out,
       call = match.call(expand.dots = FALSE))
@@ -1644,14 +2238,15 @@ nplsqreg.default <-
     out <- .nplsqreg_record_omit(out, train.omit)
     if (!eval.present)
       out <- .nplsqreg_pad_fit_outputs(out, train.omit)
-    if (isTRUE(residuals) && .nplsqreg_omit_length(train.omit))
-      out$resid <- .nplsqreg_napredict_eval(train.omit, out$resid)
+    out$bws <- .nplsqreg_record_omit(out$bws, train.omit)
+    out <- .nplsqreg_restore_training_rows(out, train.omit)
     if (eval.present && .nplsqreg_omit_length(eval.omit)) {
       out$eval.omit <- eval.omit
       out$eval.rows.omit <- as.vector(eval.omit)
       out$eval.nobs.omit <- length(eval.omit)
       out <- .nplsqreg_pad_fit_outputs(out, eval.omit)
     }
-    environment(out$call) <- parent.frame()
-    out
+    out$call <- .nplsqreg_describe_call(out$call, parent.frame())
+    .npreg_finish_empty_rows(out, empty.rows, omitted = eval.omit,
+      defer = defer.empty, owner = "nplsqreg", row.labels = row.names(fit$eval))
   }

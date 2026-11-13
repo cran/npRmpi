@@ -20,8 +20,14 @@ Object to interrogate for standard errors.
   from objects. 
 }
 \details{
-  This function provides a generic interface for extraction of standard
-  errors from objects.
+  This function extracts stored standard errors; it does not select
+  bandwidths, refit a model, or run a bootstrap. For estimators with a
+  \code{se} fitting control, request \code{se = TRUE} when those errors
+  will be needed. With \code{se = FALSE}, errors are deliberately absent
+  and this accessor explains how to refit with \code{se = TRUE}, reusing
+  the bandwidth object without repeating bandwidth selection.
+  Requested but unavailable standard errors may remain \code{NA};
+  extraction does not replace or recompute them.
 }
 \seealso{
   \code{\link{fitted}}, \code{\link{residuals}}, \code{\link{coef}},
@@ -69,7 +75,7 @@ set.seed(42)
 
 x <- rnorm(10)
 bw <- npudensbw(~x)
-fhat <- npudens(bw)
+fhat <- npudens(bw, se = TRUE)
 
 se(fhat)
 

@@ -1,13 +1,13 @@
 Package: npRmpi
-Version: 0.70-5
-Date: 2026-07-15
+Version: 0.80-2
+Date: 2026-11-11
 Depends: R (>= 3.5.0)
-Imports: boot, cubature, methods, quadprog, quantreg, stats, parallel,
-        tools, crs (>= 0.15-44)
+Imports: compiler, boot, methods, quadprog, quantreg, stats, parallel,
+        tools, crs (>= 0.15-46)
 SystemRequirements: MPI
 Suggests: MASS, logspline, ks, testthat, np, withr, knitr, rmarkdown,
-        rgl
-LinkingTo: crs (>= 0.15-44)
+        rgl, htmlwidgets
+LinkingTo: crs (>= 0.15-46)
 VignetteBuilder: knitr
 Config/testthat/edition: 3
 RoxygenNote: 0.0.0
@@ -33,7 +33,7 @@ Description: Nonparametric (and semiparametric) kernel methods that seamlessly
     gratefully acknowledge support from the Natural Sciences and Engineering
     Research Council of Canada (NSERC, <https://www.nserc-crsng.gc.ca/>), the
     Social Sciences and Humanities Research Council of Canada (SSHRC,
-    <https://www.sshrc-crsh.gc.ca/>), and the Shared Hierarchical Academic
+    <https://sshrc-crsh.canada.ca/en.aspx>), and the Shared Hierarchical Academic
     Research Computing Network (SHARCNET, <https://sharcnet.ca/>). We would
     also like to acknowledge the contributions of the 'GNU GSL' authors. In
     particular, we adapt the 'GNU GSL' B-spline routine 'gsl_bspline.c' adding
@@ -42,14 +42,15 @@ Description: Nonparametric (and semiparametric) kernel methods that seamlessly
     splines beyond their endpoints.
 License: GPL
 Encoding: UTF-8
-URL: https://github.com/JeffreyRacine/R-Package-np
+URL: https://github.com/JeffreyRacine/R-Package-np,
+        https://jeffreyracine.github.io/gallery/
 BugReports: https://github.com/JeffreyRacine/R-Package-np/issues
 Repository: CRAN
 NeedsCompilation: yes
-Packaged: 2026-07-14 17:20:05 UTC; jracine
+Packaged: 2026-11-12 17:04:58 UTC; jracine
 Author: Jeffrey S. Racine [aut, cre],
   Tristen Hayfield [aut],
   Hao Yu [ctb, cph],
   The GSL Team [cph],
   Numerical Recipes Software [cph]
-Date/Publication: 2026-07-15 00:20:02 UTC
+Date/Publication: 2026-11-13 15:10:02 UTC

@@ -1,64 +1,48 @@
-np_seed_enter <- getFromNamespace(".np_seed_enter", "npRmpi")
-np_seed_exit <- getFromNamespace(".np_seed_exit", "npRmpi")
-np_with_seed <- getFromNamespace(".np_with_seed", "npRmpi")
-
-test_that(".np_seed_exit restores prior seed when one exists", {
-  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  if (had_seed) {
-    seed_orig <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  }
-  on.exit({
-    if (had_seed) {
-      assign(".Random.seed", seed_orig, envir = .GlobalEnv)
-    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
-      rm(".Random.seed", envir = .GlobalEnv)
-    }
-  }, add = TRUE)
-
+test_that("temporary scopes restore supported caller state on return and error", {
   set.seed(123)
-  seed_before <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  state <- np_seed_enter(42)
-  np_seed_exit(state)
-  seed_after <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  expect_identical(seed_after, seed_before)
+  before <- .Random.seed
+  expected <- c(runif(4), rnorm(5))
+  assign(".Random.seed", before, .GlobalEnv)
+  expect_identical(.np_with_seed(42L, invisible(2L)), 2L)
+  expect_error(.np_with_seed(42L, {rnorm(3); stop("body error")}), "body error")
+  expect_identical(.Random.seed, before)
+  expect_identical(c(runif(4), rnorm(5)), expected)
 })
 
-test_that(".np_seed_exit remove_if_absent drops synthetic seed", {
-  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  if (had_seed) {
-    seed_orig <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-    rm(".Random.seed", envir = .GlobalEnv)
-  }
-  on.exit({
-    if (had_seed) {
-      assign(".Random.seed", seed_orig, envir = .GlobalEnv)
-    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
-      rm(".Random.seed", envir = .GlobalEnv)
-    }
-  }, add = TRUE)
-
-  expect_false(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
-  state <- np_seed_enter(42)
-  expect_true(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
-  np_seed_exit(state, remove_if_absent = TRUE)
-  expect_false(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+test_that("an absent supported caller seed is restored on success and error", {
+  kind <- RNGkind(); set.seed(123); before <- .Random.seed
+  on.exit({do.call(RNGkind, as.list(kind)); assign(".Random.seed", before, .GlobalEnv)}, add = TRUE)
+  RNGkind("Mersenne-Twister", "Inversion"); set.seed(42L)
+  expected <- c(runif(3), rnorm(2))
+  rm(".Random.seed", envir = .GlobalEnv)
+  expect_identical(.np_with_seed(42L, c(runif(3), rnorm(2))), expected)
+  expect_false(exists(".Random.seed", .GlobalEnv, inherits = FALSE))
+  expect_error(.np_with_seed(42L, stop("body error")), "body error")
+  expect_false(exists(".Random.seed", .GlobalEnv, inherits = FALSE))
 })
 
-test_that(".np_with_seed restores absent seed state", {
-  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  if (had_seed) {
-    seed_orig <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-    rm(".Random.seed", envir = .GlobalEnv)
-  }
-  on.exit({
-    if (had_seed) {
-      assign(".Random.seed", seed_orig, envir = .GlobalEnv)
-    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
-      rm(".Random.seed", envir = .GlobalEnv)
-    }
-  }, add = TRUE)
+test_that("cached normals are refused without changing their continuation", {
+  kind <- RNGkind(); set.seed(123); before <- .Random.seed
+  on.exit({do.call(RNGkind, as.list(kind)); assign(".Random.seed", before, .GlobalEnv)}, add=TRUE)
+  RNGkind(normal.kind = "Box-Muller"); set.seed(21L)
+  invisible(rnorm(1)); expected <- rnorm(1)
+  set.seed(21L); invisible(rnorm(1)); visible <- .Random.seed
+  expect_error(.np_with_seed(42L, stop("body entered")), "Box-Muller")
+  expect_identical(.Random.seed, visible)
+  expect_identical(rnorm(1), expected)
+  set.seed(21L); invisible(rnorm(1)); visible <- .Random.seed
+  rm(".Random.seed", envir = .GlobalEnv)
+  expect_error(.np_with_seed(42L, stop("body entered")), "Box-Muller")
+  expect_error(.np_rng_scope_capture(uniform.only = TRUE), "Box-Muller")
+  expect_false(exists(".Random.seed", .GlobalEnv, inherits = FALSE))
+  assign(".Random.seed", visible, .GlobalEnv)
+  expect_identical(rnorm(1), expected)
+})
 
-  expect_false(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
-  expect_equal(np_with_seed(42, runif(1)), np_with_seed(42, runif(1)))
-  expect_false(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+test_that("uniform-only transport does not certify a generator reset", {
+  set.seed(123); before <- .Random.seed
+  scope <- .np_rng_scope_capture(uniform.only = TRUE)
+  expect_error(.np_rng_scope_seed(scope, 42L), "uniform-only")
+  expect_error(.np_rng_scope_state(scope, before), "uniform-only")
+  expect_identical(.Random.seed, before)
 })

@@ -1,0 +1,498 @@
+beta_deleted_cdf_predictions <- function(dat, bws, empirical = FALSE) {
+  n <- nrow(dat)
+  fit <- matrix(NA_real_, n, n)
+  for (held in seq_len(n)) {
+    donor <- setdiff(seq_len(n), held)
+    args <- list(bws=bws, tdat=dat[donor, , drop=FALSE])
+    # Explicit external grids include all queries; empirical queries retain
+    # occurrence identity on the deleted training sample.
+    if (!empirical) args$edat <- dat
+    query <- if (empirical) donor else seq_len(n)
+    fit[held, query] <- as.numeric(fitted(do.call(npudist, args)))
+  }
+  fit
+}
+
+test_that("beta deleted-CDF test helper agrees with independent distance ranks", {
+  dat <- data.frame(x=c(.03,.08,.15,.29,.41,.53,.69,.81,.92))
+  n <- nrow(dat); k <- 3L
+  for (type in c("generalized_nn", "adaptive_nn")) {
+    bw <- npudistbw(dat=dat, bws=k, bandwidth.compute=FALSE,
+      bwtype=type, ckertype="beta", ckerbound="fixed", ckerlb=0, ckerub=1)
+    for (empirical in c(FALSE, TRUE)) {
+      expected <- matrix(NA_real_, n, n)
+      for (i in seq_len(n)) {
+        donor <- setdiff(seq_len(n), i)
+        for (j in if (empirical) donor else seq_len(n)) {
+          h <- if (type=="adaptive_nn") vapply(donor, function(d) {
+            sort(abs(dat$x[setdiff(donor,d)] - dat$x[d]))[k]
+          }, numeric(1L)) else {
+            neighbor <- if (empirical) setdiff(donor,j) else donor
+            sort(abs(dat$x[neighbor] - dat$x[j]))[k]
+          }
+          expected[i,j] <- mean(pbeta(dat$x[j], 1+dat$x[donor]/h^2,
+            1+(1-dat$x[donor])/h^2))
+        }
+      }
+      expect_equal(beta_deleted_cdf_predictions(dat,bw,empirical), expected,
+        tolerance=3e-13, info=paste(type, empirical))
+    }
+  }
+})
+
+beta_density_objective <- function(x, bandwidth, method = c("cv.ml", "cv.ls"),
+                                   order = 2L, bwtype = "fixed",
+                                   bwscaling = FALSE) {
+  method <- match.arg(method)
+  bws <- npudensbw(
+    dat = x, bws = bandwidth, bandwidth.compute = FALSE,
+    bwmethod = method, bwtype = bwtype, bwscaling = bwscaling,
+    ckertype = "beta", ckerorder = order,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+  out <- npRmpi:::npudensbw.bandwidth(
+    dat = x, bws = bws, bandwidth.compute = TRUE,
+    eval.only = TRUE, nmulti = 1L, invalid.penalty = "dbmax"
+  )
+  -as.numeric(out$fval[1L])
+}
+
+beta_distribution_objective <- function(x, bandwidth, order = 2L,
+                                        bwtype = "fixed", gdat = NULL,
+                                        do.full.integral = FALSE,
+                                        ngrid = 19L) {
+  bws <- npudistbw(
+    dat = x, bws = bandwidth, bandwidth.compute = FALSE,
+    bwtype = bwtype, ckertype = "beta", ckerorder = order,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+  out <- npRmpi:::npudistbw.dbandwidth(
+    dat = x, bws = bws, gdat = gdat,
+    bandwidth.compute = TRUE, eval.only = TRUE, nmulti = 1L,
+    do.full.integral = do.full.integral, ngrid = ngrid,
+    invalid.penalty = "dbmax"
+  )
+  as.numeric(out$fval[1L])
+}
+
+beta_regression_objective <- function(x, y, bandwidth,
+                                      method = c("cv.ls", "cv.aic"),
+                                      order = 2L, bwtype = "fixed") {
+  method <- match.arg(method)
+  bws <- npregbw(
+    xdat = x, ydat = y, bws = bandwidth, bandwidth.compute = FALSE,
+    regtype = "lc", bwmethod = method, bwtype = bwtype,
+    ckertype = "beta", ckerorder = order,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+  as.numeric(npRmpi:::.npregbw_eval_only(
+    xdat = x, ydat = y, bws = bws, invalid.penalty = "dbmax"
+  )$objective[1L])
+}
+
+test_that("beta CVML and local-constant regression objectives match kernel weights", {
+  xval <- c(0.002, 0.012, 0.045, 0.13, 0.31, 0.58, 0.79, 0.93, 0.995)
+  x <- data.frame(x = xval)
+  y <- sin(3 * xval) + xval^2
+
+  for (order in c(2L, 4L, 6L, 8L)) {
+    weights_loo <- npksum(
+      txdat = x, bws = 0.14, leave.one.out = TRUE,
+      return.kernel.weights = TRUE,
+      ckertype = "beta", ckerorder = order,
+      ckerbound = "fixed", ckerlb = 0, ckerub = 1
+    )$kw
+    density_loo <- colSums(weights_loo) / (nrow(x) - 1L)
+    expected_ml <- sum(vapply(density_loo, function(fit) {
+      if (fit > .Machine$double.xmin)
+        return(-log(fit))
+      if (fit < -.Machine$double.xmin)
+        return(log(-fit) - 2 * log(.Machine$double.xmin))
+      -log(.Machine$double.xmin)
+    }, numeric(1L)))
+    fitted_loo <- colSums(weights_loo * y) / colSums(weights_loo)
+    expected_ls <- mean((y - fitted_loo)^2)
+
+    expect_equal(
+      beta_density_objective(x, 0.14, "cv.ml", order),
+      expected_ml,
+      tolerance = 2e-11
+    )
+    expect_equal(
+      beta_regression_objective(x, y, 0.14, "cv.ls", order),
+      expected_ls,
+      tolerance = 2e-11
+    )
+
+    weights_full <- npksum(
+      txdat = x, exdat = x, bws = 0.14,
+      return.kernel.weights = TRUE,
+      ckertype = "beta", ckerorder = order,
+      ckerbound = "fixed", ckerlb = 0, ckerub = 1
+    )$kw
+    denominator <- colSums(weights_full)
+    fitted_full <- colSums(weights_full * y) / denominator
+    trace_hat <- sum(diag(weights_full) / denominator)
+    loss <- mean((y - fitted_full)^2)
+    penalty <- (1 + trace_hat / nrow(x)) /
+      (1 - (trace_hat + 2) / nrow(x))
+    expected_aic <- if (is.finite(loss) && loss > 0 &&
+                        is.finite(penalty) && penalty >= 0) {
+      log(loss) + penalty
+    } else {
+      .Machine$double.xmax
+    }
+    expect_equal(
+      beta_regression_objective(x, y, 0.14, "cv.aic", order),
+      expected_aic,
+      tolerance = 2e-10
+    )
+  }
+})
+
+test_that("beta density CVLS uses bounded target-coordinate quadrature", {
+  x <- data.frame(x = c(0.003, 0.018, 0.07, 0.19, 0.43, 0.68, 0.87, 0.982))
+  grid <- data.frame(x = seq(0, 1, length.out = 81L))
+  step <- 1 / 80
+
+  for (order in c(2L, 8L)) {
+    grid_weights <- npksum(
+      txdat = x, exdat = grid, bws = 0.16,
+      return.kernel.weights = TRUE,
+      ckertype = "beta", ckerorder = order,
+      ckerbound = "fixed", ckerlb = 0, ckerub = 1
+    )$kw
+    density <- colMeans(grid_weights)
+    integrated_square <- step *
+      (sum(density^2) - 0.5 * density[1L]^2 - 0.5 * density[81L]^2)
+    loo_weights <- npksum(
+      txdat = x, bws = 0.16, leave.one.out = TRUE,
+      return.kernel.weights = TRUE,
+      ckertype = "beta", ckerorder = order,
+      ckerbound = "fixed", ckerlb = 0, ckerub = 1
+    )$kw
+    cross_term <- mean(colSums(loo_weights) / (nrow(x) - 1L))
+    expected <- integrated_square - 2 * cross_term
+
+    expect_equal(
+      beta_density_objective(x, 0.16, "cv.ls", order),
+      expected,
+      tolerance = 3e-10
+    )
+  }
+})
+
+test_that("mixed beta density objectives match independent kernel-weight oracles", {
+  old <- options(np.categorical.compress = FALSE)
+  on.exit(options(old), add = TRUE)
+  training <- data.frame(
+    x = c(0.01, 0.04, 0.08, 0.13, 0.2, 0.29, 0.38,
+          0.49, 0.61, 0.72, 0.82, 0.9, 0.96, 0.99),
+    u = factor(rep(letters[1:3], length.out = 14L)),
+    o = ordered(rep(1:4, length.out = 14L), levels = 1:4)
+  )
+  q <- 81L
+  grid <- expand.grid(
+    x = seq(0, 1, length.out = q),
+    u = levels(training$u),
+    o = levels(training$o),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
+  grid$u <- factor(grid$u, levels = levels(training$u))
+  grid$o <- ordered(grid$o, levels = levels(training$o))
+  quadrature_weight <- rep(
+    c(0.5, rep(1, q - 2L), 0.5) / (q - 1L),
+    times = nlevels(training$u) * nlevels(training$o)
+  )
+  guarded_log <- function(fit) {
+    if (fit > .Machine$double.xmin)
+      return(-log(fit))
+    if (fit < -.Machine$double.xmin)
+      return(log(-fit) - 2 * log(.Machine$double.xmin))
+    -log(.Machine$double.xmin)
+  }
+
+  for (order in c(2L, 4L, 6L, 8L)) {
+    for (bwtype in c("fixed", "generalized_nn", "adaptive_nn")) {
+      bandwidth <- if (identical(bwtype, "fixed")) {
+        c(0.15, 0.21, 0.29)
+      } else {
+        c(5, 0.21, 0.29)
+      }
+      bw <- npudensbw(
+        dat = training, bws = bandwidth, bandwidth.compute = FALSE,
+        bwmethod = "cv.ml", bwtype = bwtype, bwscaling = FALSE,
+        ckertype = "beta", ckerorder = order,
+        ckerbound = "fixed", ckerlb = 0, ckerub = 1
+      )
+      ## Density routes use normalized ordered Li--Racine weights; npksum()
+      ## exposes that low-level variant as nliracine.
+      oracle_bw <- bw
+      oracle_bw[["okertype"]] <- "nliracine"
+      # Delete the occurrence before constructing NN radii, not afterwards.
+      loo_weights <- matrix(0,nrow(training),nrow(training))
+      for(i in seq_len(nrow(training)))
+        loo_weights[-i,i] <- npksum(bws=oracle_bw,
+          txdat=training[-i,,drop=FALSE],exdat=training[i,,drop=FALSE],
+          return.kernel.weights=TRUE)$kw[,1L]
+      loo_density <- colSums(loo_weights) / (nrow(training) - 1L)
+      expected_ml <- sum(vapply(
+        loo_density, guarded_log, numeric(1L)
+      ))
+      grid_weights <- npksum(
+        bws = oracle_bw, txdat = training, exdat = grid,
+        return.kernel.weights = TRUE
+      )$kw
+      grid_density <- colMeans(grid_weights)
+      expected_ls <- sum(quadrature_weight * grid_density^2) -
+        2 * mean(loo_density)
+
+      options(np.categorical.compress = FALSE)
+      dense_ml <- beta_density_objective(
+        training, bandwidth, "cv.ml", order, bwtype
+      )
+      dense_ls <- beta_density_objective(
+        training, bandwidth, "cv.ls", order, bwtype
+      )
+      options(np.categorical.compress = TRUE)
+      compressed_ml <- beta_density_objective(
+        training, bandwidth, "cv.ml", order, bwtype
+      )
+      compressed_ls <- beta_density_objective(
+        training, bandwidth, "cv.ls", order, bwtype
+      )
+
+      expect_equal(dense_ml, expected_ml, tolerance = 3e-10)
+      expect_equal(dense_ls, expected_ls, tolerance = 3e-10)
+      expect_identical(dense_ml, compressed_ml)
+      expect_identical(dense_ls, compressed_ls)
+    }
+  }
+})
+
+test_that("beta CDF cross-validation matches explicit leave-one-out matrices", {
+  xval <- c(0.002, 0.02, 0.09, 0.24, 0.51, 0.76, 0.94, 0.997)
+  x <- data.frame(x = xval)
+  grid <- data.frame(x = c(0, 0.01, 0.08, 0.3, 0.65, 0.9, 1))
+
+  for (order in c(2L, 4L, 6L, 8L)) {
+    weights <- npksum(
+      txdat = x, exdat = grid, bws = 0.15,
+      operator = "integral", return.kernel.weights = TRUE,
+      ckertype = "beta", ckerorder = order,
+      ckerbound = "fixed", ckerlb = 0, ckerub = 1
+    )$kw
+    fitted_loo <-
+      (matrix(colSums(weights), nrow(x), nrow(grid), byrow = TRUE) - weights) /
+      (nrow(x) - 1L)
+    indicator <- outer(xval, grid$x, "<=")
+    expected <- mean((indicator - fitted_loo)^2)
+
+    expect_equal(
+      beta_distribution_objective(x, 0.15, order, gdat = grid),
+      expected,
+      tolerance = 3e-11
+    )
+  }
+
+  train_weights <- npksum(
+    txdat = x, exdat = x, bws = 0.15,
+    operator = "integral", return.kernel.weights = TRUE,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )$kw
+  fitted_loo <-
+    (matrix(colSums(train_weights), nrow(x), nrow(x), byrow = TRUE) -
+       train_weights) / (nrow(x) - 1L)
+  squared <- (outer(xval, xval, "<=") - fitted_loo)^2
+  expected_train <-
+    (sum(squared) - sum(diag(squared))) /
+    (nrow(x) * (nrow(x) - 1L))
+  expect_equal(
+    beta_distribution_objective(
+      x, 0.15, 2L, do.full.integral = TRUE
+    ),
+    expected_train,
+    tolerance = 3e-11
+  )
+})
+
+test_that("beta CDF cross-validation matches all order and topology oracles", {
+  xval <- c(0.003, 0.014, 0.037, 0.081, 0.16, 0.27,
+            0.41, 0.57, 0.71, 0.83, 0.92, 0.982)
+  x <- data.frame(x = xval)
+
+  for (order in c(2L, 4L, 6L, 8L)) {
+    for (bwtype in c("fixed", "generalized_nn", "adaptive_nn")) {
+      bandwidth <- if (identical(bwtype, "fixed")) 0.14 else 5
+      bws <- npudistbw(
+        dat = x, bws = bandwidth, bandwidth.compute = FALSE,
+        bwtype = bwtype, bwscaling = FALSE,
+        ckertype = "beta", ckerorder = order,
+        ckerbound = "fixed", ckerlb = 0, ckerub = 1
+      )
+      fitted_loo <- beta_deleted_cdf_predictions(x, bws)
+      expected <- mean((outer(xval, xval, "<=") - fitted_loo)^2)
+
+      expect_equal(
+        beta_distribution_objective(
+          x, bandwidth, order, bwtype, gdat = x
+        ),
+        expected,
+        tolerance = 5e-11
+      )
+    }
+  }
+})
+
+test_that("mixed beta CDF cross-validation matches ordered-product oracles", {
+  old <- options(np.categorical.compress = FALSE)
+  on.exit(options(old), add = TRUE)
+  training <- data.frame(
+    x = c(0.003, 0.014, 0.037, 0.081, 0.16, 0.27,
+          0.41, 0.57, 0.71, 0.83, 0.92, 0.982),
+    o = ordered(rep(1:4, length.out = 12L), levels = 1:4)
+  )
+  n <- nrow(training)
+  empirical.cdf <- outer(training$x, training$x, "<=") *
+    outer(as.integer(training$o), as.integer(training$o), "<=")
+
+  for (order in c(2L, 4L, 6L, 8L)) {
+    for (bwtype in c("fixed", "generalized_nn", "adaptive_nn")) {
+      bandwidth <- if (identical(bwtype, "fixed")) {
+        c(0.14, 0.29)
+      } else {
+        c(5, 0.29)
+      }
+      bws <- npudistbw(
+        dat = training, bws = bandwidth, bandwidth.compute = FALSE,
+        bwtype = bwtype, bwscaling = FALSE,
+        ckertype = "beta", ckerorder = order,
+        ckerbound = "fixed", ckerlb = 0, ckerub = 1
+      )
+      fitted.loo <- beta_deleted_cdf_predictions(training, bws)
+      expected <- mean((empirical.cdf - fitted.loo)^2)
+      empirical.fit <- beta_deleted_cdf_predictions(
+        training, bws, empirical=TRUE)
+      squared <- (empirical.cdf - empirical.fit)^2
+      expected.on.train <- sum(squared[!diag(n)]) / (n * (n - 1L))
+
+      options(np.categorical.compress = FALSE)
+      ordinary <- beta_distribution_objective(
+        training, bandwidth, order, bwtype, gdat = training
+      )
+      options(np.categorical.compress = TRUE)
+      compressed <- beta_distribution_objective(
+        training, bandwidth, order, bwtype, gdat = training
+      )
+      on.train <- beta_distribution_objective(
+        training, bandwidth, order, bwtype,
+        do.full.integral = TRUE
+      )
+
+      expect_equal(ordinary, expected, tolerance = 5e-11)
+      expect_equal(compressed, expected, tolerance = 5e-11)
+      expect_equal(compressed, ordinary, tolerance = 5e-15)
+      expect_equal(on.train, expected.on.train, tolerance = 5e-11)
+    }
+  }
+})
+
+test_that("beta objectives support fixed and both nearest-neighbor modes", {
+  xval <- c(0.004, 0.015, 0.04, 0.11, 0.23, 0.39, 0.58, 0.74, 0.88, 0.97)
+  x <- data.frame(x = xval)
+  y <- cos(2.5 * xval) + 0.1 * xval
+
+  for (bwtype in c("fixed", "generalized_nn", "adaptive_nn")) {
+    bandwidth <- if (identical(bwtype, "fixed")) 0.13 else 4
+    expect_true(is.finite(beta_density_objective(
+      x, bandwidth, "cv.ml", 4L, bwtype
+    )))
+    expect_true(is.finite(beta_density_objective(
+      x, bandwidth, "cv.ls", 4L, bwtype
+    )))
+    expect_true(is.finite(beta_distribution_objective(
+      x, bandwidth, 4L, bwtype, gdat = x
+    )))
+    expect_true(is.finite(beta_regression_objective(
+      x, y, bandwidth, "cv.ls", 4L, bwtype
+    )))
+  }
+})
+
+test_that("beta fixed-bandwidth objectives preserve normalized scaling semantics", {
+  x <- data.frame(x = c(0.006, 0.02, 0.08, 0.2, 0.41, 0.63, 0.81, 0.96))
+  scale_factor <- 0.9
+  bws <- npudensbw(
+    dat = x, bws = scale_factor, bandwidth.compute = FALSE,
+    bwmethod = "cv.ml", bwscaling = TRUE,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )
+  raw_bandwidth <- scale_factor * bws$sdev * bws$nconfac
+  weights <- npksum(
+    txdat = x, bws = raw_bandwidth, leave.one.out = TRUE,
+    return.kernel.weights = TRUE,
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1
+  )$kw
+  expected <- -sum(log(colSums(weights) / (nrow(x) - 1L)))
+
+  expect_equal(
+    beta_density_objective(
+      x, scale_factor, "cv.ml", 2L, "fixed", bwscaling = TRUE
+    ),
+    expected,
+    tolerance = 2e-11
+  )
+})
+
+test_that("beta automatic selectors return usable Powell and native NOMAD objects", {
+  set.seed(1909)
+  xval <- rbeta(24, 0.7, 2.1)
+  x <- data.frame(x = xval)
+  y <- sin(4 * xval) + rnorm(length(xval), sd = 0.02)
+  common <- list(
+    ckertype = "beta", ckerorder = 2,
+    ckerbound = "fixed", ckerlb = 0, ckerub = 1,
+    nmulti = 1L
+  )
+
+  density <- do.call(npudensbw, c(list(
+    dat = x, bwmethod = "cv.ml", bwsolver = "powell", itmax = 80L
+  ), common))
+  distribution <- do.call(npudistbw, c(list(
+    dat = x, bwsolver = "powell", itmax = 80L, ngrid = 17L
+  ), common))
+  regression <- do.call(npregbw, c(list(
+    xdat = x, ydat = y, regtype = "lc", bwmethod = "cv.ls",
+    bwsolver = "powell", itmax = 80L
+  ), common))
+
+  expect_true(all(is.finite(c(density$bw, distribution$bw, regression$bw))))
+  expect_true(all(c(density$bw, distribution$bw, regression$bw) > 0))
+  expect_true(all(is.finite(fitted(npudens(bws = density, tdat = x)))))
+  expect_true(all(is.finite(fitted(npudist(bws = distribution, tdat = x)))))
+  expect_true(all(is.finite(fitted(npreg(
+    bws = regression, txdat = x, tydat = y
+  )))))
+
+  skip_if_not_installed("crs", minimum_version = "0.15.46")
+  mads <- do.call(npregbw, c(list(
+    xdat = x, ydat = y, regtype = "lc", bwmethod = "cv.ls",
+    bwsolver = "mads", nomad.opts = list(MAX_BB_EVAL = 12)
+  ), common))
+  expect_true(is.finite(mads$bw) && mads$bw > 0)
+  expect_true(is.finite(mads$fval))
+
+  distribution_mads <- do.call(npudistbw, c(list(
+    dat = x, bwsolver = "mads", ngrid = 17L,
+    nomad.opts = list(MAX_BB_EVAL = 12)
+  ), common))
+  expect_true(is.finite(distribution_mads$bw) && distribution_mads$bw > 0)
+  expect_true(is.finite(distribution_mads$fval))
+  expect_true(all(is.finite(fitted(npudist(
+    bws = distribution_mads, tdat = x
+  )))))
+})

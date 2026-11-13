@@ -1,43 +1,218 @@
-## This function will compute the cumulative integral at each sample
-## realization using the trapezoidal rule and the cumsum function as
-## we need to compute this in a computationally efficient manner.
+# Sampled quadrature has two distinct contracts: an anchored cumulative
+# integral, and a total with the historical uniform-grid endpoint correction.
+# Coordinates, not observations, are collapsed. Retain this geometry across
+# repeated integrations (notably the IV iteration).
+.np_quadrature_prepare <- function(x) {
+  if(!is.numeric(x) || any(!is.finite(x)))
+    stop("quadrature coordinates must be finite numeric values")
+  ord <- order(x)
+  xs <- x[ord]
+  keep <- !duplicated(xs)
+  unique.x <- xs[keep]
+  dx <- diff(unique.x)
+  uniform <- length(dx) > 0L &&
+    all(abs(dx-dx[1L]) <= 64*.Machine$double.eps*max(abs(dx), diff(range(unique.x))))
+  list(n=length(x), order=ord, inverse=order(ord), keep=keep,
+       map=cumsum(keep), dx=dx, uniform=uniform)
+}
 
-# integrate.trapezoidal <- function(x,y) {
-#   n <- length(x)
-#   rank.x <- rank(x)
-#   order.x <- order(x)
-#   y <- y[order.x]
-#   x <- x[order.x]
-#   int.vec <- numeric(length(x))
-#   ## Use a correction term at the boundary: -cx^2/12*(f'(b)-f'(a)),
-#   ## check for NaN case
-#   cx  <- x[2]-x[1]
-#   ca <- (y[2]-y[1])/cx
-#   cb <- (y[n]-y[n-1])/cx
-#   cf <- cx^2/12*(cb-ca)
-#   if(!is.finite(cf)) cf <- 0
-#   int.vec[1] <- 0
-#   int.vec[2:n] <- cumsum((x[2:n]-x[2:n-1])*(y[2:n]+y[2:n-1])/2)
-#   return(int.vec[rank.x]-cf)
-# }
+.np_quadrature_values <- function(y, geometry) {
+  if(!is.numeric(y) || length(y) != geometry$n)
+    stop("quadrature ordinates must be numeric and match the coordinates")
+  ys <- y[geometry$order]
+  if(any(!geometry$keep)) {
+    n <- length(ys)
+    left <- ys[-n]
+    right <- ys[-1L]
+    same <- (left == right) | (is.na(left) & is.na(right))
+    conflict <- same[!geometry$keep[-1L]]
+    if(anyNA(conflict) || any(!conflict))
+      stop("conflicting quadrature ordinates at duplicate coordinates")
+  }
+  ys[geometry$keep]
+}
 
-# Benches 1.3-1.7 times faster (mean/median) produces identical results
+.np_quadrature_cumulative <- function(y, geometry) {
+  ys <- .np_quadrature_values(y, geometry)
+  n <- length(ys)
+  if(n == 0L) return(numeric())
+  integral <- if(n == 1L) 0 else
+    c(0, cumsum(geometry$dx*(ys[-n]+ys[-1L])/2))
+  integral[geometry$map][geometry$inverse]
+}
+
+.np_quadrature_total <- function(x, y, geometry=.np_quadrature_prepare(x)) {
+  ys <- .np_quadrature_values(y, geometry)
+  n <- length(ys)
+  if(n < 2L) return(0)
+  total <- cumsum(geometry$dx*(ys[-n]+ys[-1L])/2)[n-1L]
+  if(geometry$uniform) {
+    # This corrects the TOTAL only, never every cumulative ordinate.
+    step <- geometry$dx[1L]
+    dy <- diff(ys)
+    correction <- step^2/12*(dy[n-1L]/step-dy[1L]/step)
+    if(is.finite(correction)) total <- total-correction
+  }
+  total
+}
 
 integrate.trapezoidal <- function(x, y) {
-  n <- length(x)
-  order.x <- order(x)
-  x <- x[order.x]
-  y <- y[order.x]
-  dx <- diff(x)
-  dy <- diff(y)
-  cx <- dx[1]
-  ca <- dy[1] / cx
-  cb <- dy[n - 1] / cx
-  cf <- cx^2 / 12 * (cb - ca)
-  if (!is.finite(cf)) cf <- 0
-  int.vec <- c(0, cumsum(dx * (y[-n] + y[-1]) / 2))
-  int.vec <- int.vec - cf
-  int.vec[order(order.x)]  # inverse permutation == rank(x) when no ties
+  .np_quadrature_cumulative(y, .np_quadrature_prepare(x))
+}
+
+# Continuous quadrature is deliberately separate from the sampled-data rule.
+# Legendre coefficients give a reusable primitive without resampling the fit
+# for each requested CDF point. All state is local to one fitted invocation.
+.np_quad_legendre <- function(x, degree) {
+  p <- matrix(1, length(x), degree+1L)
+  if(degree > 0L) p[,2L] <- x
+  if(degree > 1L) for(k in 2:degree)
+    p[,k+1L] <- ((2*k-1)*x*p[,k]-(k-1)*p[,k-1L])/k
+  p
+}
+
+.np_quad_gauss <- function(n) {
+  j <- seq_len(n-1L)
+  off <- j/sqrt(4*j*j-1)
+  a <- matrix(0,n,n)
+  a[cbind(j,j+1L)] <- a[cbind(j+1L,j)] <- off
+  eig <- eigen(a, symmetric=TRUE)
+  ord <- order(eig$values)
+  x <- eig$values[ord]
+  w <- 2*eig$vectors[1L,ord]^2
+  list(x=x, w=w,
+       project=t(.np_quad_legendre(x,n-1L)*w)*((2*(0:(n-1L))+1)/2))
+}
+
+.np_quad_primitive <- function(x, coef, positive, rule) {
+  n <- length(coef)
+  if(!positive) {
+    p <- .np_quad_legendre(x,n)
+    return(drop(coef[1L]*(x+1)+
+      (p[,3:(n+1L),drop=FALSE]-p[,1:(n-1L),drop=FALSE]) %*%
+        (coef[-1L]/(2*(1:(n-1L))+1))))
+  }
+  # Squaring a degree-31 root-density polynomial gives degree 62. The
+  # 32-point positive Gauss rule integrates it exactly, including partial
+  # intervals. This prevents polynomial undershoot from creating negative mass.
+  out <- numeric(length(x))
+  for(first in seq.int(1L,length(x),by=128L)) {
+    ix <- first:min(length(x),first+127L)
+    half <- (x[ix]+1)/2
+    nodes <- as.vector(outer(rule$x+1,half)-1)
+    values <- matrix(drop(.np_quad_legendre(nodes,n-1L) %*% coef)^2,
+                     nrow=length(rule$x))
+    out[ix] <- half*colSums(values*rule$w)
+  }
+  out
+}
+
+.np_density_integral <- function(fun, y, a, b, sample, scale,
+                                 breaks=numeric(), positive=FALSE,
+                                 widths=rep(scale,length(sample)),tol=1e-8) {
+  if(!is.finite(scale) || scale <= 0 || any(!is.finite(sample)))
+    stop("continuous density integration requires finite data and a positive finite scale")
+  if(!length(y)) return(list(F=numeric(),total=NA_real_))
+  # Geometry seeds resolve separated/narrow modes without using Y as a fit or
+  # integration grid. Retain representatives of occupied 4-bandwidth bins.
+  ord <- order(sample)
+  keep <- !duplicated(sample[ord])
+  sx <- sample[ord][keep]
+  widths <- widths[ord][keep]
+  if(length(widths)!=length(sx) || any(!is.finite(widths) | widths<=0))
+    stop("continuous density integration requires positive finite mode widths")
+  group <- floor((sx-sx[1L])/(4*scale))
+  retained <- unique(c(which(!duplicated(group)),length(sx)))
+  centers <- sx[retained]
+  radius <- widths[retained]
+  # Add mode shoulders only across a genuinely wide gap. Adding every shoulder
+  # in dense geometry needlessly partitions an already-resolved smooth region.
+  left.gap <- centers-c(a,head(centers,-1L))
+  right.gap <- c(tail(centers,-1L),b)-centers
+  left <- which(left.gap>8*radius)
+  right <- which(right.gap>8*radius)
+  seeds <- unique(c(centers,centers[left]-radius[left],
+                    centers[left]-8*radius[left],centers[right]+radius[right],
+                    centers[right]+8*radius[right],breaks))
+  span <- max(scale,diff(range(sx)))
+  if(is.finite(a) && is.finite(b)) {
+    to.unit <- function(x) (x-a)/(b-a)
+    from.unit <- function(t) a+(b-a)*t
+    jacobian <- function(t) rep(b-a,length(t))
+  } else if(is.finite(a)) {
+    to.unit <- function(x) {z <- x-a; ifelse(is.infinite(z),1,z/(span+z))}
+    from.unit <- function(t) a+span*t/(1-t)
+    jacobian <- function(t) span/(1-t)^2
+  } else if(is.finite(b)) {
+    to.unit <- function(x) {z <- b-x; ifelse(is.infinite(z),0,span/(span+z))}
+    from.unit <- function(t) b-span*(1-t)/t
+    jacobian <- function(t) span/t^2
+  } else {
+    center <- median(sx)
+    to.unit <- function(x) atan((x-center)/span)/pi+.5
+    from.unit <- function(t) center+span*tan(pi*(t-.5))
+    jacobian <- function(t) pi*span/cos(pi*(t-.5))^2
+  }
+  knots <- sort(unique(c(0,1,to.unit(seeds[seeds>a & seeds<b]))))
+  rule <- .np_quad_gauss(32L)
+  check <- .np_quad_gauss(8L)$x
+  check.basis <- .np_quad_legendre(check,31L)
+  evaluations <- 0L
+  if((length(knots)-1L)*40>200000L)
+    stop("continuous density integration exceeded its evaluation budget")
+  estimate <- function(left,right,depth) {
+    half <- (right-left)/2; middle <- (right+left)/2
+    nodes <- middle+half*c(rule$x,check)
+    values <- fun(from.unit(nodes))*jacobian(nodes)
+    evaluations <<- evaluations+length(nodes)
+    if(length(values)!=length(nodes) || any(!is.finite(values)))
+      stop("non-finite continuous density integrand")
+    if(positive) {
+      if(any(values<0)) stop("negative integrand in positive density quadrature")
+      fit.values <- sqrt(values[1:32])
+    } else fit.values <- values[1:32]
+    coef <- drop(rule$project %*% fit.values)
+    predicted <- drop(check.basis %*% coef)
+    if(positive) predicted <- predicted^2
+    residual <- max(abs(predicted-values[33:40]))
+    tail.bound <- sum(abs(coef[25:32]))
+    if(positive) tail.bound <- tail.bound*(2*sum(abs(coef))+tail.bound)
+    error <- 2*half*max(residual,tail.bound)
+    mass <- if(positive) half*sum(rule$w*fit.values^2) else 2*half*coef[1L]
+    list(left=left,right=right,depth=depth,coef=coef,mass=mass,error=error)
+  }
+  pieces <- Map(estimate,head(knots,-1L),tail(knots,-1L),0L)
+  # Allocate the absolute/relative error budget globally, refining the largest
+  # contributor. A per-unit-width budget unnecessarily demands near-machine
+  # relative precision in negligible endpoint slivers (e.g. square-root cusps).
+  # Summed partial-integral error estimates also protect every requested CDF.
+  repeat {
+    errors <- vapply(pieces,`[[`,0.0,"error")
+    masses <- vapply(pieces,`[[`,0.0,"mass")
+    if(sum(errors) <= tol*(1+sum(abs(masses)))) break
+    i <- which.max(errors)
+    cell <- pieces[[i]]
+    left <- cell$left; right <- cell$right; middle <- (left+right)/2
+    if(cell$depth>=30 || evaluations+80L>200000L || middle==left || middle==right)
+      stop("continuous density integration did not converge")
+    pieces[[i]] <- estimate(left,middle,cell$depth+1L)
+    pieces[[length(pieces)+1L]] <- estimate(middle,right,cell$depth+1L)
+  }
+  pieces <- pieces[order(vapply(pieces,`[[`,0.0,"left"))]
+  starts <- vapply(pieces,`[[`,0.0,"left")
+  cumulative <- c(0,cumsum(vapply(pieces,`[[`,0.0,"mass")))
+  target <- to.unit(y)
+  owner <- pmin(findInterval(target,starts),length(pieces))
+  F <- numeric(length(y))
+  for(i in unique(owner)) {
+    ix <- which(owner==i)
+    cell <- pieces[[i]]; half <- (cell$right-cell$left)/2
+    F[ix] <- cumulative[i]+half*.np_quad_primitive(
+      (target[ix]-cell$left)/half-1,cell$coef,positive,rule)
+  }
+  F[target==0] <- 0
+  F[target==1] <- tail(cumulative,1L)
+  list(F=F,total=tail(cumulative,1L))
 }
 
 ## No Zero Denominator, used in C code for kernel estimation...
@@ -132,6 +307,43 @@ npRidgeSequenceFromBase <- function(n.train, ridge.base = 0.0, cap = 1.0) {
   if (utils::tail(seq.out, 1L) < cap)
     seq.out <- c(seq.out, cap)
   unique(as.double(seq.out))
+}
+
+npRidgeInterceptCorrection <- function(ridge, intercept, pristine.anchor) {
+  # Scalar zero-ridge solves need no correction, even for nonfinite moments.
+  # Keep coercion and conformance checks on the original path for other inputs.
+  if (identical(ridge, 0.0) &&
+      is.double(intercept) && !is.object(intercept) && length(intercept) == 1L &&
+      is.double(pristine.anchor) && !is.object(pristine.anchor) &&
+      length(pristine.anchor) == 1L)
+    return(0.0)
+
+  lengths <- c(length(ridge), length(intercept), length(pristine.anchor))
+  target <- max(lengths)
+  if (any(lengths == 0L) || any(!(lengths %in% c(1L, target))))
+    stop("internal ridge-correction inputs are not conformable")
+
+  ridge <- rep_len(as.double(ridge), target)
+  intercept <- rep_len(as.double(intercept), target)
+  pristine.anchor <- rep_len(as.double(pristine.anchor), target)
+  correction <- rep.int(NA_real_, target)
+
+  zero <- is.finite(ridge) & ridge == 0.0
+  correction[zero] <- 0.0
+  active <- is.finite(ridge) & ridge > 0.0 & is.finite(intercept) &
+    is.finite(pristine.anchor) & pristine.anchor != 0.0
+  if (any(active)) {
+    value <- ridge[active] * (intercept[active] / pristine.anchor[active])
+    rescue <- !is.finite(value)
+    if (any(rescue))
+      value[rescue] <- (ridge[active][rescue] /
+                          pristine.anchor[active][rescue]) *
+        intercept[active][rescue]
+    keep <- is.finite(value)
+    correction[which(active)[keep]] <- value[keep]
+  }
+
+  if (target == 1L) correction[[1L]] else correction
 }
 
 .np_glp_degree_hard_max <- 100L
@@ -245,6 +457,27 @@ npValidateScalarLogical <- function(value, argname) {
   if (length(value) != 1L || is.na(value))
     stop(sprintf("'%s' must be TRUE or FALSE", argname))
   value
+}
+
+npRejectLegacyBooleanErrors <- function(dots, where) {
+  dot.names <- if (is.list(dots)) names(dots) else as.character(dots)
+  if (!is.null(dot.names) && any(dot.names == "errors", na.rm = TRUE)) {
+    stop(sprintf(
+      "%s no longer accepts the Boolean estimation argument 'errors'; use 'se' instead",
+      where
+    ), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+npRejectLegacyBootstrapCount <- function(dot.names, where) {
+  if (!is.null(dot.names) && any(dot.names == "boot.num", na.rm = TRUE)) {
+    stop(sprintf(
+      "%s no longer accepts 'boot.num'; use 'B' instead",
+      where
+    ), call. = FALSE)
+  }
+  invisible(TRUE)
 }
 
 npValidateNomadControl <- function(value, argname = "nomad") {
@@ -554,6 +787,16 @@ npValidatePositiveFiniteNumeric <- function(value, argname) {
   as.double(value)
 }
 
+npValidateRegressionPenaltyMultiplier <- function(value) {
+  if (!is.numeric(value) || length(value) != 1L || is.na(value) ||
+      !is.finite(value) || value < 1)
+    stop(paste(
+      "'penalty.multiplier' must be a finite numeric scalar",
+      "greater than or equal to 1"
+    ))
+  as.double(value)
+}
+
 npScaleFactorSearchOldNames <- c(
   "cfac.init",
   "lbc.init",
@@ -624,6 +867,40 @@ npResolveScaleFactorLowerBound <- function(value,
     return(as.double(fallback))
 
   npValidateScaleFactorLowerBound(value, argname = argname)
+}
+
+# Search admission only: repeated response endpoints can make beta CVLS prefer
+# a vanishing bandwidth. This conservative policy is not a divergence theorem
+# for signed LP weights. Keep the positive-floor fast path lazy in the data.
+.np_beta_cvls_search_admission <- function(bws, response, lower, automatic,
+                                           conditional = FALSE,
+                                           companion = NULL,
+                                           where = "density bandwidth search") {
+  if (!automatic || lower > 0 ||
+      !identical(bws[["type"]], "fixed") ||
+      !identical(bws[["method"]], "cv.ls"))
+    return(invisible(NULL))
+  kernel <- if (conditional) bws[["cykertype"]] else bws[["ckertype"]]
+  if (!identical(kernel, "beta"))
+    return(invisible(NULL))
+
+  continuous <- if (conditional) bws[["iycon"]] else bws[["icon"]]
+  if (!any(continuous))
+    return(invisible(NULL))
+  lb <- if (conditional) bws[["cykerlb"]] else bws[["ckerlb"]]
+  ub <- if (conditional) bws[["cykerub"]] else bws[["ckerub"]]
+  response <- toFrame(response)
+  keep <- if (is.null(companion)) complete.cases(response) else
+    complete.cases(response, toFrame(companion))
+  for (j in which(continuous)) {
+    y <- response[[j]][keep]
+    if (sum(y == lb[j]) > 1L || sum(y == ub[j]) > 1L)
+      stop(sprintf(paste0(
+        "%s: automatic fixed-bandwidth beta CVLS with repeated response ",
+        "endpoints requires a positive 'scale.factor.search.lower'; ",
+        "the default is 0.1"), where), call. = FALSE)
+  }
+  invisible(NULL)
 }
 
 npResolveScaleFactorSearchLower <- function(value,
@@ -817,7 +1094,7 @@ npValidateCategoricalFirstDifferenceGradientOrder <- function(
 .np_singleindex_reject_higher_gradient_order <- function(
     dots,
     where = "npindex") {
-  order.names <- intersect(c("gradient.order", "gradient_order"), names(dots))
+  order.names <- intersect("gradient.order", names(dots))
   for (argname in order.names) {
     value <- dots[[argname]]
     if (is.null(value))
@@ -839,12 +1116,12 @@ npValidateCategoricalFirstDifferenceGradientOrder <- function(
   invisible(NULL)
 }
 
-npValidateLcGradientOrder <- function(regtype,
+npValidateFirstDerivativeOrder <- function(regtype,
                                       gradient.order,
                                       ncon,
                                       argname = "gradient.order",
                                       where = "local-constant regression") {
-  if (!identical(regtype, "lc"))
+  if (!regtype %in% c("lc", "ll"))
     return(invisible(NULL))
 
   gradient.order <- npValidateGlpGradientOrder(
@@ -854,12 +1131,20 @@ npValidateLcGradientOrder <- function(regtype,
     argname = argname
   )
   if (any(gradient.order != 1L)) {
-    stop(sprintf("%s supports only first derivatives for regtype='lc'; use regtype='lp' with sufficient degree for higher-order derivatives",
-                 where),
+    stop(sprintf("%s supports only first derivatives for regtype='%s'; use regtype='lp' with sufficient degree for higher-order derivatives",
+                 where, regtype),
          call. = FALSE)
   }
 
   gradient.order
+}
+
+npValidateLcGradientOrder <- function(regtype, gradient.order, ncon,
+                                      argname = "gradient.order",
+                                      where = "local-constant regression") {
+  if (!identical(regtype, "lc"))
+    return(invisible(NULL))
+  npValidateFirstDerivativeOrder(regtype, gradient.order, ncon, argname, where)
 }
 
 npGlpDegree0FirstDerivativeLcOk <- function(regtype.engine,
@@ -872,6 +1157,17 @@ npGlpDegree0FirstDerivativeLcOk <- function(regtype.engine,
     all(degree.engine == 0L) &&
     length(gradient.order) == ncon &&
     all(gradient.order == 1L)
+}
+
+npGlpCategoricalEffectsRequired <- function(regtype.engine,
+                                             degree.engine,
+                                             ncat,
+                                             gradients) {
+  isTRUE(gradients) &&
+    identical(regtype.engine, "lp") &&
+    as.integer(ncat)[1L] > 0L &&
+    length(degree.engine) > 0L &&
+    any(as.integer(degree.engine) > 0L)
 }
 
 npGlpGradientAvailability <- function(regtype.engine,
@@ -921,6 +1217,90 @@ npGlpGradientUnavailableSummary <- function(degree.engine,
           con.names[bad],
           as.integer(gradient.order)[bad],
           as.integer(degree.engine)[bad])
+}
+
+npStopGlpGradientNoneAvailable <- function(where,
+                                           action = "provide",
+                                           degree.engine,
+                                           gradient.order,
+                                           available,
+                                           con.names = NULL) {
+  if (!length(available) || any(available)) {
+    stop(sprintf("%s received an invalid all-unavailable derivative condition", where),
+         call. = FALSE)
+  }
+
+  unavailable <- npGlpGradientUnavailableSummary(
+    degree.engine = degree.engine,
+    gradient.order = gradient.order,
+    available = available,
+    con.names = con.names
+  )
+  if (!length(unavailable)) {
+    stop(sprintf("%s received incoherent all-unavailable derivative metadata", where),
+         call. = FALSE)
+  }
+
+  stop(sprintf(
+    paste0(
+      "%s cannot %s the requested derivatives because no requested component ",
+      "is available (no available derivative components) at the fitted polynomial ",
+      "degrees: %s. Lower gradient.order ",
+      "for at least one continuous predictor or refit with sufficient polynomial degree."
+    ),
+    where,
+    action,
+    paste(unavailable, collapse = "; ")
+  ), call. = FALSE)
+}
+
+npCategoricalFirstDifferenceFrames <- function(exdat, index, where) {
+  exdat <- toFrame(exdat)
+  index <- as.integer(index)[1L]
+  if (is.na(index) || index < 1L || index > ncol(exdat)) {
+    stop(sprintf("%s received an invalid categorical coordinate", where),
+         call. = FALSE)
+  }
+
+  x <- exdat[[index]]
+  if (!is.factor(x)) {
+    stop(sprintf("%s received a non-categorical coordinate", where),
+         call. = FALSE)
+  }
+
+  lev <- levels(x)
+  if (!length(lev)) {
+    stop(sprintf("%s received a categorical coordinate without levels", where),
+         call. = FALSE)
+  }
+
+  code <- as.integer(x)
+  lower.code <- rep.int(1L, length(code))
+  upper.code <- code
+  if (is.ordered(x)) {
+    if (length(lev) < 2L) {
+      lower.code[] <- 1L
+      upper.code[] <- 1L
+    } else {
+      lower.code <- pmax.int(code - 1L, 1L)
+      first <- !is.na(code) & code == 1L
+      upper.code[first] <- 2L
+    }
+  }
+
+  lower <- upper <- exdat
+  lower[[index]] <- .np_factor_with_levels(
+    lev[lower.code], levels = lev, ordered = is.ordered(x)
+  )
+  upper[[index]] <- .np_factor_with_levels(
+    lev[upper.code], levels = lev, ordered = is.ordered(x)
+  )
+  if (anyNA(lev)) {
+    is.na(lower[[index]]) <- is.na(code)
+    is.na(upper[[index]]) <- is.na(code)
+  }
+
+  list(lower = lower, upper = upper)
 }
 
 npWarnGlpGradientPartialAvailability <- function(where,
@@ -990,49 +1370,245 @@ npValidateGlpGradientDegree <- function(regtype.engine,
   invisible(gradient.order)
 }
 
-npConditionalRegEngineSpec <- function(bws, where = "conditional estimator") {
-  reg.engine <- if (is.null(bws$regtype.engine)) {
-    if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
+npExactRequiredField <- function(object, field, where) {
+  if (!is.list(object))
+    stop(sprintf("%s must be a list-like bandwidth object", where),
+         call. = FALSE)
+
+  object.names <- names(object)
+  matches <- if (is.null(object.names)) {
+    integer(0L)
   } else {
-    as.character(bws$regtype.engine)
+    which(!is.na(object.names) & object.names == field)
   }
-  basis.engine <- if (is.null(bws$basis.engine)) {
-    if (is.null(bws$basis)) "glp" else bws$basis
-  } else {
-    bws$basis.engine
+  if (length(matches) == 0L) {
+    stop(sprintf("%s is missing required field '%s'", where, field),
+         call. = FALSE)
   }
-  degree.engine <- if (is.null(bws$degree.engine)) {
-    if (bws$xncon > 0L) {
-      if (identical(reg.engine, "lc")) {
-        rep.int(0L, bws$xncon)
-      } else {
-        npValidateGlpDegree(
-          regtype = "lp",
-          degree = bws$degree,
-          ncon = bws$xncon
-        )
-      }
-    } else {
-      integer(0)
-    }
-  } else {
-    as.integer(bws$degree.engine)
-  }
-  bernstein.engine <- if (is.null(bws$bernstein.basis.engine)) {
-    isTRUE(bws$bernstein.basis)
-  } else {
-    isTRUE(bws$bernstein.basis.engine)
+  if (length(matches) > 1L) {
+    stop(sprintf("%s contains duplicate field '%s'", where, field),
+         call. = FALSE)
   }
 
-  if (!identical(reg.engine, "lp") && bws$xncon > 0L)
-    degree.engine <- rep.int(if (identical(reg.engine, "ll")) 1L else 0L, bws$xncon)
+  object[[matches[[1L]]]]
+}
+
+npValidateConditionalRegEngineState <- function(regtype.engine,
+                                                 basis.engine,
+                                                 degree.engine,
+                                                 bernstein.basis.engine,
+                                                 ncon,
+                                                 where = "conditional estimator") {
+  ncon <- npValidateNonNegativeInteger(ncon, paste0(where, " ncon"))
+
+  if (!is.character(regtype.engine) ||
+      length(regtype.engine) != 1L ||
+      is.na(regtype.engine) ||
+      !(regtype.engine %in% c("lc", "lp"))) {
+    stop(sprintf(
+      "%s field 'regtype.engine' must be exactly 'lc' or 'lp'",
+      where
+    ), call. = FALSE)
+  }
+
+  if (!is.character(basis.engine) ||
+      length(basis.engine) != 1L ||
+      is.na(basis.engine) ||
+      !(basis.engine %in% c("glp", "additive", "tensor"))) {
+    stop(sprintf(
+      "%s field 'basis.engine' must be exactly 'glp', 'additive', or 'tensor'",
+      where
+    ), call. = FALSE)
+  }
+
+  if (!is.numeric(degree.engine) ||
+      length(degree.engine) != ncon ||
+      anyNA(degree.engine) ||
+      any(!is.finite(degree.engine)) ||
+      any(degree.engine < 0) ||
+      any(degree.engine != floor(degree.engine)) ||
+      any(degree.engine > .np_glp_degree_hard_max)) {
+    stop(sprintf(
+      "%s field 'degree.engine' must contain %d finite non-negative integer value(s) in [0,%d]",
+      where,
+      ncon,
+      .np_glp_degree_hard_max
+    ), call. = FALSE)
+  }
+  degree.engine <- as.integer(degree.engine)
+
+  if (!is.logical(bernstein.basis.engine) ||
+      length(bernstein.basis.engine) != 1L ||
+      is.na(bernstein.basis.engine)) {
+    stop(sprintf(
+      "%s field 'bernstein.basis.engine' must be TRUE or FALSE",
+      where
+    ), call. = FALSE)
+  }
+
+  if (identical(regtype.engine, "lc")) {
+    if (any(degree.engine != 0L)) {
+      stop(sprintf(
+        "%s has incoherent local-constant engine state: 'degree.engine' must be all zero",
+        where
+      ), call. = FALSE)
+    }
+    if (isTRUE(bernstein.basis.engine)) {
+      stop(sprintf(
+        "%s has incoherent local-constant engine state: 'bernstein.basis.engine' must be FALSE",
+        where
+      ), call. = FALSE)
+    }
+  } else if (ncon == 0L) {
+    stop(sprintf(
+      "%s has incoherent local-polynomial engine state: 'lp' requires at least one continuous predictor",
+      where
+    ), call. = FALSE)
+  }
 
   list(
-    reg.engine = reg.engine,
+    reg.engine = regtype.engine,
     basis.engine = basis.engine,
     degree.engine = degree.engine,
-    bernstein.engine = bernstein.engine
+    bernstein.engine = bernstein.basis.engine,
+    ncon = ncon
   )
+}
+
+npConditionalRegEngineSpec <- function(bws,
+                                       where = "conditional estimator",
+                                       ncon.field = "xncon") {
+  npValidateConditionalRegEngineState(
+    regtype.engine = npExactRequiredField(
+      bws, "regtype.engine", where
+    ),
+    basis.engine = npExactRequiredField(
+      bws, "basis.engine", where
+    ),
+    degree.engine = npExactRequiredField(
+      bws, "degree.engine", where
+    ),
+    bernstein.basis.engine = npExactRequiredField(
+      bws, "bernstein.basis.engine", where
+    ),
+    ncon = npExactRequiredField(
+      bws, ncon.field, where
+    ),
+    where = where
+  )
+}
+
+npValidatedConditionalRegSpec <- function(bws,
+                                          where = "conditional estimator",
+                                          ncon.field = "xncon",
+                                          ncon = NULL) {
+  state <- if (is.null(ncon)) {
+    npConditionalRegEngineSpec(
+      bws = bws,
+      where = where,
+      ncon.field = ncon.field
+    )
+  } else {
+    npValidateConditionalRegEngineState(
+      regtype.engine = npExactRequiredField(
+        bws, "regtype.engine", where
+      ),
+      basis.engine = npExactRequiredField(
+        bws, "basis.engine", where
+      ),
+      degree.engine = npExactRequiredField(
+        bws, "degree.engine", where
+      ),
+      bernstein.basis.engine = npExactRequiredField(
+        bws, "bernstein.basis.engine", where
+      ),
+      ncon = ncon,
+      where = where
+    )
+  }
+
+  spec <- npCanonicalConditionalRegSpec(
+    regtype = npExactRequiredField(bws, "regtype", where),
+    basis = npExactRequiredField(bws, "basis", where),
+    degree = npExactRequiredField(bws, "degree", where),
+    bernstein.basis = npExactRequiredField(
+      bws, "bernstein.basis", where
+    ),
+    ncon = state$ncon,
+    where = where
+  )
+
+  expected <- list(
+    regtype.engine = state$reg.engine,
+    basis.engine = state$basis.engine,
+    degree.engine = state$degree.engine,
+    bernstein.basis.engine = state$bernstein.engine
+  )
+  for (field in names(expected)) {
+    if (!identical(spec[[field]], expected[[field]])) {
+      stop(sprintf(
+        "%s has incoherent public and canonical engine metadata for field '%s'",
+        where,
+        field
+      ), call. = FALSE)
+    }
+  }
+
+  spec
+}
+
+# Private demand for the ordinary scalar categorical influence post-pass only.
+.np_conditional_cat_se_demand <- function(demand, ncat) {
+  if (is.null(demand))
+    return(rep.int(TRUE, ncat))
+  if (identical(demand, FALSE))
+    return(rep.int(FALSE, ncat))
+  if (!is.logical(demand) || length(demand) != ncat || anyNA(demand))
+    stop("invalid internal conditional categorical-SE demand", call. = FALSE)
+  demand
+}
+
+.np_conditional_cat_se_request <- function(gradients, partial,
+                                          categorical.effects, bws, demand) {
+  if (!isTRUE(gradients) || isTRUE(partial) ||
+      isTRUE(categorical.effects) || !any(demand))
+    return(NULL)
+  public.index <- which(bws$ixuno | bws$ixord)
+  native.index <- c(which(bws$ixuno), which(bws$ixord))
+  as.integer(demand[match(native.index, public.index)])
+}
+
+# Private demand for newly available partial-LP first-derivative errors only.
+# Existing fully requested uncertainty and all point owners are unchanged.
+.np_conditional_first_se_demand <- function(demand, ncon) {
+  if (is.null(demand))
+    return(rep.int(TRUE, ncon))
+  if (identical(demand, FALSE))
+    return(rep.int(FALSE, ncon))
+  if (!is.logical(demand) || length(demand) != ncon || anyNA(demand))
+    stop("invalid internal conditional first-SE demand", call. = FALSE)
+  demand
+}
+
+.np_conditional_first_se_request <- function(gradients, partial, degree,
+                                               order, available, demand) {
+  if (!isTRUE(gradients) || !isTRUE(partial))
+    return(NULL)
+  mask <- available & order == 1L & demand
+  if (!any(mask))
+    return(NULL)
+  if (length(degree) != length(order) || any(order[mask] > degree[mask]))
+    stop("incoherent internal conditional first-SE request", call. = FALSE)
+  list(order = as.integer(order), se = as.integer(mask))
+}
+
+.np_conditional_merge_first_se <- function(out, native.se, request, bws, enrow) {
+  if (is.null(request))
+    return(out)
+  selected <- which(request[["se", exact = TRUE]] == 1L)
+  native.se <- matrix(native.se, nrow = enrow, ncol = bws$xndim)
+  out$congerr[, which(bws$ixcon)[selected]] <- native.se[, selected, drop = FALSE]
+  out
 }
 
 npConditionalGradientOrder <- function(bws,
@@ -1071,7 +1647,7 @@ npCheckRegressionDesignCondition <- function(reg.code,
   kappa.warn <- 1e8
   kappa.stop <- 1e12
 
-  if (!(reg.code %in% c(REGTYPE_LL, REGTYPE_LP)))
+  if (!identical(reg.code, REGTYPE_LP))
     return(invisible(NULL))
 
   xcon <- as.data.frame(xcon)
@@ -1079,16 +1655,12 @@ npCheckRegressionDesignCondition <- function(reg.code,
   if (is.null(n) || n <= 0L)
     return(invisible(NULL))
 
-  B <- if (identical(reg.code, REGTYPE_LP)) {
-    if (is.null(degree))
-      stop(sprintf("%s: LP degree vector missing for design-conditioning check", where))
-    W.lp(xdat = xcon,
-         degree = degree,
-         basis = basis,
-         bernstein.basis = isTRUE(bernstein.basis))
-  } else {
-    cbind(1, as.matrix(xcon))
-  }
+  if (is.null(degree))
+    stop(sprintf("%s: LP degree vector missing for design-conditioning check", where))
+  B <- W.lp(xdat = xcon,
+            degree = degree,
+            basis = basis,
+            bernstein.basis = isTRUE(bernstein.basis))
 
   p <- ncol(B)
   if (is.null(p) || p <= 0L)
@@ -1100,7 +1672,7 @@ npCheckRegressionDesignCondition <- function(reg.code,
   tol.rank <- max(dim(B)) * max(sv) * .Machine$double.eps
   r <- sum(sv > tol.rank)
   if (r < p) {
-    stop(sprintf("%s: regression design matrix is rank deficient (rank=%d < p=%d). Reduce polynomial degree or remove collinear continuous predictors.",
+    stop(sprintf("%s: regression design matrix is numerically rank deficient in the selected basis (rank=%d < p=%d). For a raw basis, consider centring/scaling continuous predictors or using regtype='lp' with bernstein.basis=TRUE. Reduce polynomial degree or remove genuinely redundant predictors if needed.",
                  where, r, p))
   }
 
@@ -1109,12 +1681,12 @@ npCheckRegressionDesignCondition <- function(reg.code,
     kB <- Inf
 
   if (kB > kappa.stop) {
-    stop(sprintf("%s: regression design matrix is severely ill-conditioned (kappa(B)=%.3e > %.1e). Reduce polynomial degree or remove collinear continuous predictors.",
+    stop(sprintf("%s: regression design matrix is severely ill-conditioned (kappa(B)=%.3e > %.1e). For a raw basis, consider centring/scaling continuous predictors or using regtype='lp' with bernstein.basis=TRUE. Reduce polynomial degree or remove genuinely redundant predictors if needed.",
                  where, kB, kappa.stop))
   }
 
   if (kB > kappa.warn) {
-    .np_warning(sprintf("%s: regression design matrix is ill-conditioned (kappa(B)=%.3e > %.1e). Estimation may rely heavily on ridging; consider lower degree or less collinear predictors.",
+    .np_warning(sprintf("%s: regression design matrix is ill-conditioned (kappa(B)=%.3e > %.1e). Estimation may rely heavily on ridging. For a raw basis, consider centring/scaling continuous predictors or using regtype='lp' with bernstein.basis=TRUE; otherwise consider lower degree or less collinear predictors.",
                     where, kB, kappa.warn),
             call. = FALSE, immediate. = TRUE)
   }
@@ -1124,16 +1696,58 @@ npCheckRegressionDesignCondition <- function(reg.code,
 
 npRegtypeToC <- function(regtype, degree, ncon, context = "npreg") {
   # Internal regression-type codes:
-  # lc -> REGTYPE_LC, ll -> REGTYPE_LL, lp -> REGTYPE_LP.
+  # Public lc and explicit all-zero lp share the canonical scalar LP0 engine.
+  # Positive-degree ll/lp use the general LP engine.
   if (identical(regtype, "lc"))
-    return(list(code = REGTYPE_LC, degree = NULL))
+    return(list(code = REGTYPE_LP0, degree = rep.int(0L, ncon)))
 
   if (identical(regtype, "ll"))
-    return(list(code = REGTYPE_LL, degree = NULL))
+    return(list(code = REGTYPE_LP, degree = rep.int(1L, ncon)))
 
   degree <- npValidateGlpDegree(regtype, degree, ncon)
 
-  list(code = REGTYPE_LP, degree = degree)
+  list(
+    code = if (length(degree) == 0L || all(degree == 0L))
+      REGTYPE_LP0
+    else
+      REGTYPE_LP,
+    degree = degree
+  )
+}
+
+npIsCanonicalLp0 <- function(regtype.engine, degree.engine, ncon) {
+  state <- npValidateConditionalRegEngineState(
+    regtype.engine = regtype.engine,
+    basis.engine = "glp",
+    degree.engine = degree.engine,
+    bernstein.basis.engine = FALSE,
+    ncon = ncon,
+    where = "conditional local-polynomial state"
+  )
+
+  identical(state$reg.engine, "lc") ||
+    all(state$degree.engine == 0L)
+}
+
+npIsCanonicalLp0Spec <- function(spec, ncon) {
+  npIsCanonicalLp0(
+    regtype.engine = npExactRequiredField(
+      spec, "regtype.engine", "conditional local-polynomial specification"
+    ),
+    degree.engine = npExactRequiredField(
+      spec, "degree.engine", "conditional local-polynomial specification"
+    ),
+    ncon = ncon
+  )
+}
+
+npConditionalRegtypeCode <- function(regtype.engine, degree.engine, ncon) {
+  if (npIsCanonicalLp0(regtype.engine = regtype.engine,
+                       degree.engine = degree.engine,
+                       ncon = ncon))
+    REGTYPE_LP0
+  else
+    REGTYPE_LP
 }
 
 npCanonicalConditionalRegSpec <- function(regtype = c("lc", "ll", "lp"),
@@ -1202,62 +1816,6 @@ npCanonicalConditionalRegSpec <- function(regtype = c("lc", "ll", "lp"),
     basis.engine = basis,
     degree.engine = degree,
     bernstein.basis.engine = bernstein.basis
-  )
-}
-
-npIsRawDegreeOneConditionalSpec <- function(spec, ncon) {
-  degree <- if (is.null(spec$degree.engine)) integer(0) else as.integer(spec$degree.engine)
-  ncon <- as.integer(ncon)
-  identical(spec$regtype.engine, "lp") &&
-    !isTRUE(spec$bernstein.basis.engine) &&
-    length(degree) == ncon &&
-    ncon > 0L &&
-    all(degree == 1L)
-}
-
-npIsRawDegreeOneConditionalRequest <- function(regtype,
-                                               degree = NULL,
-                                               bernstein.basis = FALSE) {
-  regtype <- as.character(regtype)[1L]
-  if (identical(regtype, "ll"))
-    return(TRUE)
-  if (!identical(regtype, "lp"))
-    return(FALSE)
-  if (isTRUE(bernstein.basis) || is.null(degree))
-    return(FALSE)
-  degree <- suppressWarnings(as.numeric(degree))
-  length(degree) > 0L &&
-    all(is.finite(degree)) &&
-    all(degree == 1)
-}
-
-npWithLocalLinearRawBasisSearchError <- function(expr,
-                                                 where,
-                                                 spec,
-                                                 bwmethod,
-                                                 ncon) {
-  expected <- switch(where,
-    npcdensbw = "C_np_density_conditional_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective",
-    npcdistbw = "C_np_distribution_conditional_bw: optimizer returned a fixed-bandwidth candidate with invalid raw objective",
-    NULL
-  )
-  tryCatch(
-    force(expr),
-    error = function(e) {
-      msg <- conditionMessage(e)
-      targeted <- !is.null(expected) &&
-        identical(msg, expected) &&
-        identical(bwmethod, "cv.ls") &&
-        npIsRawDegreeOneConditionalSpec(spec, ncon)
-
-      if (targeted) {
-        stop(sprintf(
-          "%s() local-linear cv.ls failed while using the canonical raw degree-1 basis. Try regtype = \"lp\", degree = 1, bernstein.basis = TRUE, or center/scale continuous regressors.",
-          where
-        ), call. = FALSE)
-      }
-      stop(e)
-    }
   )
 }
 
@@ -1452,13 +2010,6 @@ is.monotone.increasing <- function(x) {
 ## just their sorted order Actually, the ord/badord paradigm must go,
 ## in place of levels caching
 
-matrix.sd <- function(x, na.rm=FALSE) {
-  if(is.matrix(x)) apply(x, 2, sd, na.rm=na.rm)
-  else if(is.vector(x)) sd(x, na.rm=na.rm)
-  else if(is.data.frame(x)) sapply(x, sd, na.rm=na.rm)
-  else sd(as.vector(x), na.rm=na.rm)
-}
-
 .np_validate_seed_scalar <- function(seed) {
   if (is.null(seed) || length(seed) != 1L || !is.numeric(seed) || is.na(seed) || !is.finite(seed))
     stop("'seed' must be a single finite numeric value", call. = FALSE)
@@ -1471,47 +2022,15 @@ matrix.sd <- function(x, na.rm=FALSE) {
   as.integer(normalized)
 }
 
-npseed <- function(seed){
-  .Call("C_np_set_seed", .np_validate_seed_scalar(seed), PACKAGE = "npRmpi")
+.np_backend_seed_local <- function(seed) {
+  .Call("C_np_set_seed", seed, PACKAGE = "npRmpi")
   invisible()
 }
 
-erf <- function(z) { 2 * pnorm(z*sqrt(2)) - 1 }
-
-nptgauss <- function(b){
-
-  rel.tol <- sqrt(.Machine$double.eps)
-
-  b.max <- sqrt(-2*log(.Machine$double.eps))
-
-  if((b < 0) || (b > b.max))
-    stop(paste("b must be between 0 and",b.max))
-
-  alpha <- 1.0/(pnorm(b)-pnorm(-b)-2*b*dnorm(b))
-
-  tgauss <- function(z) {
-    out <- alpha * (dnorm(z) - dnorm(b))
-    out[abs(z) >= b] <- 0.0
-    out
-  }
-
-  c0 <- alpha*dnorm(b)
-
-  k <- integrate(f = function(z) { tgauss(z)^2 }, -b, b)$value
-  k2 <- integrate(f = function(z) { z^2*tgauss(z) }, -b, b)$value
-  k22 <- integrate(f = function(z) { (z*tgauss(z))^2 }, -b, b)$value
-  km <- integrate(f = function(z) { tgauss(z-0.5)*tgauss(z+0.5) }, -b+0.5, b-0.5)$value
-
-  a0 <- (0.5 + 2*b*c0)/integrate(f = function(z){ erf(z/2 + b)*exp(-0.25*z^2) }, -2*b, 0)$value
-  a2 <- (c0 + k - a0*erf(b))/erf(b/sqrt(2))
-  a1 <- -(a2*erf(b/sqrt(2)) + c0)/(2*b)
-
-  int.kernels[CKER_TGAUSS + 1] <- k
-  
-  invisible(.Call("C_np_set_tgauss2",
-                  as.double(c(b, alpha, c0, a0, a1, a2, k, k2, k22, km)),
-                  PACKAGE = "npRmpi"))
-
+npseed <- function(seed){
+  seed <- .np_validate_seed_scalar(seed)
+  .npRmpi_set_validated_backend_seed(seed)
+  invisible()
 }
 
 numNotIn <- function(x){
@@ -1533,9 +2052,80 @@ numNotIn <- function(x){
 dlev <- function(x){
   if(is.ordered(x))
     x.dlev <- suppressWarnings(as.numeric(levels(x)))
-  if (!is.ordered(x) || any(is.na(x.dlev)))
+  if (!is.ordered(x) || any(is.na(x.dlev))) {
     x.dlev <- as.numeric(seq_len(nlevels(x)))
+  } else if (length(x.dlev)) {
+    offset <- x.dlev - x.dlev[1L]
+    if (any(!is.finite(x.dlev)) || any(!is.finite(offset)) ||
+        any(diff(x.dlev) <= 0))
+      stop(paste0("numeric ordered-factor levels must be finite and increasing; ",
+                  "use explicit nonnumeric labels if ordinal rank distances are intended"),
+           call. = FALSE)
+  }
   x.dlev
+}
+
+# Representation is metric; admission belongs to the actual smoothing role.
+# Density/CDF 'liracine' is normalized LR, unlike raw regression/kernel weights.
+.np_ordered_levels_contract <- function(levels, kernel = "lattice") {
+  if (!length(levels)) return(invisible(TRUE))
+  offset <- levels - levels[1L]
+  if (any(!is.finite(levels)) || any(!is.finite(offset)) || any(diff(levels) <= 0))
+    stop("numeric ordered-factor levels must be finite and increasing", call. = FALSE)
+  if (!kernel %in% c("liracine", "racineliyan")) {
+    lattice <- round(offset)
+    tolerance <- 8 * .Machine$double.eps * pmax(1, abs(offset))
+    if (any(diff(lattice) <= 0) || any(abs(offset-lattice) > tolerance) ||
+        tail(lattice, 1L) >= .Machine$integer.max)
+      stop(paste0("ordered ", kernel, " role requires integer distances within the native index range; ",
+                  "a unit lattice cannot be established reliably from these numeric levels. ",
+                  "Decimal labels at large magnitudes can lose precision; ",
+                  "use Racine-Li-Yan (okertype='racineliyan') for retained-support smoothing"),
+           call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Refuse ambiguity; never use magnitude-dependent tolerance to admit a lattice
+# or round genuine fractional distances. Match the native cumulative guard.
+.np_ordered_lr_cumulative_contract <- function(levels) {
+  if (length(levels) < 2L) return(invisible(TRUE))
+  offset <- levels - levels[1L]
+  residual <- abs(offset - round(offset))
+  tolerance <- 8 * .Machine$double.eps * pmax(1, abs(offset))
+  uncertainty <- .Machine$double.eps * abs(levels) +
+    .Machine$double.eps * abs(levels[1L]) +
+    .Machine$double.eps * abs(offset)
+  if (any(residual > tolerance) &&
+      all(residual <= pmax(tolerance, uncertainty)))
+    stop("raw Li-Racine cumulative support is numerically ambiguous between a unit lattice and retained fractional levels; use Racine-Li-Yan (okertype='racineliyan') for an explicit retained-support cumulative operator",
+         call. = FALSE)
+  invisible(TRUE)
+}
+
+.np_ordered_bandwidth_contract <- function(bws) {
+  raw <- inherits(bws, "kbandwidth")
+  info <- if (raw) list(x = bws[["xdati", exact = TRUE]],
+                       y = bws[["ydati", exact = TRUE]]) else bws[["dati", exact = TRUE]]
+  for (role in names(info)) {
+    d <- info[[role]]
+    if (is.null(d)) next
+    columns <- which(d[["iord", exact = TRUE]])
+    if (!length(columns)) next
+    kernel <- if (raw && role == "x") bws[["okertype", exact = TRUE]] else
+      bws[["klist", exact = TRUE]][[role]][["okertype", exact = TRUE]]
+    if (is.null(kernel)) kernel <- "lattice"
+    normalized <- (inherits(bws, c("bandwidth", "dbandwidth")) && role == "x") ||
+      (inherits(bws, c("conbandwidth", "condbandwidth")) && role == "y")
+    if (normalized && identical(kernel, "liracine")) kernel <- "nliracine"
+    for (i in columns) .np_ordered_levels_contract(d[["all.dlev", exact = TRUE]][[i]], kernel)
+    d[[".np.ordered.kernel"]] <- kernel
+    info[[role]] <- d
+    alias <- if (role == "index") "idati" else paste0(role, "dati")
+    if (!is.null(bws[[alias, exact = TRUE]])) bws[[alias]] <- d
+  }
+  if (!raw) bws[["dati"]] <- info
+  bws
 }
 
 isNum <- function(x){
@@ -1602,6 +2192,36 @@ untangle <- function(frame){
     t.ret
   })
 
+  all.min.next <- lapply(frame, function(y) {
+    t.ret <- NULL
+    if (is.numeric(y)) {
+      finite <- y[is.finite(y)]
+      if (length(finite)) {
+        lower <- min(finite)
+        above <- finite[finite > lower]
+        t.ret <- if (length(above)) min(above) else NA_real_
+      } else {
+        t.ret <- NA_real_
+      }
+    }
+    t.ret
+  })
+
+  all.max.prev <- lapply(frame, function(y) {
+    t.ret <- NULL
+    if (is.numeric(y)) {
+      finite <- y[is.finite(y)]
+      if (length(finite)) {
+        upper <- max(finite)
+        below <- finite[finite < upper]
+        t.ret <- if (length(below)) max(below) else NA_real_
+      } else {
+        t.ret <- NA_real_
+      }
+    }
+    t.ret
+  })
+
   list(iord = iord,
        iuno = iuno,
        icon = icon,
@@ -1611,7 +2231,9 @@ untangle <- function(frame){
        all.dlev = all.dlev,
        all.nlev = all.nlev,
        all.min = all.min,
-       all.max = all.max)
+       all.max = all.max,
+       all.min.next = all.min.next,
+       all.max.prev = all.max.prev)
 }
 
 npKernelBoundsResolve <- function(dati,
@@ -1619,8 +2241,10 @@ npKernelBoundsResolve <- function(dati,
                                   kerbound = c("none", "range", "fixed"),
                                   kerlb = NULL,
                                   kerub = NULL,
-                                  argprefix = "cker") {
+                                  argprefix = "cker",
+                                  range.policy = c("exact", "beta_half_spacing")) {
   kerbound <- match.arg(kerbound)
+  range.policy <- match.arg(range.policy)
   icon.idx <- which(dati$icon)
   ncon <- length(icon.idx)
   if (is.null(varnames) || length(varnames) != length(dati$icon))
@@ -1644,10 +2268,16 @@ npKernelBoundsResolve <- function(dati,
                    paste0(argprefix, "lb"),
                    paste0(argprefix, "ub")))
     x <- as.numeric(x)
-    if (!(length(x) %in% c(1L, ncon))) {
-      stop(sprintf("length(%s) must be 1 or equal to the number of continuous variables (%d).",
-                   nm, ncon))
-    }
+    if (length(x) == length(dati$icon))
+      x <- x[icon.idx]
+    if (!(length(x) %in% c(1L, ncon)))
+      stop(sprintf(
+        paste0(
+          "length(%s) must be 1, the number of continuous variables (%d), ",
+          "or the total number of variables (%d)."
+        ),
+        nm, ncon, length(dati$icon)
+      ))
     if (length(x) == 1L)
       rep(x, ncon)
     else
@@ -1660,6 +2290,47 @@ npKernelBoundsResolve <- function(dati,
   } else if (kerbound == "range") {
     lb <- mins
     ub <- maxs
+    if (identical(range.policy, "beta_half_spacing") &&
+        !is.null(dati$all.min.next) && !is.null(dati$all.max.prev)) {
+      nexts <- unlist(dati$all.min.next[icon.idx], use.names = FALSE)
+      prevs <- unlist(dati$all.max.prev[icon.idx], use.names = FALSE)
+      if (length(nexts) != ncon || length(prevs) != ncon) {
+        stop(sprintf(
+          paste0(
+            "Internal beta range metadata inconsistency: expected %d entries ",
+            "in 'all.min.next' and 'all.max.prev'; found %d and %d"
+          ),
+          ncon, length(nexts), length(prevs)
+        ), call. = FALSE)
+      }
+      distinct.ok <- is.finite(nexts) & is.finite(prevs) &
+        nexts > mins & prevs < maxs
+      if (any(!distinct.ok)) {
+        bad.vars <- paste(cnames[!distinct.ok], collapse = ", ")
+        stop(sprintf(
+          paste0(
+            "Beta '%s = \"range\"' half-spacing bounds require at least ",
+            "two distinct finite training values for each continuous variable. ",
+            "Violations: %s"
+          ),
+          paste0(argprefix, "bound"), bad.vars
+        ), call. = FALSE)
+      }
+      lb <- mins - (nexts - mins) / 2
+      ub <- maxs + (maxs - prevs) / 2
+      representable <- is.finite(lb) & is.finite(ub) &
+        lb < mins & ub > maxs
+      if (any(!representable)) {
+        bad.vars <- paste(cnames[!representable], collapse = ", ")
+        stop(sprintf(
+          paste0(
+            "Beta '%s = \"range\"' half-spacing bounds are not finite ",
+            "and strictly outside the training extrema. Violations: %s"
+          ),
+          paste0(argprefix, "bound"), bad.vars
+        ), call. = FALSE)
+      }
+    }
   } else {
     lb <- recycleBounds(kerlb, paste0(argprefix, "lb"))
     ub <- recycleBounds(kerub, paste0(argprefix, "ub"))
@@ -1750,6 +2421,295 @@ npKernelBoundsCheckEval <- function(evaldat,
   invisible(TRUE)
 }
 
+npBetaRangeCertificationEligible <- function(bws,
+                                             method,
+                                             bwsolver,
+                                             bandwidth.compute = TRUE,
+                                             eval.only = FALSE) {
+  isTRUE(bandwidth.compute) && !isTRUE(eval.only) &&
+    identical(as.character(bwsolver)[1L], "powell") &&
+    identical(bws[["ckertype", exact = TRUE]], "beta") &&
+    identical(bws[["ckerbound", exact = TRUE]], "range") &&
+    identical(bws[["type", exact = TRUE]], "fixed") &&
+    identical(as.integer(bws[["ckerorder", exact = TRUE]])[1L], 2L) &&
+    identical(as.integer(bws[["ncon", exact = TRUE]])[1L], 1L) &&
+    identical(as.integer(bws[["ndim", exact = TRUE]])[1L], 1L) &&
+    identical(as.character(bws[["method", exact = TRUE]])[1L], method)
+}
+
+npBetaRangeCertificationBandwidths <- function(bws, where) {
+  icon <- which(bws[["icon", exact = TRUE]])
+  if (length(icon) != 1L)
+    stop(where, " requires exactly one continuous beta coordinate",
+         call. = FALSE)
+
+  lower <- as.double(bws[["ckerlb", exact = TRUE]][icon])
+  upper <- as.double(bws[["ckerub", exact = TRUE]][icon])
+  width <- upper - lower
+  if (length(width) != 1L || !is.finite(width) || width <= 0)
+    stop(where, " requires a finite positive resolved beta support width",
+         call. = FALSE)
+
+  metric.to.raw <- 1
+  if (isTRUE(bws[["scaling", exact = TRUE]])) {
+    sdev <- as.double(bws[["sdev", exact = TRUE]])
+    nconfac <- as.double(bws[["nconfac", exact = TRUE]])
+    metric.to.raw <- sdev[[1L]] * nconfac[[1L]]
+    if (!is.finite(metric.to.raw) || metric.to.raw <= 0)
+      stop(where, " cannot convert metric and scale-factor bandwidths",
+           call. = FALSE)
+  }
+
+  bridge.metric <- width
+  tail.metric <- width * 2^26
+  bridge.raw <- bridge.metric / metric.to.raw
+  tail.raw <- tail.metric / metric.to.raw
+  if (!is.finite(bridge.raw) || bridge.raw <= 0 ||
+      !is.finite(tail.raw) || tail.raw <= 0) {
+    stop(where, " asymptotic certification bandwidth is not representable",
+         call. = FALSE)
+  }
+
+  bridge <- as.double(bws[["bw", exact = TRUE]])
+  tail <- bridge
+  bridge[icon] <- bridge.raw
+  tail[icon] <- tail.raw
+  list(
+    bridge = bridge,
+    tail = tail,
+    bridge.metric = bridge.metric,
+    tail.metric = tail.metric
+  )
+}
+
+npBetaRangeObjectiveBetter <- function(candidate,
+                                       incumbent,
+                                       direction = c("min", "max")) {
+  direction <- match.arg(direction)
+  candidate <- as.double(candidate)[1L]
+  incumbent <- as.double(incumbent)[1L]
+  if (!is.finite(candidate))
+    return(FALSE)
+  if (!is.finite(incumbent))
+    return(TRUE)
+  tolerance <- sqrt(.Machine$double.eps) *
+    (1 + abs(candidate) + abs(incumbent))
+  if (identical(direction, "min"))
+    candidate < incumbent - tolerance
+  else
+    candidate > incumbent + tolerance
+}
+
+npBetaRangeCertifySearch <- function(ordinary,
+                                     evaluate,
+                                     refine,
+                                     direction = c("min", "max"),
+                                     elapsed.start,
+                                     where) {
+  direction <- match.arg(direction)
+  candidate.bw <- npBetaRangeCertificationBandwidths(ordinary, where = where)
+  tail <- evaluate(candidate.bw$tail)
+  triggered <- npBetaRangeObjectiveBetter(
+    tail[["fval", exact = TRUE]], ordinary[["fval", exact = TRUE]],
+    direction = direction
+  )
+  refinement <- NULL
+  if (triggered)
+    refinement <- refine(candidate.bw$bridge)
+
+  selected <- ordinary
+  selected.source <- "ordinary"
+  if (npBetaRangeObjectiveBetter(
+        tail[["fval", exact = TRUE]], selected[["fval", exact = TRUE]],
+        direction = direction)) {
+    selected <- tail
+    selected.source <- "asymptotic"
+  }
+  if (!is.null(refinement) && npBetaRangeObjectiveBetter(
+        refinement[["fval", exact = TRUE]],
+        selected[["fval", exact = TRUE]], direction = direction)) {
+    selected <- refinement
+    selected.source <- "refinement"
+  }
+
+  payloads <- Filter(Negate(is.null), list(ordinary, tail, refinement))
+  count <- function(name, entries = payloads) {
+    values <- vapply(entries, function(x) {
+      value <- suppressWarnings(as.double(x[[name, exact = TRUE]])[1L])
+      if (length(value) && is.finite(value)) value else 0
+    }, numeric(1L))
+    sum(values)
+  }
+  append.history <- function(name) {
+    unlist(lapply(payloads, function(x) x[[name, exact = TRUE]]),
+           use.names = FALSE)
+  }
+
+  selected[["num.feval"]] <- count("num.feval")
+  selected[["num.feval.fast"]] <- count("num.feval.fast")
+  selected[["num.feval.certified"]] <-
+    count("num.feval", entries = payloads[-1L])
+  selected[["fval.history"]] <- append.history("fval.history")
+  selected[["eval.history"]] <- append.history("eval.history")
+  selected[["invalid.history"]] <- append.history("invalid.history")
+  selected[["total.time"]] <- proc.time()[3L] - elapsed.start
+  selected[["beta.range.certification"]] <- list(
+    version = 1L,
+    concentration = .Machine$double.eps,
+    tail.metric = candidate.bw$tail.metric,
+    tail.objective = as.double(tail[["fval", exact = TRUE]])[1L],
+    triggered = triggered,
+    bridge.metric = if (triggered) candidate.bw$bridge.metric else NA_real_,
+    refinement.objective = if (is.null(refinement)) NA_real_ else
+      as.double(refinement[["fval", exact = TRUE]])[1L],
+    selected = selected.source
+  )
+  selected
+}
+
+npBetaRangeCertifySelector <- function(ordinary,
+                                       args,
+                                       selector,
+                                       method,
+                                       direction = c("min", "max"),
+                                       elapsed.start,
+                                       where) {
+  direction <- match.arg(direction)
+  resolved.bwsolver <- if (is.null(args$bwsolver)) {
+    "powell"
+  } else {
+    npValidateBwsolver(args$bwsolver)
+  }
+  resolved.compute <- if (is.null(args$bandwidth.compute)) {
+    TRUE
+  } else {
+    isTRUE(args$bandwidth.compute)
+  }
+  resolved.eval.only <- !is.null(args$eval.only) && isTRUE(args$eval.only)
+
+  if (!npBetaRangeCertificationEligible(
+        ordinary, method = method, bwsolver = resolved.bwsolver,
+        bandwidth.compute = resolved.compute,
+        eval.only = resolved.eval.only)) {
+    return(ordinary)
+  }
+
+  run <- function(candidate.bw, eval.only) {
+    candidate.args <- args
+    candidate <- ordinary
+    candidate$bw <- candidate.bw
+    candidate.args$bws <- candidate
+    candidate.args$bandwidth.compute <- TRUE
+    candidate.args$eval.only <- eval.only
+    candidate.args$nmulti <- 1L
+    candidate.args$bwsolver <- "powell"
+    candidate.args$.beta.range.certify <- FALSE
+    do.call(selector, candidate.args)
+  }
+  npBetaRangeCertifySearch(
+    ordinary = ordinary,
+    evaluate = function(candidate.bw) run(candidate.bw, TRUE),
+    refine = function(candidate.bw) run(candidate.bw, FALSE),
+    direction = direction, elapsed.start = elapsed.start, where = where
+  )
+}
+
+npValidateBetaKernelSpecification <- function(ckertype,
+                                              ckerorder,
+                                              bwtype,
+                                              ckerbound,
+                                              ckerlb,
+                                              ckerub,
+                                              dati,
+                                              bw,
+                                              bandwidth.compute = FALSE,
+                                              where = "beta kernel",
+                                              regtype = NULL,
+                                              allow.categorical = FALSE,
+                                              allow.general.lp = FALSE,
+                                              arg.prefix = c("cker", "cxker", "cyker")) {
+  if (!identical(ckertype, "beta"))
+    return(invisible(FALSE))
+
+  arg.prefix <- match.arg(arg.prefix)
+  conditional.side <- !identical(arg.prefix, "cker")
+  subject <- if (conditional.side) where else "beta kernels"
+  verb <- if (conditional.side) "requires" else "require"
+
+  if (!(as.integer(ckerorder) %in% c(2L, 4L, 6L, 8L)))
+    stop(subject, " ", verb, " ", arg.prefix,
+         "order in 2, 4, 6, or 8", call. = FALSE)
+  if (!(bwtype %in% c("fixed", "generalized_nn", "adaptive_nn")))
+    stop(subject, " ", verb,
+         " a recognized fixed or nearest-neighbor bandwidth mode",
+         call. = FALSE)
+  if (!(ckerbound %in% c("fixed", "range"))) {
+    if (!conditional.side)
+      stop("beta kernels require ckerbound = \"fixed\" or \"range\" with finite lower and upper bounds",
+           call. = FALSE)
+    stop(subject, " requires ", arg.prefix,
+         "bound = \"fixed\" or \"range\" with finite ", arg.prefix,
+         "lb and ", arg.prefix, "ub", call. = FALSE)
+  }
+
+  icon <- dati$icon
+  if (is.null(icon) || !any(icon))
+    stop(subject, " ", verb, " at least one continuous variable",
+         call. = FALSE)
+  if (!isTRUE(allow.categorical) && (any(dati$iuno) || any(dati$iord)))
+    stop(subject, if (conditional.side) " currently supports" else
+           " currently support", " continuous variables only", call. = FALSE)
+  if (any(!is.finite(ckerlb[icon])) || any(!is.finite(ckerub[icon]))) {
+    if (!conditional.side)
+      stop("beta kernels require finite lower and upper bounds for every continuous variable",
+           call. = FALSE)
+    stop(subject, " requires finite ", arg.prefix, "lb and ",
+         arg.prefix, "ub for every continuous variable", call. = FALSE)
+  }
+  bw.continuous <- bw[icon]
+  automatic.zero.start <- isTRUE(bandwidth.compute) &&
+    length(bw.continuous) > 0L && all(bw.continuous == 0)
+  if (!automatic.zero.start &&
+      (any(!is.finite(bw.continuous)) ||
+       (identical(bwtype, "fixed") && any(bw.continuous <= 0)) ||
+       (!identical(bwtype, "fixed") && any(bw.continuous < 1)))) {
+    if (identical(bwtype, "fixed"))
+      stop(if (conditional.side) paste(where, "bandwidths") else
+             "beta kernel bandwidths",
+           " must be finite and strictly positive", call. = FALSE)
+    stop(if (conditional.side) paste(where, "nearest-neighbor bandwidths") else
+           "beta nearest-neighbor bandwidths",
+         " must be finite and at least 1",
+         call. = FALSE)
+  }
+  if (!is.null(regtype) && !identical(regtype, "lc") &&
+      !isTRUE(allow.general.lp))
+    stop(where, " currently supports only regtype = \"lc\"", call. = FALSE)
+  invisible(TRUE)
+}
+
+npWarnIgnoredUniformKernelOrder <- function(call.names,
+                                            kernel.type,
+                                            order.arg = "ckerorder") {
+  if (!(order.arg %in% call.names))
+    return(invisible(FALSE))
+
+  kernel.type <- match.arg(
+    kernel.type,
+    c("gaussian", "epanechnikov", "uniform", "beta")
+  )
+  if (!identical(kernel.type, "uniform"))
+    return(invisible(FALSE))
+
+  warning.text <- if (identical(order.arg, "ckerorder"))
+    "ignoring kernel order specified with uniform kernel type"
+  else
+    paste("ignoring", order.arg, "specified with uniform",
+          sub("order$", "type", order.arg))
+  .npRmpi_defer_named_warning(.np_warning(warning.text))
+  invisible(TRUE)
+}
+
 npKernelBoundsMarshal <- function(kerlb, kerub) {
   lb <- as.double(kerlb)
   ub <- as.double(kerub)
@@ -1760,6 +2720,7 @@ npKernelBoundsMarshal <- function(kerlb, kerub) {
 }
 
 validateBandwidth <- function(bws){
+  bws <- .np_ordered_bandwidth_contract(bws)
   vari <- names(bws$bandwidth)
   bchecker <- function(j){
     v <- vari[j]
@@ -1902,7 +2863,8 @@ validateBandwidthTF <- function(bws){
     }
   }
 
-  if ((bws$xncon + bws$yncon) > 0L) {
+  # Continuous NN coordinates remain counts, not fixed physical widths.
+  if ((bws$xncon + bws$yncon) > 0L && bws$type == "fixed") {
     sdev <- as.numeric(bws$sdev)
     sx <- if (bws$xncon > 0L) sdev[seq_len(bws$xncon)] else numeric(0L)
     sy <- if (bws$yncon > 0L) sdev[bws$xncon + seq_len(bws$yncon)] else numeric(0L)
@@ -1941,17 +2903,113 @@ validateBandwidthTF <- function(bws){
   bws
 }
 
-npRegressionNnLowerBound <- function(bws) {
-  if (!inherits(bws, "rbandwidth"))
-    return(1L)
+npRegressionNnCapability <- function(bws, owner = c("regression", "lsq")) {
+  owner <- match.arg(owner)
+  field <- function(name, default = NULL) {
+    value <- bws[[name, exact = TRUE]]
+    if (is.null(value)) default else value
+  }
+  type <- as.character(field("type", ""))[1L]
+  ncon.value <- field("ncon")
+  icon <- field("icon")
+  ncon <- if (!is.null(ncon.value)) {
+    as.integer(ncon.value)[1L]
+  } else if (!is.null(icon)) {
+    sum(as.logical(icon))
+  } else {
+    0L
+  }
 
-  if (is.null(bws$type) || identical(bws$type, "fixed"))
-    return(1L)
+  if (is.na(ncon) || ncon <= 0L || identical(type, "fixed")) {
+    return(list(code = "not-continuous-nonfixed", lower = 1L))
+  }
 
-  if (is.null(bws$icon) || !any(bws$icon))
-    return(1L)
+  if (!inherits(bws, "rbandwidth")) {
+    if (identical(owner, "regression"))
+      return(list(code = "not-regression", lower = 1L))
+    return(list(code = "noncore-k2-only", lower = 2L))
+  }
 
-  2L
+  if (!identical(owner, "regression"))
+    return(list(code = "noncore-k2-only", lower = 2L))
+
+  nuno <- as.integer(field("nuno", 0L))[1L]
+  nord <- as.integer(field("nord", 0L))[1L]
+  kernel <- as.character(field("ckertype", ""))[1L]
+  order <- as.integer(field("ckerorder", NA_integer_))[1L]
+  bound <- as.character(field("ckerbound", ""))[1L]
+  engine <- as.character(field("regtype.engine", ""))[1L]
+  degree <- as.integer(field("degree.engine", integer()))
+  lower.bound <- field("ckerlb", numeric())
+  upper.bound <- field("ckerub", numeric())
+  ordinary.bounds <- length(lower.bound) == 1L &&
+    length(upper.bound) == 1L &&
+    is.infinite(lower.bound[[1L]]) && lower.bound[[1L]] < 0 &&
+    is.infinite(upper.bound[[1L]]) && upper.bound[[1L]] > 0
+  scalar.mean <- identical(engine, "lc") ||
+    (identical(engine, "lp") && length(degree) == 1L && degree[[1L]] == 0L)
+
+  if (identical(type, "generalized_nn") &&
+      identical(ncon, 1L) && identical(nuno, 0L) && identical(nord, 0L) &&
+      kernel %in% c("gaussian", "epanechnikov") && identical(order, 2L) &&
+      identical(bound, "none") && ordinary.bounds && scalar.mean) {
+    return(list(code = "gnn-univariate-positive-lc-k1", lower = 1L))
+  }
+
+  list(code = "k2-only", lower = 2L)
+}
+
+npRegressionNnLowerBound <- function(bws, owner = c("regression", "lsq")) {
+  npRegressionNnCapability(bws, owner = match.arg(owner))$lower
+}
+
+npRegressionNnSearchLowerBound <- function(bws,
+                                           owner = c("regression", "lsq"),
+                                           degree.candidates = NULL) {
+  owner <- match.arg(owner)
+  fixed.lower <- npRegressionNnLowerBound(bws, owner = owner)
+  if (is.null(degree.candidates) || !identical(owner, "regression"))
+    return(fixed.lower)
+
+  ncon <- if (is.null(bws$ncon)) 0L else as.integer(bws$ncon)[1L]
+  if (is.na(ncon) || ncon != 1L || length(degree.candidates) != 1L)
+    return(2L)
+
+  candidates <- as.integer(degree.candidates[[1L]])
+  if (!length(candidates) || anyNA(candidates))
+    return(2L)
+  lower <- vapply(candidates, function(degree) {
+    candidate <- bws
+    candidate$regtype.engine <- "lp"
+    candidate$degree.engine <- degree
+    npRegressionNnLowerBound(candidate, owner = owner)
+  }, integer(1L))
+  max(lower)
+}
+
+npRegressionK1GeometryValidate <- function(bws, txdat, exdat = NULL) {
+  if (!inherits(bws, "rbandwidth") ||
+      !identical(bws[["type", exact = TRUE]], "generalized_nn") ||
+      !identical(npRegressionNnLowerBound(bws), 1L))
+    return(invisible(TRUE))
+
+  icon <- which(as.logical(bws[["icon", exact = TRUE]]))
+  bandwidth <- bws[["bw", exact = TRUE]]
+  if (length(icon) != 1L || length(bandwidth) < icon ||
+      !is.finite(bandwidth[[icon]]) || bandwidth[[icon]] != 1)
+    return(invisible(TRUE))
+
+  train <- as.double(txdat[[icon]])
+  train.is.eval <- is.null(exdat)
+  evaluation <- if (train.is.eval) train else as.double(exdat[[icon]])
+  .np_with_nn_radius_context(.Call(
+    "C_np_regression_k1_geometry_validate",
+    train,
+    evaluation,
+    train.is.eval,
+    PACKAGE = "npRmpi"
+  ), continuous.names = bws[["xnames", exact = TRUE]][icon])
+  invisible(TRUE)
 }
 
 npExtendedNnEnabled <- function() {
@@ -1985,7 +3043,6 @@ npContinuousExtendedNnNomadUpper <- function(traindat,
     gaussian = sqrt(-2.0 * log(1.0 - rel.tol)),
     epanechnikov = sqrt(rel.tol),
     uniform = 1.0 - 32.0 * .Machine$double.eps,
-    "truncated gaussian" = sqrt(-2.0 * log(1.0 - rel.tol)),
     0.0
   )
 
@@ -2030,24 +3087,6 @@ npContinuousExtendedNnNomadUpper <- function(traindat,
   }
 
   upper
-}
-
-npRegressionExtendedNnNomadUpper <- function(xdat,
-                                          template,
-                                          cont.idx,
-                                          safety.margin = 1.5,
-                                          hard.upper = .Machine$integer.max / 4) {
-  if (!inherits(template, "rbandwidth"))
-    return(rep.int(as.double(as.integer(NROW(xdat)) - 1L), length(cont.idx)))
-
-  npContinuousExtendedNnNomadUpper(
-    traindat = xdat,
-    bwtype = template$type,
-    ckertype = template$ckertype,
-    cont.idx = cont.idx,
-    safety.margin = safety.margin,
-    hard.upper = hard.upper
-  )
 }
 
 npRegressionHasExtendedNn <- function(bws) {
@@ -2224,17 +3263,18 @@ npValidateConditionalExtendedNn <- function(bws,
 
 npValidateRegressionExtendedNn <- function(bws,
                                         where,
-                                        bandwidth.compute = FALSE) {
+                                        bandwidth.compute = FALSE,
+                                        nobs = bws$nobs) {
   if (!inherits(bws, "rbandwidth") ||
       is.null(bws$type) ||
       identical(as.character(bws$type)[1L], "fixed") ||
       is.null(bws$icon) ||
       !any(bws$icon) ||
-      is.null(bws$nobs)) {
+      is.null(nobs)) {
     return(invisible(bws))
   }
 
-  upper <- as.integer(bws$nobs) - 1L
+  upper <- as.integer(nobs) - 1L
   if (!is.finite(upper) || upper < 1L)
     return(invisible(bws))
 
@@ -2270,8 +3310,9 @@ npValidateRegressionExtendedNn <- function(bws,
 
 npValidateRegressionNnLowerBound <- function(bws,
                                              where,
+                                             owner = c("regression", "lsq"),
                                              allow.zero.placeholder = FALSE) {
-  lower <- npRegressionNnLowerBound(bws)
+  lower <- npRegressionNnLowerBound(bws, owner = match.arg(owner))
   if (lower <= 1L)
     return(invisible(bws))
 
@@ -2312,12 +3353,11 @@ npValidateRegressionNnLowerBound <- function(bws,
 }
 
 explodeFormula <- function(formula, data=NULL){
+  .np_formula_validate_syntax(formula, conditional.response = TRUE)
   formula.terms <- if (is.null(data)) terms(formula) else terms(formula, data = data)
   response <- if (length(formula) == 3L) all.vars(formula[[2L]]) else character(0)
   term.labels.raw <- attr(formula.terms, "term.labels")
-  term.labels <- ifelse(grepl("^`[^`]+`$", term.labels.raw),
-                        substring(term.labels.raw, 2L, nchar(term.labels.raw) - 1L),
-                        term.labels.raw)
+  term.labels <- .np_formula_term_names(term.labels.raw)
   res <- list(response, term.labels)
   stopifnot(all(sapply(res,length) > 0))
   names(res) <- c("response","terms")
@@ -2363,14 +3403,21 @@ explodePipe <- function(formula, env = parent.frame()){
     if (inherits(formula, "error"))
       stop(conditionMessage(formula), call. = FALSE)
   }
-  tf <- as.character(formula)  
-  tf <- tf[length(tf)]
-  lhs <- if (length(as.character(formula)) == 3) {
-    strsplit(as.character(formula)[2], " *[+] *")
-  } else {
-    list()
+  .np_formula_validate_syntax(formula)
+  # Split actual formula operators, not punctuation inside quoted names or
+  # transformations. Keep parseable labels for the existing formula owners.
+  split.operator <- function(expr, operator) {
+    if (is.call(expr) && length(expr) == 3L &&
+        identical(expr[[1L]], as.name(operator)))
+      return(c(split.operator(expr[[2L]], operator),
+               split.operator(expr[[3L]], operator)))
+    list(expr)
   }
-  rhs <- strsplit(strsplit(tf, " *[|] *")[[1]], " *[+] *")
+  labels <- function(expr) vapply(split.operator(expr, "+"), function(term)
+    paste(deparse(term, backtick = TRUE, width.cutoff = 500L), collapse = ""),
+    character(1L))
+  lhs <- if (length(formula) == 3L) list(labels(formula[[2L]])) else list()
+  rhs <- lapply(split.operator(formula[[length(formula)]], "|"), labels)
   c(lhs, rhs)
 }
 
@@ -2382,6 +3429,36 @@ explodePipe <- function(formula, env = parent.frame()){
 coarseclass <- function(a) {
   if (inherits(a, "integer")) return("numeric")
   return(class(a)[1])
+}
+
+# Return omissions in the current input, not historical indices left by an
+# earlier na.omit/na.exclude call. Do not alter the caller's restoration map.
+.np_formula_output_action <- function(object, frame, formula.eval,
+                                       native.restored = FALSE) {
+  if (formula.eval || isTRUE(object[["trainiseval", exact = TRUE]]))
+    return(attr(frame, "na.action", exact = TRUE))
+  # Quantile and class native owners already restore their external rows.
+  if (native.restored)
+    return(NULL)
+  # External native rows belong to the native owner, never the training frame.
+  # Its established policy omits incomplete rows; do not inherit na.exclude.
+  omitted <- object[["eval.rows.omit", exact = TRUE]]
+  if (!length(omitted) || (length(omitted) == 1L && is.na(omitted)))
+    return(NULL)
+  structure(as.integer(omitted), class = "omit")
+}
+
+.np_require_paired_rows <- function(a, b, a.name, b.name) {
+  if (NROW(a) != NROW(b))
+    stop(sprintf("'%s' and '%s' must have the same number of rows", a.name, b.name),
+         call. = FALSE)
+  invisible(NULL)
+}
+
+.np_current_rows_omit <- function(frame) {
+  if (!is.null(attr(frame, "na.action", exact = TRUE)))
+    attr(frame, "na.action") <- NULL
+  attr(stats::na.omit(frame), "na.action")
 }
 
 toFrame <- function(frame) {
@@ -2404,16 +3481,28 @@ toFrame <- function(frame) {
 }
 
 
+.np_factor_with_levels <- function(x, levels, ordered = is.ordered(x)) {
+  if (!anyNA(levels))
+    return(factor(x, levels = levels, ordered = ordered))
+  # A missing label may name a valid category. A missing factor code remains
+  # a missing observation: converting through character would conflate them.
+  lev <- base::levels(factor(character(), levels = levels, exclude = NULL))
+  codes <- if (is.factor(x))
+    match(base::levels(x), lev)[as.integer(x)] else match(as.character(x), lev)
+  structure(codes, levels = lev, names = names(x),
+            class = if (ordered) c("ordered", "factor") else "factor")
+}
+
 cast <- function(a, b, same.levels = TRUE){
   if(is.ordered(b)){
     if(same.levels)
-      ordered(a, levels = levels(b))
+      .np_factor_with_levels(a, levels = levels(b), ordered = TRUE)
     else
       ordered(a)
   }   
   else if(is.factor(b)){
     if(same.levels)
-      factor(a, levels = levels(b))
+      .np_factor_with_levels(a, levels = levels(b), ordered = FALSE)
     else
       factor(a)
   }
@@ -2432,6 +3521,24 @@ cast <- function(a, b, same.levels = TRUE){
 subcol <- function(x, v, i){
   x[,i] = cast(v,x[,i])
   x
+}
+
+.np_native_categorical_support <- function(bws) {
+  bws <- .np_ordered_bandwidth_contract(bws)
+  info <- bws[["dati", exact = TRUE]]
+  if (!is.list(info) || is.null(info[["x", exact = TRUE]]))
+    stop("bandwidth object is missing declared training support")
+  role <- function(name) {
+    d <- info[[name, exact = TRUE]]
+    if (is.null(d)) return(list())
+    columns <- c(which(d[["iuno", exact = TRUE]]),
+                 which(d[["iord", exact = TRUE]]))
+    lapply(d[["all.dlev", exact = TRUE]][columns], as.double)
+  }
+  # Regression responses are not kernel coordinates, even when categorical.
+  # Regression, LSQ and X-only conditional adapters share rbandwidth objects.
+  if (inherits(bws, "rbandwidth")) return(c(role("x")))
+  c(role("y"), role("x"))
 }
 
 mcvConstruct <- function(dati){
@@ -2464,6 +3571,15 @@ mcvConstruct <- function(dati){
 ## if an ordered, but scaleless variable contains a new category, error
 ## if an ordered, scale-possessing variable contains a new category lacking scale, error
 
+.np_regression_response_levels <- function(data, dati, allowNewCells = FALSE) {
+  coding <- dati[["all.dlev", exact = TRUE]]
+  if (!(isTRUE(dati[["iord", exact = TRUE]][1L]) ||
+        isTRUE(dati[["iuno", exact = TRUE]][1L])) ||
+      length(coding) != 1L || length(coding[[1L]]) == 0L)
+    stop("factor response requires bandwidths fitted to a factor response")
+  adjustLevels(data, dati, allowNewCells = allowNewCells)
+}
+
 adjustLevels <- function(data, dati, allowNewCells = FALSE){
   for (i in which(dati$iord | dati$iuno)){
     if (allowNewCells){
@@ -2474,7 +3590,7 @@ adjustLevels <- function(data, dati, allowNewCells = FALSE){
             .np_warning(paste("more than one 'new' category is redundant when estimating on unordered data.\n",
                           "training data categories: ", paste(dati$all.lev[[i]], collapse=" "),"\n",
                           "redundant estimation data categories: ", paste(newCats, collapse=" "), "\n", sep=""))
-          data[,i] <- factor(data[,i], levels = c(dati$all.lev[[i]], newCats))
+          data[,i] <- .np_factor_with_levels(data[,i], levels = c(dati$all.lev[[i]], newCats))
         } else {
           if (dati$inumord[i]){
             if (!isNum(newCats))
@@ -2487,18 +3603,25 @@ adjustLevels <- function(data, dati, allowNewCells = FALSE){
                        "categorical, qualitative variable is not supported.\n"))
           }
 
-          data[,i] <- ordered(data[,i], levels = sort(as.numeric(c(dati$all.lev[[i]], newCats))))
+          data[,i] <- .np_factor_with_levels(data[,i],
+            levels = sort(as.numeric(c(dati$all.lev[[i]], newCats))), ordered = TRUE)
         }
       } else {
-        data[,i] <- factor(data[,i], levels = dati$all.lev[[i]])
+        data[,i] <- .np_factor_with_levels(data[,i], levels = dati$all.lev[[i]])
       }
     } else {
       if (!all(is.element(levels(data[,i]), dati$all.lev[[i]])))
         stop("data contains unknown factors (wrong dataset provided?)")
-      data[,i] <- factor(data[,i], levels = dati$all.lev[[i]])
+      data[,i] <- .np_factor_with_levels(data[,i], levels = dati$all.lev[[i]])
     }
   }
 
+  # Validate newly admitted evaluation levels against this role, before MPI
+  # dispatch/native arithmetic. Old objects without policy keep their lattice
+  # admission until reconstructed by a bandwidth constructor.
+  kernel <- dati[[".np.ordered.kernel", exact = TRUE]]
+  if (is.null(kernel)) kernel <- "lattice"
+  for (i in which(dati$iord)) .np_ordered_levels_contract(dlev(data[, i]), kernel)
   data
 }
 
@@ -2509,18 +3632,6 @@ toMatrix <- function(data) {
     y})
   dim(tq) <- dim(data) ## cover the corner case of single element d.f.
   tq
-}
-
-## this doesn't just strictly check for the response, but does tell you
-## that evaluating with response fails ... in principle the evaluation
-## could fail without the response too, but then the calling routine is about
-## to die a noisy death anyhow ...
-succeedWithResponse <- function(tt, frame){
-  vars <- attr(tt, "variables")
-  if (is.null(vars))
-    return(FALSE)
-  out <- .np_try_eval_in_frames(vars, eval_env = frame, enclos = NULL, search_frames = FALSE)
-  isTRUE(out$ok)
 }
 
 ## determine whether a bandwidth
@@ -2594,10 +3705,6 @@ blank <- function(len){
   sapply(len, function(nb){
     paste(rep(' ', times = nb), collapse='')
   })
-}
-
-formatv <- function(v){
-  sapply(seq_along(v), function(j){ format(v[j]) })
 }
 
 ## strings used in various report generating functions
@@ -2931,7 +4038,7 @@ genRegEstStr <- function(x){
   bern <- if (!is.null(x$bernstein.basis)) x$bernstein.basis else if (!is.null(x_bws)) x_bws$bernstein.basis else NULL
   est.label <- if (identical(regtype, "lp")) npFormatRegressionType(x) else x$pregtype
   basis.family <- if (identical(regtype, "lp")) npLpBasisFamilyLabel(basis) else NULL
-  basis.rep <- if (identical(regtype, "lp")) npLpBasisRepresentationLabel(bern) else NULL
+  basis.rep <- if (identical(regtype, "lp")) npLpBasisRepresentationLabel(bern, basis) else NULL
   est.prefix <- if (!is.null(x_bws) && npUsesPolynomialSummaryLabel(x_bws))
     "Polynomial Type"
   else
@@ -2954,18 +4061,172 @@ npLpBasisFamilyLabel <- function(basis){
          tools::toTitleCase(b))
 }
 
-npLpBasisRepresentationLabel <- function(bernstein){
-  if (isTRUE(bernstein)) "Bernstein" else "Raw"
+npLpBasisRepresentationLabel <- function(bernstein, basis = "glp"){
+  if (!isTRUE(bernstein))
+    return("Raw")
+  if (identical(tolower(basis), "glp"))
+    return("Shifted Legendre (degree-graded orthonormal)")
+  "Bernstein"
+}
+
+.np_lp_term_capacity <- 100000L
+
+npLpCompleteTermStatus <- function(basis = "glp", degree, nobs = Inf,
+                                   capacity = .np_lp_term_capacity) {
+  basis <- match.arg(basis, c("glp", "additive", "tensor"))
+  degree <- npValidateGlpDegree(
+    regtype = "lp",
+    degree = degree,
+    ncon = length(degree),
+    argname = "degree"
+  )
+  if (length(nobs) != 1L || !is.numeric(nobs) || is.na(nobs) ||
+      nobs <= 0 || (!is.finite(nobs) && !identical(as.double(nobs), Inf)))
+    stop("nobs must be a single positive finite value or Inf", call. = FALSE)
+  if (is.finite(nobs) && nobs != floor(nobs))
+    stop("nobs must be integer-valued", call. = FALSE)
+  if (length(capacity) != 1L || !is.numeric(capacity) || is.na(capacity) ||
+      !is.finite(capacity) || capacity <= 0 || capacity != floor(capacity) ||
+      capacity >= .Machine$integer.max)
+    stop("capacity must be a single positive integer", call. = FALSE)
+
+  capacity <- as.integer(capacity)
+  ceiling <- as.integer(capacity) + 1L
+  nterms <- if (!length(degree)) {
+    1L
+  } else if (identical(basis, "additive")) {
+    value <- 1L
+    for (d in degree) {
+      if (d >= ceiling - value) {
+        value <- ceiling
+        break
+      }
+      value <- value + d
+    }
+    value
+  } else if (identical(basis, "tensor")) {
+    value <- 1L
+    for (d in degree) {
+      factor <- d + 1L
+      if (value > ceiling %/% factor) {
+        value <- ceiling
+        break
+      }
+      value <- value * factor
+    }
+    value
+  } else {
+    dmax <- max(degree)
+    count <- integer(dmax + 1L)
+    count[[1L]] <- 1L
+    for (d in degree) {
+      next.count <- integer(dmax + 1L)
+      for (total in 0L:dmax) {
+        if (count[[total + 1L]] == 0L)
+          next
+        upper <- min(d, dmax - total)
+        for (value in 0L:upper) {
+          idx <- total + value + 1L
+          add <- count[[total + 1L]]
+          next.count[[idx]] <- if (add >= ceiling - next.count[[idx]])
+            ceiling
+          else
+            next.count[[idx]] + add
+        }
+      }
+      count <- next.count
+    }
+    value <- 0L
+    for (add in count) {
+      if (add >= ceiling - value) {
+        value <- ceiling
+        break
+      }
+      value <- value + add
+    }
+    value
+  }
+
+  capacity.ok <- nterms <= capacity
+  rank.ok <- !is.finite(nobs) || nterms < as.double(nobs)
+  status <- if (!capacity.ok) {
+    "capacity_exceeded"
+  } else if (!rank.ok) {
+    "rank_inadmissible"
+  } else {
+    "valid"
+  }
+
+  structure(
+    list(
+      basis = basis,
+      nterms = nterms,
+      nobs = as.double(nobs),
+      capacity = as.double(capacity),
+      capacity.ok = capacity.ok,
+      rank.ok = rank.ok,
+      status = status
+    ),
+    class = "np.lp.term.status"
+  )
+}
+
+.np_undefined_fit_rows <- function(rows, where, external = FALSE,
+                                   reason = "kernel-weighted system has no usable support or could not be solved") {
+  location <- paste(utils::head(rows, 6L), collapse = ", ")
+  if (length(rows) > 6L)
+    location <- paste0(location, ", ...")
+  message <- sprintf("%s: local fit is undefined at %d row(s) (%s): %s",
+                     where, length(rows), location, reason)
+  if (!external)
+    stop(message, call. = FALSE)
+  if (!isTRUE(getOption("npRmpi.mpi.initialized", FALSE)) ||
+      (isTRUE(mpi.is.master()) && isTRUE(mpi.comm.rank(0L) == 0L)))
+    .np_warning(paste0(message,
+      "; returning NA for fitted values and associated outputs. ",
+      "Consider a larger bandwidth or another kernel."), call. = FALSE)
+  invisible(NULL)
+}
+
+npValidateLpBasisAdmission <- function(basis = "glp", degree, nobs,
+                                       where = "local-polynomial estimator") {
+  admission <- npLpCompleteTermStatus(
+    basis = basis,
+    degree = degree,
+    nobs = nobs
+  )
+  if (!admission$capacity.ok) {
+    message <- sprintf(
+      "%s: LP basis dimension exceeds supported term capacity (%d); reduce degree",
+      where,
+      as.integer(admission$capacity)
+    )
+  } else if (!admission$rank.ok) {
+    message <- sprintf(
+      "%s: LP basis dimension (%s) exceeds nobs - 1 (%s); reduce degree",
+      where,
+      format(admission$nterms, trim = TRUE, scientific = FALSE),
+      format(admission$nobs - 1.0, trim = TRUE, scientific = FALSE)
+    )
+  } else {
+    return(invisible(admission))
+  }
+  stop(errorCondition(message, call = NULL,
+    class = "np_degree_candidate_invalid",
+    degree = as.integer(degree), admission = admission))
 }
 
 npLpBasisNcol <- function(basis = "glp", degree){
   if (is.null(degree) || !length(degree))
     return(NA_real_)
-  d <- dim_basis(basis = basis,
-                 kernel = TRUE,
-                 degree = as.integer(degree),
-                 segments = rep.int(1L, length(degree)))
-  if (identical(tolower(basis), "tensor")) d else d + 1.0
+  admission <- npLpCompleteTermStatus(basis = basis, degree = degree)
+  if (!admission$capacity.ok) {
+    stop(sprintf(
+      "LP basis dimension exceeds supported term capacity (%d)",
+      as.integer(admission$capacity)
+    ), call. = FALSE)
+  }
+  admission$nterms
 }
 
 npFormatRegressionType <- function(x){
@@ -3389,6 +4650,15 @@ npUsesPolynomialSummaryLabel <- function(x){
                                .np_summary_format_count(guarded)))
   }
 
+  if (!(is.null(x$num.feval.certified) ||
+        (length(x$num.feval.certified) == 1L &&
+         is.na(x$num.feval.certified)))) {
+    certified <- suppressWarnings(as.numeric(x$num.feval.certified[1L]))
+    if (is.finite(certified) && certified > 0)
+      lines <- c(lines, paste0("Beta-range certification evaluations: ",
+                               .np_summary_format_count(certified)))
+  }
+
   lines
 }
 
@@ -3523,184 +4793,125 @@ genBwScaleStrs <- function(x){
   }))
 }
 
+.np_bootstrap_upper_tail_pvalue <- function(bootstrap, observed) {
+  # Ordinary bootstrap upper-tail p-value.  Ties are counted as at least as
+  # extreme so discrete/categorical tests remain conservative.
+  if (length(observed) != 1L)
+    stop("bootstrap p-value observed statistic must be scalar", call. = FALSE)
+  B <- length(bootstrap)
+  if (B < 1L)
+    stop("bootstrap p-value requires at least one replication", call. = FALSE)
+  mean(bootstrap >= observed)
+}
+
 npFormat <- function(x){
   format(sapply(x,format))
 }
 
-genBwKerStrs <- function(x){
-  vari <- names(x$klist)
-
-  ncon <- sapply(vari, function(v){
-    sum(x$dati[[v]]$icon)
-  })
-
-  nuno <- sapply(vari, function(v){
-    sum(x$dati[[v]]$iuno)
-  })
-
-  nord <- sapply(vari, function(v){
-    sum(x$dati[[v]]$iord)
-  })
-
-  cktype <- sapply(vari, function(v){
-    x$klist[[v]]$ckertype
-  })
-
-  uktype <- sapply(vari, function(v){
-    x$klist[[v]]$ukertype
-  })
-
-  oktype <- sapply(vari, function(v){
-    x$klist[[v]]$okertype
-  })
-
-  tt <- ''
-
-  if(any(ncon > 0)){
-    ctype.str <- ""
-    if (length(unique(cktype)) == 1) {
-      ctype.str <- paste("\nContinuous Kernel Type:",
-                         x$klist[[vari[1]]]$pckertype)
-    } else {
-      ctype.str <- paste(sapply(seq_along(vari), function(v){
-        if (ncon[v] > 0)
-          paste("\nContinuous Kernel Type (",
-                x$vartitleabb[[vari[v]]],
-                " Var.): ", x$klist[[vari[v]]]$pckertype, sep = "")
-        else ""
-      }), collapse = "")
+.np_match_arg_named <- function(arg, choices, arg.name) {
+  tryCatch(
+    match.arg(arg, choices),
+    error = function(condition) {
+      condition$message <- sub(
+        "'arg'", sprintf("'%s'", arg.name),
+        conditionMessage(condition), fixed = TRUE
+      )
+      condition$call <- call("match.arg", as.name(arg.name))
+      stop(condition)
     }
-    tt <- paste("\n", ctype.str, sep = "")
-    cont.str <- paste(sapply(seq_along(vari), function(i){
-      if (ncon[i] > 0)
-        paste("\nNo. Continuous", pad(x$vartitle[[vari[i]]]), "Vars.: ",
-              ncon[i], sep = "")
-      else ""
-    }), collapse = "")
-    tt <- paste(tt, cont.str, sep = "")
-  }
-                
-    
-  if(any(nuno > 0)) {
-    utype.str <- ""
-    if (length(unique(uktype)) == 1) {
-      utype.str <- paste("\nUnordered Categorical Kernel Type:",
-                         x$klist[[vari[1]]]$pukertype)
-    } else {
-      utype.str <- paste(sapply(seq_along(vari), function(i){
-        if (nuno[i] > 0)
-          paste("\nUnordered Categorical Kernel Type (",
-                x$vartitleabb[[vari[i]]],
-                " Var.): ", x$klist[[vari[i]]]$pukertype, sep = "")
-        else ""
-      }), collapse = "")
-    }
-    tt <- paste(tt, "\n", utype.str, sep = "")
-    uno.str <- paste(sapply(seq_along(vari), function(i){
-      if (nuno[i] > 0)
-        paste("\nNo. Unordered Categorical", pad(x$vartitle[[vari[i]]]), "Vars.: ",
-              nuno[i], sep = "")
-      else ""
-    }), collapse = "")
-    tt <- paste(tt, uno.str, sep = "")
-
-  }
-
-  if(any(nord > 0)) {
-    otype.str <- ""
-    if (length(unique(oktype)) == 1) {
-      otype.str <- paste("\nOrdered Categorical Kernel Type:",
-                         x$klist[[vari[1]]]$pokertype)
-    } else {
-      otype.str <- paste(sapply(seq_along(vari), function(i){
-        if (nord[i] > 0)
-          paste("\nOrdered Categorical Kernel Type (",
-                x$vartitleabb[[vari[i]]],
-                " Var.): ", x$klist[[vari[i]]]$pokertype, sep = "")
-        else ""
-      }), collapse = "")
-    }
-    tt <- paste(tt, "\n", otype.str, sep = "")
-    ord.str <- paste(sapply(seq_along(vari), function(i){
-      if (nord[i] > 0)
-        paste("\nNo. Ordered Categorical", pad(x$vartitle[[vari[i]]]), "Vars.: ",
-              nord[i], sep = "")
-      else ""
-    }), collapse = "")
-    tt <- paste(tt, ord.str, sep = "")
-
-  }
-
-  return(tt)
+  )
 }
 
-genBwKerStrsXY <- function(x){
-  t.str <- ''
-  cnt <- 0
-  
-  if (x$xncon + x$yncon > 0){
-    cker.str <- ""
-    if (x$pcxkertype == x$pcykertype) {
-      cker.str <- paste("\n\nContinuous Kernel Type:", x$pcxkertype)
+.np_bw_kernel_family_lines <- function(x, variables, family,
+                                       indicator, type, print.type,
+                                       conditional.xy) {
+  counts <- vapply(variables, function(variable) {
+    sum(x[["dati"]][[variable]][[indicator]])
+  }, numeric(1L))
+  active <- which(counts > 0)
+  if (!length(active))
+    return(character())
+
+  if (conditional.xy) {
+    type.lines <- vapply(active, function(i) {
+      variable <- variables[[i]]
+      paste0(
+        family, " Kernel Type (", x[["vartitleabb"]][[variable]],
+        " Var.): ", x[["klist"]][[variable]][[print.type]]
+      )
+    }, character(1L))
+  } else {
+    types <- vapply(variables, function(variable) {
+      x[["klist"]][[variable]][[type]]
+    }, character(1L))
+    if (length(unique(types)) == 1L) {
+      type.lines <- paste0(
+        family, " Kernel Type: ",
+        x[["klist"]][[variables[[1L]]]][[print.type]]
+      )
     } else {
-      exp.str <- if (x$xncon > 0)
-        paste("\nContinuous Kernel Type (Exp. Var.):", x$pcxkertype)
-      else ""
-      dep.str <- if (x$yncon > 0)
-        paste("\nContinuous Kernel Type (Dep. Var.):", x$pcykertype)
-      else ""
-      cker.str <- paste("\n", exp.str, dep.str)
+      type.lines <- vapply(active, function(i) {
+        variable <- variables[[i]]
+        paste0(
+          family, " Kernel Type (", x[["vartitleabb"]][[variable]],
+          " Var.): ", x[["klist"]][[variable]][[print.type]]
+        )
+      }, character(1L))
     }
-    ycon.str <- if (x$yncon > 0) paste("\nNo. Continuous Dependent Vars.:", x$yncon) else ""
-    xcon.str <- if (x$xncon > 0) paste("\nNo. Continuous Explanatory Vars.:", x$xncon) else ""
-    t.str[cnt <- cnt + 1] <-
-      paste(cker.str, ycon.str, xcon.str)
   }
 
-  if (x$xnuno + x$ynuno > 0){
-    uker.str <- ""
-    if (x$puxkertype == x$puykertype) {
-      uker.str <- paste("\n\nUnordered Categorical Kernel Type:", x$puxkertype)
-    } else {
-      exp.str <- if (x$xnuno > 0)
-        paste("\nUnordered Categorical Kernel Type (Exp. Var.):", x$puxkertype)
-      else ""
-      dep.str <- if (x$ynuno > 0)
-        paste("\nUnordered Categorical Kernel Type (Dep. Var.):", x$puykertype)
-      else ""
-      uker.str <- paste("\n", exp.str, dep.str)
-    }
-    yuno.str <- if (x$ynuno > 0) paste("\nNo. Unordered Categorical Dependent Vars.:", x$ynuno) else ""
-    xuno.str <- if (x$xnuno > 0) paste("\nNo. Unordered Categorical Explanatory Vars.:", x$xnuno) else ""
-    t.str[cnt <- cnt + 1] <-
-      paste(uker.str, yuno.str, xuno.str)
-  }
+  count.lines <- vapply(active, function(i) {
+    variable <- variables[[i]]
+    paste0(
+      "No. ", family, pad(x[["vartitle"]][[variable]]),
+      "Vars.: ", counts[[i]]
+    )
+  }, character(1L))
 
-  if (x$xnord + x$ynord > 0){
-    oker.str <- ""
-    if (x$poxkertype == x$poykertype) {
-      oker.str <- paste("\n\nOrdered Categorical Kernel Type:", x$poxkertype)
-    } else {
-      exp.str <- if (x$xnord > 0)
-        paste("\nOrdered Categorical Kernel Type (Exp. Var.):", x$poxkertype)
-      else ""
-      dep.str <- if (x$ynord > 0)
-        paste("\nOrdered Categorical Kernel Type (Dep. Var.):", x$poykertype)
-      else ""
-      oker.str <- paste("\n", exp.str, dep.str)
-    }
-    yord.str <- if (x$ynord > 0) paste("\nNo. Ordered Categorical Dependent Vars.:", x$ynord) else ""
-    xord.str <- if (x$xnord > 0) paste("\nNo. Ordered Categorical Explanatory Vars.:", x$xnord) else ""
-    t.str[cnt <- cnt + 1] <-
-      paste(oker.str, yord.str, xord.str)
-  }
-  return(t.str)
+  c(type.lines, count.lines)
 }
 
-genBwGOFStrs <- function(x) {
-  ###paste("Residual standard error:", sqrt
+genBwKerStrs <- function(x) {
+  variables <- names(x[["klist"]])
+  conditional.xy <- length(variables) == 2L &&
+    all(c("x", "y") %in% variables)
+  families <- list(
+    list(
+      family = "Continuous", indicator = "icon",
+      type = "ckertype", print.type = "pckertype"
+    ),
+    list(
+      family = "Unordered Categorical", indicator = "iuno",
+      type = "ukertype", print.type = "pukertype"
+    ),
+    list(
+      family = "Ordered Categorical", indicator = "iord",
+      type = "okertype", print.type = "pokertype"
+    )
+  )
+
+  sections <- lapply(families, function(specification) {
+    .np_bw_kernel_family_lines(
+      x = x,
+      variables = variables,
+      family = specification[["family"]],
+      indicator = specification[["indicator"]],
+      type = specification[["type"]],
+      print.type = specification[["print.type"]],
+      conditional.xy = conditional.xy
+    )
+  })
+  sections <- sections[lengths(sections) > 0L]
+  if (!length(sections))
+    return("")
+
+  paste0(
+    "\n\n",
+    paste(vapply(sections, paste, character(1L), collapse = "\n"),
+          collapse = "\n\n")
+  )
 }
-  
+
 ## statistical functions
 RSQfunc <- function(y,y.pred) {
   y.mean <- mean(y)
@@ -3807,7 +5018,7 @@ cktToPrint <- function(s, order = "", kerbound = "none"){
                 gaussian = paste(order,"Gaussian"),
                 epanechnikov =  paste(order,"Epanechnikov"),
                 uniform = "Uniform",
-                "truncated gaussian" = "Truncated Gaussian")
+                beta = paste(order, "Beta associated"))
   if (!is.null(kerbound) && !identical(kerbound, "none"))
     pck <- paste0(pck, " (bounded/", kerbound, ")")
   pck
@@ -3872,7 +5083,8 @@ mypoly <- function(x,
                    degree,
                    gradient.compute = FALSE,
                    r=0,
-                   Bernstein = TRUE) {
+                   Bernstein = TRUE,
+                   complete.glp = FALSE) {
 
   if(missing(x)) stop(" Error: x required")
   if(missing(degree)) stop(" Error: degree required")
@@ -3899,8 +5111,10 @@ mypoly <- function(x,
       Z <- outer(x,1L:degree,"^")
     }
 
-  } else {
-    ## Bernstein polynomial basis (no interior knots) aligned with C-side LP code.
+  } else if (!isTRUE(complete.glp)) {
+    ## Historical fixed-coordinate-degree Bernstein basis.  It is retained
+    ## byte-for-byte for additive and tensor bases, where the selected columns
+    ## span the requested space.  It is not closed on a sparse GLP lower set.
     x.train <- as.double(x)
     x.use <- if (is.null(ex)) x.train else as.double(ex)
     r <- if (gradient.compute) as.integer(r) else 0L
@@ -3934,6 +5148,49 @@ mypoly <- function(x,
       })
       Z <- do.call(cbind, z.list)
     }
+  } else {
+    ## Orthonormalized Bernstein representation (shifted Legendre factors),
+    ## aligned with the C-side complete-LP code. For degree k,
+    ## sqrt(2k+1) P_k(2u-1) is an exact linear combination of the degree-k
+    ## Bernstein polynomials and has exact polynomial degree k.
+    x.train <- as.double(x)
+    x.use <- if (is.null(ex)) x.train else as.double(ex)
+    r <- if (gradient.compute) as.integer(r) else 0L
+    if (is.na(r) || r < 0L) stop(" Error: derivative order must be a non-negative integer")
+
+    xmin <- min(x.train)
+    xmax <- max(x.train)
+    xrange <- xmax - xmin
+    if (!is.finite(xrange) || xrange <= 0) {
+      Z <- matrix(0.0, nrow = length(x.use), ncol = degree)
+    } else if (r > degree) {
+      Z <- matrix(0.0, nrow = length(x.use), ncol = degree)
+    } else {
+      u <- (x.use - xmin) / xrange
+      z <- 2.0 * u - 1.0
+      deriv <- array(0.0, dim = c(length(u), degree + 1L, r + 1L))
+      deriv[, 1L, 1L] <- 1.0
+      if (degree >= 1L) {
+        deriv[, 2L, 1L] <- z
+        if (r >= 1L)
+          deriv[, 2L, 2L] <- 2.0
+      }
+      if (degree >= 2L) {
+        for (k in 1L:(degree - 1L)) {
+          for (rr in 0L:min(r, k + 1L)) {
+            value <- (2.0 * k + 1.0) * z * deriv[, k + 1L, rr + 1L] -
+              k * deriv[, k, rr + 1L]
+            if (rr > 0L)
+              value <- value + (2.0 * k + 1.0) * 2.0 * rr * deriv[, k + 1L, rr]
+            deriv[, k + 2L, rr + 1L] <- value / (k + 1.0)
+          }
+        }
+      }
+      Z <- vapply(seq_len(degree), function(k) {
+        deriv[, k + 1L, r + 1L] * sqrt(2.0 * k + 1.0) / (xrange^r)
+      }, numeric(length(u)))
+      Z <- matrix(Z, nrow = length(u), ncol = degree)
+    }
   }
 
   return(as.matrix(Z))
@@ -3950,24 +5207,38 @@ npBuildLpTerms <- function(degree, basis = c("glp", "additive", "tensor")) {
     return(matrix(integer(0), nrow = 1L, ncol = 0L))
 
   degree <- as.integer(degree)
+  if (identical(basis, "glp")) {
+    dmax <- max(degree)
+    cap <- 100000L
+    current <- integer(k)
+    rows <- vector("list", min(cap, 1024L))
+    nrows <- 0L
+    visit <- function(j, used) {
+      if (j == 0L) {
+        nrows <<- nrows + 1L
+        if (nrows > cap)
+          stop(sprintf("LP basis dimension exceeds supported term capacity (%d)", cap),
+               call. = FALSE)
+        if (nrows > length(rows))
+          length(rows) <<- min(cap, max(nrows, 2L * length(rows)))
+        rows[[nrows]] <<- current
+        return(invisible(NULL))
+      }
+      for (value in 0L:min(degree[j], dmax - used)) {
+        current[j] <<- value
+        visit(j - 1L, used + value)
+      }
+      invisible(NULL)
+    }
+    visit(k, 0L)
+    return(do.call(rbind, rows[seq_len(nrows)]))
+  }
+
   degree.list <- lapply(degree, function(d) 0:d)
   z <- as.matrix(do.call(base::expand.grid, degree.list))
   s <- rowSums(z)
 
-  if (identical(basis, "glp")) {
-    ind <- (s > 0) & (s <= max(degree))
-    z <- z[ind, , drop = FALSE]
-    if (!all(degree == max(degree))) {
-      for (j in seq_along(degree)) {
-        d <- degree[j]
-        if ((d < max(degree)) && (d > 0)) {
-          s <- rowSums(z)
-          dropj <- (s > d) & (z[, j, drop = FALSE] == matrix(d, nrow(z), 1, byrow = TRUE))
-          z <- z[!dropj, , drop = FALSE]
-        }
-      }
-    }
-  } else if (identical(basis, "additive")) {
+  if (identical(basis, "additive")) {
     ind <- (s > 0) & (rowSums(z > 0) == 1L)
     z <- z[ind, , drop = FALSE]
   } else if (identical(basis, "tensor")) {
@@ -4020,10 +5291,11 @@ W.lp <- function(xdat = NULL,
 
     ## Local constant OR no continuous variables
 
+    constant <- if (gradient.compute && any(gradient.vec > 0L)) 0 else 1
     if(is.null(exdat)) {
-      return(matrix(1,nrow=nrow(as.data.frame(xdat)),ncol=1))
+      return(matrix(constant,nrow=nrow(as.data.frame(xdat)),ncol=1))
     } else {
-      return(matrix(1,nrow=nrow(as.data.frame(exdat)),ncol=1))
+      return(matrix(constant,nrow=nrow(as.data.frame(exdat)),ncol=1))
     }
 
   } else {
@@ -4035,17 +5307,15 @@ W.lp <- function(xdat = NULL,
     } else {
       res <- rep.int(1,nrow(exdat.numeric))
     }
-    res.deriv <- 1
     if(degree[1] > 0) {
       res <- cbind(1, mypoly(x=xdat.numeric[,1],
                              ex=exdat.numeric[,1],
                              degree=degree[1],
                              gradient.compute=gradient.compute,
                              r=gradient.vec[1],
-                             Bernstein=Bernstein))[, 1 + z.noi[, 1]]
+                             Bernstein=Bernstein,
+                             complete.glp=identical(basis, "glp")))[, 1 + z.noi[, 1]]
 
-      if(gradient.compute && gradient.vec[1] != 0) res.deriv <- cbind(1,matrix(NA,1,degree[1]))[, 1 + z.noi[, 1],drop=FALSE]
-      if(gradient.compute && gradient.vec[1] == 0) res.deriv <- cbind(1,matrix(0,1,degree[1]))[, 1 + z.noi[, 1],drop=FALSE]
     }
     if(k > 1) for (i in 2:k) if(degree[i] > 0) {
       res <- res * cbind(1, mypoly(x=xdat.numeric[,i],
@@ -4053,9 +5323,8 @@ W.lp <- function(xdat = NULL,
                                    degree=degree[i],
                                    gradient.compute=gradient.compute,
                                    r=gradient.vec[i],
-                                   Bernstein=Bernstein))[, 1 + z.noi[, i]]
-      if(gradient.compute && gradient.vec[i] != 0) res.deriv <- res.deriv * cbind(1,matrix(NA,1,degree[i]))[, 1 + z.noi[, i],drop=FALSE]
-      if(gradient.compute && gradient.vec[i] == 0) res.deriv <- res.deriv *cbind(1,matrix(0,1,degree[i]))[, 1 + z.noi[, i],drop=FALSE]
+                                   Bernstein=Bernstein,
+                                   complete.glp=identical(basis, "glp")))[, 1 + z.noi[, i]]
     }
 
     if(is.null(exdat)) {
@@ -4063,13 +5332,18 @@ W.lp <- function(xdat = NULL,
     } else {
       res <- matrix(res,nrow=NROW(exdat))
     }
-    if(gradient.compute) res.deriv <- matrix(res.deriv,nrow=1)
     colnames(res) <- apply(z.noi, 1L, function(x) paste(x, collapse = "."))
-    if(gradient.compute) colnames(res.deriv) <- apply(z.noi, 1L, function(x) paste(x, collapse = "."))
 
     if(gradient.compute) {
-      res[,!is.na(as.numeric(res.deriv))] <- 0
-      return(cbind(0,res))
+      # A constant factor on any differentiated axis annihilates the product.
+      # Nonconstant Bernstein column indices are not polynomial degrees;
+      # mypoly, not this mask, owns their within-axis derivatives.
+      axes <- which(gradient.vec > 0L)
+      if (length(axes)) {
+        zero <- rowSums(z.noi[, axes, drop = FALSE] == 0L) > 0L
+        res[, zero] <- 0
+      }
+      return(cbind(if (length(axes)) 0 else 1,res))
     } else {
       return(cbind(1,res))
     }
@@ -4110,7 +5384,127 @@ DO_TREE_YES = 1
 CKER_GAUSS = 0
 CKER_EPAN  = 4
 CKER_UNI   = 8
-CKER_TGAUSS = 9
+CKER_RESERVED = 9
+
+CKER_FAMILY_LEGACY = 0L
+CKER_FAMILY_BETA = 1L
+CKER_COORDINATE = -1L
+
+npContinuousKernelCode <- function(bws) {
+  ckertype <- bws[["ckertype", exact = TRUE]]
+  ckerorder <- bws[["ckerorder", exact = TRUE]]
+
+  if (identical(ckertype, "beta"))
+    return(CKER_COORDINATE)
+
+  switch(ckertype,
+    gaussian = CKER_GAUSS + ckerorder / 2 - 1,
+    epanechnikov = CKER_EPAN + ckerorder / 2 - 1,
+    uniform = CKER_UNI,
+    stop("invalid internal continuous-kernel type", call. = FALSE)
+  )
+}
+
+npContinuousKernelDescriptorOptions <- function(bws) {
+  ckertype <- bws[["ckertype", exact = TRUE]]
+  ckerorder <- bws[["ckerorder", exact = TRUE]]
+
+  if (is.null(ckertype) || length(ckertype) != 1L ||
+      is.null(ckerorder) || length(ckerorder) != 1L ||
+      !is.finite(ckerorder))
+    stop("invalid internal continuous-kernel descriptor")
+
+  list(
+    continuous.kernel.family = if (identical(ckertype, "beta"))
+      CKER_FAMILY_BETA else CKER_FAMILY_LEGACY,
+    continuous.kernel.order = as.integer(ckerorder)
+  )
+}
+
+npConditionalKernelDescriptorOptions <- function(bws) {
+  list(
+    continuous.x.kernel.family = if (identical(bws[["cxkertype", exact = TRUE]],
+                                                "beta"))
+      CKER_FAMILY_BETA else CKER_FAMILY_LEGACY,
+    continuous.x.kernel.order = as.integer(bws[["cxkerorder", exact = TRUE]]),
+    continuous.y.kernel.family = if (identical(bws[["cykertype", exact = TRUE]],
+                                                "beta"))
+      CKER_FAMILY_BETA else CKER_FAMILY_LEGACY,
+    continuous.y.kernel.order = as.integer(bws[["cykerorder", exact = TRUE]]),
+    categorical.compress = npStrictLogicalOption(
+      "np.categorical.compress", TRUE
+    )
+  )
+}
+
+npConditionalContinuousKernelCode <- function(bws, side = c("x", "y")) {
+  side <- match.arg(side)
+  type <- bws[[paste0("c", side, "kertype"), exact = TRUE]]
+  order <- bws[[paste0("c", side, "kerorder"), exact = TRUE]]
+
+  if (identical(type, "beta"))
+    return(CKER_COORDINATE)
+
+  switch(type,
+    gaussian = CKER_GAUSS + order / 2 - 1,
+    epanechnikov = CKER_EPAN + order / 2 - 1,
+    uniform = CKER_UNI,
+    stop("invalid internal conditional continuous-kernel type", call. = FALSE)
+  )
+}
+
+npValidateConditionalBetaBandwidthObject <- function(bws,
+                                                      where,
+                                                      bandwidth.compute = FALSE,
+                                                      allow.automatic.full = FALSE) {
+  beta.x <- identical(bws[["cxkertype", exact = TRUE]], "beta")
+  beta.y <- identical(bws[["cykertype", exact = TRUE]], "beta")
+  has.beta <- beta.x || beta.y
+  canonical.single.side <- xor(beta.x, beta.y)
+  canonical.manual.fit <- !isTRUE(bandwidth.compute)
+  canonical.fit.route <- isTRUE(allow.automatic.full) ||
+    canonical.single.side || canonical.manual.fit
+  if (!has.beta)
+    return(invisible(FALSE))
+
+  npValidateBetaKernelSpecification(
+    ckertype = bws[["cxkertype", exact = TRUE]],
+    ckerorder = bws[["cxkerorder", exact = TRUE]],
+    bwtype = bws[["type", exact = TRUE]],
+    ckerbound = bws[["cxkerbound", exact = TRUE]],
+    ckerlb = bws[["cxkerlb", exact = TRUE]],
+    ckerub = bws[["cxkerub", exact = TRUE]],
+    dati = bws[["xdati", exact = TRUE]],
+    bw = bws[["xbw", exact = TRUE]],
+    bandwidth.compute = bandwidth.compute,
+    where = paste(where, "explanatory beta kernel"),
+    regtype = bws[["regtype", exact = TRUE]],
+    allow.categorical = canonical.fit.route,
+    allow.general.lp = canonical.fit.route,
+    arg.prefix = "cxker"
+  )
+  npValidateBetaKernelSpecification(
+    ckertype = bws[["cykertype", exact = TRUE]],
+    ckerorder = bws[["cykerorder", exact = TRUE]],
+    bwtype = bws[["type", exact = TRUE]],
+    ckerbound = bws[["cykerbound", exact = TRUE]],
+    ckerlb = bws[["cykerlb", exact = TRUE]],
+    ckerub = bws[["cykerub", exact = TRUE]],
+    dati = bws[["ydati", exact = TRUE]],
+    bw = bws[["ybw", exact = TRUE]],
+    bandwidth.compute = bandwidth.compute,
+    where = paste(where, "dependent beta kernel"),
+    allow.categorical = canonical.fit.route,
+    arg.prefix = "cyker"
+  )
+  if (!canonical.fit.route &&
+      (bws[["xnuno", exact = TRUE]] + bws[["xnord", exact = TRUE]] +
+       bws[["ynuno", exact = TRUE]] + bws[["ynord", exact = TRUE]]) > 0L)
+    stop(where, " beta kernels currently require all X and Y variables to be continuous",
+         call. = FALSE)
+
+  invisible(TRUE)
+}
 
 UKER_AIT = 0
 UKER_LR = 1
@@ -4132,8 +5526,7 @@ DBWM_CVLS = 0
 BWM_CVAIC = 0
 RBWM_CVKS = 3L
 
-REGTYPE_LC = 0
-REGTYPE_LL = 1
+REGTYPE_LP0 = 0
 REGTYPE_LP = 2
 # legacy alias retained for internal/backward compatibility
 REGTYPE_GLP = REGTYPE_LP
@@ -4141,7 +5534,6 @@ REGTYPE_GLP = REGTYPE_LP
 ##conditional density/distribution
 CBWM_CVML = 0
 CBWM_CVLS = 1
-CBWM_NPLS = 2
 CBWM_CCDF = 3 # Added 7/2/2010 jracine
 
 ##conditional distribution
@@ -4163,11 +5555,50 @@ names(PERMUTATION_OPERATORS) <- c("none", "normal", "derivative", "integral")
 ## useful numerical constants of kernel integrals
 int.kernels <- c(0.28209479177387814348, 0.47603496111841936711, 0.62396943688265038571, 0.74785078617543927990,
                  0.26832815729997476357, 0.55901699437494742410, 0.84658823667359826246, 1.1329342579014329689,
-                 0.5, 2.90113075268188e-01)
+                 0.5, NA_real_)
 
 QFAC <- qnorm(.25,lower.tail=FALSE)*2
 
+.np_call_owner_environment <- function(owner, replacement = NULL) {
+  if (is.environment(owner) && !identical(owner, emptyenv()) &&
+      identical(parent.env(owner), environment(.np_call_owner_environment)))
+    return(replacement)
+  owner
+}
+
+.np_bws_retain_native_training <- function(bws, xdat, ydat, dat, zdat) {
+  # Retain values, never the producer's activation or an evaluation grid.
+  training <- list()
+  if (!missing(dat)) training$dat <- dat
+  if (!missing(xdat)) training$xdat <- xdat
+  if (!missing(ydat)) training$ydat <- ydat
+  if (!missing(zdat) && !is.null(zdat)) training$zdat <- zdat
+  if (!is.null(bws[["formula", exact = TRUE]]))
+    return(.np_bws_retain_formula_roles(bws, training))
+  bws[[".np.native.training"]] <- training
+  bws[[".np.formula.training"]] <- NULL
+  # A call-less internal child has no user-authored replay. Fabricating one
+  # with xdat/ydat symbols would let update.default use unrelated caller data.
+  if (!is.null(bws$call)) environment(bws$call) <- NULL
+  bws
+}
+
 .np_eval_bws_call_arg <- function(bws, arg) {
+  training <- bws[[".np.native.training", exact = TRUE]]
+  if (!is.null(training) && arg %in% names(training))
+    return(training[[arg, exact = TRUE]])
+
+  formula.training <- bws[[".np.formula.training", exact = TRUE]]
+  if (!is.null(formula.training)) {
+    roles <- .np_bws_formula_roles(bws)
+    if (arg %in% names(roles)) {
+      frame <- formula.training[["frame", exact = TRUE]]
+      if (arg == "ydat" && !inherits(bws, c("conbandwidth", "condbandwidth")))
+        return(model.response(frame))
+      return(frame[, roles[[arg]], drop = FALSE])
+    }
+  }
+
   if (is.null(bws$call))
     stop("bandwidth object does not contain a call component")
 
@@ -4387,17 +5818,4 @@ QFAC <- qnorm(.25,lower.tail=FALSE)*2
   assign(token, as.numeric(value), envir = cache$store)
   cache$raw.evals <- cache$raw.evals + 1
   invisible(TRUE)
-}
-
-.np_objective_exact_cache_stats <- function(cache) {
-  if (!is.environment(cache))
-    return(NULL)
-  c(
-    enabled = if (isTRUE(cache$enabled)) 1 else 0,
-    visits = cache$visits,
-    unique = cache$unique,
-    repeats = cache$repeats,
-    raw.evals = cache$raw.evals,
-    hits = cache$hits
-  )
 }

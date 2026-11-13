@@ -13,6 +13,31 @@ with Mixed Data Types }
   Documentation guide: see \code{\link{np.kernels}} for kernels,
   \code{\link{np.options}} for global options, and
   \code{\link{plot}} for plotting options.
+
+  For \code{distribution = "bootstrap"}, each quantile model is still
+  refitted separately using the selected bootstrap law. The resulting score
+  vectors are collected in bounded groups, and the fixed-design kernel
+  contractions for \eqn{I_n} and, when requested, \eqn{\hat\Omega} are
+  evaluated as multi-response kernel sums. This reuses kernel geometry
+  without forming a dense observation-by-observation weight matrix or
+  changing score order, \code{tau}, \code{bwydat}, pivoting, density
+  weighting, or random draws. Each MPI rank batches only its assigned replications.
+
+  The selected bandwidth's effective kernel metadata are shared by the observed
+  and bootstrap statistics. Manual bandwidth inputs and selection controls are
+  not forwarded a second time as kernel-sum arguments.
+
+  Bootstrap refits preserve the model's observation weights. Weighted quantile
+  models supply their raw design and response through the retained model frame;
+  zero observation weights need not be inverted.
+
+  Model residuals, fitted values, response and design use the model's compact
+  complete-observation sample, including when it was fitted with
+  \code{na.exclude}. The supplied test data must represent those same complete
+  observations in the same order. Row counts and response values are checked;
+  when those agree, the caller remains responsible for supplying the matching
+  covariate rows. The test does not infer a new pairing or reorder observations.
+  The original model and its missing-value restoration policy are not modified.
 }
 \usage{
 npqcmstest(formula,
@@ -25,7 +50,7 @@ npqcmstest(formula,
            distribution = c("bootstrap", "asymptotic"),
            bwydat = c("y","varepsilon"),
            boot.method = c("iid","wild","wild-rademacher"),
-           boot.num = 399,
+           B = 399,
            pivot = TRUE,
            density.weighted = TRUE,
            random.seed = 42,
@@ -38,6 +63,13 @@ These arguments identify the model formula/data interface and explicit data inpu
 }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing the variables
     in the model. If not found in data, the variables are taken from
@@ -54,8 +86,9 @@ These arguments identify the model formula/data interface and explicit data inpu
 
   \item{model}{
     a model object obtained from a call to \code{\link[quantreg]{rq}}. Important: the
-    call to \code{\link[quantreg]{rq}} must have the argument \code{model=TRUE} or
-    \code{npqcmstest} will not work.
+    model must retain its model, design and response components, normally
+    requested with \code{model=TRUE}. Availability is checked from those
+    components, not the spelling of the original call.
   }
 
 
@@ -90,7 +123,7 @@ These arguments control the quantile level, test statistic, bootstrap procedure,
   }
 
 
-  \item{boot.num}{
+  \item{B}{
     an integer value specifying the number of bootstrap replications to
     use. Defaults to \code{399}.
   }
@@ -126,13 +159,17 @@ These arguments control the quantile level, test statistic, bootstrap procedure,
 
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This is to
     ensure replicability. Defaults to 42.
   }
 
 
   \item{tau}{
-    a numeric value specifying the \eqn{\tau}{tau}th quantile is desired
+    a finite scalar in (0,1) specifying the desired \eqn{\tau}{tau}th quantile.
+    It must equal the single quantile fitted by \code{model}; the default
+    remains 0.5, so pass \code{tau} explicitly for other fitted quantiles.
   }
 
 
@@ -150,6 +187,13 @@ Further arguments are passed to the bandwidth-selection routines used by the tes
     a \code{bandwidth} object, and you do not desire the default behaviours.
   }
 
+}
+\section{Bootstrap P-Values}{
+  The bootstrap upper-tail p-value is the proportion of bootstrap statistics
+  greater than or equal to the observed statistic. Ties count as at least as
+  extreme, giving the conservative tie convention for discrete statistics.
+  This is the ordinary bootstrap proportion, without an add-one correction;
+  a reported zero is possible with a finite number of replications.
 }
 \value{
   \code{npqcmstest} returns an object of type \code{cmstest} with the
@@ -274,7 +318,7 @@ X <- data.frame(age=cps71$age)
 
 output <- npqcmstest(model=model, xdat=X,
                      ydat=cps71$logwage, tau=0.5,
-                     boot.num=29)
+                     B=29)
 
 summary(output)
 

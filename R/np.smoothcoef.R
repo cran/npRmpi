@@ -1,6 +1,12 @@
 npscoef <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npscoef")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat", "tzdat"),
+      call = sys.call(), caller = parent.frame())
+    npRejectLegacyBooleanErrors(args, "npscoef")
 
     if (!missing(bws)){
       if (is.recursive(bws)){
@@ -21,7 +27,14 @@ npscoef <-
   }
 
 npscoef.formula <-
-  function(bws, data = NULL, newdata = NULL, y.eval = FALSE, ...){
+  function(bws, data = NULL, newdata = NULL, y.eval = FALSE,
+           se = FALSE, ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+
+    dots <- list(...)
+    npRejectLegacyBooleanErrors(dots, "npscoef")
+    se <- npValidateScalarLogical(se, "se")
 
     tt <- terms(bws)
     m <- match(c("formula", "data", "subset", "na.action"),
@@ -30,55 +43,49 @@ npscoef.formula <-
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
     if (!is.null(data))
-      tmf[["data"]] <- substitute(data)
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    umf <- tmf <- if (is.null(frame.state)) .np_bws_formula_model_frame(
+      bws, mf.args, data.override = !missing(data) && !is.null(data), overrides = dots) else
+        .np_formula_frame_take(frame.state)
+    if ("tydat" %in% names(dots)) {
+      umf <- tmf <- .np_formula_replace_response(tmf, bws, dots[["tydat"]],
+                                                 dots, data.override = !is.null(data))
+      dots$tydat <- NULL
+      dots$na.action <- NULL
+    }
+    tt <- attr(tmf, "terms")
+    bws <- .np_bws_retain_fit_frame(bws, tmf)
 
     response.name <- attr(tmf, "names")[attr(attr(tmf, "terms"), "response")]
     tydat <- model.response(tmf)
-    txdat <- tmf[, bws$chromoly[[2]], drop = FALSE]
+    txdat <- tmf[, .np_formula_term_names(bws$chromoly[[2]]), drop = FALSE]
     miss.z <- !(length(bws$chromoly) == 3)
     if (!miss.z)
-      tzdat <- tmf[, bws$chromoly[[3]], drop = FALSE]
+      tzdat <- tmf[, .np_formula_term_names(bws$chromoly[[3]]), drop = FALSE]
 
-    has.eval <- !is.null(newdata)
+    has.eval <- !is.null(newdata) && !any(c("exdat", "ezdat") %in% names(dots))
     if (has.eval) {
       if (!y.eval){
         npValidateNewdataFormula(newdata, tt, include.response = FALSE)
         tt <- delete.response(tt)
 
-        orig.ts <- .np_terms_ts_mask(terms_obj = tt, data = newdata)
-        
-        ## delete.response clobbers predvars, which is used for timeseries objects
-        ## so we need to reconstruct it
-
-        if(all(orig.ts)){
-          args <- (as.list(attr(tt, "variables"))[-1])
-          attr(tt, "predvars") <- as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), args))))
-        }else if(any(orig.ts)){
-          arguments <- (as.list(attr(tt, "variables"))[-1])
-          arguments.normal <- arguments[which(!orig.ts)]
-          arguments.timeseries <- arguments[which(orig.ts)]
-
-          ix <- sort(c(which(orig.ts),which(!orig.ts)),index.return = TRUE)$ix
-          attr(tt, "predvars") <- bquote(.(as.call(c(quote(cbind),as.call(c(quote(as.data.frame),as.call(c(quote(ts.intersect), arguments.timeseries)))),arguments.normal,check.rows = TRUE)))[,.(ix)])
-        }else{
-          attr(tt, "predvars") <- attr(tt, "variables")
-        }
       }
       
       if (y.eval)
         npValidateNewdataFormula(newdata, tt, include.response = TRUE)
       umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
+      umf <- do.call(.np_formula_model_frame, umf.args, envir = parent.frame())
       emf <- umf
 
       if (y.eval)
         eydat <- model.response(emf)
       
-      exdat <- emf[, bws$chromoly[[2]], drop = FALSE]
+      exdat <- emf[, .np_formula_term_names(bws$chromoly[[2]]), drop = FALSE]
       if (!miss.z)
-        ezdat <- emf[, bws$chromoly[[3]], drop = FALSE]
+        ezdat <- emf[, .np_formula_term_names(bws$chromoly[[3]]), drop = FALSE]
     }
 
 
@@ -93,36 +100,45 @@ npscoef.formula <-
         sc.args$ezdat <- ezdat
     }
     sc.args$bws <- bws
-    ev <- do.call(npscoef, c(sc.args, list(...)))
+    ev <- do.call(npscoef, c(sc.args, list(se = se), dots))
 
     if (length(response.name) == 1L && !is.na(response.name) && nzchar(response.name)) {
       if (!is.null(ev$bws))
         ev$bws$ynames <- response.name
     }
 
-    ev$omit <- attr(umf,"na.action")
+    ev$omit <- .np_formula_output_action(ev, umf, has.eval)
     ev$rows.omit <- as.vector(ev$omit)
     ev$nobs.omit <- length(ev$rows.omit)
 
     ev$mean <- napredict(ev$omit, ev$mean)
     ev$merr <- napredict(ev$omit, ev$merr)
 
+    # Coefficients and their effects share the fitted/evaluation row owner.
+    # Unrequested outputs retain their NULL/scalar sentinel representation.
+    if (isTRUE(ev$betas))
+      ev$beta <- napredict(ev$omit, ev$beta)
+    if (is.matrix(ev$grad))
+      ev$grad <- napredict(ev$omit, ev$grad)
+    if (is.matrix(ev$gerr))
+      ev$gerr <- napredict(ev$omit, ev$gerr)
+
     if(ev$residuals){
-        ev$resid <- naresid(ev$omit, ev$resid)
+        ev$resid <- naresid(attr(tmf, "na.action"), ev$resid)
     }    
     return(ev)
   }
 
 npscoef.call <-
   function(bws, ...) {
-    call.args <- list(
-      txdat = .np_eval_bws_call_arg(bws, "xdat"),
-      tydat = .np_eval_bws_call_arg(bws, "ydat")
-    )
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    roles <- c(txdat = "xdat", tydat = "ydat")
     if (!is.null(bws$zdati))
-      call.args$tzdat <- .np_eval_bws_call_arg(bws, "zdat")
-    call.args$bws <- bws
-    do.call(npscoef, c(call.args, list(...)))
+      roles <- c(roles, tzdat = "zdat")
+    do.call(npscoef, .np_retained_training_args(bws, roles, list(...), npscoef.scbandwidth))
   }
 
 .np_scoef_fit_progress_begin <- function(handoff = FALSE, detail = NULL) {
@@ -145,15 +161,32 @@ npscoef.call <-
   isa(bws, "scbandwidth") && identical(bws$type, "adaptive_nn")
 }
 
-npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
+npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE,
+                            se = FALSE, ...) {
   .npRmpi_require_active_slave_pool(where = "npscoef()")
+  if (.npRmpi_master_local_entry_needed()) {
+    .np.local.entry <- new.env(parent=emptyenv())
+    on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+    .npRmpi_local_entry_begin(.np.local.entry)
+  }
   explicit.scbandwidth <- (!missing(bws)) && inherits(bws, "scbandwidth")
+  if (!missing(txdat) && "data" %in% names(substitute(list(...))))
+    .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
   formula.forwarded <- (!missing(txdat)) && inherits(txdat, "formula")
+  early.dots <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())
+  formula.input <- early.dots[["formula", exact = TRUE]]
+  formula.only <- missing(tydat) && missing(tzdat) &&
+    (missing(txdat) || formula.forwarded) &&
+    (formula.forwarded || inherits(formula.input, "formula") ||
+     (!missing(bws) && inherits(bws, "formula")))
   nomad <- npValidateNomadControl(nomad, "nomad")
+  npRejectLegacyBooleanErrors(early.dots, "npscoef")
+  se <- npValidateScalarLogical(se, "se")
   degree.select.value <- if (npNomadControlRequested(nomad)) {
     "coordinate"
-  } else if ("degree.select" %in% names(list(...))) {
-    match.arg(list(...)$degree.select, c("manual", "coordinate", "exhaustive"))
+  } else if ("degree.select" %in% names(early.dots)) {
+    match.arg(early.dots$degree.select, c("manual", "coordinate", "exhaustive"))
   } else {
     "manual"
   }
@@ -161,12 +194,14 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       .npRmpi_npscoef_should_localize(bws) &&
       !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
     return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame(),
+                               required.training = c("txdat", "tydat"))
   if (.npRmpi_autodispatch_active() &&
-      !formula.forwarded &&
+      (missing(bws) || "bws" %in% names(sc)) &&
+      !formula.forwarded && !formula.only &&
       (explicit.scbandwidth || identical(degree.select.value, "manual")))
-    return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+    return(.npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npscoef.default"))
 
-  sc <- sys.call()
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -186,18 +221,33 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
   ## if bws was passed in explicitly, do not compute bandwidths
 
-  if(txdat.named)
+  if(txdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(txdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
     txdat <- toFrame(txdat)
+    if (!is.null(original.name)) names(txdat) <- original.name
+  }
 
   ## if(tydat.named)
   ## tydat <- toFrame(tydat)
 
-  if(tzdat.named)
+  if(tzdat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(tzdat), "tzdat", sys.call(), parent.frame(), value = tzdat)
+    # Preserve vector syntax before coercion gives it the formal's name.
+    original.name <- if (is.null(dim(tzdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(tzdat), parent.frame())), collapse = "") else NULL
     tzdat <- toFrame(tzdat)
+    if (!is.null(original.name)) names(tzdat) <- original.name
+  }
 
   sc.bw <- sc
   
   sc.bw[[1]] <- quote(npscoefbw)
+  sc.bw$se <- NULL
 
   bws.formula <- (!no.bws) && inherits(bws, "formula")
   if (bws.formula) {
@@ -217,6 +267,18 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npscoefbw")
+  formula.input <- early.dots[["formula", exact = TRUE]]
+  frame.state <- if (!has.explicit.bws &&
+      (bws.formula || inherits(formula.input, "formula") ||
+       (!no.txdat && inherits(txdat, "formula"))) &&
+      no.tydat && no.tzdat &&
+      (no.txdat || inherits(txdat, "formula")))
+    new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
+  }
     
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
     sc.bw,
@@ -227,13 +289,19 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     if (use.outer.bandwidth.progress) {
       .np_progress_select_bandwidth_enhanced(
         "Selecting smooth coefficient bandwidth",
-        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
       )
     } else {
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat", zdat = "tzdat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
   }
 
   ## because of some ambiguities in how the function might be called
@@ -243,7 +311,9 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   ## or unnamed, and t[xyz]dat collectively either named or unnamed
 
   call.args <- list(bws = tbw)
-  if (no.bws) {
+  if (!is.null(frame.state)) {
+    call.args$.np.formula.state <- frame.state
+  } else if (no.bws) {
     call.args$txdat <- txdat
     call.args$tydat <- tydat
     if (!no.tzdat) call.args$tzdat <- tzdat
@@ -260,7 +330,10 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
   }
   if (!has.explicit.bws)
     call.args$.np_fit_progress_handoff <- TRUE
-  do.call(npscoef, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  do.call(npscoef, c(call.args, list(se = se), fit.dots))
 
 }
 
@@ -273,17 +346,19 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
            eydat,
            ezdat,
            betas = FALSE,
-           errors = TRUE,
+           se = FALSE,
            iterate = TRUE,
            leave.one.out = FALSE,
            maxiter = 100,
            residuals = FALSE,
            tol = .Machine$double.eps,
+           .np_allow_undefined = FALSE,
+           .np_coefficient_projection = NULL,
            ...){
 
     fit.start <- proc.time()[3]
     residuals <- npValidateScalarLogical(residuals, "residuals")
-    errors <- npValidateScalarLogical(errors, "errors")
+    se <- npValidateScalarLogical(se, "se")
     iterate <- npValidateScalarLogical(iterate, "iterate")
     leave.one.out <- npValidateScalarLogical(leave.one.out, "leave.one.out")
     betas <- npValidateScalarLogical(betas, "betas")
@@ -327,13 +402,35 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
     miss.z <- missing(tzdat) || is.null(tzdat)
 
+    # The returned native fit must replay the same z=x convention, including
+    # prediction without ezdat, rather than the bandwidth call's old z data.
+    if (miss.z && is.null(bws[["formula", exact = TRUE]])) {
+      bws$zdati <- NULL
+      bws$znames <- NULL
+      bws <- .np_scbandwidth_role_metadata(bws)
+    }
+
+    native.newdata <- dots[["newdata", exact = TRUE]]
+    if (missing(exdat) && missing(ezdat) && !is.null(native.newdata)) {
+      native.eval <- .np_native_newdata_parts(
+        native.newdata, if (is.null(bws$znames)) list(exdat = bws$xnames) else list(exdat = bws$xnames, ezdat = bws$znames), "npscoef")
+      exdat <- native.eval$exdat
+      if (!is.null(native.eval$ezdat)) ezdat <- native.eval$ezdat
+    }
+
+    explicit.ez <- !missing(ezdat)
+    if (missing(exdat) && explicit.ez)
+      exdat <- txdat
+    if (!missing(exdat) && missing(ezdat) && !miss.z)
+      ezdat <- tzdat
+    eval.z <- !miss.z || explicit.ez
     miss.ex = missing(exdat)
     miss.ey = missing(eydat)
 
     ## if miss.ex then if !miss.ey then ey and tx must match, to get
     ## oos errors alternatively if miss.ey you get is errors if
     ## !miss.ex then if !miss.ey then ey and ex must match, to get oos
-    ## errors alternatively if miss.ey you get NO errors since we
+    ## se alternatively if miss.ey you get NO errors since we
     ## don't evaluate on the training data
 
     txdat <- toFrame(txdat)
@@ -344,11 +441,21 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     if (!miss.z)
       tzdat <- toFrame(tzdat)
 
+    .np_require_paired_rows(txdat, tydat, "txdat", "tydat")
+    if (!miss.z)
+      .np_require_paired_rows(txdat, tzdat, "txdat", "tzdat")
+
+    bws <- .np_bws_retain_native_training(bws, xdat = txdat, ydat = tydat,
+      zdat = if (miss.z) NULL else tzdat)
+
     if (!miss.ex){
       exdat <- toFrame(exdat)
 
-      if (!miss.z)
+      if (eval.z)
         ezdat <- toFrame(ezdat)
+
+      if (eval.z)
+        .np_require_paired_rows(exdat, ezdat, "exdat", "ezdat")
 
       if (! txdat %~% exdat )
         stop("'txdat' and 'exdat' are not similar data frames!")
@@ -382,6 +489,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
     txdat <- txdat[keep.rows,,drop = FALSE]
     tydat <- tydat[keep.rows]
+    if (miss.ex && !miss.ey)
+      eydat <- eydat[keep.rows]
     if (!miss.z)
       tzdat <- tzdat[keep.rows,, drop = FALSE]
 
@@ -390,7 +499,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       eval.df <- data.frame(exdat)
       if (!miss.ey)
         eval.df <- data.frame(eval.df, eydat)
-      if (!miss.z)
+      if (eval.z)
         eval.df <- data.frame(eval.df, ezdat)
       rows.omit <- attr(na.omit(eval.df), "na.action")
       if (length(rows.omit) > 0L)
@@ -399,7 +508,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       exdat <- exdat[keep.eval,,drop = FALSE]
       if (!miss.ey)
         eydat <- eydat[keep.eval]
-      if (!miss.z)
+      if (eval.z)
         ezdat <- ezdat[keep.eval,, drop = FALSE]
 
       if (!any(keep.eval))
@@ -436,8 +545,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
     if (!miss.ex){
       exdat <- adjustLevels(exdat, bws$xdati)
-      if (!miss.z)
-        ezdat <- adjustLevels(ezdat, bws$zdati)
+      if (eval.z)
+        ezdat <- adjustLevels(ezdat, if (miss.z) bws$xdati else bws$zdati)
     }
 
     ## grab the evaluation data before it is converted to numeric
@@ -447,7 +556,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         teval <- list(exdat = txdat, ezdat = tzdat)
     } else {
       teval <- exdat
-      if (!miss.z)
+      if (eval.z)
         teval <- list(exdat = exdat, ezdat = ezdat)
     }
 
@@ -462,36 +571,62 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
 
     if (miss.z){
       tzdat <- txdat
-      if (!miss.ex)
+      if (!miss.ex && !explicit.ez)
         ezdat <- exdat
+      else if (!miss.ex)
+        ezdat <- toMatrix(ezdat)
     }
     ## from this point on txdat and exdat have been recast as matrices
     ## construct 'W' matrix
 
     spec <- .npscoef_canonical_spec(source = bws, zdat = tzdat, where = "npscoef")
-    reg.engine <- spec$regtype.engine
+    reg.engine <- if (npIsCanonicalLp0Spec(spec, ncon = bws$ncon))
+      "lc"
+    else
+      spec$regtype.engine
     W.train <- W <- as.matrix(data.frame(1,txdat))
-    maxPenalty <- sqrt(.Machine$double.xmax)
     tnrow <- nrow(txdat)
     enrow <- (if (miss.ex) nrow(txdat) else nrow(exdat))
 
     if (!miss.ex)
       W <- as.matrix(data.frame(1,exdat))
 
-    safe_chol2inv <- function(a, ridge0, eps, maxiter = 1000L){
+    accepted_moment_covariance <- function(a, ridge0, s){
       nc.local <- ncol(a)
       I.local <- diag(rep(1.0, nc.local))
       ridge.local <- max(as.double(ridge0), 0.0)
-      for (iter in seq_len(maxiter)) {
+      a.ridge <- a + ridge.local * I.local
+      chol.inverse <- TRUE
+      cm <- tryCatch(
+        chol2inv(chol(a.ridge)),
+        error = function(e) NULL
+      )
+      if (is.null(cm)) {
+        # Signed kernels may yield an accepted nonsingular indefinite system.
+        # Change the factorization, never the ridge or the fitted operator.
+        chol.inverse <- FALSE
         cm <- tryCatch(
-          chol2inv(chol(a + ridge.local * I.local)),
+          solve(a.ridge),
           error = function(e) NULL
         )
-        if (!is.null(cm))
-          return(cm)
-        ridge.local <- ridge.local + eps
       }
-      NULL
+      if (is.null(cm))
+        return(NULL)
+
+      if (ridge.local > 0.0) {
+        # The point solve corrects the intercept RHS: theta = C D b.
+        # Apply its established overflow-safe correction to C's first column.
+        cm[, 1L] <- cm[, 1L] + npRidgeInterceptCorrection(
+          ridge = ridge.local, intercept = cm[, 1L],
+          pristine.anchor = a[1L, 1L])
+        if (any(!is.finite(cm[, 1L])))
+          return(NULL)
+        return(cm %*% s %*% t(cm))
+      }
+      if (chol.inverse)
+        cm %*% s %*% cm
+      else
+        cm %*% s %*% t(cm)
     }
 
     fast_moment_solve <- function(tww.slice, tyw.slice, ridge.add, ridge.val) {
@@ -524,13 +659,32 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       NULL
     }
 
-    solve_moment_system <- function(tyw, tww, W.eval.design, Wz.eval = NULL, progress_detail = NULL) {
+    solve_moment_system <- function(tyw, tww, W.eval.design, Wz.eval = NULL,
+                                     progress_detail = NULL, allow.undefined = FALSE) {
       neval.local <- ncol(tyw)
       ncoef <- nrow(tyw)
       pcoef <- ncol(W.eval.design)
-      coef.out <- matrix(maxPenalty, nrow = pcoef, ncol = neval.local)
+      coef.out <- matrix(NA_real_, nrow = pcoef, ncol = neval.local)
       theta.out <- if (is.null(Wz.eval)) NULL else matrix(NA_real_, nrow = ncoef, ncol = neval.local)
+      theta.batch <- .npscoef_batch_zero_solve(tyw = tyw, tww = tww)
+      if (!is.null(theta.batch)) {
+        if (is.null(Wz.eval)) {
+          coef.out[,] <- theta.batch
+        } else {
+          theta.out[,] <- theta.batch
+          coef.out[,] <- .npscoef_batch_project(theta.batch, Wz.eval)
+        }
+        if (!is.null(fit.progress.step))
+          for (ii in seq_len(neval.local))
+            fit.progress.step(progress_detail)
+        return(list(
+          coef = coef.out,
+          theta = theta.out,
+          ridge = rep.int(0.0, neval.local)
+        ))
+      }
       ridge.grid <- npRidgeSequenceAdditive(n.train = tnrow, cap = 1.0)
+      invalid <- rep.int(FALSE, neval.local)
       ridge <- rep.int(ridge.grid[1L], neval.local)
       ridge.idx <- rep.int(1L, neval.local)
       doridge <- rep.int(TRUE, neval.local)
@@ -539,27 +693,39 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         iloo <- seq_len(neval.local)[doridge]
         for (ii in iloo) {
           doridge[ii] <- FALSE
-          ridge.val <- ridge[ii]*tyw[,ii][1]/NZD(tww[,,ii][1,1])
-          theta.ii <- fast_moment_solve(
-            tww.slice = tww[, , ii],
-            tyw.slice = tyw[, ii],
-            ridge.add = ridge[ii],
-            ridge.val = ridge.val
+          ridge.val <- npRidgeInterceptCorrection(
+            ridge = ridge[ii], intercept = tyw[, ii][1L],
+            pristine.anchor = tww[, , ii][1L, 1L]
           )
-          if (is.null(theta.ii)) {
-            theta.ii <- tryCatch(
-              solve(tww[,,ii] + diag(rep(ridge[ii], ncoef)),
-                    tyw[,ii] + c(ridge.val, rep(0, ncoef - 1))),
-              error = function(e) e
+          if (is.finite(ridge.val)) {
+            theta.ii <- fast_moment_solve(
+              tww.slice = tww[, , ii],
+              tyw.slice = tyw[, ii],
+              ridge.add = ridge[ii],
+              ridge.val = ridge.val
             )
-          }
-          if (inherits(theta.ii, "error")) {
-            ridge.idx[ii] <- ridge.idx[ii] + 1L
-            if (ridge.idx[ii] <= length(ridge.grid)) {
-              ridge[ii] <- ridge.grid[ridge.idx[ii]]
-              doridge[ii] <- TRUE
+            if (is.null(theta.ii)) {
+              theta.ii <- tryCatch(
+                solve(tww[,,ii] + diag(rep(ridge[ii], ncoef)),
+                      tyw[,ii] + c(ridge.val, rep(0, ncoef - 1))),
+                error = function(e) e
+              )
             }
-            theta.ii <- rep(maxPenalty, ncoef)
+            if (inherits(theta.ii, "error")) {
+              ridge.idx[ii] <- ridge.idx[ii] + 1L
+              if (ridge.idx[ii] <= length(ridge.grid)) {
+                ridge[ii] <- ridge.grid[ridge.idx[ii]]
+                doridge[ii] <- TRUE
+              }
+              theta.ii <- rep(NA_real_, ncoef)
+            }
+          } else {
+            theta.ii <- rep(NA_real_, ncoef)
+          }
+
+          if (!doridge[ii] && any(!is.finite(theta.ii))) {
+            invalid[ii] <- TRUE
+            theta.ii[] <- NA_real_
           }
 
           if (is.null(Wz.eval)) {
@@ -576,17 +742,25 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         }
       }
 
-      list(coef = coef.out, theta = theta.out, ridge = ridge)
+      invalid <- which(invalid)
+      if (length(invalid) && !allow.undefined)
+        .np_undefined_fit_rows(invalid, "npscoef()")
+      list(coef = coef.out, theta = theta.out, ridge = ridge, invalid = invalid)
     }
 
-    solve_single_moment_system <- function(tyw.vec, tww.mat) {
+    solve_single_moment_system <- function(tyw.vec, tww.mat, allow.undefined = FALSE) {
       ncoef <- length(tyw.vec)
       ridge.grid <- npRidgeSequenceAdditive(n.train = tnrow, cap = 1.0)
       ridge <- ridge.grid[1L]
       ridge.idx <- 1L
 
       repeat {
-        ridge.val <- ridge * tyw.vec[1L] / NZD(tww.mat[1L, 1L])
+        ridge.val <- npRidgeInterceptCorrection(
+          ridge = ridge, intercept = tyw.vec[1L],
+          pristine.anchor = tww.mat[1L, 1L]
+        )
+        if (!is.finite(ridge.val))
+          break
         theta <- fast_moment_solve(
           tww.slice = tww.mat,
           tyw.slice = tyw.vec,
@@ -602,18 +776,25 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
             error = function(e) e
           )
         }
-        if (!inherits(theta, "error"))
-          return(list(coef = as.double(theta), ridge = ridge))
+        if (!inherits(theta, "error")) {
+          if (all(is.finite(theta)))
+            return(list(coef = as.double(theta), ridge = ridge))
+          break
+        }
 
         ridge.idx <- ridge.idx + 1L
         if (ridge.idx > length(ridge.grid))
-          return(list(coef = rep(maxPenalty, ncoef), ridge = ridge))
+          break
         ridge <- ridge.grid[ridge.idx]
       }
+      if (!allow.undefined)
+        .np_undefined_fit_rows(1L, "npscoef()")
+      list(coef = rep(NA_real_, ncoef), ridge = ridge, invalid = 1L)
     }
 
     moment_npksum <- function(args) {
-      do.call(npksum, args)
+      .npscoefbw_search_ksum(if (identical(reg.engine, "lc")) .np_estimator_loo_ksum else .npscoef_npksum,
+              args)
     }
     lp1_moment_npksum <- function(...) {
       moment_npksum(list(...))
@@ -755,7 +936,14 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     }
 
     do.iterate <- (iterate && !is.null(bws$bw.fitted) && miss.ex && identical(reg.engine, "lc"))
-    gate.zdat <- if (miss.ex) tzdat else rbind(tzdat, ezdat)
+    gate.zdat <- if (miss.ex) tzdat else {
+      # Native columns are positional. Align only the eligibility copy;
+      # rbind.data.frame otherwise imposes an unrelated name-matching rule.
+      gate.eval <- ezdat
+      if (!identical(colnames(gate.eval), colnames(tzdat)))
+        colnames(gate.eval) <- colnames(tzdat)
+      rbind(tzdat, gate.eval)
+    }
     fast.largeh.lc <- identical(reg.engine, "lc") &&
       !leave.one.out &&
       identical(bws$type, "fixed") &&
@@ -843,6 +1031,7 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     }
 
     moments <- NULL
+    allow.undefined <- !miss.ex && isTRUE(.np_allow_undefined)
     if (fast.largeh.lc) {
       eval.z.one <- if (miss.ex) tzdat[1L, , drop = FALSE] else ezdat[1L, , drop = FALSE]
       fast.eval <- lc_fast_global_moments(z.eval.one = eval.z.one)
@@ -850,7 +1039,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         fit.progress.step("solving global coefficients")
       fast.solve <- solve_single_moment_system(
         tyw.vec = fast.eval$tyw,
-        tww.mat = fast.eval$tww
+        tww.mat = fast.eval$tww,
+        allow.undefined = allow.undefined
       )
       if (!is.null(fit.progress.step))
         fit.progress.step("assembling fitted values")
@@ -866,7 +1056,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         tydat = tydat,
         leave.one.out = leave.one.out,
         where = "npscoef",
-        solver = solve_single_moment_system,
+        solver = function(a, b)
+          solve_single_moment_system(a, b, allow.undefined = allow.undefined),
         ksum_fun = lp1_moment_npksum
       )
       if (!is.null(fit.progress.step))
@@ -882,7 +1073,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         tyw = moments$tyw,
         tww = moments$tww,
         W.eval.design = W,
-        progress_detail = "solving coefficient rows"
+        progress_detail = "solving coefficient rows",
+        allow.undefined = allow.undefined
       )
     } else {
       moments <- lp_tensor_moments(lp_state)
@@ -891,13 +1083,50 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
         tww = moments$tww,
         W.eval.design = W,
         Wz.eval = lp_state$W.eval,
-        progress_detail = "solving coefficient rows"
+        progress_detail = "solving coefficient rows",
+        allow.undefined = allow.undefined
       )
     }
 
     if (!fast.largeh) {
       coef.mat <- solver$coef
       ridge <- solver$ridge
+    }
+    invalid.rows <- if (!fast.largeh) solver[["invalid"]] else {
+      invalid <- if (fast.largeh.lc) fast.solve[["invalid"]] else fast.eval[["invalid"]]
+      if (length(invalid)) seq_len(enrow) else integer()
+    }
+
+    # Plot-only demand: retain the canonical full-geometry moment/ridge owner.
+    # Ordinary fits never construct or retain a response projection.
+    if (!is.null(.np_coefficient_projection)) {
+      j <- .np_coefficient_projection
+      if (iterate || se || leave.one.out || length(j) != 1L ||
+          !is.numeric(j) || !is.finite(j) || j != floor(j) ||
+          j < 1L || j >= nrow(coef.mat))
+        stop("invalid private smooth coefficient projection request", call. = FALSE)
+      if (isTRUE(fit.progress.active)) {
+        fit.progress <- .np_progress_end(fit.progress)
+        fit.progress.active <- FALSE
+      }
+      return(list(
+        bws = if (is.null(lp_state)) bws else lp_state$rbw,
+        z.train = if (is.null(lp_state)) tzdat else lp_state$z.train,
+        z.eval = if (is.null(lp_state)) {
+          if (miss.ex) tzdat else ezdat
+        } else lp_state$z.eval,
+        design = if (is.null(lp_state)) W.train else
+          .npscoef_row_tensor_design(W.train, lp_state$W.train),
+        basis.eval = if (is.null(lp_state)) matrix(1, enrow, 1L) else lp_state$W.eval,
+        tww = if (fast.largeh) array(fast.eval$tww,
+          c(nrow(fast.eval$tww), ncol(fast.eval$tww), 1L)) else moments$tww,
+        ridge = ridge, invalid = invalid.rows, global = fast.largeh,
+        profile.weights = !fast.largeh && use.cat.profile.lc,
+        profile = if (!fast.largeh && use.cat.profile.lc)
+          get_cat_profile_moments_cache()[c("train.id", "train.profile.codes",
+                                            "train.profile.dat")] else NULL,
+        index = as.integer(j), t0 = as.double(coef.mat[j + 1L, ])
+      ))
     }
 
     if (iterate && !is.null(bws$bw.fitted) && miss.ex && !identical(reg.engine, "lc"))
@@ -927,15 +1156,15 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
               nobs = nrow(txdat)
             )
 
-          twww <- npksum(
+          twww <- .npscoefbw_search_ksum(.np_estimator_loo_ksum, list(
             txdat=tzdat,
             tydat=cbind(partial * W[,j],W[,j]^2),
             weights=cbind(partial * W[,j],1),
             bws=partial.bws,
             leave.one.out=leave.one.out
-          )$ksum
+          ))$ksum
 
-          coef.mat[j,] <- twww[1,2,]/NZD(twww[2,2,])
+          coef.mat[j,] <- twww[2,1,]/NZD(twww[2,2,])
           resid <- partial - W[,j] * coef.mat[j,]
           if (!is.null(fit.progress.step))
             fit.progress.step(sprintf("backfit cycle %d partial %d/%d", i, j, n.part))
@@ -965,13 +1194,15 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       SIGN = SIGNfunc(tydat, mean)
     }
 
-    if (errors && do.iterate) {
+    if (se && do.iterate) {
       .np_warning("standard errors are not available for iterated npscoef fits; returning fitted values without merr/gerr")
-      errors <- FALSE
+      se <- FALSE
     }
 
-    if (errors || (residuals && miss.ex)) {
-      if (errors) {
+    # Training residuals have the same owner with or without uncertainty.
+    # External residual-only requests need the training solve, not its sandwich.
+    if (se || residuals) {
+      if (se || !miss.ex) {
         if (fast.largeh.lc) {
           if (miss.ex) {
             train.solve <- fast.solve
@@ -985,20 +1216,22 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
             mean.fit <- as.vector(W.train %*% train.solve$coef)
           }
           resid <- tydat - mean.fit
-          u2.W <- resid^2
-          s.fast <- lc_fast_global_moments(
-            z.eval.one = if (miss.ex) tzdat[1L, , drop = FALSE] else ezdat[1L, , drop = FALSE],
-            u2 = u2.W
-          )$s
-          if (!is.null(fit.progress.step))
-            fit.progress.step("estimating standard errors")
-          cm.fast <- safe_chol2inv(fast.eval$tww, fast.solve$ridge, 1.0 / nrow(txdat))
-          merr <- rep(NA_real_, enrow)
-          beta.se <- matrix(NA_real_, nrow = enrow, ncol = nrow(coef.mat))
-          if (!is.null(cm.fast)) {
-            vcv.beta.fast <- cm.fast %*% s.fast %*% cm.fast
-            merr <- sqrt(pmax(rowSums((W %*% vcv.beta.fast) * W), 0.0))
-            beta.se[] <- rep(sqrt(pmax(diag(vcv.beta.fast), 0.0)), each = enrow)
+          if (se) {
+            u2.W <- resid^2
+            s.fast <- lc_fast_global_moments(
+              z.eval.one = if (miss.ex) tzdat[1L, , drop = FALSE] else ezdat[1L, , drop = FALSE],
+              u2 = u2.W
+            )$s
+            if (!is.null(fit.progress.step))
+              fit.progress.step("estimating standard errors")
+            vcv.beta.fast <- if (length(invalid.rows)) NULL else
+              accepted_moment_covariance(fast.eval$tww, fast.solve$ridge, s.fast)
+            merr <- rep(NA_real_, enrow)
+            beta.se <- matrix(NA_real_, nrow = enrow, ncol = nrow(coef.mat))
+            if (!is.null(vcv.beta.fast)) {
+              merr <- sqrt(pmax(rowSums((W %*% vcv.beta.fast) * W), 0.0))
+              beta.se[] <- rep(sqrt(pmax(diag(vcv.beta.fast), 0.0)), each = enrow)
+            }
           }
         } else if (fast.largeh.lp1) {
           if (miss.ex) {
@@ -1019,32 +1252,34 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
             mean.fit <- sapply(seq_len(tnrow), function(i) { W.train[i,, drop = FALSE] %*% train.fast$coef[,i] })
           }
           resid <- tydat - mean.fit
-          u2.W <- resid^2
-          s.fast <- .npscoef_lp1_largeh_global_fit(
-            bws = bws,
-            tzdat = tzdat,
-            ezdat = if (miss.ex) tzdat else ezdat,
-            W.train = W.train,
-            tydat = tydat,
-            u2 = u2.W,
-            leave.one.out = leave.one.out,
-            where = "npscoef",
-            solver = solve_single_moment_system,
-            ksum_fun = lp1_moment_npksum
-          )$s
-          if (!is.null(fit.progress.step))
-            fit.progress.step("estimating standard errors")
-          cm.fast <- safe_chol2inv(fast.eval$tww, fast.eval$ridge, 1.0 / nrow(txdat))
-          merr <- rep(NA_real_, enrow)
-          beta.se <- matrix(NA_real_, nrow = enrow, ncol = nrow(coef.mat))
-          if (!is.null(cm.fast)) {
-            vcv.theta.fast <- cm.fast %*% s.fast %*% cm.fast
-            for (i in seq_len(enrow)) {
-              trans.i <- kronecker(diag(ncol(W)), matrix(fast.eval$lp_state$W.eval[i,], nrow = 1L))
-              vcv.beta.fast <- trans.i %*% vcv.theta.fast %*% t(trans.i)
-              w.i <- W[i,, drop = FALSE]
-              merr[i] <- sqrt(max(drop(w.i %*% vcv.beta.fast %*% t(w.i)), 0.0))
-              beta.se[i,] <- sqrt(pmax(diag(vcv.beta.fast), 0.0))
+          if (se) {
+            u2.W <- resid^2
+            s.fast <- .npscoef_lp1_largeh_global_fit(
+              bws = bws,
+              tzdat = tzdat,
+              ezdat = if (miss.ex) tzdat else ezdat,
+              W.train = W.train,
+              tydat = tydat,
+              u2 = u2.W,
+              leave.one.out = leave.one.out,
+              where = "npscoef",
+              solver = solve_single_moment_system,
+              ksum_fun = lp1_moment_npksum
+            )$s
+            if (!is.null(fit.progress.step))
+              fit.progress.step("estimating standard errors")
+            vcv.theta.fast <- if (length(invalid.rows)) NULL else
+              accepted_moment_covariance(fast.eval$tww, fast.eval$ridge, s.fast)
+            merr <- rep(NA_real_, enrow)
+            beta.se <- matrix(NA_real_, nrow = enrow, ncol = nrow(coef.mat))
+            if (!is.null(vcv.theta.fast)) {
+              for (i in seq_len(enrow)) {
+                trans.i <- kronecker(diag(ncol(W)), matrix(fast.eval$lp_state$W.eval[i,], nrow = 1L))
+                vcv.beta.fast <- trans.i %*% vcv.theta.fast %*% t(trans.i)
+                w.i <- W[i,, drop = FALSE]
+                merr[i] <- sqrt(max(drop(w.i %*% vcv.beta.fast %*% t(w.i)), 0.0))
+                beta.se[i,] <- sqrt(pmax(diag(vcv.beta.fast), 0.0))
+              }
             }
           }
         } else if (miss.ex && !do.iterate) {
@@ -1068,12 +1303,15 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
             W.eval.design = W.train
           )
           mean.fit <- sapply(seq_len(tnrow), function(i) { W.train[i,, drop = FALSE] %*% train.solve$coef[,i] })
-          u2.W <- (resid <- tydat - mean.fit)^2
-          moments$s <- lc_moments(
-            z.eval = if (miss.ex) NULL else ezdat,
-            leave.one.out.eval = leave.one.out,
-            u2 = u2.W
-          )$s
+          resid <- tydat - mean.fit
+          if (se) {
+            u2.W <- resid^2
+            moments$s <- lc_moments(
+              z.eval = if (miss.ex) NULL else ezdat,
+              leave.one.out.eval = leave.one.out,
+              u2 = u2.W
+            )$s
+          }
         } else {
           lp_state.err <- .npscoef_lp_state(
             bws = bws,
@@ -1090,31 +1328,35 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
             Wz.eval = lp_state.err$W.eval
           )
           mean.fit <- sapply(seq_len(tnrow), function(i) { W.train[i,, drop = FALSE] %*% train.solve$coef[,i] })
-          u2.W <- (resid <- tydat - mean.fit)^2
-          moments$s <- lp_tensor_moments(lp_state, u2 = u2.W)$s
+          resid <- tydat - mean.fit
+          if (se) {
+            u2.W <- resid^2
+            moments$s <- lp_tensor_moments(lp_state, u2 = u2.W)$s
+          }
         }
       } else if (residuals && miss.ex) {
         resid <- tydat - mean
       }
     }
 
-    if (!errors)
+    if (!se)
       beta.se <- NULL
-    if(errors && !fast.largeh){
+    if(se && !fast.largeh){
       u2 <- as.double(u2.W)
       merr <- rep(NA_real_, enrow)
       beta.se <- matrix(NA_real_, nrow = enrow, ncol = nrow(coef.mat))
-      for (i in seq_len(enrow)) {
-        cm <- safe_chol2inv(moments$tww[,,i], ridge[i], 1.0 / nrow(txdat))
-        if (is.null(cm))
+      valid.rows <- seq_len(enrow)
+      if (length(invalid.rows))
+        valid.rows <- valid.rows[-invalid.rows]
+      for (i in valid.rows) {
+        vcv.theta <- accepted_moment_covariance(
+          moments$tww[,,i], ridge[i], moments$s[,,i])
+        if (is.null(vcv.theta))
           next
 
-        s.mat <- moments$s[,,i]
-
         if (identical(reg.engine, "lc")) {
-          vcv.beta <- cm %*% s.mat %*% cm
+          vcv.beta <- vcv.theta
         } else {
-          vcv.theta <- cm %*% s.mat %*% cm
           trans.i <- kronecker(diag(ncol(W)), matrix(lp_state$W.eval[i,], nrow = 1L))
           vcv.beta <- trans.i %*% vcv.theta %*% t(trans.i)
         }
@@ -1134,14 +1376,15 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       mean = mean,
       residuals = residuals,
       betas = betas,
+      se = se,
       ntrain = nrow(txdat),
       trainiseval = miss.ex
     )
-    if (errors && !do.iterate)
+    if (se && !do.iterate)
       sc.obj.args$merr <- merr
     if (ncol(txdat) > 0L) {
       sc.obj.args$grad <- t(coef.mat[-1,,drop = FALSE])
-      if (errors && !do.iterate && !is.null(beta.se))
+      if (se && !do.iterate && !is.null(beta.se))
         sc.obj.args$gerr <- beta.se[, -1, drop = FALSE]
     }
     if (betas)
@@ -1151,6 +1394,15 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
     if (!(miss.ey && !miss.ex))
       sc.obj.args$xtra <- c(RSQ, MSE, MAE, MAPE, CORR, SIGN)
     ev <- do.call(smoothcoefficient, sc.obj.args)
+    # An outcome-only override changes reported scores, not the fitted sample.
+    # Reuse the existing training score on the ordinary path; never refit.
+    ev$training.MSE <- if (miss.ex) {
+      if (miss.ey) MSE else MSEfunc(tydat, mean)
+    } else NA_real_
+    ev$eval.rows.omit <- if (miss.ex) integer(0) else which(!keep.eval)
+    # Replay only fitting controls, never calls, caller frames or training data.
+    ev$fit.controls <- list(iterate = iterate, maxiter = maxiter, tol = tol,
+                            leave.one.out = leave.one.out)
     fit.elapsed <- proc.time()[3] - fit.start
     optim.time <- if (!is.null(bws$total.time) && is.finite(bws$total.time)) as.double(bws$total.time) else NA_real_
     total.time <- fit.elapsed + (if (is.na(optim.time)) 0.0 else optim.time)
@@ -1164,6 +1416,8 @@ npscoef.default <- function(bws, txdat, tydat, tzdat, nomad = FALSE, ...) {
       fit.progress <- .np_progress_end(fit.progress)
       fit.progress.active <- FALSE
     }
+    if (length(invalid.rows))
+      .np_undefined_fit_rows(invalid.rows, "npscoef()", external = TRUE)
     ev
 
   }
@@ -1177,15 +1431,20 @@ npscoef.scbandwidth <-
            eydat,
            ezdat,
            betas = FALSE,
-           errors = TRUE,
+           se = FALSE,
            iterate = TRUE,
            leave.one.out = FALSE,
            maxiter = 100,
            residuals = FALSE,
            tol = .Machine$double.eps,
            ...){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    npRejectLegacyBooleanErrors(list(...), "npscoef")
     residuals <- npValidateScalarLogical(residuals, "residuals")
-    errors <- npValidateScalarLogical(errors, "errors")
+    se <- npValidateScalarLogical(se, "se")
     iterate <- npValidateScalarLogical(iterate, "iterate")
     leave.one.out <- npValidateScalarLogical(leave.one.out, "leave.one.out")
     betas <- npValidateScalarLogical(betas, "betas")
@@ -1199,6 +1458,11 @@ npscoef.scbandwidth <-
     tol <- as.double(tol)
 
     .npRmpi_require_active_slave_pool(where = "npscoef()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_npscoef_should_localize(bws) &&
         !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
       return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
@@ -1209,10 +1473,21 @@ npscoef.scbandwidth <-
       isTRUE(fit.progress.allow) &&
       isTRUE(.np_progress_enabled(domain = "bandwidth"))
     if (!use.master.fit.progress && .npRmpi_autodispatch_active()) {
-      result <- .npRmpi_autodispatch_call(match.call(), parent.frame())
+      result <- .npRmpi_autodispatch_call(match.call(), parent.frame(), owner.name = "npscoef.scbandwidth")
+      # A native replacement fit can adopt z=x. Preserve that role decision
+      # when restoring the selected bandwidth's other labels and telemetry.
+      if (is.null(result$bws[["formula", exact = TRUE]]) &&
+          is.null(result$bws$zdati)) {
+        bws$znames <- NULL
+        bws$zdati <- NULL
+        bws <- .np_scbandwidth_role_metadata(bws)
+      }
       return(.npRmpi_restore_nomad_fit_bws_metadata(result, bws))
     }
 
+    .np_require_numeric_response(tydat, "npscoef", "tydat")
+    if (!missing(eydat))
+      .np_require_numeric_response(eydat, "npscoef", "eydat")
     .np_scoef_fit_internal(
       bws = bws,
       txdat = txdat,
@@ -1222,12 +1497,13 @@ npscoef.scbandwidth <-
       eydat = eydat,
       ezdat = ezdat,
       betas = betas,
-      errors = errors,
+      se = se,
       iterate = iterate,
       leave.one.out = leave.one.out,
       maxiter = maxiter,
       residuals = residuals,
       tol = tol,
+      .np_allow_undefined = TRUE,
       ...
     )
   }

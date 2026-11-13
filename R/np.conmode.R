@@ -1,6 +1,11 @@
 npconmode <-
   function(bws, ...){
-    args <- list(...)
+    mc <- match.call(expand.dots = FALSE)
+    .np_validate_public_dots(mc[["..."]], "npconmode")
+    args <- .np_formula_dispatch_args(
+      NULL, substitute(list(...))[-1L], environment(),
+      data.roles = c("txdat", "tydat"),
+      call = sys.call(), caller = parent.frame())
 
     if (!missing(bws)){
       if (is.recursive(bws)){
@@ -20,17 +25,6 @@ npconmode <-
     }
   }
 
-.npConmodeValidateNewdataTerms <- function(newdata, xnames) {
-  nd <- toFrame(newdata)
-  missing.names <- setdiff(xnames, names(nd))
-  if (length(missing.names))
-    stop(sprintf(
-      "newdata must contain columns: %s",
-      paste(shQuote(xnames), collapse = ", ")
-    ), call. = FALSE)
-  invisible(TRUE)
-}
-
 .npConmodeValidateCategoricalResponse <- function(tydat) {
   tydat <- toFrame(tydat)
   if (NCOL(tydat) != 1L)
@@ -44,7 +38,14 @@ npconmode <-
 }
 
 npconmode.formula <-
-  function(bws, data = NULL, newdata = NULL, ...){
+  function(bws, data = NULL, newdata = NULL, ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+    se <- npValidateScalarLogical(se, "se")
+    dots <- list(...)
+    frame.state <- dots[[".np.formula.state", exact = TRUE]]
+    dots$.np.formula.state <- NULL
+    dots$formula <- NULL
 
     tt <- terms(bws)
     m <- match(c("formula", "data", "subset", "na.action"),
@@ -53,63 +54,70 @@ npconmode.formula <-
     tmf[[1]] <- as.name("model.frame")
     tmf[["formula"]] <- tt
     if (!is.null(data))
-      tmf[["data"]] <- substitute(data)
+      tmf[["data"]] <- data
     mf.args <- as.list(tmf)[-1L]
-    umf <- tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
+    umf <- tmf <- if (is.null(frame.state))
+      .np_bws_formula_model_frame(bws, mf.args, data.override = !is.null(data), overrides = dots) else
+        .np_formula_frame_take(frame.state)
+    if ("tydat" %in% names(dots)) {
+      umf <- tmf <- .np_formula_replace_response(tmf, bws, dots[["tydat"]],
+                                                 dots, data.override = !is.null(data))
+      dots$tydat <- NULL
+      dots$na.action <- NULL
+    }
+    tt <- attr(tmf, "terms")
+    bws <- .np_bws_retain_fit_frame(bws, tmf)
     train.omit <- attr(tmf, "na.action")
 
     tydat <- tmf[, bws$variableNames[["response"]], drop = FALSE]
     txdat <- tmf[, bws$variableNames[["terms"]], drop = FALSE]
     .npConmodeValidateCategoricalResponse(tydat)
 
-    has.eval <- !is.null(newdata)
+    has.eval <- !is.null(newdata) && !("exdat" %in% names(dots))
     if (has.eval) {
-      .npConmodeValidateNewdataTerms(newdata, bws$variableNames[["terms"]])
-      has.ey <- bws$variableNames[["response"]] %in% names(newdata)
-
-      if (has.ey){
-        umf.args <- list(formula = tt, data = newdata)
-        umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
-        emf <- umf
-        eval.omit <- attr(emf, "na.action")
-        eydat <- emf[, bws$variableNames[["response"]], drop = FALSE]
-      } else {
-        umf.args <- list(formula = formula(bws)[-2], data = newdata)
-        umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
-        emf <- umf
-        eval.omit <- attr(emf, "na.action")
-      }
+      response <- if (!("eydat" %in% names(dots)))
+        .np_diagnostics_response(newdata, tt = tt) else NULL
+      has.ey <- !is.null(response)
+      eval.tt <- .np_formula_conditional_rhs_terms(bws)
+      npValidateNewdataFormula(newdata, eval.tt, include.response = FALSE)
+      umf <- .np_diagnostics_model_frame(eval.tt, newdata)
+      emf <- umf
+      eval.omit <- attr(emf, "na.action")
+      if ("eydat" %in% names(dots))
+        dots$eydat <- .np_diagnostics_align_response(dots$eydat, emf)
+      if (has.ey)
+        eydat <- toFrame(.np_diagnostics_align_response(response, emf))
 
       exdat <- emf[, bws$variableNames[["terms"]], drop = FALSE]
     } else {
       eval.omit <- NULL
     }
     
-    cm.args <- list(txdat = txdat, tydat = tydat)
+    cm.args <- list(txdat = txdat, tydat = tydat, se = se)
     if (has.eval) {
       cm.args$exdat <- exdat
       if (has.ey)
         cm.args$eydat <- eydat
     }
     cm.args$bws <- bws
-    ev <- do.call(npconmode, c(cm.args, list(...)))
+    ev <- do.call(npconmode, c(cm.args, dots))
 
-    ev <- .npConmodeRecordOmit(ev, train.omit)
-    if (has.eval) {
-      ev <- .npConmodeRecordEvalOmit(ev, eval.omit)
-      ev <- .npConmodePadRowOutputs(ev, eval.omit)
-    } else {
-      ev <- .npConmodePadRowOutputs(ev, train.omit)
-    }
+    output.omit <- .np_formula_output_action(ev, umf, has.eval, native.restored = TRUE)
+    ev <- .npConmodeRecordSampleOmissions(ev, train.omit,
+      if (has.eval) eval.omit else ev[["eval.omit", exact = TRUE]])
+    ev <- .npConmodePadRowOutputs(ev, output.omit)
 
     return(ev)
   }
 
 npconmode.call <-
   function(bws, ...) {
-    npconmode(txdat = .np_eval_bws_call_arg(bws, "xdat"),
-              tydat = .np_eval_bws_call_arg(bws, "ydat"),
-              bws = bws, ...)
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+    do.call(npconmode, .np_retained_training_args(
+      bws, c(txdat = "xdat", tydat = "ydat"), list(...), npconmode.conbandwidth))
   }
 
 npconmode.condbandwidth <-
@@ -125,10 +133,11 @@ npconmode.condbandwidth <-
     return(proper)
   }
 
-  regtype <- bws$regtype
-  if (!is.null(bws$regtype.engine))
-    regtype <- bws$regtype.engine
-  !identical(as.character(regtype)[1L], "lc")
+  reg.spec <- npConditionalRegEngineSpec(
+    bws,
+    where = "npconmode"
+  )
+  !identical(reg.spec$reg.engine, "lc")
 }
 
 .npConmodeProjectSimplexVector <- function(x) {
@@ -244,18 +253,20 @@ npconmode.condbandwidth <-
   enrow <- nrow(pmat)
   nlev <- ncol(pmat)
   mdens <- rep(-Inf, enrow)
-  mderr <- rep(NA_real_, enrow)
+  mderr <- if (is.null(perr)) NULL else rep(NA_real_, enrow)
   indices <- integer(enrow)
   for (i in seq_len(nlev)) {
     tf <- is.finite(pmat[, i]) & pmat[, i] > 0 & pmat[, i] > mdens
     tf[is.na(tf)] <- FALSE
     indices[tf] <- i
     mdens[tf] <- pmat[tf, i]
-    mderr[tf] <- perr[tf, i]
+    if (!is.null(perr))
+      mderr[tf] <- perr[tf, i]
   }
   invalid <- indices == 0L
   mdens[invalid] <- NA_real_
-  mderr[invalid] <- NA_real_
+  if (!is.null(perr))
+    mderr[invalid] <- NA_real_
   list(indices = indices, condens = mdens, conderr = mderr)
 }
 
@@ -263,7 +274,9 @@ npconmode.condbandwidth <-
   out <- rep(NA_character_, length(indices))
   valid <- indices > 0L
   out[valid] <- as.character(levels[indices[valid]])
-  factor(out, levels = as.character(levels), ordered = ordered)
+  out <- .np_factor_with_levels(out, levels = as.character(levels), ordered = ordered)
+  if (anyNA(levels)) is.na(out) <- !valid
+  out
 }
 
 .npConmodeOmitLength <- function(omit) {
@@ -283,9 +296,11 @@ npconmode.condbandwidth <-
   omit <- as.integer(omit)
   keep <- seq_len(NROW(x) + length(omit))[-omit]
   if (is.factor(x)) {
-    out <- factor(rep(NA_character_, length(x) + length(omit)),
+    out <- .np_factor_with_levels(rep(NA_character_, length(x) + length(omit)),
                   levels = levels(x), ordered = is.ordered(x))
+    if (anyNA(levels(x))) is.na(out) <- rep.int(TRUE, length(out))
     out[keep] <- x
+    if (anyNA(levels(x))) is.na(out)[keep[is.na(x)]] <- TRUE
     attr(out, "na.action") <- NULL
     return(out)
   }
@@ -319,6 +334,15 @@ npconmode.condbandwidth <-
   obj$eval.rows.omit <- .npConmodeOmitRows(omit)
   obj$eval.nobs.omit <- .npConmodeOmitLength(omit)
   obj
+}
+
+.npConmodeRecordSampleOmissions <- function(obj, train.omit, eval.omit = NULL) {
+  obj$train.rows.omit <- .npConmodeOmitRows(train.omit)
+  obj$train.nobs.omit <- .npConmodeOmitLength(train.omit)
+  if (isTRUE(obj[["trainiseval", exact = TRUE]]))
+    return(.npConmodeRecordOmit(obj, train.omit))
+  obj <- .npConmodeRecordEvalOmit(obj, eval.omit)
+  .npConmodeRecordOmit(obj, eval.omit)
 }
 
 .npConmodePadRowOutputs <- function(obj, omit) {
@@ -364,6 +388,123 @@ npconmode.condbandwidth <-
   out
 }
 
+.npConmodeLevelBlockWidth <- function(enrow, xwidth, nlevels) {
+  if (length(enrow) != 1L || is.na(enrow) || enrow < 1L ||
+      length(xwidth) != 1L || is.na(xwidth) || xwidth < 0L ||
+      length(nlevels) != 1L || is.na(nlevels) || nlevels < 1L)
+    stop("internal error: invalid conditional-mode level-block dimensions")
+
+  # Bound the temporary replicated evaluation frame independently of the
+  # number of response levels.  The probability and error matrices are public
+  # O(n_eval * nlevels) results already required by the estimator; this cap
+  # prevents the batching workspace from adding an unbounded copy of them.
+  target.cells <- floor((64 * 1024^2) / 8)
+  cells.per.row <- max(1, as.double(xwidth) + 3)
+  row.cap <- max(1, min(65536, floor(target.cells / cells.per.row)))
+  max(1L, min(as.integer(nlevels), as.integer(floor(row.cap / enrow))))
+}
+
+.npConmodeEvaluateLevels <- function(bws,
+                                      txdat,
+                                      tydat,
+                                      xeval,
+                                      efac,
+                                      gradients,
+                                      gradient.level.index,
+                                      direct.categorical.effects = FALSE,
+                                      se = TRUE,
+                                      allow.external = FALSE) {
+  se <- npValidateScalarLogical(se, "se")
+  allow.external <- npValidateScalarLogical(allow.external, "allow.external")
+  enrow <- nrow(xeval)
+  nlev <- nlevels(efac)
+  block.width <- .npConmodeLevelBlockWidth(
+    enrow = enrow,
+    xwidth = ncol(xeval),
+    nlevels = nlev
+  )
+  pmat <- matrix(NA_real_, enrow, nlev,
+                 dimnames = list(NULL, levels(efac)))
+  perr <- if (se) matrix(NA_real_, enrow, nlev,
+                         dimnames = list(NULL, levels(efac))) else NULL
+  pgrad <- if (isTRUE(gradients)) {
+    matrix(NA_real_, nrow = enrow, ncol = bws$xndim,
+           dimnames = list(NULL, bws$xnames))
+  } else {
+    NULL
+  }
+
+  ordinary.levels <- seq_len(nlev)
+  if (isTRUE(gradients))
+    ordinary.levels <- ordinary.levels[-gradient.level.index]
+  ordinary.blocks <- if (length(ordinary.levels)) {
+    starts <- seq.int(1L, length(ordinary.levels), by = block.width)
+    lapply(starts, function(start) {
+      ordinary.levels[seq.int(start,
+                              min(length(ordinary.levels),
+                                  start + block.width - 1L))]
+    })
+  } else {
+    list()
+  }
+  blocks <- if (isTRUE(gradients)) {
+    c(ordinary.blocks, list(gradient.level.index))
+  } else {
+    ordinary.blocks
+  }
+  empty.rows <- NULL
+
+  for (block in blocks) {
+    block.gradients <- isTRUE(gradients) &&
+      length(block) == 1L && block[[1L]] == gradient.level.index
+    eval.index <- rep.int(seq_len(enrow), times = length(block))
+    dens.obj <- npcdens(
+      txdat = txdat,
+      tydat = tydat,
+      exdat = xeval[eval.index,,drop = FALSE],
+      eydat = rep(efac[block], each = enrow),
+      bws = bws,
+      gradients = block.gradients,
+      se = se,
+      .np_lp_first_se_demand = FALSE,
+      .np_conditional_cat_se_demand = FALSE,
+      .np_categorical_effects = !isTRUE(direct.categorical.effects),
+      .np.require.complete = !allow.external,
+      .np.defer.empty.rows = TRUE
+    )
+
+    expected <- as.double(enrow) * length(block)
+    if (length(dens.obj$condens) != expected ||
+        (se && length(dens.obj$conderr) != expected))
+      stop("internal error: conditional-mode density block has invalid size")
+    flags <- attr(dens.obj, ".np.empty.rows", exact = TRUE)
+    if (!is.null(flags)) {
+      if (!is.integer(flags) || length(flags) != expected ||
+          anyNA(flags) || any(!flags %in% 0:1))
+        stop("internal error: conditional-mode empty-row metadata is invalid",
+             call. = FALSE)
+      if (any(flags == 1L)) {
+        block.empty <- integer(enrow)
+        block.empty[eval.index[flags == 1L]] <- 1L
+        empty.rows <- .npreg_merge_empty_rows(empty.rows, block.empty)
+      }
+    }
+    pmat[, block] <- matrix(dens.obj$condens, nrow = enrow)
+    if (se)
+      perr[, block] <- matrix(dens.obj$conderr, nrow = enrow)
+
+    if (block.gradients) {
+      if (is.null(dens.obj$congrad))
+        stop("internal error: conditional-density gradient was not returned")
+      pgrad[,] <- dens.obj$congrad
+    }
+  }
+
+  out <- list(probabilities = pmat, errors = perr, gradients = pgrad)
+  if (!is.null(empty.rows)) attr(out, ".np.empty.rows") <- empty.rows
+  out
+}
+
 
 npconmode.conbandwidth <-
   function (bws,
@@ -375,13 +516,32 @@ npconmode.conbandwidth <-
             probabilities = FALSE,
             gradients = FALSE,
             level = NULL,
-            ...){
+            ..., se = FALSE){
+    .np_reject_fit_subset(substitute(list(...))[-1L])
+
+  .np_reject_native_data(substitute(list(...))[-1L])
+
+
+    se <- npValidateScalarLogical(se, "se")
     .npRmpi_require_active_slave_pool(where = "npconmode()")
 
     probabilities <- npValidateScalarLogical(probabilities, "probabilities")
     gradients <- npValidateScalarLogical(gradients, "gradients")
     txdat = toFrame(txdat)
     tydat = toFrame(tydat)
+    .np_require_paired_rows(txdat, tydat, "txdat", "tydat")
+    bws <- .np_bws_retain_native_training(bws, xdat = txdat, ydat = tydat)
+
+    native.newdata <- list(...)[["newdata", exact = TRUE]]
+    if (missing(exdat) && !is.null(native.newdata)) {
+      native.eval <- .np_native_newdata_parts(
+        native.newdata, list(exdat = bws$xnames), "npconmode")
+      exdat <- native.eval$exdat
+      if (missing(eydat)) {
+        response <- .np_diagnostics_response(native.newdata, ynames = bws$ynames)
+        if (!is.null(response)) eydat <- toFrame(response)
+      }
+    }
 
     no.ex = missing(exdat)
     no.ey = missing(eydat)
@@ -391,6 +551,9 @@ npconmode.conbandwidth <-
 
     if (!no.ey)
       eydat = toFrame(eydat)
+
+    if (!no.ex && !no.ey)
+      .np_require_paired_rows(exdat, eydat, "exdat", "eydat")
 
     ## catch and destroy NA's
     keep.rows <- rep_len(TRUE, nrow(txdat))
@@ -407,8 +570,6 @@ npconmode.conbandwidth <-
     if (!no.ex){
       keep.eval <- rep_len(TRUE, nrow(exdat))
       eval.df <- data.frame(exdat)
-      if (!no.ey)
-        eval.df <- data.frame(eval.df, eydat)
       eval.omit <- attr(na.omit(eval.df), "na.action")
       if (.npConmodeOmitLength(eval.omit) > 0L)
         keep.eval[as.integer(eval.omit)] <- FALSE
@@ -434,11 +595,11 @@ npconmode.conbandwidth <-
     if (bws$yndim != 1 || bws$yncon > 0)
       stop("'tydat' must consist of one (1) discrete variable")
 
-    if(no.ey)
-      efac <- factor(bws$ydati$all.lev[[1]],levels = bws$ydati$all.lev[[1]], ordered = is.ordered(tydat[,1]))
-    else
-      efac <- factor(union(bws$ydati$all.lev[[1]], levels(eydat[,1])),
-                     levels = union(bws$ydati$all.lev[[1]], levels(eydat[,1])), ordered = is.ordered(tydat[,1]))
+    # Evaluation outcomes own goodness-of-fit diagnostics, never the fitted
+    # response support or the probability projection domain.
+    efac <- .np_factor_with_levels(
+      bws$ydati$all.lev[[1]], levels = bws$ydati$all.lev[[1]],
+      ordered = is.ordered(tydat[,1]))
 
     nlev <- nlevels(efac)
     level.values <- levels(efac)
@@ -455,34 +616,33 @@ npconmode.conbandwidth <-
       if (bws$xndim < 1L)
         stop("npconmode class-probability gradients/effects require at least one conditioning variable")
     }
-    pmat <- matrix(NA_real_, enrow, nlev, dimnames = list(NULL, level.values))
-    perr <- matrix(NA_real_, enrow, nlev, dimnames = list(NULL, level.values))
-    pgrad <- if (isTRUE(gradients)) {
-      matrix(NA_real_,
-             nrow = enrow,
-             ncol = bws$xndim,
-             dimnames = list(NULL, bws$xnames))
-    } else {
-      NULL
-    }
-
-    for (i in seq_len(nlevels(efac))) {
-        dens.obj <- npcdens(
-          txdat = txdat,
-          tydat = tydat,
-          exdat = if (no.ex) txdat else exdat,
-          eydat = rep(efac[i], enrow),
-          bws = bws,
-          gradients = isTRUE(gradients) && i == gradient.level.index
-        )
-        pmat[, i] <- dens.obj$condens
-        perr[, i] <- dens.obj$conderr
-        if (isTRUE(gradients) && i == gradient.level.index) {
-          if (is.null(dens.obj$congrad))
-            stop("internal error: conditional-density gradient was not returned")
-          pgrad[,] <- dens.obj$congrad
-        }
-    }
+    reg.spec <- npConditionalRegEngineSpec(
+      bws,
+      where = "npconmode categorical effects"
+    )
+    direct.categorical.effects <- npGlpCategoricalEffectsRequired(
+      regtype.engine = reg.spec$reg.engine,
+      degree.engine = reg.spec$degree.engine,
+      ncat = bws$xnuno + bws$xnord,
+      gradients = gradients
+    )
+    xeval <- if (no.ex) txdat else exdat
+    level.fit <- .npConmodeEvaluateLevels(
+      bws = bws,
+      txdat = txdat,
+      tydat = tydat,
+      xeval = xeval,
+      efac = efac,
+      gradients = gradients,
+      gradient.level.index = gradient.level.index,
+      direct.categorical.effects = direct.categorical.effects,
+      se = se,
+      allow.external = !no.ex
+    )
+    empty.rows <- attr(level.fit, ".np.empty.rows", exact = TRUE)
+    pmat <- level.fit$probabilities
+    perr <- level.fit$errors
+    pgrad <- level.fit$gradients
 
     proper.effective <- .npConmodeEffectiveProper(bws, proper)
     proper.out <- .npConmodeProperProbabilities(
@@ -491,11 +651,46 @@ npconmode.conbandwidth <-
       proper = proper.effective,
       proper.control = proper.control
     )
+    if (isTRUE(direct.categorical.effects)) {
+      eval.probability <- function(z) {
+        endpoint.fit <- .npConmodeEvaluateLevels(
+          bws = bws,
+          txdat = txdat,
+          tydat = tydat,
+          xeval = z,
+          efac = efac,
+          gradients = FALSE,
+          gradient.level.index = gradient.level.index,
+          se = FALSE,
+          allow.external = !no.ex
+        )
+        empty.rows <<- .npreg_merge_empty_rows(
+          empty.rows, attr(endpoint.fit, ".np.empty.rows", exact = TRUE))
+        endpoint.proper <- .npConmodeProperProbabilities(
+          endpoint.fit$probabilities,
+          levels = levels(efac),
+          proper = proper.effective,
+          proper.control = proper.control
+        )
+        endpoint.proper$probabilities[, gradient.level.index]
+      }
+      cat.idx <- which(bws$ixuno | bws$ixord)
+      for (jj in cat.idx) {
+        frames <- npCategoricalFirstDifferenceFrames(
+          exdat = xeval,
+          index = jj,
+          where = "npconmode"
+        )
+        pgrad[, jj] <- eval.probability(frames$upper) -
+          eval.probability(frames$lower)
+      }
+    }
     select <- .npConmodeSelect(proper.out$probabilities, perr)
     indices <- select$indices
     mdens <- select$condens
     mderr <- select$conderr
-    mderr[proper.out$repaired.rows] <- NA_real_
+    if (se)
+      mderr[proper.out$repaired.rows] <- NA_real_
     cm.args <- list(
       bws = bws,
       xeval = if (no.ex) txdat else exdat,
@@ -507,13 +702,16 @@ npconmode.conbandwidth <-
       proper.requested = proper.out$proper.requested,
       proper.applied = proper.out$proper.applied,
       proper.info = proper.out$proper.info,
+      proper.control = proper.control,
+      se = se,
       gradients = gradients
     )
     if (isTRUE(probabilities) || isTRUE(gradients)) {
       cm.args$probabilities <- proper.out$probabilities
       cm.args$probability.levels <- efac
       cm.args$probability.errors <- perr
-      cm.args$probability.errors[proper.out$repaired.rows, ] <- NA_real_
+      if (se)
+        cm.args$probability.errors[proper.out$repaired.rows, ] <- NA_real_
       cm.args$probability.repaired.rows <- proper.out$repaired.rows
       if (!no.ex) {
         cm.args$xtrain <- txdat
@@ -535,42 +733,50 @@ npconmode.conbandwidth <-
     if (!(no.ey && !no.ex))
       cm.args$yeval <- if (no.ey) tydat else eydat
     con.mode <- do.call(conmode, cm.args)
+    con.mode <- .np_conditional_policy_stamp(con.mode)
     
-    if (!(no.ey && !no.ex)){
+    score.y <- if (no.ex) tydat[,1] else if (!no.ey) eydat[,1] else NULL
+    score.keep <- if (is.null(score.y)) rep_len(FALSE, enrow) else
+      !is.na(score.y) & !is.na(con.mode$conmode)
+    con.mode$diagnostics.nobs <- sum(score.keep)
+    con.mode$diagnostics.sample <- if (!any(score.keep)) "unavailable" else
+      if (no.ex) "training" else "evaluation"
+    if (any(score.keep)) {
       confusion.matrix <- 
-        table(factor(if (no.ex) tydat[,1] else eydat[,1], exclude = NULL),
-              factor(con.mode$conmode,exclude = NULL), dnn=c("Actual", "Predicted"))
+        table(factor(score.y[score.keep], exclude = NULL),
+              factor(con.mode$conmode[score.keep],exclude = NULL), dnn=c("Actual", "Predicted"))
 
-      cj <- match(levels(factor(if (no.ex) tydat[,1] else eydat[,1], exclude = NULL)),
-                  levels(factor(con.mode$conmode,exclude = NULL)), nomatch = 0)
+      cj <- match(levels(factor(score.y[score.keep], exclude = NULL)),
+                  levels(factor(con.mode$conmode[score.keep],exclude = NULL)), nomatch = 0)
       rj <- cj > 0
 
       t.diag <- cj
       t.diag[rj] <-  diag(confusion.matrix[rj,cj,drop=FALSE])
       
-      CCR.overall <- sum(t.diag)/enrow
+      CCR.overall <- sum(t.diag)/sum(score.keep)
       
       CCR.byoutcome <- t.diag/rowSums(confusion.matrix)
-      names(CCR.byoutcome) <- levels(factor(if (no.ex) tydat[,1] else eydat[,1], exclude = NULL))
+      names(CCR.byoutcome) <- levels(factor(score.y[score.keep], exclude = NULL))
 
       con.mode$confusion.matrix <- confusion.matrix
       con.mode$CCR.overall <- CCR.overall
       con.mode$CCR.byoutcome <- CCR.byoutcome
 
-      confusion.matrix <- confusion.matrix/enrow
-      t.diag <- t.diag/enrow
+      confusion.matrix <- confusion.matrix/sum(score.keep)
+      t.diag <- t.diag/sum(score.keep)
 
       fit.mcfadden <- sum(t.diag) - (sum(confusion.matrix^2)-sum(t.diag^2))
       con.mode$fit.mcfadden <- fit.mcfadden
     }
-    con.mode <- .npConmodeRecordOmit(con.mode, train.omit)
+    con.mode <- .npConmodeRecordSampleOmissions(con.mode, train.omit, eval.omit)
     if (no.ex) {
       con.mode <- .npConmodePadRowOutputs(con.mode, train.omit)
     } else {
-      con.mode <- .npConmodeRecordEvalOmit(con.mode, eval.omit)
       con.mode <- .npConmodePadRowOutputs(con.mode, eval.omit)
     }
-    con.mode
+    .npreg_finish_empty_rows(con.mode, empty.rows,
+      omitted = if (no.ex) train.omit else eval.omit,
+      owner = "npconmode", row.labels = rownames(xeval))
   }
 
 npconmode.default <- function(bws, txdat, tydat,
@@ -580,13 +786,14 @@ npconmode.default <- function(bws, txdat, tydat,
                               probabilities = FALSE,
                               gradients = FALSE,
                               level = NULL,
-                              ...){
+                              ..., se = FALSE){
+  se <- npValidateScalarLogical(se, "se")
   nomad <- npValidateNomadControl(nomad, "nomad")
   probabilities <- npValidateScalarLogical(probabilities, "probabilities")
   gradients <- npValidateScalarLogical(gradients, "gradients")
   .npRmpi_require_active_slave_pool(where = "npconmode()")
 
-  sc <- sys.call()
+  sc <- .np_formula_default_call(sys.call(), sys.function(), parent.frame())
   sc.names <- names(sc)
 
   ## here we check to see if the function was called with tdat =
@@ -604,15 +811,33 @@ npconmode.default <- function(bws, txdat, tydat,
 
   ## if bws was passed in explicitly, do not compute bandwidths
     
-  if(txdat.named)
+  if(txdat.named || (bws.named && !no.txdat && !inherits(txdat, "formula"))) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(txdat), "txdat", sys.call(), parent.frame(), value = txdat)
+    # Keep the caller's vector name; explicit frame/matrix names are authoritative.
+    original.name <- if (is.null(dim(txdat)))
+      paste(deparse(.np_formula_dot_expression(substitute(txdat), parent.frame())), collapse = "") else NULL
     txdat <- toFrame(txdat)
+    if (!is.null(original.name)) names(txdat) <- original.name
+  }
 
-  if(tydat.named)
+  if(tydat.named) {
+    if ("data" %in% sc.names)
+      .np_data_argument_preflight(substitute(tydat), "tydat", sys.call(), parent.frame(), value = tydat)
+    # Keep the caller's vector name; explicit frame/matrix names are authoritative.
+    original.name <- if (is.null(dim(tydat)))
+      paste(deparse(.np_formula_dot_expression(substitute(tydat), parent.frame())), collapse = "") else NULL
     tydat <- toFrame(tydat)
+    if (!is.null(original.name)) names(tydat) <- original.name
+  }
 
   if(!no.tydat) {
-    if(!tydat.named)
+    if(!tydat.named) {
+      original.name <- if (is.null(dim(tydat)))
+        paste(deparse(.np_formula_dot_expression(substitute(tydat), parent.frame())), collapse = "") else NULL
       tydat <- toFrame(tydat)
+      if (!is.null(original.name)) names(tydat) <- original.name
+    }
     .npConmodeValidateCategoricalResponse(tydat)
   }
 
@@ -623,6 +848,7 @@ npconmode.default <- function(bws, txdat, tydat,
   sc.bw$proper.control <- NULL
   sc.bw$probabilities <- NULL
   sc.bw$gradients <- NULL
+  sc.bw$se <- NULL
   sc.bw$level <- NULL
   sc.bw$newdata <- NULL
   sc.bw$exdat <- NULL
@@ -646,21 +872,23 @@ npconmode.default <- function(bws, txdat, tydat,
   if(any(m.txy > 0)) {
     names(sc.bw)[m.txy] <- nstxy[m.txy > 0]
   }
+  sc.bw <- .np_public_dots_filter_call(sc.bw, "npcdensbw")
 
-  if (bws.formula && no.tydat) {
-    mf.call <- sc.bw
-    mf.call[[1]] <- quote(stats::model.frame)
-    keep <- match(c("formula", "data", "subset", "na.action"),
-                  names(mf.call), nomatch = 0L)
-    mf.call <- mf.call[c(1L, keep)]
-    if (!("formula" %in% names(mf.call)))
-      mf.call$formula <- bws
-    mf <- eval(mf.call, parent.frame())
-    y <- stats::model.response(mf)
-    if (is.null(y))
+  formula.input <- .np_formula_dispatch_args(
+    NULL, substitute(list(...))[-1L], environment())[["formula", exact = TRUE]]
+  training.formula <- if (bws.formula) bws else
+    if (!no.txdat && inherits(txdat, "formula")) txdat else formula.input
+  frame.state <- if (!has.explicit.bws && inherits(training.formula, "formula"))
+    new.env(parent = emptyenv()) else NULL
+  if (!is.null(frame.state)) {
+    if (length(training.formula) < 3L)
       stop("npconmode requires a categorical response in the formula",
            call. = FALSE)
-    .npConmodeValidateCategoricalResponse(data.frame(y))
+    response.names <- all.vars(training.formula[[2L]])
+    frame.state$validate.training <- function(frame)
+      .npConmodeValidateCategoricalResponse(frame[, response.names, drop = FALSE])
+    sc.bw$.np.formula.state <- frame.state
+    on.exit(rm(list = ls(frame.state, all.names = TRUE), envir = frame.state), add = TRUE)
   }
 
   use.outer.bandwidth.progress <- !.np_bw_call_uses_nomad_degree_search(
@@ -672,19 +900,28 @@ npconmode.default <- function(bws, txdat, tydat,
     if (use.outer.bandwidth.progress) {
       .np_progress_select_bandwidth_enhanced(
         "Selecting conditional density bandwidth",
-        .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
       )
     } else {
-      .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
     }
   } else {
-    .np_eval_bw_call(sc.bw, caller_env = parent.frame())
+        .np_eval_bw_call(sc.bw, caller_env = parent.frame(),
+                        native.map = c(bws = "bws", xdat = "txdat", ydat = "tydat"), native.frame = environment(),
+                         formula.value = .np_formula_value(formula.input, bws, txdat))
   }
 
   call.args <- list(bws = tbw)
+  if (!is.null(frame.state)) call.args$.np.formula.state <- frame.state
   if (no.bws) {
-    call.args$txdat <- txdat
-    call.args$tydat <- tydat
+    if (is.null(frame.state)) {
+      call.args$txdat <- txdat
+      call.args$tydat <- tydat
+    }
   } else {
     if (txdat.named) call.args$txdat <- txdat
     if (tydat.named) call.args$tydat <- tydat
@@ -696,6 +933,10 @@ npconmode.default <- function(bws, txdat, tydat,
   call.args$proper.control <- proper.control
   call.args$probabilities <- probabilities
   call.args$gradients <- gradients
+  call.args$se <- se
   call.args$level <- level
-  do.call(npconmode, c(call.args, list(...)))
+  fit.dots <- if (!is.null(tbw[["formula", exact = TRUE]]))
+    .np_formula_dispatch_args(NULL, substitute(list(...))[-1L], environment())
+  else list(...)
+  do.call(npconmode, c(call.args, fit.dots))
 }

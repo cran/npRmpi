@@ -65,7 +65,7 @@ sibandwidth <-
            degree = NULL,
            bernstein.basis = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"), 
+           ckertype = c("gaussian","epanechnikov","uniform"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -114,9 +114,6 @@ sibandwidth <-
     if (!any(kord == ckerorder))
       stop("ckerorder must be one of ", paste(kord,collapse=" "))
   }
-
-  if (ckertype == "truncated gaussian" && ckerorder != 2)
-    .np_warning("using truncated gaussian of order 2, higher orders not yet implemented")
 
   porder = switch( ckerorder/2, "Second-Order", "Fourth-Order", "Sixth-Order", "Eighth-Order" )
   cbounds <- npKernelBoundsResolve(
@@ -215,6 +212,7 @@ sibandwidth <-
     mybw$pmethod <- "Manual"
 
   class(mybw) = "sibandwidth"
+  mybw <- .np_ordered_bandwidth_contract(mybw)
   if(!any(is.na(mybw$bandwidth)))
     validateBandwidth(mybw)
   mybw
@@ -224,7 +222,7 @@ sibandwidth <-
 print.sibandwidth <- function(x, digits=NULL, ...){
   cat("\nSingle Index Model",
       "\nRegression data (",x$nobs,
-      " observations, ",x$ndim," variable(s)):\n\n",sep="")
+      " observations, ",x$ndim,if (is.null(x[["index.design", exact = TRUE]])) " variable(s)):" else " index coordinate(s)):","\n\n",sep="")
 
   print(matrix(x$beta,ncol=x$ndim,dimnames=list(paste("Beta",":",sep=""),x$xnames)))
   cat("Bandwidth: ",x$bw)
@@ -247,7 +245,7 @@ predict.sibandwidth <- function(object, ...) { npindex(bws = object, ...) }
 summary.sibandwidth <- function(object, ...){
   cat("\nSingle Index Model",
       "\nRegression data (",object$nobs,
-      " observations, ",object$ndim," variable(s)):\n\n",sep="")
+      " observations, ",object$ndim,if (is.null(object[["index.design", exact = TRUE]])) " variable(s)):" else " index coordinate(s)):","\n\n",sep="")
 
   print(matrix(object$beta,ncol=object$ndim,dimnames=list(paste("Beta",":",sep=""),object$xnames)))
   cat("Bandwidth: ",object$bw)

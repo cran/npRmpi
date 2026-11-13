@@ -58,7 +58,9 @@ conmode =
            probability.gradient.info = NULL,
            xtrain = NULL,
            ytrain = NULL,
-           gradients = FALSE){
+           gradients = FALSE,
+           se = TRUE,
+           proper.control = list()){
 
     if (missing(bws) || missing(xeval) || missing(conmode) || missing(condens) || missing(ntrain))
       stop("improper invocation of conmode constructor")
@@ -94,13 +96,15 @@ conmode =
       proper.requested = proper.requested,
       proper.applied = proper.applied,
       proper.info = proper.info,
+      proper.control = proper.control,
       confusion.matrix = confusion.matrix,
       CCR.overall = CCR.overall,
       CCR.byoutcome = CCR.byoutcome,
       fit.mcfadden = fit.mcfadden,
       ntrain = ntrain,
       trainiseval = trainiseval,
-      gradients = gradients)
+      gradients = gradients,
+      se = se)
 
     if (!is.null(probabilities)) {
       d$probabilities <- probabilities
@@ -183,13 +187,8 @@ fitted.conmode <- function(object, ...) {
   ynames <- object$ynames
 
   if (!is.null(xnames) && length(xnames)) {
-    missing.names <- setdiff(xnames, names(nd))
-    if (length(missing.names))
-      stop(sprintf(
-        "newdata must contain columns: %s",
-        paste(shQuote(xnames), collapse = ", ")
-      ), call. = FALSE)
-    dots$exdat <- nd[, xnames, drop = FALSE]
+    dots$exdat <- .np_native_newdata_parts(
+      newdata, list(exdat = xnames), "predict.npconmode")$exdat
     if (is.null(dots$eydat) &&
         !is.null(ynames) && length(ynames) && all(ynames %in% names(nd)))
       dots$eydat <- nd[, ynames, drop = FALSE]
@@ -211,6 +210,11 @@ predict.conmode <- function(object,
     stop("predict.conmode(se.fit=TRUE) is available only for type=\"prob\"",
          call. = FALSE)
   dots <- list(...)
+  if ("se" %in% names(dots) &&
+      !identical(npValidateScalarLogical(dots[["se"]], "se"), se.fit))
+    stop("conflicting 'se' and 'se.fit' requests; use se.fit to request prediction standard errors",
+         call. = FALSE)
+  dots[["se"]] <- se.fit
   has.native.eval <- .npConmodePredictHasNativeEvalArgs(dots)
   has.native.ey <- "eydat" %in% names(dots) && !is.null(dots$eydat)
   if (isTRUE(has.native.ey) && !isTRUE(has.native.eval) && is.null(newdata))
@@ -223,12 +227,17 @@ predict.conmode <- function(object,
       return(object$conmode)
     probs <- object$probabilities
     if (is.null(probs))
-      stop("class probabilities are not stored: fit with probabilities=TRUE")
+      stop(paste0("class probabilities are not stored; ",
+                  .np_se_refit_hint(substitute(object), "npconmode",
+                                    switches = if (se.fit) "probabilities = TRUE, se = TRUE" else "probabilities = TRUE")),
+           call. = FALSE)
     if (isTRUE(se.fit)) {
-      se <- object$probability.errors
-      if (is.null(se))
-        stop("class-probability standard errors are not stored: refit with probabilities=TRUE")
-      return(list(fit = probs, se.fit = se))
+      errors <- .np_require_stored_se(
+        object, object[["probability.errors", exact = TRUE]], "npconmode",
+        what = "class-probability standard errors", expr = substitute(object),
+        switches = "probabilities = TRUE, se = TRUE"
+      )
+      return(list(fit = probs, se.fit = errors))
     }
     return(probs)
   }
@@ -246,6 +255,12 @@ predict.conmode <- function(object,
     dots$probabilities <- TRUE
   }
 
+  if (!"proper" %in% names(dots) &&
+      !is.null(object[["proper.requested", exact = TRUE]]))
+    dots$proper <- object[["proper.requested", exact = TRUE]]
+  if (!"proper.control" %in% names(dots) &&
+      !is.null(object[["proper.control", exact = TRUE]]))
+    dots$proper.control <- object[["proper.control", exact = TRUE]]
   ev <- do.call(npconmode, c(list(bws = object$bws), dots))
   if (identical(type, "class"))
     return(ev$conmode)
@@ -260,13 +275,19 @@ predict.conmode <- function(object,
   }
   probs
 }
-gradients.conmode <- function(x, level = NULL, errors = FALSE, ...) {
-  errors <- npValidateScalarLogical(errors, "errors")
-  if (isTRUE(errors))
+gradients.conmode <- function(x, level = NULL, se = FALSE, ...) {
+  .np_reject_gradient_order_alias(substitute(list(...))[-1L],
+                                  "gradients.conmode")
+  npRejectLegacyBooleanErrors(list(...), "gradients.conmode")
+  se <- npValidateScalarLogical(se, "se")
+  if (isTRUE(se))
     stop("gradient standard errors are not available for conmode objects")
   gout <- x$probability.gradients
   if (is.null(gout))
-    stop("class-probability gradients/effects are not available: fit with gradients=TRUE")
+    .np_stop_missing_output(
+      substitute(x), "npconmode",
+      message = "class-probability gradients/effects are not available.",
+      switches = "gradients = TRUE")
   stored.level <- x$probability.gradient.level
   if (!is.null(level) && !identical(as.character(level), as.character(stored.level)))
     stop(sprintf("stored class-probability gradients are for level %s; refit with level=%s to obtain that level",
@@ -293,6 +314,7 @@ summary.conmode <- function(object, ...){
 
   cat(genBwSelStr(object$bws))
   cat('\n')
+  .np_diagnostics_summary(object)
   pCatGofStr(object)
 
   cat(genBwKerStrs(object$bws))

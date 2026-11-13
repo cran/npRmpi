@@ -61,14 +61,15 @@ test_that("nplsqreg gradient accessors enforce the stored derivative order", {
     regtype = "lp",
     degree = c(3L, 2L)
   )
-  fit <- nplsqreg(bw, gradients = TRUE, gradient.order = c(2L, 1L))
+  fit <- nplsqreg(bw, gradients = TRUE, se = TRUE,
+                  gradient.order = c(2L, 1L))
 
   expect_identical(
     gradients(fit, gradient.order = c(2L, 1L)),
     fit$quantgrad
   )
   expect_identical(
-    gradients(fit, errors = TRUE, gradient.order = c(2L, 1L)),
+    gradients(fit, se = TRUE, gradient.order = c(2L, 1L)),
     fit$quantgerr
   )
   expect_error(
@@ -106,7 +107,7 @@ test_that("nplsqreg gradient accessors enforce the stored derivative order", {
   )
 })
 
-test_that("nplsqreg plot treats gradient_order as an order, not a flag", {
+test_that("nplsqreg plot treats gradient.order as an order, not a flag", {
   skip_if_not(spawn_mpi_slaves(1L), "MPI pool unavailable")
   old.opts <- options(np.messages = FALSE)
   on.exit(options(old.opts), add = TRUE)
@@ -138,7 +139,9 @@ test_that("nplsqreg plot treats gradient_order as an order, not a flag", {
     errors = "none",
     perspective = FALSE
   )
-  expect_identical(names(out), c("cd1", "cd2"))
-  expect_s3_class(out$cd1, "lsqregression")
-  expect_identical(out$cd1$gradient.order, c(2L, 1L))
+  expect_s3_class(out, "np_plot_data")
+  expect_length(out$panels, 2L)
+  expect_identical(out$targets$order, c(2L, 2L, 1L, 1L))
+  expect_identical(out$targets$variable, c("x1", "x1", "x2", "x2"))
+  expect_identical(out$targets$tau, rep(c(.25, .75), 2L))
 })

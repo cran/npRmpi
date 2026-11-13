@@ -6,21 +6,24 @@
 \alias{gradients.lsqregression}
 \alias{gradients.npregression}
 \alias{gradients.qregression}  
+\alias{gradients.conmode}
 \alias{gradients.singleindex}
 \usage{
 gradients(x, \dots)
 
-\method{gradients}{condensity}(x, errors = FALSE, gradient.order = NULL, \dots)
+\method{gradients}{condensity}(x, se = FALSE, gradient.order = NULL, \dots)
 
-\method{gradients}{condistribution}(x, errors = FALSE, gradient.order = NULL, \dots)
+\method{gradients}{condistribution}(x, se = FALSE, gradient.order = NULL, \dots)
 
-\method{gradients}{lsqregression}(x, errors = FALSE, gradient.order = NULL, \dots)
+\method{gradients}{lsqregression}(x, se = FALSE, gradient.order = NULL, \dots)
 
-\method{gradients}{npregression}(x, errors = FALSE, gradient.order = NULL, \dots)
+\method{gradients}{npregression}(x, se = FALSE, gradient.order = NULL, \dots)
 
-\method{gradients}{qregression}(x, errors = FALSE, \dots)
+\method{gradients}{qregression}(x, se = FALSE, \dots)
 
-\method{gradients}{singleindex}(x, errors = FALSE, \dots)
+\method{gradients}{conmode}(x, level = NULL, se = FALSE, \dots)
+
+\method{gradients}{singleindex}(x, se = FALSE, \dots)
 }
 
 \arguments{
@@ -30,8 +33,11 @@ Object to interrogate and whether gradient standard errors are requested.
 
   \item{x}{an object for which the extraction of gradients is
     meaningful.}
-  \item{errors}{ a logical value specifying whether or not standard
+  \item{se}{ a logical value specifying whether or not standard
     errors of gradients are desired. Defaults to \code{FALSE}.}
+  \item{level}{for \code{conmode} objects, an optional dependent-variable
+    class level identifying the stored class-probability gradients to extract.
+    If supplied, it must match the level requested when the object was fitted.}
 
 \subsection{Derivative Order Controls}{
 Optional local-polynomial derivative order controls.
@@ -44,13 +50,18 @@ Optional local-polynomial derivative order controls.
     continuous predictor). For \code{npregression}, \code{condensity}, and
     \code{condistribution}, unavailable components whose order exceeds the
     fitted polynomial degree are returned as \code{NA} when another requested
-    continuous component remains available. For \code{lsqregression}, a
+    continuous component or categorical first-difference effect remains
+    available. Although the formal derivative of the fitted truncated
+    polynomial is zero above its degree, that zero is not an estimate of the
+    corresponding derivative of the unknown target; \code{NA} records that
+    the derivative was not estimated. For \code{lsqregression}, a
     supplied order must exactly identify the stored order; unavailable stored
     components remain \code{NA}, while any different requested order is
     rejected. If another derivative order is desired, compute the fit,
     prediction, or evaluation with \code{gradients=TRUE} and that
     \code{gradient.order}; \code{gradients()} does not recompute derivatives
-    after fitting.
+    after fitting. Gradient standard errors additionally require the object
+    to have been created with \code{se=TRUE}.
   }
 
 \subsection{Additional Arguments}{
@@ -75,7 +86,7 @@ Further method-specific arguments.
   derivative order to extract; it is not a post-fit recomputation control.
   For \code{lsqregression}, the requested order must exactly match the stored
   order. For \code{qregression} objects,
-  \code{errors=TRUE} returns
+  \code{se=TRUE} returns
   asymptotic standard errors for the quantile gradients when the object was
   fitted with \code{gradients=TRUE}.
 }

@@ -1,39 +1,46 @@
 .np_condens_engine_spec <- function(bws) {
-  reg.engine <- if (is.null(bws$regtype.engine)) {
-    if (is.null(bws$regtype)) "lc" else as.character(bws$regtype)
-  } else {
-    as.character(bws$regtype.engine)
-  }
-
-  degree.engine <- if (is.null(bws$degree.engine)) {
-    if (isTRUE(bws$xncon > 0L)) {
-      if (identical(reg.engine, "lc")) {
-        rep.int(0L, bws$xncon)
-      } else {
-        as.integer(npValidateGlpDegree(
-          regtype = "lp",
-          degree = bws$degree,
-          ncon = bws$xncon
-        ))
-      }
-    } else {
-      integer(0L)
-    }
-  } else {
-    as.integer(bws$degree.engine)
-  }
-
-  list(
-    reg.engine = reg.engine,
-    degree.engine = degree.engine
+  npConditionalRegEngineSpec(
+    bws,
+    where = "conditional density slice"
   )
 }
 
 .np_condens_is_already_proper_by_design <- function(bws) {
-  spec <- .np_condens_engine_spec(bws)
+  .np_conditional_proper_certificate(bws, cdf = FALSE)
+}
 
-  identical(spec$reg.engine, "lc") ||
-    (identical(spec$reg.engine, "lp") && all(spec$degree.engine == 0L))
+.np_conditional_proper_certificate <- function(bws, cdf) {
+  spec <- .np_condens_engine_spec(bws)
+  if (!(identical(spec$reg.engine, "lc") ||
+        (identical(spec$reg.engine, "lp") && all(spec$degree.engine == 0L))))
+    return(FALSE)
+  nonnegative <- function(kernel, order) {
+    identical(kernel, "uniform") ||
+      (kernel %in% c("gaussian", "epanechnikov", "beta") && order == 2L)
+  }
+  # At fixed X, LC/LP0 must form a convex mixture. Higher-order predictor
+  # kernels can give signed mixture weights even with a positive Y kernel.
+  if (bws$xncon > 0L && !nonnegative(bws$cxkertype, bws$cxkerorder))
+    return(FALSE)
+  if (bws$yncon > 0L) {
+    if (!nonnegative(bws$cykertype, bws$cykerorder) ||
+        identical(bws$type, "generalized_nn"))
+      return(FALSE)
+    # Target-centred beta/boundary densities are not normalized as functions
+    # of evaluation Y. Their observation-centred CDF siblings are proper.
+    if (!cdf && (identical(bws$cykertype, "beta") ||
+                 any(is.finite(bws$cykerlb[bws$iycon])) ||
+                 any(is.finite(bws$cykerub[bws$iycon]))))
+      return(FALSE)
+  }
+  # Both unordered density kernels are normalized over the retained support.
+  if (bws$ynuno > 0L && !(bws$uykertype %in% c("aitchisonaitken", "liracine")) &&
+      any(bws$ybw[bws$iyuno] != 0))
+    return(FALSE)
+  if (bws$ynord > 0L && !identical(bws$oykertype, "racineliyan") &&
+      any(bws$ybw[bws$iyord] != 0))
+    return(FALSE)
+  TRUE
 }
 
 .np_condens_slice_dispatch_enabled <- function() {

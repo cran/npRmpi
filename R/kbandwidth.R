@@ -1,3 +1,19 @@
+# Numerical helpers consume physical smoothing parameters, never search scale
+# factors. Conditional objects have two roles; other bandwidth families retain
+# one vector (possibly wrapped in a named list for display).
+.np_physical_bandwidth <- function(bws, role = NULL) {
+  raw <- bws[[if (is.null(role)) "bw" else paste0(role, "bw"), exact = TRUE]]
+  if (!isTRUE(bws[["scaling", exact = TRUE]]))
+    return(raw)
+  retained <- bws[["bandwidth", exact = TRUE]]
+  physical <- if (is.null(role)) unlist(retained, use.names = FALSE) else
+    retained[[role, exact = TRUE]]
+  if (!is.numeric(physical) || length(physical) != length(raw) ||
+      any(!is.finite(physical)))
+    stop("numerical operator requires retained physical bandwidths", call. = FALSE)
+  physical
+}
+
 kbandwidth <-
   function(bw = stop("kbandwidth:argument 'bw' missing"), ...) {
     UseMethod("kbandwidth")
@@ -6,8 +22,24 @@ kbandwidth <-
 kbandwidth.integer <-
   function(bw, ...) { kbandwidth.numeric(bw = bw, ...) }
 
+# Density/distribution families and raw kernel sums use different spellings
+# for the same ordered mass. Translate semantics at the object boundary, not
+# at the numerical kernel or by rescaling a finished estimate.
+.np_density_okertype <- function(okertype) {
+  if (identical(okertype, "liracine")) "nliracine" else okertype
+}
+
+.np_kbandwidth_okertype <- function(bw) {
+  if (inherits(bw, c("bandwidth", "dbandwidth")))
+    .np_density_okertype(bw[["okertype", exact = TRUE]])
+  else
+    bw[["okertype", exact = TRUE]]
+}
+
 kbandwidth.default <- function(bw, ...){
-  kbandwidth.numeric(bw = unlist(bw$bandwidth),
+  # Stored metadata is not a fresh user request for a uniform-kernel order.
+  # Keep the order itself and every other constructor condition unchanged.
+  withCallingHandlers(kbandwidth.numeric(bw = unlist(bw$bandwidth),
                      bwscaling = FALSE,
                      bwtype = bw$type,
                      ckertype = bw$ckertype,
@@ -16,20 +48,26 @@ kbandwidth.default <- function(bw, ...){
                      ckerlb = if (!is.null(bw$ckerlb)) bw$ckerlb else NULL,
                      ckerub = if (!is.null(bw$ckerub)) bw$ckerub else NULL,
                      ukertype = bw$ukertype,
-                     okertype = bw$okertype,
+                     okertype = .np_kbandwidth_okertype(bw),
                      nobs = bw$nobs,
                      xdati = if(is.null(bw$zdati)) bw$xdati else bw$zdati,
                      ydati = bw$ydati,
                      xnames = if(is.null(bw$zdati)) bw$xnames else bw$znames,
                      ynames = bw$ynames,
-                     ...)
+                     ...),
+    warning = function(w) {
+      if (identical(bw$ckertype, "uniform") &&
+          identical(conditionMessage(w), unname(.np_io_prefix_text(
+            "ignoring kernel order specified with uniform kernel type"))))
+        invokeRestart("muffleWarning")
+    })
 }
 
 kbandwidth.numeric <-
   function(bw,
            bwscaling = FALSE,
            bwtype = c("fixed","generalized_nn","adaptive_nn"),
-           ckertype = c("gaussian","truncated gaussian","epanechnikov","uniform"),
+           ckertype = c("gaussian","epanechnikov","uniform","beta"),
            ckerorder = c(2,4,6,8),
            ckerbound = c("none","range","fixed"),
            ckerlb = NULL,
@@ -69,7 +107,22 @@ kbandwidth.numeric <-
       kerbound = ckerbound,
       kerlb = ckerlb,
       kerub = ckerub,
-      argprefix = "cker")
+      argprefix = "cker",
+      range.policy = if (identical(ckertype, "beta"))
+        "beta_half_spacing" else "exact")
+    npValidateBetaKernelSpecification(
+      ckertype = ckertype,
+      ckerorder = ckerorder,
+      bwtype = bwtype,
+      ckerbound = cbounds$bound,
+      ckerlb = cbounds$lb,
+      ckerub = cbounds$ub,
+      dati = xdati,
+      bw = bw,
+      bandwidth.compute = FALSE,
+      where = "beta kernel sums",
+      allow.categorical = TRUE
+    )
     bounded_nonfixed_supported <- bwtype %in% c("generalized_nn", "adaptive_nn")
     if (bwtype != "fixed" && cbounds$bound != "none" && !bounded_nonfixed_supported)
       stop("finite continuous kernel bounds require bwtype = \"fixed\"")
@@ -107,6 +160,7 @@ kbandwidth.numeric <-
       xmcv = mcvConstruct(xdati))
 
     class(mybw) = "kbandwidth"
+    mybw <- .np_ordered_bandwidth_contract(mybw)
     mybw
     
   }

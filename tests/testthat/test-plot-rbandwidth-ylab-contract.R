@@ -148,7 +148,7 @@ test_that("rbandwidth mixed gradient plot still returns data payloads", {
     data_overlay = FALSE
   )))
 
-  expect_type(out, "list")
-  expect_length(out, 2L)
-  expect_true(all(vapply(out, inherits, logical(1), "npregression")))
+  expect_s3_class(out, "np_plot_data")
+  expect_length(out$panels, 2L)
+  expect_identical(out$targets$variable, c("g", "x"))
 })

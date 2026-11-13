@@ -9,34 +9,30 @@ test_that("uocquantile basic functionality works", {
   expect_equal(as.character(uocquantile(x_ord, 0.5)), "Medium")
 })
 
-test_that("nptgauss basic functionality works", {
-  # nptgauss is called for its side effect (setting C variables) 
-  # or returns NULL/constants.
-  expect_silent(nptgauss(3.0))
-})
-
 test_that("plot basic functionality works", {
   # skip_on_cran()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
 
   data("faithful")
   bw <- npudensbw(dat=faithful, bws=c(0.5, 5), bandwidth.compute=FALSE)
   
   # Use pdf(NULL) to avoid opening a window
   pdf(NULL)
-  on.exit(dev.off())
+  on.exit(dev.off(), add = TRUE)
   
-  plot(bw)
+  expect_error(plot(bw), NA)
 })
 
 test_that("se and gradients methods work", {
   # skip_on_cran()
   if (!spawn_mpi_slaves()) skip("Could not spawn MPI slaves")
+  on.exit(close_mpi_slaves(force = TRUE), add = TRUE)
 
   data("cps71")
   cps71_sub <- cps71[1:50, ]
   bw <- npregbw(logwage~age, data=cps71_sub, bws=1.0, bandwidth.compute=FALSE)
-  model <- npreg(bws=bw, gradients=TRUE)
+  model <- npreg(bws=bw, gradients=TRUE, se=TRUE)
   
   expect_type(se(model), "double")
   expect_length(se(model), 50)

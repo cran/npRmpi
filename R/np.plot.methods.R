@@ -1,3 +1,13 @@
+.np_plot_match_coef_index <- function(value, maximum = NULL) {
+  if (!is.numeric(value) || length(value) != 1L || is.na(value) ||
+      !is.finite(value) || value < 1L || value > .Machine$integer.max)
+    stop("coef_index must be a positive finite numeric scalar", call. = FALSE)
+  index <- as.integer(value)
+  if (!is.null(maximum) && index > maximum)
+    stop(sprintf("coef_index exceeds the %d available coefficients", maximum), call. = FALSE)
+  index
+}
+
 .np_plot_scalar_match <- function(value, choices, argname) {
   if (is.null(value))
     return(NULL)
@@ -29,15 +39,54 @@
 }
 
 np_boot_control <- function(nonfixed = c("exact", "frozen"),
-                            wild = c("rademacher", "mammen"),
-                            blocklen = NULL) {
+                            wild = c("mammen", "rademacher"),
+                            blocklen = NULL,
+                            calibration = c("default", "absolute", "separate-tails", "tail-envelope", "percentile-tails", "symmetric-sd", "asymmetric-sd", "smoothed-percentile", "legacy")) {
+  calibration <- if (missing(calibration)) "default" else
+    .np_plot_scalar_match(calibration,
+      c("default", "absolute", "separate-tails", "tail-envelope", "percentile-tails", "symmetric-sd", "asymmetric-sd", "smoothed-percentile", "legacy"), "calibration")
+  if (is.null(calibration)) stop("calibration must be a single supported name", call. = FALSE)
   nonfixed <- match.arg(nonfixed)
   wild <- match.arg(wild)
   blocklen <- .np_plot_validate_count(blocklen, "blocklen")
   structure(
-    list(nonfixed = nonfixed, wild = wild, blocklen = blocklen),
+    list(nonfixed = nonfixed, wild = wild, blocklen = blocklen, calibration = calibration),
     class = "np_boot_control"
   )
+}
+
+.np_plot_boot_calibration <- function(control) {
+  if (!inherits(control, "np_boot_control") || anyDuplicated(names(control)) ||
+      any(!names(control) %in% c("nonfixed", "wild", "blocklen", "calibration")))
+    stop("invalid np_boot_control object", call. = FALSE)
+  if (!"calibration" %in% names(control)) return("default")
+  value <- control[["calibration", exact = TRUE]]
+  if (!is.character(value) || length(value) != 1L || is.na(value) ||
+      !value %in% c("default", "absolute", "separate-tails", "tail-envelope", "percentile-tails", "symmetric-sd", "asymmetric-sd", "smoothed-percentile", "legacy"))
+    stop("invalid bootstrap calibration control", call. = FALSE)
+  value
+}
+
+.np_plot_legacy_bias_control <- function(calibration, control, family, center, method) {
+  if (!identical(calibration, "legacy")) return(control)
+  if (!identical(center, "bias-corrected") || !identical(method, "bootstrap"))
+    stop('calibration="legacy" requires center="bias-corrected" and errors="bootstrap"', call.=FALSE)
+  constructor <- switch(family, regression=np_bias_control,
+    density=np_udens_bias_control, distribution=np_udist_bias_control,
+    stop("legacy calibration is unavailable for this estimator", call.=FALSE))
+  expected <- constructor(construction="legacy")
+  if (is.null(control)) return(expected)
+  if (!inherits(control, class(expected)) || !is.list(control) ||
+      !identical(control[["construction", exact=TRUE]], "legacy"))
+    stop("calibration=\"legacy\" conflicts with the supplied nonlegacy bias_control", call.=FALSE)
+  control # The family's existing validator checks the complete retained control.
+}
+
+.np_plot_calibration_method <- function(value, family) {
+  if (identical(value, "symmetric-sd")) return("absolute")
+  if (identical(value, "asymmetric-sd"))
+    return(if (identical(family, "density")) "percentile-tails" else "separate-tails")
+  value
 }
 
 np_grid_control <- function(xtrim = NULL, xq = NULL, slices = NULL) {
@@ -55,12 +104,12 @@ np_grid_control <- function(xtrim = NULL, xq = NULL, slices = NULL) {
 
 np_render_control <- function(style = c("band", "bar"),
                               bar = c("|", "I"),
-                              bar_num = NULL) {
+                              bar.num = NULL) {
   style <- match.arg(style)
   bar <- match.arg(bar)
-  bar_num <- .np_plot_validate_count(bar_num, "bar_num")
+  bar.num <- .np_plot_validate_count(bar.num, "bar.num")
   structure(
-    list(style = style, bar = bar, bar_num = bar_num),
+    list(style = style, bar = bar, bar_num = bar.num),
     class = "np_render_control"
   )
 }
@@ -73,6 +122,12 @@ np_render_control <- function(style = c("band", "bar"),
     rep.int("", length(dots_call))
   else
     nms
+}
+
+.np_plot_reject_retired_spelling <- function(dots_call, replacements) {
+  retired <- chartr(".", "_", replacements)
+  bad <- intersect(.np_plot_dot_names(dots_call), retired)
+  .np_plot_stop_unused_args(bad, replacements)
 }
 
 .np_plot_stop_unused_args <- function(bad, allowed) {
@@ -119,11 +174,11 @@ np_render_control <- function(style = c("band", "bar"),
 
 .np_plot_canonical_arg_names <- function() {
   c("errors", "band", "alpha", "bootstrap", "B", "center",
-    "output", "data_overlay", "data_rug", "layout", "legend",
-    "factor_boxplot", "boxplot_outliers", "coef_index",
-    "gradient_order", "common_scale", "proper_method", "proper_control",
+    "output", "data.overlay", "data.rug", "layout", "legend",
+    "factor.boxplot", "boxplot.outliers", "coef.index",
+    "common.scale", "proper.method", "proper.control",
     "renderer", "neval", "perspective",
-    "boot_control", "grid_control", "render_control")
+    "boot.control", "grid.control", "render.control")
 }
 
 .np_plot_legacy_arg_names <- function() {
@@ -163,7 +218,10 @@ np_render_control <- function(style = c("band", "bar"),
     method <- .np_plot_engine_for_bws(bws)
   if (is.null(method))
     return(character())
-  setdiff(names(formals(method)), c("bws", "..."))
+  args <- setdiff(names(formals(method)), c("bws", "...", ".np.empty.report"))
+  if (identical(method, .np_plot_sibandwidth_engine))
+    args <- c(args, "gradient.order")
+  args
 }
 
 .np_plot_validate_public_dots <- function(dots_call,
@@ -171,6 +229,19 @@ np_render_control <- function(style = c("band", "bar"),
                                           bws = NULL,
                                           context = "plot") {
   dot.names <- .np_plot_dot_names(dots_call)
+  .np_plot_check_public_names(dot.names)
+  if ("data" %in% dot.names) {
+    data.owner <- if (identical(method, .np_plot_compat_dispatch))
+      .np_plot_engine_for_bws(bws) else method
+    if (identical(data.owner, .np_plot_bandwidth_engine) ||
+        identical(data.owner, .np_plot_dbandwidth_engine) ||
+        identical(data.owner, .np_plot_rbandwidth_engine) ||
+        identical(data.owner, .np_plot_conbandwidth_engine) ||
+        identical(data.owner, .np_plot_condbandwidth_engine) ||
+        identical(data.owner, .np_plot_scbandwidth_engine) ||
+        identical(data.owner, .np_plot_sibandwidth_engine))
+      .np_plot_data_error()
+  }
   if (any(!nzchar(dot.names)))
     stop(sprintf("unnamed plot arguments are not supported for %s", context),
          call. = FALSE)
@@ -183,12 +254,12 @@ np_render_control <- function(style = c("band", "bar"),
   if ("bands" %in% dot.names)
     stop("unused plot argument: bands; did you mean band?",
          call. = FALSE)
-  canonical <- .np_plot_canonical_arg_names()
-  legacy <- .np_plot_legacy_arg_names()
+  canonical <- .np_plot_public_names(.np_plot_canonical_arg_names())
   engine <- .np_plot_allowed_engine_args(method = method, bws = bws)
-  dispatcher <- "random.seed"
-  allowed <- unique(c(canonical, legacy, dispatcher, engine,
-                      .np_plot_graphics_arg_names()))
+  engine <- .np_plot_public_names(setdiff(engine, .np_plot_legacy_arg_names()))
+  allowed <- unique(c(canonical, "random_seed", engine,
+                      .np_plot_graphics_arg_names(),
+                      .np_plot_rgl_prefixed_arg_names()))
   bad <- setdiff(dot.names[nzchar(dot.names)], allowed)
   .np_plot_stop_unused_args(bad, allowed)
   invisible(NULL)
@@ -216,7 +287,14 @@ np_render_control <- function(style = c("band", "bar"),
   identical(layout, "auto")
 }
 
-.np_plot_normalize_public_dots <- function(dots, context = "plot") {
+.np_plot_center_needs_bootstrap <- function(center, method,
+                                             allow_asymptotic_bias = FALSE) {
+  !(identical(method, "asymptotic") &&
+      (identical(center, "estimate") || allow_asymptotic_bias))
+}
+
+.np_plot_normalize_public_dots <- function(dots, context = "plot", allow_asymptotic_bias = FALSE) {
+  dots <- .np_plot_internal_names(dots)
   supplied <- names(dots)
   has <- function(x) x %in% supplied
 
@@ -258,7 +336,7 @@ np_render_control <- function(style = c("band", "bar"),
       stop("unused plot argument: bootstrap list; use scalar bootstrap, B, and boot_control",
            call. = FALSE)
     bootstrap <- .np_plot_scalar_match(dots$bootstrap,
-                                       c("wild", "inid", "fixed", "geom"),
+                                       c("wild", "inid", "fixed", "geom", "residual", "conditional-pilot"),
                                        "bootstrap")
     dots$bootstrap <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "bootstrap",
@@ -266,6 +344,9 @@ np_render_control <- function(style = c("band", "bar"),
   }
   if (has("B")) {
     B <- dots$B
+    if (inherits(dots[["bias.control",exact=TRUE]],"np_conditional_bias_control") &&
+        (!is.numeric(B) || length(B)!=1L || !is.finite(B) || B<2 || B!=floor(B) || B>.Machine$integer.max))
+      stop("conditional inference B must be an integer from 2 through .Machine$integer.max",call.=FALSE)
     if (!is.numeric(B) || length(B) != 1L || is.na(B) || B < 1)
       stop("B must be a positive numeric scalar", call. = FALSE)
     dots$B <- NULL
@@ -282,7 +363,7 @@ np_render_control <- function(style = c("band", "bar"),
   }
   if (has("output")) {
     output <- .np_plot_scalar_match(dots$output,
-                                    c("plot", "data", "both", "plot-data"),
+                                    c("plot", "data", "plot-data"),
                                     "output")
     if (identical(output, "both"))
       output <- "plot-data"
@@ -298,15 +379,15 @@ np_render_control <- function(style = c("band", "bar"),
     dots <- .np_plot_set_normalized_arg(dots, "behavior",
                                         "plot.behavior", behavior)
   }
-  if (has("data_overlay")) {
-    data_overlay <- .np_plot_match_flag(dots$data_overlay, "data_overlay")
-    dots$data_overlay <- NULL
+  if (has("data.overlay")) {
+    data_overlay <- .np_plot_match_flag(dots$data.overlay, "data_overlay")
+    dots$data.overlay <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "data_overlay",
                                         "plot.data.overlay", data_overlay)
   }
-  if (has("data_rug")) {
-    data_rug <- .np_plot_match_flag(dots$data_rug, "data_rug")
-    dots$data_rug <- NULL
+  if (has("data.rug")) {
+    data_rug <- .np_plot_match_flag(dots$data.rug, "data_rug")
+    dots$data.rug <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "data_rug",
                                         "plot.rug", data_rug)
   }
@@ -316,74 +397,39 @@ np_render_control <- function(style = c("band", "bar"),
     dots <- .np_plot_set_normalized_arg(dots, "layout",
                                         "plot.par.mfrow", layout)
   }
-  if (has("factor_boxplot")) {
-    factor_boxplot <- .np_plot_match_flag(dots$factor_boxplot,
+  if (has("factor.boxplot")) {
+    factor_boxplot <- .np_plot_match_flag(dots$factor.boxplot,
                                           "factor_boxplot")
-    dots$factor_boxplot <- NULL
+    dots$factor.boxplot <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "factor_boxplot",
                                         "plot.bxp", factor_boxplot)
   }
-  if (has("boxplot_outliers")) {
-    boxplot_outliers <- .np_plot_match_flag(dots$boxplot_outliers,
+  if (has("boxplot.outliers")) {
+    boxplot_outliers <- .np_plot_match_flag(dots$boxplot.outliers,
                                             "boxplot_outliers")
-    dots$boxplot_outliers <- NULL
+    dots$boxplot.outliers <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "boxplot_outliers",
                                         "plot.bxp.out", boxplot_outliers)
   }
-  if (has("coef_index")) {
-    coef_index <- dots$coef_index
-    if (!is.numeric(coef_index) || length(coef_index) != 1L ||
-        is.na(coef_index) || coef_index < 1L)
-      stop("coef_index must be a positive numeric scalar", call. = FALSE)
-    dots$coef_index <- NULL
-    dots <- .np_plot_set_normalized_arg(dots, "coef_index",
-                                        "coef.index", as.integer(coef_index))
-  }
-  if (has("gradient_order")) {
-    gradient_order <- dots$gradient_order
-    if (!is.numeric(gradient_order) || any(is.na(gradient_order)) ||
-        any(gradient_order < 1L))
-      stop("gradient_order must contain positive numeric values",
-           call. = FALSE)
-    dots$gradient_order <- NULL
-    dots <- .np_plot_set_normalized_arg(dots, "gradient_order",
-                                        "gradient.order",
-                                        as.integer(gradient_order))
-  }
-  if (has("common_scale")) {
-    common_scale <- .np_plot_match_flag(dots$common_scale, "common_scale")
-    dots$common_scale <- NULL
-    dots <- .np_plot_set_normalized_arg(dots, "common_scale",
-                                        "common.scale", common_scale)
-  }
-  if (has("proper_method")) {
-    proper_method <- dots$proper_method
-    if (!is.character(proper_method) || length(proper_method) != 1L ||
-        is.na(proper_method))
-      stop("proper_method must be a character scalar", call. = FALSE)
-    dots$proper_method <- NULL
-    dots <- .np_plot_set_normalized_arg(dots, "proper_method",
-                                        "proper.method", proper_method)
-  }
-  if (has("proper_control")) {
-    proper_control <- dots$proper_control
-    if (!is.list(proper_control))
-      stop("proper_control must be a list", call. = FALSE)
-    dots$proper_control <- NULL
-    dots <- .np_plot_set_normalized_arg(dots, "proper_control",
-                                        "proper.control", proper_control)
-  }
+  if (has("coef.index"))
+    dots$coef.index <- .np_plot_match_coef_index(dots$coef.index)
+  if (has("common.scale"))
+    dots$common.scale <- .np_plot_match_flag(dots$common.scale, "common_scale")
   if (has("perspective")) {
     perspective <- isTRUE(dots$perspective)
     dots$perspective <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "perspective",
                                         "perspective", perspective)
   }
-  if (has("boot_control")) {
-    if (!inherits(dots$boot_control, "np_boot_control"))
+  if (has("boot.control")) {
+    if (!inherits(dots$boot.control, "np_boot_control"))
       stop("boot_control must be created by np_boot_control()", call. = FALSE)
-    ctrl <- dots$boot_control
-    dots$boot_control <- NULL
+    ctrl <- dots$boot.control
+    calibration <- .np_plot_boot_calibration(ctrl)
+    dots$boot.control <- NULL
+    if (calibration != "default")
+      dots <- .np_plot_set_normalized_arg(dots, "boot_control$calibration",
+                                          "plot.errors.boot.calibration", calibration)
     dots <- .np_plot_set_normalized_arg(dots, "boot_control$nonfixed",
                                         "plot.errors.boot.nonfixed",
                                         ctrl$nonfixed)
@@ -395,14 +441,15 @@ np_render_control <- function(style = c("band", "bar"),
                                           "plot.errors.boot.blocklen",
                                           ctrl$blocklen)
   }
-  if (has("grid_control")) {
-    if (!inherits(dots$grid_control, "np_grid_control"))
+  if (has("grid.control")) {
+    if (!inherits(dots$grid.control, "np_grid_control"))
       stop("grid_control must be created by np_grid_control()", call. = FALSE)
-    ctrl <- dots$grid_control
-    dots$grid_control <- NULL
+    ctrl <- dots$grid.control
+    dots$grid.control <- NULL
     if (!is.null(ctrl$xtrim))
       dots <- .np_plot_set_normalized_arg(dots, "grid_control$xtrim",
-                                          "xtrim", ctrl$xtrim)
+                                          "xtrim", structure(list(probs = ctrl$xtrim),
+                                            class = "np_plot_trim_range"))
     if (!is.null(ctrl$xq))
       dots <- .np_plot_set_normalized_arg(dots, "grid_control$xq",
                                           "xq", ctrl$xq)
@@ -410,11 +457,11 @@ np_render_control <- function(style = c("band", "bar"),
       stop(sprintf("grid_control$slices is not yet supported for %s", context),
            call. = FALSE)
   }
-  if (has("render_control")) {
-    if (!inherits(dots$render_control, "np_render_control"))
+  if (has("render.control")) {
+    if (!inherits(dots$render.control, "np_render_control"))
       stop("render_control must be created by np_render_control()", call. = FALSE)
-    ctrl <- dots$render_control
-    dots$render_control <- NULL
+    ctrl <- dots$render.control
+    dots$render.control <- NULL
     dots <- .np_plot_set_normalized_arg(dots, "render_control$style",
                                         "plot.errors.style", ctrl$style)
     dots <- .np_plot_set_normalized_arg(dots, "render_control$bar",
@@ -430,16 +477,18 @@ np_render_control <- function(style = c("band", "bar"),
     "none"
   boot.only <- c("plot.errors.boot.method", "plot.errors.boot.num",
                  "plot.errors.boot.nonfixed", "plot.errors.boot.wild",
-                 "plot.errors.boot.blocklen")
-  boot.supplied <- any(c("bootstrap", "B", "boot_control", "center",
-                         "plot.errors.center", boot.only) %in% supplied)
+                 "plot.errors.boot.blocklen", "plot.errors.boot.calibration")
+  center.only <- if (.np_plot_center_needs_bootstrap(
+    dots[["plot.errors.center", exact = TRUE]], method, allow_asymptotic_bias))
+    c("center", "plot.errors.center") else character()
+  boot.supplied <- any(c("bootstrap", "B", "boot.control", center.only, boot.only) %in% supplied)
   if (!identical(method, "bootstrap") && boot.supplied)
     stop("bootstrap controls require errors = \"bootstrap\"",
          call. = FALSE)
   error.only <- c("plot.errors.type", "plot.errors.alpha",
                   "plot.errors.style", "plot.errors.bar",
                   "plot.errors.bar.num")
-  error.supplied <- any(c("band", "alpha", "render_control",
+  error.supplied <- any(c("band", "alpha", "render.control",
                           error.only) %in% supplied)
   if (identical(method, "none") && error.supplied)
     stop("band, alpha, and interval rendering controls require errors != \"none\"",
@@ -457,8 +506,50 @@ np_render_control <- function(style = c("band", "bar"),
     bws = bws,
     context = .plot_context
   )
-  dots <- list(...)
-  dots <- .np_plot_normalize_public_dots(dots, context = .plot_context)
+  dots <- .np_plot_internal_names(list(...))
+  if (isTRUE(dots$coef)) {
+    # Fitted wrappers have already normalized these request fields; bandwidth
+    # wrappers have not. Apply the same display-only policy at this shared owner.
+    coefficient.errors <- dots[["errors", exact = TRUE]]
+    if (is.null(coefficient.errors))
+      coefficient.errors <- dots[["plot.errors.method", exact = TRUE]]
+    coefficient.inference.args <- c("band", "alpha", "center", "bootstrap", "B",
+      "boot.control", "bias.control", "plot.errors.type", "plot.errors.alpha",
+      "plot.errors.center", "plot.errors.boot.method", "plot.errors.boot.num",
+      "plot.errors.boot.nonfixed", "plot.errors.boot.wild",
+      "plot.errors.boot.blocklen", "plot.errors.boot.calibration")
+    coefficient.inference <- any(coefficient.inference.args %in% names(dots))
+    if (inherits(bws, "scbandwidth") &&
+        ((!is.null(coefficient.errors) && !identical(coefficient.errors, "none")) ||
+         coefficient.inference))
+      stop("smooth coefficient displays do not implement confidence intervals; use errors='none'", call. = FALSE)
+    if (inherits(bws, "plbandwidth") && coefficient.inference)
+      stop("parametric coefficient bars show one standard error; band/alpha/calibration requests are not supported", call. = FALSE)
+  }
+  if (!is.null(dots[["bias.control", exact = TRUE]]))
+    .np_udist_score_scope(dots[["bias.control", exact = TRUE]], inherits(bws, "dbandwidth"))
+  conditional.optin <- inherits(dots[["bias.control", exact=TRUE]], "np_conditional_bias_control")
+  if (conditional.optin && !inherits(bws,c("conbandwidth","condbandwidth")))
+    stop("np_conditional_bias_control requires conditional density/distribution plots",call.=FALSE)
+  dots <- .np_plot_normalize_public_dots(dots, context = .plot_context,
+    allow_asymptotic_bias = conditional.optin || identical(method, .np_plot_rbandwidth_engine) ||
+      identical(method, .np_plot_bandwidth_engine) ||
+      identical(method, .np_plot_dbandwidth_engine) ||
+      (identical(method, .np_plot_compat_dispatch) &&
+       (inherits(bws, "rbandwidth") || inherits(bws, "bandwidth") ||
+        inherits(bws, "dbandwidth"))))
+  if (!is.null(dots[["plot.errors.boot.calibration", exact = TRUE]]) &&
+      !inherits(bws, c("rbandwidth", "bandwidth", "dbandwidth")) && !conditional.optin)
+    stop("explicit bootstrap calibration currently requires bias-corrected regression or supported density/distribution inference", call. = FALSE)
+  if (isTRUE(dots[["plot.errors.boot.calibration", exact = TRUE]] %in% "percentile-tails") &&
+      !inherits(bws, "bandwidth"))
+    stop("percentile density calibration requires supported density inference", call. = FALSE)
+  if (identical(dots[["plot.errors.boot.method", exact = TRUE]], "residual") &&
+      !(inherits(bws, "rbandwidth") &&
+        identical(dots[["plot.errors.boot.calibration", exact = TRUE]], "smoothed-percentile")))
+    stop('bootstrap="residual" requires regression calibration="smoothed-percentile"', call. = FALSE)
+  if (identical(dots[["plot.errors.boot.method", exact=TRUE]], "conditional-pilot") && !conditional.optin)
+    stop('bootstrap="conditional-pilot" requires np_conditional_bias_control()',call.=FALSE)
   random.seed <- if (!is.null(dots$random.seed)) dots$random.seed else 42L
   dots$random.seed <- NULL
 
@@ -476,7 +567,7 @@ np_render_control <- function(style = c("band", "bar"),
   dots$persp <- NULL
 
   if (!is.null(dots$plot.rug)) {
-    dots$plot.rug <- .np_plot_match_flag(dots$plot.rug, "plot.rug")
+    dots$plot.rug <- .np_plot_match_flag(dots$plot.rug, "data_rug")
     if (isTRUE(dots$plot.rug) &&
         !identical(method, .np_plot_rbandwidth_engine) &&
         !identical(method, .np_plot_bandwidth_engine) &&
@@ -532,10 +623,79 @@ np_render_control <- function(style = c("band", "bar"),
     }
   }
 
-  .np_with_seed(
-    random.seed,
-    do.call(method, c(list(bws = .npRmpi_autodispatch_untag(bws)), dots))
-  )
+  .np_plot_rng_replay_preflight(method, bws, dots)
+
+  owns.empty.rows <- identical(method, .np_plot_rbandwidth_engine) ||
+    identical(method, .np_plot_conbandwidth_engine) ||
+    identical(method, .np_plot_condbandwidth_engine) ||
+    identical(method, .np_plot_plbandwidth_engine) ||
+    identical(method, .np_plot_sibandwidth_engine) ||
+    (identical(method, .np_plot_compat_dispatch) &&
+     any(c("rbandwidth", "plbandwidth", "sibandwidth",
+           "conbandwidth", "condbandwidth") %in% class(bws)))
+  progress.enabled <- (identical(dots$plot.errors.method, "bootstrap") || conditional.optin) &&
+    !identical(dots$plot.errors.boot.nonfixed, "frozen")
+  progress.label <- if (identical(dots$plot.errors.method, "asymptotic"))
+    "Plot inference" else "Plot bootstrap"
+  if (!owns.empty.rows && (.np_udens_beta_request(bws, dots$bias.control,
+      dots$plot.errors.center, dots$plot.errors.method) ||
+      .np_udens_fgd_request(bws, dots$bias.control,
+      dots$plot.errors.center, dots$plot.errors.method,
+      dots$plot.errors.boot.calibration))) {
+    # Bounded density inference owns its child stream; preserve cached normals.
+    npValidateNonNegativeInteger(random.seed, "random.seed")
+    dots$random.seed <- random.seed
+    value <- .np_plot_progress_run(.np_udens_resolution_run(
+      do.call(method, c(list(bws = bws), dots))), enabled = TRUE, label = progress.label)
+    return(.np_plot_data_finish(value, bws, dots, method, random.seed))
+  }
+  if (!owns.empty.rows && .np_udens_d8_default(bws, dots$bias.control,
+      dots$plot.errors.center, dots$plot.errors.method,
+      if (is.null(dots$plot.errors.alpha)) .05 else dots$plot.errors.alpha)) {
+    # The D8 entry owns its seed. An outer set.seed scope would destroy the
+    # caller's cached Box-Muller normal even if .Random.seed were restored.
+    npValidateNonNegativeInteger(random.seed, "random.seed")
+    dots$random.seed <- random.seed
+    value <- .np_plot_progress_run(.np_udens_resolution_run(
+      do.call(method, c(list(bws = bws), dots))), enabled = TRUE, label = progress.label)
+    return(.np_plot_data_finish(value, bws, dots, method, random.seed))
+  }
+  if (!owns.empty.rows && inherits(bws, c("bandwidth", "dbandwidth"))) {
+    # Compact inference owns a child seed in addition to this outer scope.
+    # Forward the request without bypassing either existing RNG admission guard.
+    if (.np_udens_compact_q2_request(bws, dots$bias.control,
+        dots$plot.errors.center, dots$plot.errors.method, dots$plot.errors.type,
+        dots$plot.errors.boot.calibration,
+        identical(dots$plot.errors.boot.method, "inid") &&
+          isTRUE(dots$plot.errors.type %in% c("pointwise", "simultaneous", "bonferroni", "all"))) ||
+        .np_udens_compact_normal_q2_request(bws, dots$bias.control,
+        dots$plot.errors.center, dots$plot.errors.method,
+        dots$plot.errors.type, dots$plot.errors.boot.calibration) ||
+        .np_udens_compact_request(bws, dots$bias.control,
+        dots$plot.errors.center, dots$plot.errors.method,
+        dots$plot.errors.boot.calibration,
+        identical(dots$plot.errors.boot.method, "inid") &&
+          isTRUE(dots$plot.errors.type %in%
+            c("pointwise", "simultaneous", "bonferroni", "all"))))
+      dots$random.seed <- random.seed
+    value <- .np_plot_progress_run(
+      .np_with_seed(random.seed, .np_udens_resolution_run(
+        do.call(method, c(list(bws = bws), dots)))),
+      enabled = progress.enabled, label = progress.label)
+    return(.np_plot_data_finish(value, bws, dots, method, random.seed))
+  }
+  if(!owns.empty.rows) {
+    value <- .np_plot_progress_run(
+      .np_with_seed(random.seed, do.call(method, c(list(bws = .npRmpi_autodispatch_untag(bws)), dots))),
+      enabled = progress.enabled, label = progress.label)
+    return(.np_plot_data_finish(value, bws, dots, method, random.seed))
+  }
+  publisher <- .npreg_plot_empty_publisher(.plot_context)
+  dots$.np.empty.report <- publisher$record
+  value <- .np_plot_progress_run(.npreg_finish_plot_call(
+    .np_with_seed(random.seed, do.call(method, c(list(bws = .npRmpi_autodispatch_untag(bws)), dots))), publisher),
+    enabled = progress.enabled, label = progress.label)
+  .np_plot_data_finish(value, bws, dots, method, random.seed)
 }
 
 .np_plot_compat_dispatch <- function(bws, ...) {
@@ -555,7 +715,7 @@ np_render_control <- function(style = c("band", "bar"),
   }
 
   if (!is.null(dots$plot.rug)) {
-    dots$plot.rug <- .np_plot_match_flag(dots$plot.rug, "plot.rug")
+    dots$plot.rug <- .np_plot_match_flag(dots$plot.rug, "data_rug")
     if (isTRUE(dots$plot.rug) &&
         !any(c("rbandwidth", "bandwidth", "dbandwidth",
                "conbandwidth", "condbandwidth",
@@ -571,7 +731,7 @@ np_render_control <- function(style = c("band", "bar"),
     dots$plot.data.overlay <- .np_plot_match_flag(dots$plot.data.overlay,
                                                   "plot.data.overlay")
     if (isTRUE(dots$plot.data.overlay)) {
-      stop("plot.data.overlay=TRUE is available only for regression, quantile regression, single-index, partially linear, and smooth coefficient plot surfaces.",
+      stop("data_overlay=TRUE is available only for regression, quantile regression, single-index, partially linear, and smooth coefficient plot surfaces.",
            call. = FALSE)
     }
     dots$plot.data.overlay <- NULL
@@ -610,7 +770,10 @@ np_render_control <- function(style = c("band", "bar"),
 }
 
 .np_plot_restore_bandwidth_from_call <- function(object, bws, caller_env = parent.frame()) {
-  if (!is.null(bws$formula) || is.null(object$call))
+  # The fitted sample is authoritative; calls only recover legacy state.
+  if (!is.null(bws$formula) ||
+      !is.null(bws[[".np.native.training", exact = TRUE]]) ||
+      is.null(object$call))
     return(bws)
 
   bws.orig <- tryCatch(
@@ -631,35 +794,19 @@ np_render_control <- function(style = c("band", "bar"),
     return(out)
 
   if (!is.null(bws$formula) && !is.null(bws$call)) {
-    tt <- terms(bws)
-    m <- match(c("formula", "data", "subset", "na.action"),
-               names(bws$call), nomatch = 0)
-
-    tmf.xf <- tmf <- bws$call[c(1, m)]
-    tmf[[1]] <- tmf.xf[[1]] <- as.name("model.frame")
-    tmf[["formula"]] <- tt
-
-    mf.args <- as.list(tmf)[-1L]
-    tmf <- do.call(stats::model.frame, mf.args, envir = environment(tt))
-
-    bronze <- lapply(bws$chromoly, paste, collapse = " + ")
-    tmf.xf[["formula"]] <- as.formula(paste(" ~ ", bronze[[2]]),
-                                      env = environment(tt))
-    mf.xf.args <- as.list(tmf.xf)[-1L]
-    tmf.xf <- do.call(stats::model.frame, mf.xf.args, envir = environment(tt))
-
-    out$ydat <- model.response(tmf)
-    out$xdat <- tmf.xf
-    out$zdat <- tmf[, bws$chromoly[[3]], drop = FALSE]
+    training <- .np_plreg_formula_training(bws)
+    out$ydat <- training$tydat
+    out$xdat <- training$txdat
+    out$zdat <- training$tzdat
     return(out)
   }
 
   if (!is.null(bws$call)) {
-    out$xdat <- tryCatch(data.frame(.np_eval_bws_call_arg(bws, "xdat")),
+    out$xdat <- tryCatch(data.frame(.np_eval_bws_call_arg(bws, "xdat"), check.names = FALSE),
                          error = function(e) NULL)
     out$ydat <- tryCatch(.np_eval_bws_call_arg(bws, "ydat"),
                          error = function(e) NULL)
-    out$zdat <- tryCatch(data.frame(.np_eval_bws_call_arg(bws, "zdat")),
+    out$zdat <- tryCatch(data.frame(.np_eval_bws_call_arg(bws, "zdat"), check.names = FALSE),
                          error = function(e) NULL)
   }
 
@@ -674,15 +821,11 @@ np_render_control <- function(style = c("band", "bar"),
     context = "plot.npregression"
   )
   dots <- list(...)
-  dots <- .np_plot_normalize_public_dots(dots, context = "plot.npregression")
-  if (is.null(dots$xdat) && is.null(dots$ydat) &&
-      is.null(object$bws$formula) &&
-      !is.null(object$call)) {
-    bws.orig <- tryCatch(.np_eval_call_arg(object$call, "bws", caller_env = parent.frame(2L)),
-                         error = function(e) NULL)
-    if (!is.null(bws.orig) && any(grepl("bandwidth$", class(bws.orig))))
-      object$bws <- bws.orig
-  }
+  dots <- .np_plot_normalize_public_dots(dots, context = "plot.npregression", allow_asymptotic_bias = TRUE)
+  if (is.null(dots$xdat) && is.null(dots$ydat))
+    object$bws <- .np_plot_restore_bandwidth_from_call(
+      object, object$bws, caller_env = parent.frame(2L)
+    )
 
   if (is.null(dots$xdat) && is.null(dots$ydat) &&
       isTRUE(object$trainiseval) &&
@@ -694,12 +837,14 @@ np_render_control <- function(style = c("band", "bar"),
       all(is.finite(object$mean)) &&
       all(is.finite(object$resid))) {
     dots$xdat <- object$eval
-    dots$ydat <- object$mean + object$resid
+    dots$ydat <- .np_plot_reconstruct_response(object, object$bws,
+                                                 "plot.npregression")
     dots$fit.mean.train <- object$mean
   }
 
   plot.args <- c(list(object = object, slot = "bws"), dots)
-  use.local.plot <- !.npRmpi_has_active_slave_pool(comm = 1L) &&
+  use.local.plot <- !.npRmpi_autodispatch_called_from_bcast() &&
+    !.npRmpi_has_active_slave_pool(comm = 1L) &&
     identical(as.character(dots$plot.behavior)[1L], "data")
 
   if (use.local.plot)
@@ -718,55 +863,8 @@ np_render_control <- function(style = c("band", "bar"),
     stop("unused plot argument: plot.rug; did you mean data_rug?",
          call. = FALSE)
   dots <- list(...)
-  dots <- .np_plot_normalize_public_dots(dots, context = "plot.npdensity")
-  plot.rug <- FALSE
-  if (!is.null(dots$plot.rug)) {
-    plot.rug <- .np_plot_match_flag(dots$plot.rug, "plot.rug")
-    dots$plot.rug <- NULL
-  }
-
-  direct.args <- c("plot.behavior", "plot.errors.method", "plot.errors.type",
-                   "plot.errors.boot.num", "plot.errors.boot.method",
-                   "plot.errors.boot.nonfixed",
-                   "plot.errors.alpha", "perspective", "gradients",
-                   "xdat", "data", "neval", "xtrim", "xq")
-  use.direct <- isTRUE(object$ndim == 1) &&
-    isTRUE(object$trainiseval) &&
-    !any(direct.args %in% names(dots))
-
-  if (use.direct) {
-    ex <- object$eval[[1]]
-    if (!is.factor(ex)) {
-      ord <- order(ex)
-      xlab.val <- if (!is.null(dots$xlab)) dots$xlab else gen.label(object$xnames[1], "X1")
-      ylab.val <- if (!is.null(dots$ylab)) dots$ylab else "Density"
-      type.val <- if (!is.null(dots$type)) dots$type else "l"
-
-      dots$xlab <- NULL
-      dots$ylab <- NULL
-      dots$type <- NULL
-
-      do.call(plot, c(list(x = as.numeric(ex[ord]),
-                           y = as.numeric(object$dens[ord]),
-                           type = type.val,
-                           xlab = xlab.val,
-                           ylab = ylab.val),
-                      dots))
-      if (isTRUE(plot.rug)) {
-        .np_plot_validate_rug_request(
-          plot.rug = TRUE,
-          route = "plot.npdensity()",
-          supported.route = TRUE,
-          renderer = "base"
-        )
-        .np_plot_draw_rug_1d(as.numeric(ex))
-      }
-      return(invisible(object))
-    }
-  }
-
-  if (isTRUE(plot.rug))
-    dots$plot.rug <- TRUE
+  dots <- .np_plot_normalize_public_dots(dots, context = "plot.npdensity",
+    allow_asymptotic_bias = TRUE)
   do.call(.np_plot_from_slot, c(list(object = object, slot = "bws"), dots))
 }
 .np_plot_condensity <- function(object, ..., .plot_dots_call = NULL) {
@@ -776,10 +874,10 @@ np_render_control <- function(style = c("band", "bar"),
     bws = object$bws,
     context = "plot.condensity"
   )
-  dots <- list(...)
-  dots <- .np_plot_normalize_public_dots(dots, context = "plot.condensity")
-  if (is.null(dots$proper) && isTRUE(object$proper.requested))
-    dots$proper <- TRUE
+  dots <- .np_plot_internal_names(list(...))
+  dots <- .np_plot_normalize_public_dots(dots, context = "plot.condensity",
+    allow_asymptotic_bias = inherits(dots[["bias.control",exact=TRUE]],"np_conditional_bias_control"))
+  dots <- .np_conditional_replay_proper(object, dots)
   do.call(.np_plot_from_slot, c(list(object = object, slot = "bws"), dots))
 }
 .np_plot_condistribution <- function(object, ..., .plot_dots_call = NULL) {
@@ -789,10 +887,10 @@ np_render_control <- function(style = c("band", "bar"),
     bws = object$bws,
     context = "plot.condistribution"
   )
-  dots <- list(...)
-  dots <- .np_plot_normalize_public_dots(dots, context = "plot.condistribution")
-  if (is.null(dots$proper) && isTRUE(object$proper.requested))
-    dots$proper <- TRUE
+  dots <- .np_plot_internal_names(list(...))
+  dots <- .np_plot_normalize_public_dots(dots, context = "plot.condistribution",
+    allow_asymptotic_bias = inherits(dots[["bias.control",exact=TRUE]],"np_conditional_bias_control"))
+  dots <- .np_conditional_replay_proper(object, dots)
   do.call(.np_plot_from_slot, c(list(object = object, slot = "bws"), dots))
 }
 .np_plot_npdistribution <- function(object, ..., .plot_dots_call = NULL)
@@ -810,6 +908,8 @@ np_render_control <- function(style = c("band", "bar"),
   dots <- .np_plot_normalize_public_dots(dots, context = "plot.qregression")
   if (is.null(dots$quantreg))
     dots$quantreg <- TRUE
+  if (isTRUE(dots$quantreg))
+    dots <- .npqreg_replay_controls(object, dots)
   if (is.null(dots$tau) && !is.null(object$tau))
     dots$tau <- object$tau
   if (is.null(dots$plot.data.overlay) && !isTRUE(dots$gradients))
@@ -833,7 +933,13 @@ np_render_control <- function(style = c("band", "bar"),
                                   center = "estimate",
                                   bootstrap = "inid",
                                   B = 399L,
-                                  blocklen = NULL) {
+                                  blocklen = NULL,
+                                       gaussian.draws = 9999L) {
+  reconstruct.uncertainty <- (identical(errors, "bootstrap") && !isTRUE(gradients)) ||
+    (identical(errors, "asymptotic") &&
+       (isTRUE(gradients) || band %in% c("simultaneous", "all")))
+  if (reconstruct.uncertainty)
+    .np_conditional_require_replay_policy(object, "plot.conmode")
   lev <- if (!is.null(object$probability.levels)) {
     as.character(object$probability.levels)
   } else if (!is.null(object$probability.gradient.level)) {
@@ -859,10 +965,16 @@ np_render_control <- function(style = c("band", "bar"),
   level.idx <- match(level, lev)
 
   if (isTRUE(gradients)) {
+    .np_plot_conmode_gradient_availability(
+      bws = object$bws,
+      where = "plot.conmode"
+    )
     values <- object$probability.gradients
     if (is.null(values))
-      stop("class-probability gradients/effects are not available: fit with gradients=TRUE",
-           call. = FALSE)
+      .np_stop_missing_output(
+        quote(NULL), "npconmode",
+        message = "class-probability gradients/effects are not available.",
+        switches = "gradients = TRUE")
     stored.level <- object$probability.gradient.level
     if (!identical(as.character(level), as.character(stored.level)))
       stop(sprintf("stored class-probability gradients are for level %s; refit with level=%s to plot that level",
@@ -923,10 +1035,11 @@ np_render_control <- function(style = c("band", "bar"),
     if (!isTRUE(gradients) && !identical(errors, "none")) {
       se <- rep(NA_real_, nrow(out[[j]]))
       if (identical(errors, "asymptotic")) {
-        se <- object$probability.errors
-        if (is.null(se))
-          stop("class-probability standard errors are not available: refit with probabilities=TRUE",
-               call. = FALSE)
+        se <- .np_require_stored_se(
+          object, object[["probability.errors", exact = TRUE]], "npconmode",
+          what = "class-probability standard errors", expr = substitute(object),
+          switches = "probabilities = TRUE, se = TRUE"
+        )
         se <- as.matrix(se)[, level.idx]
         repaired <- object$probability.repaired.rows
         if (!is.null(repaired)) {
@@ -943,19 +1056,72 @@ np_render_control <- function(style = c("band", "bar"),
         center = center,
         bootstrap_raw = boot.raw
       )
+      if (identical(errors, "asymptotic") && band %in% c("simultaneous", "all")) {
+        if (j == 1L) {
+          training <- .np_plot_conmode_training_data(object)
+          out[[j]] <- .np_plot_conmode_joint_columns(out[[j]], object,
+            training$xtrain, training$ytrain, xeval, level, lev, se,
+            alpha, band, gaussian.draws)
+        } else {
+          fields <- if (identical(band, "all")) c("simultaneous.lower", "simultaneous.upper") else c("lower", "upper")
+          out[[j]][fields] <- out[[1L]][fields]
+          attr(out[[j]], "band.calibration") <- attr(out[[1L]], "band.calibration", exact = TRUE)
+        }
+      }
     }
   }
+  if (isTRUE(gradients) && identical(errors,"asymptotic")) {
+    training <- .np_plot_conmode_training_data(object)
+    for(j in seq_len(p)) out[[j]] <- .np_plot_conmode_joint_columns(
+      out[[j]],object,training$xtrain,training$ytrain,xeval,level,lev,
+      rep(NA_real_,nrow(xeval)),alpha,band,gaussian.draws)
+  }
+  for (j in seq_len(p)) attr(out[[j]], "plot.grid") <- xeval
   names(out) <- xnames
   out
 }
 
+.np_plot_conmode_gradient_availability <- function(bws, where) {
+  available <- rep.int(TRUE, bws$xndim)
+  reg.spec <- npConditionalRegEngineSpec(bws, where = where)
+  if (!identical(reg.spec$reg.engine, "lp") || bws$xncon < 1L)
+    return(available)
+
+  order <- rep.int(1L, bws$xncon)
+  continuous.available <- npGlpGradientAvailability(
+    regtype.engine = reg.spec$reg.engine,
+    degree.engine = reg.spec$degree.engine,
+    gradient.order = order,
+    ncon = bws$xncon
+  )
+  available[which(bws$ixcon)] <- continuous.available
+  if (!any(available)) {
+    npStopGlpGradientNoneAvailable(
+      where = where,
+      action = "plot",
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = order,
+      available = continuous.available,
+      con.names = bws$xnames[bws$ixcon]
+    )
+  }
+  if (any(!continuous.available)) {
+    npWarnGlpGradientPartialAvailability(
+      where = where,
+      degree.engine = reg.spec$degree.engine,
+      gradient.order = order,
+      available = continuous.available,
+      con.names = bws$xnames[bws$ixcon]
+    )
+  }
+  available
+}
+
 .np_plot_conmode_cast_like <- function(x, template) {
   if (is.factor(template))
-    return(factor(as.character(x),
+    return(.np_factor_with_levels(x,
                   levels = levels(template),
                   ordered = is.ordered(template)))
-  if (is.integer(template))
-    return(as.integer(x))
   if (is.numeric(template))
     return(as.numeric(x))
   x
@@ -963,7 +1129,7 @@ np_render_control <- function(style = c("band", "bar"),
 
 .np_plot_conmode_grid_values <- function(x, neval, xtrim) {
   if (is.factor(x)) {
-    return(factor(levels(x), levels = levels(x), ordered = is.ordered(x)))
+    return(.np_factor_with_levels(levels(x), levels = levels(x), ordered = is.ordered(x)))
   }
   rng <- stats::quantile(x, probs = xtrim, names = FALSE, na.rm = TRUE)
   seq(rng[1L], rng[2L], length.out = neval)
@@ -980,7 +1146,7 @@ np_render_control <- function(style = c("band", "bar"),
 
 .np_plot_conmode_level_factor <- function(ytrain, level, n) {
   y <- ytrain[[1L]]
-  factor(rep(level, n),
+  .np_factor_with_levels(rep(level, n),
          levels = levels(y),
          ordered = is.ordered(y))
 }
@@ -998,7 +1164,16 @@ np_render_control <- function(style = c("band", "bar"),
   if (is.null(xtrain) || is.null(ytrain))
     stop("fixed-grid plot.conmode displays require an object fitted with probabilities=TRUE or gradients=TRUE",
          call. = FALSE)
-  list(xtrain = as.data.frame(xtrain), ytrain = as.data.frame(ytrain))
+  xtrain <- as.data.frame(xtrain)
+  ytrain <- as.data.frame(ytrain)
+  # Training outputs may have been padded to their original NA positions.
+  # Numerical plot owners use the compact paired sample, retaining its order.
+  if (anyNA(xtrain) || anyNA(ytrain)) {
+    keep <- complete.cases(xtrain, ytrain)
+    xtrain <- xtrain[keep, , drop = FALSE]
+    ytrain <- ytrain[keep, , drop = FALSE]
+  }
+  list(xtrain = xtrain, ytrain = ytrain)
 }
 
 .np_plot_conmode_levels <- function(object, ytrain) {
@@ -1043,6 +1218,7 @@ np_render_control <- function(style = c("band", "bar"),
 }
 
 .np_plot_conmode_resolve_xtrim <- function(xtrim) {
+  if (inherits(xtrim, "np_plot_trim_range")) xtrim <- xtrim$probs
   if (!is.numeric(xtrim) || length(xtrim) != 2L ||
       any(is.na(xtrim)) || any(xtrim < 0) || any(xtrim > 1) ||
       xtrim[1L] >= xtrim[2L])
@@ -1074,7 +1250,8 @@ np_render_control <- function(style = c("band", "bar"),
     tydat = ytrain,
     exdat = exdat,
     eydat = .np_plot_conmode_level_factor(ytrain, level, nrow(exdat)),
-    bws = object$bws
+    bws = object$bws,
+    se = TRUE
   )
   as.vector(dens.obj$conderr)
 }
@@ -1295,6 +1472,23 @@ np_render_control <- function(style = c("band", "bar"),
                                            method,
                                            B,
                                            blocklen) {
+  # Padded display rows are not bootstrap targets. Compute on defined
+  # conditioning rows, then restore the original display positions.
+  if (anyNA(exdat)) {
+    keep <- complete.cases(exdat)
+    omit <- which(!keep)
+    if (length(omit)) {
+      out <- .np_plot_conmode_bootstrap_raw(object, xtrain, ytrain,
+        exdat[keep, , drop = FALSE], level, levels, t0[keep], alpha, band,
+        center, method, B, blocklen)
+      out$boot.err <- .npConmodeNapredictRows(omit, out$boot.err)
+      if (!is.null(out$boot.all.err))
+        out$boot.all.err <- lapply(out$boot.all.err, function(z)
+          .npConmodeNapredictRows(omit, z))
+      out$boot.t <- t(.npConmodeNapredictRows(omit, t(out$boot.t)))
+      return(out)
+    }
+  }
   boot.out <- .np_plot_conmode_bootstrap_values(
     object = object,
     xtrain = xtrain,
@@ -1379,13 +1573,16 @@ np_render_control <- function(style = c("band", "bar"),
                                        center = "estimate",
                                        bootstrap = "inid",
                                        B = 399L,
-                                       blocklen = NULL) {
+                                       blocklen = NULL,
+                                       gaussian.draws = 9999L) {
   if (!isTRUE(gradients) && is.null(object$probabilities))
     stop("class probabilities are not available: fit with probabilities=TRUE or gradients=TRUE",
          call. = FALSE)
   if (isTRUE(gradients) && is.null(object$probability.gradients))
-    stop("class-probability gradients/effects are not available: fit with gradients=TRUE",
-         call. = FALSE)
+    .np_stop_missing_output(
+      quote(NULL), "npconmode",
+      message = "class-probability gradients/effects are not available.",
+      switches = "gradients = TRUE")
 
   training <- .np_plot_conmode_training_data(object)
   xtrain <- training$xtrain
@@ -1412,6 +1609,14 @@ np_render_control <- function(style = c("band", "bar"),
   ixcon <- object$bws$ixcon
   if (is.null(ixcon) || length(ixcon) != p)
     ixcon <- vapply(xtrain, is.numeric, logical(1L))
+  gradient.available <- if (isTRUE(gradients)) {
+    .np_plot_conmode_gradient_availability(
+      bws = object$bws,
+      where = "plot.conmode"
+    )
+  } else {
+    rep.int(TRUE, p)
+  }
 
   for (j in seq_len(p)) {
     grid <- .np_plot_conmode_grid_values(xtrain[[j]], neval = neval,
@@ -1420,7 +1625,9 @@ np_render_control <- function(style = c("band", "bar"),
     exdat[[j]] <- .np_plot_conmode_cast_like(grid, xtrain[[j]])
 
     if (isTRUE(gradients)) {
-      if (isTRUE(ixcon[j])) {
+      if (!gradient.available[j]) {
+        vals <- rep.int(NA_real_, nrow(exdat))
+      } else if (isTRUE(ixcon[j])) {
         s <- integer(sum(ixcon))
         names(s) <- xnames[ixcon]
         s[xnames[j]] <- 1L
@@ -1435,7 +1642,28 @@ np_render_control <- function(style = c("band", "bar"),
           s = s
         )
       } else {
-        vals <- rep(0, nrow(exdat))
+        frames <- npCategoricalFirstDifferenceFrames(
+          exdat = exdat,
+          index = j,
+          where = "plot.conmode"
+        )
+        eval.level <- function(z) {
+          if (isTRUE(object$proper.requested)) {
+            probability <- .np_plot_conmode_probability_matrix(
+              object, xtrain, ytrain, z, lev)$probabilities
+            return(as.vector(probability[, match(level, lev)]))
+          }
+          as.vector(npcdenshat(
+            bws = object$bws,
+            txdat = xtrain,
+            tydat = ytrain,
+            exdat = z,
+            eydat = .np_plot_conmode_level_factor(ytrain, level, nrow(z)),
+            y = rhs,
+            output = "apply"
+          ))
+        }
+        vals <- eval.level(frames$upper) - eval.level(frames$lower)
       }
       out[[j]] <- data.frame(
         variable = xnames[j],
@@ -1446,6 +1674,9 @@ np_render_control <- function(style = c("band", "bar"),
         view = "fixed",
         stringsAsFactors = FALSE
       )
+      if (identical(errors,"asymptotic")) out[[j]] <- .np_plot_conmode_joint_columns(
+        out[[j]],object,xtrain,ytrain,exdat,level,lev,
+        rep(NA_real_,nrow(exdat)),alpha,band,gaussian.draws)
     } else {
       pmat <- matrix(NA_real_, nrow(exdat), length(lev),
                      dimnames = list(NULL, lev))
@@ -1513,9 +1744,13 @@ np_render_control <- function(style = c("band", "bar"),
           center = center,
           bootstrap_raw = boot.raw
         )
+        if (identical(errors, "asymptotic") && band %in% c("simultaneous", "all"))
+          dat <- .np_plot_conmode_joint_columns(dat, object, xtrain, ytrain,
+            exdat, level, lev, se, alpha, band, gaussian.draws)
       }
       out[[j]] <- dat
     }
+    attr(out[[j]], "plot.grid") <- exdat
   }
   out
 }
@@ -1531,19 +1766,22 @@ np_render_control <- function(style = c("band", "bar"),
   con.names <- xnames[ixcon]
   if (is.null(plot.vars)) {
     if (length(con.names) != 2L)
-      stop("surface plot.conmode payloads require exactly two continuous conditioning variables, or a length-two 'plot.vars' selection",
+      stop("surface plot.conmode payloads require exactly two continuous conditioning variables, or a length-two 'plot_vars' selection",
            call. = FALSE)
-    return(con.names)
+    plot.vars <- con.names
   }
   if (!is.character(plot.vars) || length(plot.vars) != 2L ||
       any(is.na(plot.vars)) || any(!nzchar(plot.vars)))
-    stop("'plot.vars' must be a character vector naming exactly two conditioning variables",
+    stop("'plot_vars' must be a character vector naming exactly two conditioning variables",
+         call. = FALSE)
+  if (anyDuplicated(plot.vars))
+    stop("'plot_vars' must name two distinct conditioning variables",
          call. = FALSE)
   if (any(!(plot.vars %in% xnames)))
-    stop("'plot.vars' must name conditioning variables in the fitted conmode object",
+    stop("'plot_vars' must name conditioning variables in the fitted conmode object",
          call. = FALSE)
   if (any(!(plot.vars %in% con.names)))
-    stop("surface plot.conmode payloads currently require continuous variables in 'plot.vars'",
+    stop("surface plot.conmode payloads currently require continuous variables in 'plot_vars'",
          call. = FALSE)
   plot.vars
 }
@@ -1556,7 +1794,8 @@ np_render_control <- function(style = c("band", "bar"),
                                           plot.vars = NULL,
                                           errors = "none",
                                           alpha = 0.05,
-                                          band = "pointwise") {
+                                          band = "pointwise",
+                                          gaussian.draws = 9999L) {
   if (is.null(object$probabilities))
     stop("class probabilities are not available: fit with probabilities=TRUE or gradients=TRUE",
          call. = FALSE)
@@ -1652,6 +1891,9 @@ np_render_control <- function(style = c("band", "bar"),
       alpha = alpha,
       band = band
     )
+    if (identical(errors, "asymptotic") && band %in% c("simultaneous", "all"))
+      surface <- .np_plot_conmode_joint_columns(surface, object, xtrain, ytrain,
+        exdat, level, lev, se, alpha, band, gaussian.draws)
   }
   held.vars <- setdiff(xnames, plot.vars)
   held <- if (length(held.vars)) base[, held.vars, drop = FALSE] else data.frame()
@@ -1677,6 +1919,43 @@ np_render_control <- function(style = c("band", "bar"),
   matrix(payload$surface$probability, nrow = dims[1L], ncol = dims[2L])
 }
 
+.np_plot_conmode_surface_intervals <- function(payload, band) {
+  dims <- payload$grid$dims
+  surface <- payload$surface
+  if (!is.numeric(dims) || length(dims) != 2L || anyNA(dims) ||
+      any(!is.finite(dims)) || any(dims < 1 | dims != floor(dims)) ||
+      prod(dims) != nrow(surface))
+    stop("conmode surface interval grid is incompatible with its payload", call. = FALSE)
+  i <- surface$grid_index1
+  j <- surface$grid_index2
+  if (!is.numeric(i) || !is.numeric(j) || length(i) != nrow(surface) ||
+      length(j) != nrow(surface) || anyNA(i) || anyNA(j) ||
+      any(!is.finite(i)) || any(!is.finite(j)) ||
+      any(i < 1 | i > dims[1L] | i != floor(i)) ||
+      any(j < 1 | j > dims[2L] | j != floor(j)))
+    stop("conmode surface interval indices are invalid", call. = FALSE)
+  cell <- i + dims[1L] * (j - 1)
+  if (anyDuplicated(cell))
+    stop("conmode surface interval grid has duplicated cells", call. = FALSE)
+  row.order <- order(cell)
+  as.surface <- function(name) {
+    values <- surface[[name]]
+    if (!is.numeric(values) || length(values) != nrow(surface))
+      stop("conmode surface interval column is missing or incompatible: ", name,
+           call. = FALSE)
+    matrix(values[row.order], nrow = dims[1L], ncol = dims[2L])
+  }
+  out <- list(z = as.surface("probability"),
+              lower = as.surface("lower"), upper = as.surface("upper"),
+              lower.all = NULL, upper.all = NULL)
+  if (identical(band, "all")) {
+    bands <- c("pointwise", "simultaneous", "bonferroni")
+    out$lower.all <- setNames(lapply(paste0(bands, ".lower"), as.surface), bands)
+    out$upper.all <- setNames(lapply(paste0(bands, ".upper"), as.surface), bands)
+  }
+  out
+}
+
 .np_plot_conmode_validate_zlim <- function(zlim) {
   if (is.null(zlim))
     return(NULL)
@@ -1687,14 +1966,20 @@ np_render_control <- function(style = c("band", "bar"),
   zlim
 }
 
-.np_plot_conmode_surface_panel <- function(payload, dots, renderer = "base") {
+.np_plot_conmode_surface_panel <- function(payload, dots, renderer = "base",
+                                            errors = "none", band = "pointwise",
+                                            alpha = 0.05, legend = TRUE) {
   vars <- payload$grid$variables
   x1 <- payload$grid$values[[1L]]
   x2 <- payload$grid$values[[2L]]
-  z <- .np_plot_conmode_surface_matrix(payload)
+  intervals <- if (identical(errors, "none")) NULL else
+    .np_plot_conmode_surface_intervals(payload, band)
+  z <- if (is.null(intervals)) .np_plot_conmode_surface_matrix(payload) else intervals$z
   zlim <- .np_plot_conmode_validate_zlim(dots$zlim)
-  if (is.null(zlim))
-    zlim <- c(0, 1)
+  if (is.null(zlim)) {
+    zlim <- if (is.null(intervals)) c(0, 1) else
+      range(c(0, 1, unlist(intervals, use.names = FALSE)), finite = TRUE)
+  }
 
   theta <- .np_plot_scalar_default(dots$theta, 0)
   phi <- .np_plot_scalar_default(dots$phi, 20)
@@ -1709,6 +1994,8 @@ np_render_control <- function(style = c("band", "bar"),
 
   if (identical(renderer, "rgl")) {
     rgl.view <- .np_plot_rgl_view_angles(theta = theta, phi = phi)
+    rgl.controls <- if (is.null(intervals)) .np_plot_rgl_controls(dots) else
+      .np_plot_rgl_controls(dots, legend = legend)
     return(.np_plot_render_surface_rgl(
       x = x1,
       y = x2,
@@ -1722,11 +2009,21 @@ np_render_control <- function(style = c("band", "bar"),
       col = dots$col,
       border = border,
       zlim = zlim,
-      par3d.args = .np_plot_collect_rgl_args(dots, "rgl.par3d", "rgl.par3d."),
-      view3d.args = .np_plot_collect_rgl_args(dots, "rgl.view3d", "rgl.view3d."),
-      persp3d.args = .np_plot_collect_rgl_args(dots, "rgl.persp3d", "rgl.persp3d."),
-      grid3d.args = .np_plot_collect_rgl_args(dots, "rgl.grid3d", "rgl.grid3d."),
-      widget.args = .np_plot_collect_rgl_args(dots, "rgl.widget", "rgl.widget.")
+      par3d.args = rgl.controls$par3d,
+      view3d.args = rgl.controls$view3d,
+      persp3d.args = rgl.controls$persp3d,
+      grid3d.args = rgl.controls$grid3d,
+      widget.args = rgl.controls$widget,
+      draw.extras = if (is.null(intervals)) NULL else function() {
+        .np_plot_error_surfaces_rgl(
+          x = x1, y = x2, plot.errors.type = band,
+          plot.errors.method = errors,
+          lerr = intervals$lower, herr = intervals$upper,
+          lerr.all = intervals$lower.all, herr.all = intervals$upper.all,
+          surface3d.args = rgl.controls$surface3d,
+          legend3d.args = rgl.controls$legend3d
+        )
+      }
     ))
   }
 
@@ -1744,7 +2041,7 @@ np_render_control <- function(style = c("band", "bar"),
     main = main,
     col = grDevices::adjustcolor(
       .np_plot_persp_surface_colors(z = z, col = dots$col),
-      alpha.f = 0.5
+      alpha.f = .np_plot_surface_alpha("base")
     ),
     border = border
   )
@@ -1752,7 +2049,34 @@ np_render_control <- function(style = c("band", "bar"),
     persp.args,
     .np_plot_user_args(dots, "persp")
   )
-  do.call(graphics::persp, persp.args)
+  if (!is.null(intervals) && "sub" %in% names(dots))
+    persp.args$sub <- dots$sub
+  persp.mat <- .np_plot_render_surface_base_frame(
+    persp.args = persp.args,
+    xlim = range(x1, finite = TRUE),
+    ylim = range(x2, finite = TRUE),
+    zlim = zlim
+  )
+  if (!is.null(intervals)) {
+    .np_plot_draw_error_wireframes_persp(
+      x = x1, y = x2, persp.mat = persp.mat, plot.errors.type = band,
+      lerr = intervals$lower, herr = intervals$upper,
+      lerr.all = intervals$lower.all, herr.all = intervals$upper.all,
+      border = .np_plot_color("context_wire"),
+      lwd = .np_plot_scalar_default(dots$lwd, graphics::par()$lwd),
+      annotation = .np_plot_variability_annotation_spec(
+        plot.errors.method = errors, plot.errors.type = band,
+        plot.errors.alpha = alpha, plot.errors.center = "estimate",
+        sub.supplied = "sub" %in% names(dots), plot.args = persp.args,
+        continuous = TRUE, fixed = TRUE
+      )
+    )
+    if (identical(band, "all"))
+      .np_plot_draw_all_band_legend(
+        legend = legend, x = "topright", plot.errors.method = errors,
+        lerr.all = intervals$lower.all, herr.all = intervals$upper.all
+      )
+  }
   invisible(NULL)
 }
 
@@ -1764,9 +2088,11 @@ np_render_control <- function(style = c("band", "bar"),
                                    data_rug = FALSE,
                                    main = NULL,
                                    xlab = NULL,
-                                   ylab = NULL) {
+                                   ylab = NULL,
+                                   annotation = NULL) {
   x <- dat$x
   y <- if (isTRUE(gradients)) dat$effect else dat$probability
+  y <- .np_plot_geometry_values(y)
   vname <- dat$variable[1L]
   if (is.null(main))
     main <- if (isTRUE(gradients)) {
@@ -1777,7 +2103,15 @@ np_render_control <- function(style = c("band", "bar"),
   if (is.null(xlab))
     xlab <- vname
   if (is.null(ylab))
-    ylab <- if (isTRUE(gradients)) "Effect" else "Probability"
+    ylab <- if (isTRUE(gradients)) {
+      .np_plot_gradient_axis_label(
+        target = paste0("Pr(Y=", level, "|X=x)"),
+        predictor = vname,
+        categorical = is.factor(x)
+      )
+    } else {
+      "Probability"
+    }
 
   fixed.grid <- identical(dat$view[1L], "fixed")
   if (is.factor(x) && !is.ordered(x) && !isTRUE(fixed.grid)) {
@@ -1810,6 +2144,8 @@ np_render_control <- function(style = c("band", "bar"),
     args,
     plot.user.args
   )
+  if (!any(is.finite(y)) && is.null(args$ylim))
+    args$ylim <- c(-1, 1)
   if (is.factor(x)) {
     args$xaxt <- "n"
     do.call(graphics::plot, args)
@@ -1829,8 +2165,15 @@ np_render_control <- function(style = c("band", "bar"),
         graphics::segments(xord[good], lower[good], xord[good], upper[good],
                            col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
       } else {
-        graphics::lines(xord[good], lower[good], col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
-        graphics::lines(xord[good], upper[good], col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
+        geometry <- .np_plot_interval_geometry(xord, lower, upper)
+        graphics::lines(geometry$x, geometry$lower, col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
+        graphics::lines(geometry$x, geometry$upper, col = .np_plot_color("interval_context"), lty = .np_plot_lty("interval"))
+      }
+      if (!is.null(annotation)) {
+        annotation$plot.args$main <- args$main
+        annotation$plot.args$xlab <- args$xlab
+        annotation$continuous <- !is.factor(x)
+        .np_plot_draw_variability_annotation(annotation)
       }
     }
   }
@@ -1840,35 +2183,37 @@ np_render_control <- function(style = c("band", "bar"),
 .np_plot_conmode <- function(object, ...,
                              gradients = FALSE,
                              level = NULL,
-                             output = c("plot", "data", "plot-data", "both"),
-                             data_rug = FALSE,
+                             output = c("plot", "data", "plot-data"),
+                             data.rug = FALSE,
                              layout = TRUE,
                              legend = TRUE,
                              .plot_dots_call = NULL) {
-  dots <- list(...)
   dot.names <- .np_plot_dot_names(.plot_dots_call)
+  .np_plot_check_public_names(dot.names)
+  dot.names <- names(.np_plot_internal_names(setNames(vector("list", length(dot.names)), dot.names)))
   if (any(!nzchar(dot.names)))
     stop("unnamed plot arguments are not supported for plot.conmode",
          call. = FALSE)
-  interval.args <- c("errors", "band", "alpha", "bootstrap", "B", "center",
-                     "render_control",
-                     "boot_control", "plot.errors.method", "plot.errors.type",
+  interval.args <- c("errors", "band", "alpha", "gaussian.draws", "bootstrap", "B", "center",
+                     "render.control",
+                     "boot.control", "plot.errors.method", "plot.errors.type",
                      "plot.errors.alpha", "plot.errors.boot.method",
                      "plot.errors.boot.num", "plot.errors.boot.nonfixed",
                      "plot.errors.boot.wild", "plot.errors.boot.blocklen",
                      "plot.errors.center", "plot.errors.style",
                      "plot.errors.bar", "plot.errors.bar.num")
   surface.args <- c("renderer", "perspective", "persp", "plot.vars")
-  grid.args <- c("neval", "grid_control", "view", "xtrim", "xq")
+  grid.args <- c("neval", "grid.control", "view", "xtrim", "xq")
   grid.supplied <- intersect(dot.names[nzchar(dot.names)], grid.args)
   rgl.prefixed.args <- dot.names[startsWith(dot.names, "rgl.")]
-  allowed <- unique(c("gradients", "level", "output", "data_rug",
+  allowed <- unique(c("gradients", "level", "output", "data.rug",
                       "random.seed",
                       "layout", "legend", grid.args, surface.args,
                       interval.args, rgl.prefixed.args,
                       .np_plot_graphics_arg_names()))
   .np_plot_stop_unused_args(setdiff(dot.names[nzchar(dot.names)], allowed),
                             allowed)
+  dots <- .np_plot_internal_names(list(...))
   perspective.raw <- dots$perspective
   persp.raw <- dots$persp
   dots$perspective <- NULL
@@ -1883,7 +2228,7 @@ np_render_control <- function(style = c("band", "bar"),
     dots$plot.behavior <- NULL
   }
   if (!is.null(dots$plot.rug)) {
-    data_rug <- dots$plot.rug
+    data.rug <- dots$plot.rug
     dots$plot.rug <- NULL
   }
   if (!is.null(dots$plot.par.mfrow)) {
@@ -1902,6 +2247,13 @@ np_render_control <- function(style = c("band", "bar"),
                           c("pmzsd", "pointwise", "bonferroni",
                             "simultaneous", "all"),
                           "plot.errors.type")
+  joint.request <- identical(errors, "asymptotic") && band %in% c("simultaneous", "all")
+  gaussian.draws <- if (is.null(dots$gaussian.draws)) 9999L else dots$gaussian.draws
+  if (!is.null(dots$gaussian.draws) && !joint.request)
+    stop("gaussian_draws requires asymptotic simultaneous or all bands", call. = FALSE)
+  if (joint.request)
+    gaussian.draws <- .np_plot_gaussian_integer(gaussian.draws, "gaussian.draws")
+  dots$gaussian.draws <- NULL
   alpha <- if (is.null(dots$plot.errors.alpha)) 0.05 else
     dots$plot.errors.alpha
   center <- if (is.null(dots$plot.errors.center)) "estimate" else
@@ -1933,10 +2285,10 @@ np_render_control <- function(style = c("band", "bar"),
     stop("plot.conmode probability intervals currently use simple asymptotic line/error-bar rendering; render_control/style arguments are not yet implemented",
          call. = FALSE)
   gradients <- npValidateScalarLogical(gradients, "gradients")
-  if (!identical(errors, "none") && isTRUE(gradients))
-    stop("plot.conmode intervals are available for class probabilities, not probability gradients/effects",
+  if (identical(errors, "bootstrap") && isTRUE(gradients))
+    stop("plot.conmode gradient/effect intervals currently require errors=\"asymptotic\"",
          call. = FALSE)
-  data_rug <- npValidateScalarLogical(data_rug, "data_rug")
+  data.rug <- npValidateScalarLogical(data.rug, "data.rug")
   renderer <- "base"
   if (!is.null(dots$renderer))
     renderer <- .np_plot_match_renderer(dots$renderer)
@@ -1953,7 +2305,7 @@ np_render_control <- function(style = c("band", "bar"),
     perspective <- persp.value
   }
   if (!is.null(dots$plot.vars) && !isTRUE(perspective))
-    stop("'plot.vars' is only supported for fixed surface payloads with perspective=TRUE",
+    stop("'plot_vars' is only supported for fixed surface payloads with perspective=TRUE",
          call. = FALSE)
   if (!identical(renderer, "base") && !isTRUE(perspective))
     stop("renderer='rgl' is supported only for fixed surface payloads with perspective=TRUE",
@@ -1973,30 +2325,26 @@ np_render_control <- function(style = c("band", "bar"),
     neval <- 50L
   xtrim <- dots$xtrim
   xq <- dots$xq
-  if (!is.null(dots$grid_control)) {
-    if (!inherits(dots$grid_control, "np_grid_control"))
+  if (!is.null(dots$grid.control)) {
+    if (!inherits(dots$grid.control, "np_grid_control"))
       stop("grid_control must be created by np_grid_control()", call. = FALSE)
-    if (!is.null(dots$grid_control$slices))
+    if (!is.null(dots$grid.control$slices))
       stop("grid_control$slices is not yet supported for plot.conmode",
            call. = FALSE)
-    if (!is.null(dots$grid_control$xtrim))
-      xtrim <- dots$grid_control$xtrim
-    if (!is.null(dots$grid_control$xq))
-      xq <- dots$grid_control$xq
+    if (!is.null(dots$grid.control$xtrim))
+      xtrim <- dots$grid.control$xtrim
+    if (!is.null(dots$grid.control$xq))
+      xq <- dots$grid.control$xq
   }
   if (is.null(xtrim))
     xtrim <- c(0, 1)
-  plot.par.mfrow <- .np_plot_match_layout(layout)
+  plot.par.mfrow <- .np_plot_resolve_mfrow(.np_plot_match_layout(layout))
   output <- match.arg(output)
   if (identical(output, "both"))
     output <- "plot-data"
   output <- .np_plot_scalar_match(output, c("plot", "data", "plot-data"), "output")
-  if (!identical(errors, "none") && isTRUE(perspective) &&
-      !identical(output, "data"))
-    stop("surface probability intervals are available as output=\"data\" only; surface band rendering is not yet implemented for plot.conmode",
-         call. = FALSE)
   if (identical(errors, "bootstrap") && isTRUE(perspective))
-    stop("surface bootstrap intervals are not yet implemented for plot.conmode; use one-dimensional views or errors=\"asymptotic\" with output=\"data\"",
+    stop("surface bootstrap intervals are not yet implemented for plot.conmode; use one-dimensional views or errors=\"asymptotic\"",
          call. = FALSE)
   plot.user.args <- .np_plot_user_args(dots, "plot")
   line.user.args <- .np_plot_user_args(dots, "lines")
@@ -2014,7 +2362,8 @@ np_render_control <- function(style = c("band", "bar"),
         plot.vars = dots$plot.vars,
         errors = errors,
         alpha = alpha,
-        band = band
+        band = band,
+        gaussian.draws = gaussian.draws
       )
     } else if (identical(view, "fixed")) {
       .np_plot_conmode_grid_data(
@@ -2030,7 +2379,8 @@ np_render_control <- function(style = c("band", "bar"),
         center = center,
         bootstrap = bootstrap,
         B = B,
-        blocklen = boot.blocklen
+        blocklen = boot.blocklen,
+        gaussian.draws = gaussian.draws
       )
     } else {
       .np_plot_conmode_data(
@@ -2043,32 +2393,44 @@ np_render_control <- function(style = c("band", "bar"),
         center = center,
         bootstrap = bootstrap,
         B = B,
-        blocklen = boot.blocklen
+        blocklen = boot.blocklen,
+        gaussian.draws = gaussian.draws
       )
     }
   })
 
+  plot.result <- if (!identical(output, "plot"))
+    .np_plot_data_from_conmode(plot.data,
+      list(errors = errors, band = band, alpha = alpha, center = center,
+           bootstrap = bootstrap, B = B, gradients = gradients, view = view,
+           gaussian_draws = gaussian.draws, random_seed = random.seed), gradients = gradients) else NULL
+
   if (isTRUE(perspective)) {
     if (identical(output, "data"))
-      return(plot.data)
+      return(plot.result)
     render.out <- .np_plot_conmode_surface_panel(plot.data, dots,
-                                                 renderer = renderer)
+                                                 renderer = renderer,
+                                                 errors = errors, band = band,
+                                                 alpha = alpha, legend = legend)
     if (identical(renderer, "rgl"))
       return(.np_plot_rgl_finalize(
         rgl.out = render.out,
         plot.behavior = output,
-        plot.data = plot.data
+        plot.data = plot.result
       ))
     if (identical(output, "plot-data"))
-      return(plot.data)
-    return(invisible(object))
+      return(plot.result)
+    return(invisible(NULL))
   }
   level <- plot.data[[1L]]$level[1L]
 
   if (identical(output, "data"))
-    return(plot.data)
+    return(plot.result)
 
   oldpar <- NULL
+  annotation.context <- .np_plot_variability_context(
+    isTRUE(plot.par.mfrow) && length(plot.data) > 1L
+  )
   if (isTRUE(plot.par.mfrow) && length(plot.data) > 1L) {
     oldpar <- graphics::par(no.readonly = TRUE)
     on.exit(graphics::par(oldpar), add = TRUE)
@@ -2076,22 +2438,33 @@ np_render_control <- function(style = c("band", "bar"),
   }
 
   for (i in seq_along(plot.data)) {
+    .np_plot_variability_panel_begin(annotation.context)
     panel.dots <- plot.user.args
     if (!is.null(dots$main) && length(plot.data) > 1L)
       panel.dots$main <- paste(dots$main, names(plot.data)[i], sep = ": ")
-    .np_plot_conmode_panel(
+    joint.all <- identical(errors, "asymptotic") && (identical(band, "all") || isTRUE(gradients)) &&
+      !is.null(attr(plot.data[[i]], "band.calibration", exact = TRUE))
+    panel <- if (joint.all) function(...) .np_plot_conmode_all_panel(..., legend = legend, band = band) else
+      .np_plot_conmode_panel
+    panel(
       plot.data[[i]],
       gradients = gradients,
       level = level,
       plot.user.args = panel.dots,
       line.user.args = line.user.args,
-      data_rug = data_rug
+      data_rug = data.rug,
+      annotation = .np_plot_variability_annotation_spec(
+        errors, band, alpha, center,
+        sub.supplied = "sub" %in% names(dots),
+        plot.args = dots,
+        context = annotation.context
+      )
     )
   }
 
   if (identical(output, "plot-data"))
-    return(plot.data)
-  invisible(object)
+    return(plot.result)
+  invisible(NULL)
 }
 .np_plot_singleindex <- function(object, ..., .plot_dots_call = NULL)
   .np_plot_from_slot(object, "bws", ...,
@@ -2127,7 +2500,8 @@ np_render_control <- function(style = c("band", "bar"),
     } else {
       dots$xdat <- object$eval
     }
-    dots$ydat <- object$mean + object$resid
+    dots$ydat <- .np_plot_reconstruct_response(object, obj.bws,
+                                                 "plot.smoothcoefficient")
   }
 
   do.call(.np_plot_call_method,
@@ -2160,7 +2534,8 @@ np_render_control <- function(style = c("band", "bar"),
       all(is.finite(object$mean)) &&
       all(is.finite(object$resid))) {
     dots$xdat <- object$evalx
-    dots$ydat <- object$mean + object$resid
+    dots$ydat <- .np_plot_reconstruct_response(object, obj.bws,
+                                                 "plot.plregression")
     dots$zdat <- object$evalz
   }
 

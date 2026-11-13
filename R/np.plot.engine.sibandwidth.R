@@ -21,11 +21,13 @@
            lwd = NULL,
            plot.behavior = c("plot","plot-data","data"),
            neval = 50,
+           xtrim = NULL,
+           xq = NULL,
            plot.errors.method = c("none","bootstrap","asymptotic"),
-           plot.errors.boot.num = 1999,
+           plot.errors.boot.num = 9999,
            plot.errors.boot.method = c("wild", "inid", "fixed", "geom"),
            plot.errors.boot.nonfixed = c("exact", "frozen"),
-           plot.errors.boot.wild = c("rademacher", "mammen"),
+           plot.errors.boot.wild = c("mammen", "rademacher"),
            plot.errors.boot.blocklen = NULL,
            plot.errors.center = c("estimate", "bias-corrected"),
            plot.errors.type = c("pmzsd","pointwise","bonferroni","simultaneous","all"),
@@ -37,7 +39,26 @@
            plot.data.overlay = TRUE,
            plot.rug = FALSE,
            ...,
-           random.seed){
+           random.seed, .np.empty.report = NULL, gaussian.draws = 9999L){
+
+    if (.np_data_formal_supplied(sys.call(), sys.function()))
+      .np_plot_data_error()
+
+    if (!is.null(xq))
+      stop("grid_control$xq is not applicable to a single-index plot", call. = FALSE)
+    if (!is.null(xtrim))
+      xtrim <- .np_plot_conmode_resolve_xtrim(xtrim)
+
+    saved.plot.style <- list(xlab = xlab, ylab = ylab,
+        main = main, sub = sub, xlim = xlim, ylim = ylim, col = col,
+        lty = lty, lwd = lwd, type = type)
+    publish.plot <- function(value) .np_plot_data_publish_display(value,
+      coordinates = data.frame(index = train.index), roles = "index", response = ydat,
+      overlay = isTRUE(plot.data.overlay) && !gradients, rug = plot.rug,
+      style = utils::modifyList(plot.user.args, saved.plot.style),
+      points_args = points.user.args, boxplot = FALSE)
+
+    sub.supplied <- !missing(sub)
 
     dots <- list(...)
     .np_singleindex_reject_higher_gradient_order(
@@ -45,13 +66,20 @@
       where = "plot.sibandwidth"
     )
     engine.ctx <- .np_plot_engine_begin(plot.par.mfrow = plot.par.mfrow)
-    on.exit(.np_plot_restore_par(engine.ctx$oldpar), add = TRUE)
     plot.par.mfrow <- engine.ctx$plot.par.mfrow
 
     miss.xy = c(missing(xdat),missing(ydat))
+    if (all(miss.xy) && !is.null(bws[["index.design", exact = TRUE]]) &&
+        all(c("xdat", "ydat") %in% names(bws$call))) {
+      xdat <- toFrame(.np_eval_bws_call_arg(bws, "xdat"))
+      ydat <- .np_eval_bws_call_arg(bws, "ydat")
+      miss.xy <- c(FALSE, FALSE)
+    }
     xy <- .np_plot_resolve_xydat(bws = bws, xdat = xdat, ydat = ydat, miss.xy = miss.xy)
     xdat <- xy$xdat
     ydat <- xy$ydat
+    if (!is.null(bws[["index.design", exact = TRUE]]))
+      xdat <- .np_index_design_apply(bws[["index.design", exact = TRUE]], xdat)
 
 
     if (missing(plot.errors.method) &
@@ -62,6 +90,24 @@
         "errors must be set to \"bootstrap\" when bootstrap controls are supplied",
         call. = FALSE
       )
+    }
+
+    error.request <- .np_plot_normalize_error_request(plot.errors.method,
+                                                      plot.errors.type)
+    joint.request <- identical(error.request$method, "asymptotic") &&
+      error.request$type %in% c("simultaneous", "all")
+    if (!missing(gaussian.draws) && !joint.request)
+      stop("gaussian_draws requires asymptotic simultaneous or all bands", call. = FALSE)
+    joint.eligible <- FALSE
+    joint.calibration <- NULL
+    if (joint.request) {
+      if (isTRUE(.npRmpi_autodispatch_called_from_bcast()))
+        stop("asymptotic joint bands require coordinator context in an active session or attach pool; they cannot run inside mpi.bcast.cmd(...)",
+             call. = FALSE)
+      gaussian.draws <- .np_plot_gaussian_integer(gaussian.draws, "gaussian.draws")
+      joint.eligible <- bws[["type", exact = TRUE]] %in% c("fixed", "generalized_nn", "adaptive_nn") &&
+        bws$ckertype %in% c("gaussian", "epanechnikov") &&
+        identical(as.integer(bws$ckerorder), 2L)
     }
 
     normalized.opts <- .np_plot_normalize_common_options(
@@ -79,10 +125,14 @@
       xdat = xdat,
       common.scale = common.scale,
       ylim = ylim,
-      allow_asymptotic_quantile = FALSE
+      allow_asymptotic_quantile = FALSE,
+      error.request = error.request
     )
 
     plot.behavior <- .npRmpi_plot_behavior_for_rank(normalized.opts$plot.behavior)
+    # Data-only evaluation does not own the caller's graphics state.
+    if (plot.behavior != "data")
+      on.exit(.np_plot_restore_par(engine.ctx$oldpar), add = TRUE)
     plot.errors.method <- normalized.opts$plot.errors.method
     plot.errors.boot.method <- normalized.opts$plot.errors.boot.method
     plot.errors.boot.nonfixed <- normalized.opts$plot.errors.boot.nonfixed
@@ -119,6 +169,7 @@
     )
 
     plot.out = list()
+    .np_plot_progress_plan(1L)
 
     scalar_default <- .np_plot_scalar_default
 
@@ -163,7 +214,8 @@
       xdat = xdat,
       neval = neval,
       trim = 0.0,
-      where = "plot.sibandwidth"
+      where = "plot.sibandwidth",
+      probs = xtrim
     )
     maxneval <- nrow(eval.info$idx.eval)
 
@@ -176,7 +228,8 @@
         txdat = xdat,
         tydat = ydat,
         gradients = gradients,
-        index.eval = eval.info$index.eval
+        index.eval = eval.info$index.eval,
+        .np.empty.report = .np.empty.report
       )
     } else {
       tobj <- .np_plot_singleindex_local_eval(
@@ -184,7 +237,8 @@
         idx.train = eval.info$idx.train,
         idx.eval = eval.info$idx.eval,
         ydat = ydat,
-        gradients = gradients
+        gradients = gradients,
+        .np.empty.report = .np.empty.report
       )
     }
     
@@ -203,6 +257,37 @@
           band.type = plot.errors.type,
           m = maxneval
         )
+        if (joint.eligible) {
+          .np_plot_joint_try({
+          target.se <- if (gradients) tobj$gerr.index else tobj$merr
+          target.value <- if (gradients) tobj$grad.index else tobj$mean
+          if (any(!is.finite(target.se)) || any(!is.finite(target.value)))
+            .np_plot_joint_unavailable("joint variability bands require identified finite uncertainty at every grid point",
+                 call. = FALSE)
+          rbw <- .np_indexhat_rbw(bws, eval.info$idx.train)
+          joint <- .np_plot_activity_run("Computing joint single-index plot covariance",
+            .np_plot_regression_joint_covariance(rbw, eval.info$idx.train,
+              .np_hat_response(ydat, bws[["ydati", exact = TRUE]]), eval.info$idx.eval,
+              deriv = if (gradients) 1L else NULL))
+          if (gradients && any(abs(joint$estimate - target.value) >
+                               1e-9 * pmax(1, abs(target.value))))
+            .np_plot_joint_unavailable("joint influence map does not reproduce the single-index derivative",
+                 call. = FALSE)
+          if (any(abs(sqrt(diag(joint$covariance)) - target.se) >
+                  1e-9 * pmax(1, abs(target.se))))
+            .np_plot_joint_unavailable("joint covariance does not reproduce the single-index standard errors",
+                 call. = FALSE)
+          joint.calibration <- .np_plot_activity_run("Calibrating Gaussian plot maximum",
+            .np_plot_gaussian_calibrate(joint$covariance,
+              alpha = plot.errors.alpha, draws = gaussian.draws))
+          joint.calibration$conditioning <- "fitted index coefficients and smoothing specification"
+          simultaneous <- cbind(target.se, target.se, deparse.level = 0L) * joint.calibration$critical
+          if (identical(plot.errors.type, "all"))
+            asym.obj$all.err$simultaneous <- simultaneous
+          else
+            asym.obj$err <- simultaneous
+          })
+        }
         temp.err[,1:2] <- asym.obj$err
         temp.all.err <- asym.obj$all.err
       } else if (plot.errors.method == "bootstrap") {
@@ -264,14 +349,23 @@
       out
     }
 
+    singleindex_gradient_errors <- function(err, beta.i, idx) {
+      if (is.null(err)) return(NULL)
+      # A negative index coefficient reverses the endpoints of asymmetric
+      # bootstrap intervals, so lower and upper widths exchange roles.
+      columns <- if (beta.i < 0) c(2L, 1L) else c(1L, 2L)
+      out <- abs(beta.i) * err[idx, columns, drop = FALSE]
+      colnames(out) <- colnames(err)
+      out
+    }
+
     singleindex_gradient_component_range <- function(beta.i, idx = seq_along(temp.mean)) {
       estimate.i <- beta.i * temp.mean[idx]
       if (plot.errors && plot.errors.type == "all" && !is.null(temp.all.err)) {
         center.base <- if (plot.errors.center == "estimate") temp.mean[idx] else temp.err[idx, 3L]
         center.i <- beta.i * center.base
         scaled.all.err <- lapply(temp.all.err, function(err) {
-          if (is.null(err)) return(NULL)
-          abs(beta.i) * err[idx,,drop = FALSE]
+          singleindex_gradient_errors(err, beta.i, idx)
         })
         yr <- compute.all.error.range(center.i, scaled.all.err)
         vals <- c(estimate.i, yr)
@@ -311,6 +405,7 @@
 
       if (plot.behavior != "data"){      
         plot.layout <- .np_plot_layout_activate(plot.layout)
+        .np_plot_variability_panel_begin(engine.ctx$annotation)
         if (plot.errors){
           plot.args <- list(x = tobj$index[i.sort],
                             y = temp.mean[i.sort],
@@ -337,6 +432,15 @@
                     c(list(x = train.index, y = ydat), overlay.points.args))
           if (plot.rug)
             .np_plot_draw_rug_1d(train.index)
+          panel.annotation <- .np_plot_variability_annotation_spec(
+            plot.errors.method = plot.errors.method,
+            plot.errors.type = plot.errors.type,
+            plot.errors.alpha = plot.errors.alpha,
+            plot.errors.center = plot.errors.center,
+            sub.supplied = sub.supplied,
+            plot.args = plot.args,
+            context = engine.ctx$annotation
+          )
           if (plot.errors.type == "all") {
             sorted.all.err <- lapply(temp.all.err, function(err) {
               if (is.null(err)) return(NULL)
@@ -346,28 +450,32 @@
               ex = na.omit(tobj$index[i.sort]),
               center = na.omit(if (plot.errors.center == "estimate") temp.mean[i.sort] else temp.err[i.sort,3]),
               all.err = sorted.all.err,
+              plot.errors.method = plot.errors.method,
               plot.errors.style = plot.errors.style,
               plot.errors.bar = plot.errors.bar,
               plot.errors.bar.num = plot.errors.bar.num,
               lty = .np_plot_lty("interval"),
-              legend = plot.legend)
+              legend = plot.legend,
+              annotation = panel.annotation)
           } else if (plot.errors.center == "estimate") {
-            draw.errors(ex = na.omit(tobj$index[i.sort]),
-                        ely = na.omit(temp.mean[i.sort] - temp.err[i.sort,1]),
-                        ehy = na.omit(temp.mean[i.sort] + temp.err[i.sort,2]),
+            draw.errors(ex = tobj$index[i.sort],
+                        ely = temp.mean[i.sort] - temp.err[i.sort,1],
+                        ehy = temp.mean[i.sort] + temp.err[i.sort,2],
                         plot.errors.style = plot.errors.style,
                         plot.errors.bar = plot.errors.bar,
                         plot.errors.bar.num = plot.errors.bar.num,
-                        lty = .np_plot_lty("interval"))
+                        lty = .np_plot_lty("interval"),
+                        annotation = panel.annotation)
           } else if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
             lines(na.omit(tobj$index[i.sort]), na.omit(temp.err[i.sort,3]), lty = .np_plot_lty("center"))
-            draw.errors(ex = na.omit(tobj$index[i.sort]),
-                        ely = na.omit(temp.err[i.sort,3] - temp.err[i.sort,1]),
-                        ehy = na.omit(temp.err[i.sort,3] + temp.err[i.sort,2]),
+            draw.errors(ex = tobj$index[i.sort],
+                        ely = temp.err[i.sort,3] - temp.err[i.sort,1],
+                        ehy = temp.err[i.sort,3] + temp.err[i.sort,2],
                         plot.errors.style  = plot.errors.style,
                         plot.errors.bar = plot.errors.bar,
                         plot.errors.bar.num = plot.errors.bar.num,
-                        lty = .np_plot_lty("interval"))
+                        lty = .np_plot_lty("interval"),
+                        annotation = panel.annotation)
             .np_plot_draw_bias_center_legend(
               legend = plot.legend,
               estimate.col = scalar_default(col, par()$col),
@@ -414,8 +522,14 @@
           gradients.flag = FALSE,
           trainiseval = eval.info$trainiseval
         )
+        plot.out[[1]][[".plot_std_error"]] <- tobj$merr
         if (plot.errors) {
           plot.out[[1]]$merr <- cbind(-temp.err[,1], temp.err[,2])
+          if (!is.null(joint.calibration) || identical(plot.errors.type, "all")) {
+            plot.out[[1]]$band.calibration <- joint.calibration
+            if (identical(plot.errors.type, "all"))
+              plot.out[[1]]$band.errors <- temp.all.err
+          }
           if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
             plot.out[[1]] <- .np_plot_add_bias_fields(
               object = plot.out[[1]],
@@ -444,8 +558,21 @@
             gradients.flag = TRUE,
             trainiseval = eval.info$trainiseval
           )
+          plot.out[[1]][[".plot_std_error"]] <- if (is.null(tobj$gerr.index)) NULL else
+            outer(tobj$gerr.index[i.sort], abs(bws$beta))
           plot.out[[1]]$glerr = matrix(data=0,nrow = maxneval, ncol = ncol(xdat))
           plot.out[[1]]$gherr = matrix(data=0,nrow = maxneval, ncol = ncol(xdat))
+          if (!is.null(joint.calibration) || identical(plot.errors.type, "all")) {
+            plot.out[[1]]$band.calibration <- joint.calibration
+            if (identical(plot.errors.type, "all"))
+              plot.out[[1]]$band.errors <- lapply(temp.all.err, function(err) {
+                out <- array(NA_real_, dim = c(maxneval, 2L, ncol(xdat)),
+                  dimnames = list(NULL, c("lower", "upper"), bws$xnames))
+                for (j in seq_len(ncol(xdat)))
+                  out[, , j] <- singleindex_gradient_errors(err, bws$beta[j], i.sort)
+                out
+              })
+          }
           if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
             plot.out[[1]]$gbias = matrix(data=0,nrow = maxneval, ncol = ncol(xdat))
             plot.out[[1]]$gradient.bias.corrected = matrix(data=0,nrow = maxneval, ncol = ncol(xdat))
@@ -457,6 +584,7 @@
         for (i in seq_len(ncol(xdat))) {
           if (plot.behavior != "data"){
             plot.layout <- .np_plot_layout_activate(plot.layout)
+            .np_plot_variability_panel_begin(engine.ctx$annotation)
 
             if (is.null(ylim)) {
               if (!common.scale) {
@@ -480,7 +608,9 @@
                                 ylab,
                                 .np_plot_gradient_axis_label(
                                   target = response.axis.label,
-                                  predictor = bws$xnames[i],
+                                  predictor = if (!is.null(bws[["index.design", exact = TRUE]]) &&
+                                    bws$index.design$factor.columns[i])
+                                    paste0(bws$xnames[i], " (contrast)") else bws$xnames[i],
                                   predictor.fallback = paste0("X", i)
                                 )
                               ),
@@ -498,41 +628,53 @@
               .np_plot_draw_rug_1d(train.index)
             
             if (plot.errors){
+              panel.annotation <- .np_plot_variability_annotation_spec(
+                plot.errors.method = plot.errors.method,
+                plot.errors.type = plot.errors.type,
+                plot.errors.alpha = plot.errors.alpha,
+                plot.errors.center = plot.errors.center,
+                sub.supplied = sub.supplied,
+                plot.args = plot.args,
+                context = engine.ctx$annotation
+              )
               if (plot.errors.type == "all") {
                 scaled.all.err <- lapply(temp.all.err, function(err) {
-                  if (is.null(err)) return(NULL)
-                  abs(bws$beta[i]) * err[i.sort,,drop = FALSE]
+                  singleindex_gradient_errors(err, bws$beta[i], i.sort)
                 })
                 draw.all.error.types(
                   ex = na.omit(tobj$index[i.sort]),
                   center = na.omit(bws$beta[i] * if (plot.errors.center == "estimate") temp.mean[i.sort] else temp.err[i.sort,3]),
                   all.err = scaled.all.err,
+                  plot.errors.method = plot.errors.method,
                   plot.errors.style = plot.errors.style,
                   plot.errors.bar = plot.errors.bar,
                   plot.errors.bar.num = plot.errors.bar.num,
                   lty = .np_plot_lty("interval"),
-                  legend = plot.legend)
+                  legend = plot.legend,
+                  annotation = panel.annotation)
               } else if (plot.errors.center == "estimate") {
                 lo.i <- bws$beta[i] * (temp.mean[i.sort] - temp.err[i.sort,1])
                 hi.i <- bws$beta[i] * (temp.mean[i.sort] + temp.err[i.sort,2])
-                draw.errors(ex = na.omit(tobj$index[i.sort]),
-                            ely = na.omit(pmin(lo.i, hi.i)),
-                            ehy = na.omit(pmax(lo.i, hi.i)),
+                draw.errors(ex = tobj$index[i.sort],
+                            ely = pmin(lo.i, hi.i),
+                            ehy = pmax(lo.i, hi.i),
                             plot.errors.style = plot.errors.style,
                             plot.errors.bar = plot.errors.bar,
                             plot.errors.bar.num = plot.errors.bar.num,
-                            lty = .np_plot_lty("interval"))
+                            lty = .np_plot_lty("interval"),
+                            annotation = panel.annotation)
               } else if (.np_plot_center_is_bias_corrected(plot.errors.center)) {
                 lo.i <- bws$beta[i] * (temp.err[i.sort,3] - temp.err[i.sort,1])
                 hi.i <- bws$beta[i] * (temp.err[i.sort,3] + temp.err[i.sort,2])
                 lines(na.omit(tobj$index[i.sort]), na.omit(bws$beta[i] * temp.err[i.sort,3]), lty = .np_plot_lty("center"))
-                draw.errors(ex = na.omit(tobj$index[i.sort]),
-                            ely = na.omit(pmin(lo.i, hi.i)),
-                            ehy = na.omit(pmax(lo.i, hi.i)),
+                draw.errors(ex = tobj$index[i.sort],
+                            ely = pmin(lo.i, hi.i),
+                            ehy = pmax(lo.i, hi.i),
                             plot.errors.style  = plot.errors.style,
                             plot.errors.bar = plot.errors.bar,
                             plot.errors.bar.num = plot.errors.bar.num,
-                            lty = .np_plot_lty("interval"))
+                            lty = .np_plot_lty("interval"),
+                            annotation = panel.annotation)
                 .np_plot_draw_bias_center_legend(
                   legend = plot.legend,
                   estimate.col = scalar_default(col, par()$col),
@@ -568,9 +710,14 @@
       par(mfrow=c(1,1),cex=par()$cex)
     
     if (plot.behavior != "plot"){
+      if (gradients && !is.null(bws[["index.design", exact = TRUE]])) {
+        for (name in c("grad", "glerr", "gherr", "gbias", "gradient.bias.corrected"))
+          if (is.matrix(plot.out[[1L]][[name]]))
+            colnames(plot.out[[1L]][[name]]) <- bws$xnames
+      }
       names(plot.out) = paste(if (gradients) "si.grad" else "si", seq_along(plot.out), sep = "")
       
-      return (plot.out)
+      return(publish.plot(plot.out))
     }
 
     

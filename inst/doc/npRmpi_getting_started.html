@@ -386,7 +386,107 @@ than to rely on <code>mode = &quot;auto&quot;</code>.</p>
 <span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a>fit <span class="ot">&lt;-</span> <span class="fu">npreg</span>(<span class="at">bws =</span> bw)</span>
 <span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a><span class="fu">summary</span>(fit)</span>
 <span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a></span>
-<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a><span class="fu">npRmpi.quit</span>()</span></code></pre></div>
+<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a>new_points <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">x =</span> <span class="fu">c</span>(<span class="fl">0.25</span>, <span class="fl">0.5</span>, <span class="fl">0.75</span>))</span>
+<span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a><span class="fu">predict</span>(fit, <span class="at">newdata =</span> new_points)</span>
+<span id="cb1-15"><a href="#cb1-15" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" tabindex="-1"></a><span class="co"># Reuse the bandwidth: no second bandwidth search is performed.</span></span>
+<span id="cb1-17"><a href="#cb1-17" tabindex="-1"></a>fit_inference <span class="ot">&lt;-</span> <span class="fu">npreg</span>(<span class="at">bws =</span> fit<span class="sc">$</span>bws, <span class="at">gradients =</span> <span class="cn">TRUE</span>, <span class="at">se =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb1-18"><a href="#cb1-18" tabindex="-1"></a><span class="fu">head</span>(<span class="fu">se</span>(fit_inference))</span>
+<span id="cb1-19"><a href="#cb1-19" tabindex="-1"></a><span class="fu">head</span>(<span class="fu">gradients</span>(fit_inference))</span>
+<span id="cb1-20"><a href="#cb1-20" tabindex="-1"></a><span class="fu">head</span>(<span class="fu">gradients</span>(fit_inference, <span class="at">se =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb1-21"><a href="#cb1-21" tabindex="-1"></a>prediction <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit, <span class="at">newdata =</span> new_points, <span class="at">se.fit =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb1-22"><a href="#cb1-22" tabindex="-1"></a>prediction<span class="sc">$</span>fit</span>
+<span id="cb1-23"><a href="#cb1-23" tabindex="-1"></a>prediction<span class="sc">$</span>se.fit</span>
+<span id="cb1-24"><a href="#cb1-24" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" tabindex="-1"></a><span class="fu">npRmpi.quit</span>()</span></code></pre></div>
+<p>The examples in this vignette are alternative session layouts, not
+one script to concatenate after MPI has finalized. Keep the original
+training data available when refitting or predicting with a retained
+bandwidth object.</p>
+</div>
+<div id="uncertainty-and-migration-from-0.70-5" class="section level2">
+<h2>Uncertainty and migration from 0.70-5</h2>
+<p>Statistical requests follow the same conventions as
+<code>np</code>:</p>
+<table>
+<colgroup>
+<col width="50%" />
+<col width="50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Request</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>se = TRUE</code> in an estimator call</td>
+<td>Compute its supported fit-time uncertainty.</td>
+</tr>
+<tr class="even">
+<td><code>gradients = TRUE</code> in an estimator call</td>
+<td>Compute supported derivatives or categorical contrasts. Add
+<code>se = TRUE</code> for their standard errors.</td>
+</tr>
+<tr class="odd">
+<td><code>se(fit)</code> or <code>gradients(fit, se = TRUE)</code></td>
+<td>Read stored standard errors; do not refit or repeat search.</td>
+</tr>
+<tr class="even">
+<td><code>predict(fit, newdata = ..., se.fit = TRUE)</code></td>
+<td>Evaluate predictions and their supported standard errors.</td>
+</tr>
+<tr class="odd">
+<td><code>vcov(fit)</code></td>
+<td>Read coefficient covariance for families such as
+<code>npindex</code> and <code>npplreg</code>, not a universal
+covariance of the fitted surface.</td>
+</tr>
+<tr class="even">
+<td><code>plot(fit, errors = &quot;bootstrap&quot;)</code> or
+<code>errors = &quot;asymptotic&quot;</code></td>
+<td>Request plot-time uncertainty through that family’s plot
+method.</td>
+</tr>
+</tbody>
+</table>
+<p>Fit-time standard errors are opt-in across the principal families.
+The intentional exception is <code>npindex</code>, whose default
+<code>se = TRUE, se.type = &quot;asymptotic&quot;</code> includes coefficient
+covariance; <code>se = FALSE</code> requests a point-only fit. Gradients
+remain a separate request. The example above shows the no-search refit
+used when stored results are absent.</p>
+<p>Consult each estimator’s help for supported kernels, bandwidth types
+and derivative orders. Missing stored uncertainty, unsupported inference
+and an undefined evaluation row are different conditions; do not
+interpret <code>NA</code> as zero uncertainty. Asymptotic results
+condition on the selected smoothing settings, without bandwidth or
+polynomial-degree selection uncertainty. Supported plot targets provide
+asymptotic simultaneous variability bands over the finite evaluation
+grid within each panel, conditional on the selected smoothing settings.
+They do not provide joint coverage across separate panels. See
+<code>?np.plot</code> for supported targets, working-covariance
+assumptions and unavailability conditions.</p>
+<p>For plot calls, use snake_case names such as
+<code>gradient_order</code>, <code>data_overlay</code> and
+<code>data_rug</code>, and <code>B</code> for bootstrap replication
+counts. Estimator and control constructor arguments retain their
+documented names, including <code>gradient.order</code>. With
+<code>output = &quot;data&quot;</code> or <code>&quot;plot-data&quot;</code>, the returned
+<code>np_plot_data</code> object stores the evaluation grid, target
+values and absolute interval endpoints. For example,
+<code>as.data.frame(out, panel = 1L, band = &quot;simultaneous&quot;)</code>
+returns one row per evaluation point for the selected target; its
+<code>lower</code> and <code>upper</code> columns are grid-aligned
+vectors, not scalar critical values. See <code>?np_plot_data</code>.
+Unknown named arguments are rejected with a spelling hint where
+available. The full package NEWS (<code>news(package = &quot;npRmpi&quot;)</code>)
+lists the replacements and family-specific changes. The <a href="https://jeffreyracine.github.io/gallery/faq.html">Gallery FAQ</a>
+provides further troubleshooting guidance.</p>
+</div>
+<div id="joint-polynomial-order-and-bandwidth-selection" class="section level2">
+<h2>Joint polynomial-order and bandwidth selection</h2>
 <p>The same joint polynomial-order and bandwidth selection route is also
 available here for local-polynomial-capable methods via
 <code>search.engine = &quot;nomad+powell&quot;</code>, but this package-side
@@ -395,12 +495,11 @@ vignette stays operational rather than methodological.</p>
 tuning arguments, use <code>nomad = TRUE</code>. This is a documented
 convenience preset, not a generic optimizer alias: it fills only missing
 LP degree-search controls and leaves compatible explicit overrides in
-place. This route uses the optional NOMAD backend provided by the
-suggested package <code>crs</code>, so install <code>crs</code> first if
-you want to use <code>nomad = TRUE</code> or
-<code>search.engine = &quot;nomad&quot;</code>/<code>&quot;nomad+powell&quot;</code>.</p>
+place. This route uses the NOMAD backend supplied by the required
+<code>crs</code> dependency (version 0.15-46 or later), installed with
+<code>npRmpi</code>.</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">requireNamespace</span>(<span class="st">&quot;crs&quot;</span>, <span class="at">quietly =</span> <span class="cn">TRUE</span>) <span class="sc">&amp;&amp;</span></span>
-<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>    utils<span class="sc">::</span><span class="fu">packageVersion</span>(<span class="st">&quot;crs&quot;</span>) <span class="sc">&gt;=</span> <span class="fu">package_version</span>(<span class="st">&quot;0.15-41&quot;</span>)) {</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>    utils<span class="sc">::</span><span class="fu">packageVersion</span>(<span class="st">&quot;crs&quot;</span>) <span class="sc">&gt;=</span> <span class="fu">package_version</span>(<span class="st">&quot;0.15-46&quot;</span>)) {</span>
 <span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>  <span class="fu">npRmpi.init</span>(<span class="at">nslaves =</span> <span class="dv">1</span>)</span>
 <span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a></span>
 <span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a>  <span class="fu">set.seed</span>(<span class="dv">7</span>)</span>

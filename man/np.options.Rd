@@ -21,13 +21,20 @@
       plot/bootstrap progress heartbeats on the master rank. Default is
       \code{TRUE}.
 
+      \item \code{np.progress.interval.sec} (numeric): canonical minimum
+      elapsed time between optimization/search progress heartbeats on the
+      master rank. The default is \code{2}. Family-specific progress intervals
+      remain supported when this option is unset; setting this option overrides
+      those bandwidth, fit, and related optimization intervals uniformly.
+
       \item \code{np.plot.progress.start.grace.sec} (numeric): delay before
       the first plot/bootstrap progress line is shown. Default is
       \code{0.75}.
 
       \item \code{np.plot.progress.interval.sec} (numeric): minimum elapsed
       time between plot/bootstrap heartbeat lines once progress reporting has
-      started. Default is \code{0.5}.
+      started. Default is \code{2} when
+      \code{np.progress.interval.sec} is unset.
 
       \item \code{np.plot.progress.max.intermediate} (integer): maximum
       number of mid-run plot/bootstrap heartbeat lines emitted between the
@@ -42,6 +49,26 @@
       routes on, \code{FALSE} disables them, and \code{"auto"} enables trees
       only when active continuous kernels are bounded support
       (\code{"epanechnikov"} or \code{"uniform"}). Default is \code{"auto"}.
+      Conditional-distribution generalized-neighbor bandwidth selection admits
+      explicit \code{TRUE} for second-order Epanechnikov and uniform kernels
+      without boundary normalization. The same explicit selection is available
+      for local-constant and linear/polynomial conditional density/distribution
+      fitting from generalized-neighbor CVLS bandwidth objects. Linear/polynomial
+      adaptive-neighbor fitting reuses bounded evaluation-tree batches.
+      Automatic-selection policies are unchanged.
+      The same explicit compact-kernel selection is available for linear and
+      polynomial regression generalized- and adaptive-neighbor
+      \code{cv.ls}/\code{cv.aic} bandwidth selection, and for generalized-neighbor
+      linear/polynomial regression fitting and its hat/apply operators.
+      Adaptive-neighbor linear/polynomial regression fitting also supports
+      this explicit selection, using donor-radius evaluation-tree batches.
+      GNN fitting may use dense accumulation when an exact support certificate
+      proves that tree traversal cannot prune any donor; kernel weights remain
+      varying, and no occupancy or conditioning threshold is used.
+      Fixed-bandwidth regression fitting and regression automatic-selection
+      policies are unchanged. Tree and dense accumulation can differ numerically on
+      nearly singular local-polynomial designs; enabling trees does not change
+      the basis, ridge or rank policies.
 
       \item \code{np.categorical.compress} (logical): enables exact
       unique-profile compression for eligible all-categorical routes. This is
@@ -82,6 +109,13 @@
       \code{\link{optim}} evaluations. Set
       \code{options(np.objective.cache = FALSE)} to force repeated eligible
       candidates through the evaluator for diagnostic timing comparisons.
+      Each rank-local native Powell-side cache has an independent 64 MiB peak
+      workspace ceiling, including replacement storage during growth. If one
+      rank reaches the ceiling or cannot allocate a replacement, that rank
+      retains its existing entries. The existing all-rank cache-hit agreement
+      ensures that a candidate cached on only some ranks is evaluated normally;
+      the selected search continues, and diagnostics aggregate any rank's
+      failure through \code{allocation.failed}.
       This option is synchronized to MPI workers in
       autodispatch sessions. MADS/NOMAD solver caching is separate and is not
       controlled by this option, and the saturated extended-NN distance cache is

@@ -1,10 +1,87 @@
+# These cheap ACK fixtures cover reporting decisions without starting MPI.
+# Real collectives and sequence divergence are covered by the subprocess tests.
+spmd_ack_fixture <- function(condition = simpleError("invalid option"), size = 4L) {
+  envelope <- getFromNamespace(".npRmpi_spmd_make_envelope", "npRmpi")(
+    opcode = "autodispatch.unit_test", seq_id = 1L, timeout_class = "unit")
+  ok <- is.null(condition)
+  ack <- list(seq_id = 1L, opcode = envelope$opcode,
+              status = if (ok) "ACK" else "ERR",
+              publication_kind = "", publication_id = "",
+              publication_capability = "", publication_fingerprint = "")
+  local <- list(ok = ok, ack = ack, result = if (ok) 17L else NULL)
+  if (!ok) {
+    local$error <- conditionMessage(condition)
+    local$condition <- condition
+  }
+  fields <- c("rank", "seq_id", "opcode", "status", "error",
+              "publication_kind", "publication_id", "publication_capability",
+              "publication_fingerprint")
+  acks <- vapply(seq_len(size) - 1L, function(rank)
+    c(as.character(rank), "1", envelope$opcode, ack$status,
+      if (ok) "" else conditionMessage(condition), rep("", 4L)), character(9L))
+  rownames(acks) <- fields
+  list(envelope = envelope, local = local, acks = acks, size = size)
+}
+
+spmd_ack_run_fixture <- function(fixture, rank = 0L, gather.error = NULL) {
+  testthat::with_mocked_bindings(
+    getFromNamespace(".npRmpi_spmd_collective_ack", "npRmpi")(
+      fixture$local, fixture$envelope, where = "unit ACK"),
+    mpi.comm.size = function(comm) fixture$size,
+    mpi.comm.rank = function(comm) rank,
+    mpi.allgather.Robj = function(obj, comm) {
+      if (!is.null(gather.error)) stop(gather.error)
+      as.vector(fixture$acks)
+    }, .package = "npRmpi")
+}
+
+test_that("SPMD unanimous failures retain the captured condition", {
+  conditions <- list(
+    simpleError("unused nplsqregbw argument 'total_nonsense'"),
+    structure(simpleError("typed application error"), class = c("unit_error", "error", "condition")),
+    structure(simpleError("coordinated failure"), class = c("npRmpi_coordinated_error", "error", "condition")),
+    structure(simpleError("zero radius"), class = c("np_nn_zero_radius", "error", "condition")))
+  for (condition in conditions) {
+    fixture <- spmd_ack_fixture(condition)
+    got <- tryCatch(spmd_ack_run_fixture(fixture), error = identity)
+    expect_identical(got, condition)
+    expect_identical(spmd_ack_run_fixture(fixture, rank = 1L), fixture$local)
+  }
+})
+
+test_that("SPMD error agreement cannot hide transaction disagreement", {
+  for (field in c("status", "error", "seq_id", "opcode")) {
+    fixture <- spmd_ack_fixture()
+    fixture$acks[field, 2L] <- switch(field, status = "ACK", error = "different error",
+                                    seq_id = "9", opcode = "autodispatch.other")
+    expect_error(spmd_ack_run_fixture(fixture), "ACK mismatch", fixed = TRUE)
+  }
+  fixture <- spmd_ack_fixture()
+  fixture$acks["seq_id", 2L] <- NA_character_
+  expect_error(spmd_ack_run_fixture(fixture), "ACK mismatch", fixed = TRUE)
+  fixture$acks <- fixture$acks[, -2L, drop = FALSE]
+  expect_error(spmd_ack_run_fixture(fixture), "ACK gather shape mismatch", fixed = TRUE)
+  expect_error(spmd_ack_run_fixture(spmd_ack_fixture(), gather.error = simpleError("transport failed")),
+               "ACK gather failed", fixed = TRUE)
+})
+
+test_that("SPMD success, publication checks and local fallback are unchanged", {
+  fixture <- spmd_ack_fixture(NULL)
+  expect_identical(spmd_ack_run_fixture(fixture), fixture$local)
+  fixture$acks["publication_id", 2L] <- "different publication"
+  expect_error(spmd_ack_run_fixture(fixture), "ACK mismatch", fixed = TRUE)
+  fixture <- spmd_ack_fixture(NULL, size = 1L)
+  expect_identical(spmd_ack_run_fixture(fixture), fixture$local)
+  expect_error(spmd_ack_run_fixture(spmd_ack_fixture(size = 1L)), "local failure", fixed = TRUE)
+})
+
 run_spmd_subprocess <- function(lines, timeout = 60L, env = character()) {
   script <- tempfile("npRmpi-spmd-", fileext = ".R")
   writeLines(lines, script, useBytes = TRUE)
   on.exit(unlink(script), add = TRUE)
 
   cmd <- file.path(R.home("bin"), "Rscript")
-  out <- suppressWarnings(system2(
+  out <- suppressWarnings(npRmpi_test_system2(
     cmd,
     c("--no-save", script),
     stdout = TRUE,
@@ -24,8 +101,8 @@ test_that("SPMD envelope sequence contract fails fast on mismatch", {
   try.exec <- getFromNamespace(".npRmpi_spmd_try_execute_local", "npRmpi")
   set.seq <- getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")
 
-  old.seq <- getOption("npRmpi.spmd.seq_id", 0L)
-  on.exit(options(npRmpi.spmd.seq_id = old.seq), add = TRUE)
+  old.seq <- getFromNamespace(".npRmpi_spmd_seq_get", "npRmpi")()
+  on.exit(getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")(old.seq), add = TRUE)
 
   set.seq(0L)
   env1 <- make.env(opcode = "spmd.ping", timeout_class = "smoke")
@@ -101,7 +178,7 @@ test_that("SPMD step diverged sequence fails fast with ACK mismatch diagnostics"
       "on.exit(try(npRmpi.quit(), silent=TRUE), add=TRUE)",
       "mk <- getFromNamespace('.npRmpi_spmd_make_envelope', 'npRmpi')",
       "bcast <- getFromNamespace('.npRmpi_bcast_cmd_expr', 'npRmpi')",
-      "mpi.bcast.cmd(if (mpi.comm.rank(1L) == 1L) options(npRmpi.spmd.seq_id = 5L), caller.execute=TRUE)",
+      "mpi.bcast.cmd(if (mpi.comm.rank(1L) == 1L) getFromNamespace('.npRmpi_spmd_seq_set', 'npRmpi')(5L), caller.execute=TRUE)",
       "env <- mk(opcode='spmd.ping', timeout_class='smoke')",
       "cmd <- substitute({",
       "  run <- get('.npRmpi_spmd_execute_step', envir=asNamespace('npRmpi'), inherits=FALSE)",
@@ -148,13 +225,15 @@ test_that("SPMD opcode selection tags LL/LP CV routes for core bw families", {
   op.reg.est <- opcode.fun(mc = mc.reg.est, caller_env = environment())
   expect_identical(op.reg.est, "autodispatch.npreg.core")
 
-  mc.sc.est <- quote(npscoef(bws = bw, gradients = FALSE))
+  mc.sc.est <- quote(npscoef(bws = bw))
   op.sc.est <- opcode.fun(mc = mc.sc.est, caller_env = environment())
   expect_identical(op.sc.est, "autodispatch.npscoef.core")
+  expect_false("gradients" %in% names(as.list(mc.sc.est)))
 
-  mc.pl.est <- quote(npplreg(bws = bw, gradients = FALSE))
+  mc.pl.est <- quote(npplreg(bws = bw))
   op.pl.est <- opcode.fun(mc = mc.pl.est, caller_env = environment())
   expect_identical(op.pl.est, "autodispatch.npplreg.core")
+  expect_false("gradients" %in% names(as.list(mc.pl.est)))
 
   mc.ud.est <- quote(npudens(tdat = x, bws = bw))
   op.ud.est <- opcode.fun(mc = mc.ud.est, caller_env = environment())
@@ -223,6 +302,53 @@ test_that("SPMD opcode selection tags LL/LP CV routes for core bw families", {
   mc.noncv <- quote(npregbw(xdat = x, ydat = y, regtype = "lc", bwmethod = "cv.ls"))
   op.noncv <- opcode.fun(mc = mc.noncv, caller_env = environment())
   expect_identical(op.noncv, "autodispatch.npregbw")
+})
+
+test_that("SPMD opcode selection gives the scoped NOMAD context a locked identity", {
+  opcode.fun <- getFromNamespace(".npRmpi_spmd_opcode_from_call", "npRmpi")
+  context.symbol <- getFromNamespace(".npRmpi_lease_context_symbol", "npRmpi")()
+  context.call <- getFromNamespace(".npRmpi_lease_is_context_call", "npRmpi")
+  context.fun <- getFromNamespace(".npscoefbw_nomad_context_prepare", "npRmpi")
+  mc <- quote(.placeholder(xdat = x, ydat = y, zdat = z))
+  mc[[1L]] <- context.fun
+  expect_identical(
+    opcode.fun(mc = mc, caller_env = environment()),
+    "autodispatch.npscoefbw.nomad_context"
+  )
+
+  transported <- mc
+  transported[[1L]] <- context.symbol
+  transported <- unserialize(serialize(transported, NULL))
+  expect_true(context.call(transported))
+  expect_identical(
+    opcode.fun(mc = transported, caller_env = environment()),
+    "autodispatch.npscoefbw.nomad_context"
+  )
+
+  lookalike.closure <- mc
+  lookalike.fun <- context.fun
+  environment(lookalike.fun) <- new.env(parent = environment(context.fun))
+  expect_identical(formals(lookalike.fun), formals(context.fun))
+  expect_identical(body(lookalike.fun), body(context.fun))
+  lookalike.closure[[1L]] <- lookalike.fun
+  expect_false(context.call(lookalike.closure))
+  malformed <- transported
+  malformed[[1L]] <- as.name(".npscoefbw_nomad_context_prepare_lookalike")
+  expect_false(context.call(malformed))
+
+  handler <- getFromNamespace(".npRmpi_spmd_get_opcode", "npRmpi")(
+    "autodispatch.npscoefbw.nomad_context"
+  )
+  expect_error(
+    handler(
+      payload = list(call = malformed),
+      envelope = list(opcode = "autodispatch.npscoefbw.nomad_context")
+    ),
+    "received an unauthorized call"
+  )
+
+  locked <- getFromNamespace(".npRmpi_spmd_locked_opcodes", "npRmpi")()
+  expect_true("autodispatch.npscoefbw.nomad_context" %in% locked)
 })
 
 test_that("SPMD timeout class marks LL/LP CV bw opcodes as cv-regression", {
@@ -307,8 +433,8 @@ test_that("SPMD locked core opcodes reject mismatched call heads", {
   try.exec <- getFromNamespace(".npRmpi_spmd_try_execute_local", "npRmpi")
   set.seq <- getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")
 
-  old.seq <- getOption("npRmpi.spmd.seq_id", 0L)
-  on.exit(options(npRmpi.spmd.seq_id = old.seq), add = TRUE)
+  old.seq <- getFromNamespace(".npRmpi_spmd_seq_get", "npRmpi")()
+  on.exit(getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")(old.seq), add = TRUE)
   set.seq(0L)
 
   env.reg <- make.env(opcode = "autodispatch.npregbw.cv_lllp", timeout_class = "cv-regression")
@@ -364,8 +490,8 @@ test_that("SPMD dynamic autodispatch opcode executes payload with ACK", {
   try.exec <- getFromNamespace(".npRmpi_spmd_try_execute_local", "npRmpi")
   set.seq <- getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")
 
-  old.seq <- getOption("npRmpi.spmd.seq_id", 0L)
-  on.exit(options(npRmpi.spmd.seq_id = old.seq), add = TRUE)
+  old.seq <- getFromNamespace(".npRmpi_spmd_seq_get", "npRmpi")()
+  on.exit(getFromNamespace(".npRmpi_spmd_seq_set", "npRmpi")(old.seq), add = TRUE)
   set.seq(0L)
 
   env <- make.env(opcode = "autodispatch.unit_test", timeout_class = "unit")

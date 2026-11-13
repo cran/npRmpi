@@ -14,6 +14,14 @@ make_proper_test_bws <- function() {
     ynord = 0L,
     ynuno = 0L,
     yncon = 1L,
+    type = "fixed",
+    cxkertype = "gaussian",
+    cykertype = "gaussian",
+    cxkerorder = 2L,
+    cykerorder = 2L,
+    iycon = TRUE,
+    cykerlb = -Inf,
+    cykerub = Inf,
     pscaling = "Bandwidth(s)",
     ptype = "Fixed",
     pcxkertype = "Gaussian",
@@ -25,7 +33,9 @@ make_proper_test_bws <- function() {
     regtype = "lp",
     degree = 3L,
     regtype.engine = "lp",
-    degree.engine = 3L
+    basis.engine = "glp",
+    degree.engine = 3L,
+    bernstein.basis.engine = FALSE
   )
 }
 

@@ -1,0 +1,135 @@
+locate_lp_source <- function(name) {
+  candidates <- c(
+    test_path("..", "..", "src", name),
+    test_path("..", "..", "..", "src", name),
+    file.path(Sys.getenv("R_PACKAGE_DIR", ""), "src", name),
+    file.path(Sys.getenv("R_PACKAGE_SOURCE", ""), "src", name),
+    file.path(getwd(), "src", name),
+    file.path(getwd(), "..", "src", name)
+  )
+  candidates <- unique(candidates[nzchar(candidates)])
+  hits <- candidates[file.exists(candidates)]
+  if (length(hits) == 0L) NULL else hits[[1L]]
+}
+
+test_that("response and adjoint LP owners retain validated factorizations", {
+  jksum_file <- locate_lp_source("jksum.c")
+  solve_file <- locate_lp_source("jksum_lp_solve.c")
+  header_file <- locate_lp_source("jksum_lp_solve.h")
+  skip_if(
+    any(vapply(
+      list(jksum_file, solve_file, header_file),
+      is.null,
+      logical(1L)
+    )),
+    "LP source files unavailable in this test context"
+  )
+
+  jksum_lines <- np_test_read_incumbent_c_source(jksum_file, warn = FALSE)
+  solve_lines <- np_test_read_incumbent_c_source(solve_file, warn = FALSE)
+  header_lines <- np_test_read_incumbent_c_source(header_file, warn = FALSE)
+
+  expect_equal(
+    sum(grepl("np_lp_solve_workspace_solve_factored\\(", jksum_lines)),
+    1L
+  )
+  # Classify retained back-solves by owner rather than pinning a whole-file
+  # count. PREPARING and stable categorical contrasts also need adjoints;
+  # neither adds a refactorization to accepted covariance directions.
+  adjoint.name <- "np_lp_solve_workspace_solve_adjoint_factored("
+  owner.names <- c("np_conditional_lp_project_accepted",
+                   "np_regression_general_lp_point_at_frame",
+                   "np_regression_general_lp_fit_body")
+  owner.bodies <- lapply(owner.names, function(name)
+    npRmpi_test_extract_c_function(jksum_lines, name))
+  names(owner.bodies) <- owner.names
+  count.calls <- function(body, name) {
+    hit <- gregexpr(name, body, fixed = TRUE)[[1L]]
+    sum(hit > 0L)
+  }
+  # The actual MPI owner also retains the categorical SE-off base
+  # adjoint; both local and rank-owned calls must remain covered.
+  expect_identical(vapply(owner.bodies, count.calls, integer(1L),
+                          name = adjoint.name),
+                   setNames(c(1L, 1L, 7L), owner.names))
+  # The opt-in plot projection reuses the accepted factor for one more adjoint.
+  # Ordinary fitted calls leave fit_projection NULL.
+  expect_match(owner.bodies[[3L]], "if(call->fit_projection != NULL)", fixed = TRUE)
+  conditional <- owner.bodies[[1L]]
+  frame <- owner.bodies[[2L]]
+  fit <- owner.bodies[[3L]]
+  # Both transport wrappers must enter this same arithmetic/factor owner.
+  for (ann in c(FALSE, TRUE)) {
+    wrapper <- npRmpi_test_extract_c_function(jksum_lines,
+      if (ann) "np_regression_general_lp_fit_ann_execute"
+      else "np_regression_general_lp_fit_execute")
+    expect_match(wrapper,
+      paste0("return np_regression_general_lp_fit_body(data, ",
+             as.integer(ann), ");"), fixed = TRUE)
+  }
+  # The accepted ridge branch still uses the adjoint factor; the nonridge
+  # branch still uses the plain factor. Capture is an opt-in observer after a
+  # successful solve and must not change either owner's returned status.
+  conditional.dispatch <- paste0(
+    "const int ok = diagnostics->ridge_total > 0.0 ? ",
+    "np_lp_solve_workspace_solve_adjoint_factored( ",
+    "workspace, nterms, nrhs, pristine_anchor, diagnostics) == ",
+    "NP_LP_SOLVE_POLICY_OK : ",
+    "np_lp_solve_workspace_solve_factored(workspace, nterms, nrhs);")
+  conditional.capture <- paste0(
+    "if(ok && np_conditional_plot_capture_current != NULL) ",
+    "np_conditional_plot_capture_accepted(workspace, nterms, nrhs);")
+  expect_match(gsub("[[:space:]]+", " ", conditional),
+    paste(conditional.dispatch, conditional.capture, "return ok;"),
+    fixed = TRUE)
+  expect_identical(count.calls(conditional,
+    "np_conditional_plot_capture_accepted("), 1L)
+  expect_identical(count.calls(conditional, "return "), 1L)
+  expect_match(conditional, "np_lp_solve_workspace_solve_factored(", fixed = TRUE)
+  expect_match(frame, "if(projection != NULL)", fixed = TRUE)
+  expect_match(fit, "if(hc0_residual_preparing)", fixed = TRUE)
+  expect_identical(count.calls(fit, "np_regression_hc0_lp_prepare_row("), 2L)
+  expect_match(fit, "if(!ordinary_hc0 && !hc0_residual_preparing)", fixed = TRUE)
+  expect_identical(count.calls(fit, "if(!ordinary_hc0 && !hc0_residual_preparing)"),
+                   2L)
+  expect_match(gsub("[[:space:]]+", " ", fit),
+    paste0(adjoint.name, " &owner->solve_workspace, owner->nterms, variance_rhs,"),
+    fixed = TRUE)
+  expect_true(any(grepl("int factor_ready;", header_lines, fixed = TRUE)))
+  expect_true(any(grepl("int factor_p;", header_lines, fixed = TRUE)))
+
+  response_body <- npRmpi_test_extract_c_function(
+    solve_lines, "np_lp_solve_workspace_try_dgesv"
+  )
+  expect_true(grepl("workspace->factor_ready = 0;", response_body, fixed = TRUE))
+  expect_true(grepl("workspace->factor_ready = 1;", response_body, fixed = TRUE))
+  expect_true(grepl("workspace->factor_p = p;", response_body, fixed = TRUE))
+  expect_true(grepl("F77_CALL(dgesv)", response_body, fixed = TRUE))
+
+  response_policy <- npRmpi_test_extract_c_function(
+    solve_lines, "np_lp_solve_workspace_solve_response_ranked"
+  )
+  adjoint_policy <- npRmpi_test_extract_c_function(
+    solve_lines, "np_lp_solve_workspace_solve_adjoint_ranked"
+  )
+  for (body in list(response_policy, adjoint_policy)) {
+    expect_true(grepl(
+      "np_lp_solve_workspace_admit_retained_factor(", body, fixed = TRUE
+    ))
+  }
+  expect_true(grepl(
+    "np_lp_solve_workspace_solve_adjoint_factored(",
+    adjoint_policy,
+    fixed = TRUE
+  ))
+
+  factored_body <- npRmpi_test_extract_c_function(
+    solve_lines, "np_lp_solve_workspace_solve_factored_with_trans"
+  )
+  expect_true(grepl("!workspace->factor_ready", factored_body, fixed = TRUE))
+  expect_true(grepl("workspace->factor_p != p", factored_body, fixed = TRUE))
+  expect_true(grepl("F77_CALL(dgetrs)", factored_body, fixed = TRUE))
+  expect_false(grepl("F77_CALL(dgesv)", factored_body, fixed = TRUE))
+  expect_false(grepl("F77_CALL(dgetrf)", factored_body, fixed = TRUE))
+  expect_false(grepl("gram_source", factored_body, fixed = TRUE))
+})

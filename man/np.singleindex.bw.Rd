@@ -40,7 +40,7 @@ npindexbw(\dots)
           search.engine = c("nomad+powell", "cell", "nomad"),
           nomad = FALSE,
           nomad.nmulti = 0L,
-            degree.min = NULL,
+          degree.min = NULL,
           degree.max = NULL,
           degree.start = NULL,
           degree.restarts = 0L,
@@ -68,6 +68,7 @@ npindexbw(\dots)
           ydat = stop("training data ydat missing"),
           bws,
           bandwidth.compute = TRUE,
+          .certify.selected = TRUE,
           nmulti,
           only.optimize.beta = FALSE,
           optim.abstol = .Machine$double.eps,
@@ -80,7 +81,10 @@ npindexbw(\dots)
           scale.factor.init.upper = 2.0,
           scale.factor.init = 0.5,
           scale.factor.search.lower = NULL,
-          \dots)
+          .restore.first.start = TRUE,
+          \dots,
+          .fixed.h.lower = NULL,
+          .rng.collective = .npRmpi_rng_scope_collective())
 
 }
 
@@ -96,12 +100,37 @@ These arguments identify the data, formula interface, method label, and whether 
     in \code{bws}. Defaults to \code{TRUE}.
   }
 
+  \item{.certify.selected}{
+    internal logical control requiring one raw-objective replay of the
+    selected search point. This argument is used by package search owners
+    and is not intended for direct user control.
+  }
+
+  \item{.restore.first.start}{
+    internal logical control enabling bounded restoration of eligible
+    automatically generated raw-invalid first optimizer evaluations.
+    It is used by package search owners and is not intended for direct user control.
+  }
+
+  \item{.rng.collective}{
+    internal temporary-RNG agreement ownership. Package search owners use
+    local scopes only after collective admission and activation have succeeded
+    before entering a worker service. This argument is not intended for
+    direct user control; leave its context-dependent default unchanged.
+  }
+
+  \item{.fixed.h.lower}{
+    internal physical-bandwidth floor passed from a NOMAD search to its
+    fixed-degree refinement. The default retains the direct-call scale-factor
+    domain. This argument is not intended for direct user control.
+  }
+
   \item{bws}{
     a bandwidth specification. This can be set as a
     \code{singleindexbandwidth}
     object returned from an invocation of \code{npindexbw}, or
     as a vector of parameters (beta) with each element \eqn{i}
-    corresponding to the coefficient for column \eqn{i} in \code{xdat}
+    corresponding to the coefficient for design column \eqn{i} (see Factors and Index Coordinates)
     where the first element is normalized to 1, and a scalar bandwidth
     (h). If specified as a vector, then additional arguments will need
     to be supplied as necessary to specify the bandwidth type, kernel
@@ -115,6 +144,13 @@ These arguments identify the data, formula interface, method label, and whether 
   }
 
   \item{data}{
+    This argument belongs to the formula interface (including supported
+    formula-bearing bandwidth-object refits). Native calls must supply their
+    vectors, matrices or data frames directly, or use \code{with(data, ...)}.
+    Supplying \code{data}, including explicit \code{data = NULL}, to a native
+    route that does not consume it is an error; see
+    \code{\link{np-data-interfaces}}.
+
     an optional data frame, list or environment (or object
     coercible to a data frame by \code{\link{as.data.frame}}) containing
     the variables
@@ -158,6 +194,11 @@ These arguments identify the data, formula interface, method label, and whether 
     a one (1) dimensional numeric or integer vector of dependent data, each
     element \eqn{i} corresponding to each observation (row) \eqn{i} of
     \code{xdat}.
+    For \code{method="kleinspady"}, the response must be numeric 0/1 with both
+    values present after jointly omitting rows with missing predictors or
+    responses. Missing outcomes are permitted; a complete sample containing
+    only one response class is rejected. Factor responses are rejected rather than converted to
+    internal category codes; explanatory variables may still be factors.
   }
 
 
@@ -235,7 +276,11 @@ These controls define deterministic and random continuous scale-factor starts an
     to \code{0.1}. The value supplied by the user is not rewritten, but
     the effective random-start lower endpoint is
     \code{max(scale.factor.init.lower, scale.factor.search.lower)}. See
-    Details.
+    Details. Random fixed-bandwidth restarts use the index scale at their
+    own drawn beta. After conversion to search coordinates, an automatically
+    generated bandwidth outside the existing search bounds is set to the
+    nearest bound without drawing a new random value. The first start and
+    explicitly supplied or held bandwidths are not changed by this step.
   }
   \item{scale.factor.init.upper}{
     upper endpoint for random continuous scale-factor starts. Defaults
@@ -254,7 +299,10 @@ These controls define deterministic and random continuous scale-factor starts an
     candidates and to effective search starts only. It does not rewrite
     explicit bandwidths supplied for storage with
     \code{bandwidth.compute = FALSE}. Final fixed-bandwidth search
-    candidates must also have a finite valid raw objective value.
+    candidates must also have a finite valid raw objective value. A supplied
+    positive fixed bandwidth held by a
+    \code{only.optimize.beta=TRUE} refit is not a
+    bandwidth-search candidate and is not restricted by this control.
   }
 
 \subsection{Local-Polynomial Model Specification}{
@@ -268,8 +316,10 @@ These arguments control the index smoother, local-polynomial basis, and fixed de
   }
 
   \item{bernstein.basis}{
-    logical flag used when \code{regtype="lp"}; if \code{TRUE}, use a
-    Bernstein/B-spline basis for local polynomial terms. When automatic
+    logical flag used when \code{regtype="lp"}. For \code{basis="glp"},
+    \code{TRUE} selects the complete degree-graded, orthonormal shifted-Legendre
+    representation defined in \code{\link{npreg}}; additive and tensor bases
+    retain their fixed-coordinate-degree Bernstein representation. When automatic
     degree search is requested and \code{bernstein.basis} is not
     explicitly supplied, the search route defaults to \code{TRUE} for
     numerical stability. Explicit \code{bernstein.basis=FALSE} is
@@ -396,8 +446,22 @@ These arguments control outer optimization behavior for the semiparametric searc
 }
 
    \item{only.optimize.beta}{
-     signals the routine to only minimize the objective function with
-     respect to beta
+     minimizes the objective function with respect to beta while retaining
+     the existing polynomial degree and bandwidth (or nearest-neighbor count).
+     Automatic degree search, including NOMAD and cell search, is not run;
+     \code{nomad}, \code{degree.select} and other degree-search controls do
+     not replace the retained model specification. A bandwidth object carries
+     its selected degree; with a numeric \code{bws} vector and
+     \code{regtype="lp"}, supply \code{degree} explicitly.
+     The public \code{scale.factor.search.lower} control does not restrict
+     a supplied positive fixed bandwidth held in this way, whether inherited
+     or explicitly supplied. The control is retained for later bandwidth
+     searches. Positivity, finiteness and raw-objective validity checks still
+     apply. When no positive bandwidth is supplied, the usual initialization
+     rules apply. A supplied normalized beta vector is used as the first
+     starting point, including when all its free coefficients are zero.
+     With \code{nmulti=1}, this provides a single hot start; the usual
+     convergence checks and recovery rules still apply.
    }
 
   \item{optim.abstol}{
@@ -457,6 +521,8 @@ These arguments control outer optimization behavior for the semiparametric searc
   }
 
   \item{random.seed}{
+    Temporary caller-state restoration requires a certifiable initialized
+    state; see \link{np_rng_scope}.
     an integer used to seed R's random number generator. This ensures
     replicability of the numerical search. Defaults to 42.
   }
@@ -480,6 +546,64 @@ These arguments collect remaining controls passed through S3 methods.
 }
 
 \details{
+  The primary response must be a one-dimensional numeric (integer or double)
+  vector. Factors and ordered factors are not accepted as primary responses,
+  including retained responses used in a new fit or bandwidth search.
+  Categorical predictors retain their existing support. Internal auxiliary
+  responses used to represent predictors retain their established encoding.
+  Klein--Spady retains its stricter numeric 0/1 response requirement.
+
+  \subsection{Factors and Index Coordinates}{
+    For newly constructed bandwidth objects, factors enter the linear index
+    through R model-matrix contrasts. An unordered factor with \eqn{k} observed
+    levels ordinarily contributes \eqn{k-1} coefficients. Ordered factors use
+    their R contrasts (polynomial contrasts by default), including when their
+    level labels look numeric. To fit a single coefficient on specified scores
+    instead, supply those scores as a numeric predictor.
+
+    For supported additive formulas, coefficient names and predictor columns
+    follow \code{model.matrix()}. The intercept is absorbed into the unknown
+    link and is not an index coefficient. The first retained design coefficient
+    is normalized to one; the package does not reorder predictors to choose a
+    different normalization. Thus a factor listed first can supply the
+    normalized contrast coefficient. These are relative index coefficients,
+    not linear-regression slopes. This representation does not add support for
+    otherwise unsupported formula syntax.
+
+    Native data-frame calls use the corresponding additive design. A manually
+    supplied \code{bws} vector contains one beta for each expanded design column,
+    in model-matrix order, followed by the scalar bandwidth. Automatic start
+    vectors use the same coordinates. Numeric-only inputs keep their existing
+    representation. A new factor design with aliased columns or a constant
+    direction is rejected: for example, \code{y ~ 0 + x + group} supplies all
+    group indicators and has an unidentified constant direction. Use the
+    ordinary contrast formula \code{y ~ x + group} or independent numeric columns.
+
+    Factor levels and the actual contrast matrices are retained at construction.
+    Prediction uses this design even if global contrast options change or an
+    evaluation sample omits some training levels. New evaluation levels are an
+    error. Levels absent from the complete training sample do not identify
+    coefficients. Custom contrasts must remain identifiable on that sample.
+
+    Older saved bandwidth objects without retained design metadata preserve
+    their historical single-score factor representation. Reconstruct a bandwidth
+    object to adopt the contrast design; the package does not silently reinterpret
+    an existing coefficient vector. The \code{index.design} component records the
+    raw predictor names, retained levels/contrasts, and expanded column mapping;
+    coefficient names and dimensions refer to the expanded design.
+  }
+
+Formula bandwidth objects retain the prepared training sample (after alignment,
+subsetting and missing-value handling) and the resolved missing-value policy.
+Later refits use that sample even if constructor variables are rebound.
+Supplying explicit training data to the estimator replaces the training data;
+evaluation via \code{newdata} does not. Retention requires storage proportional
+to the sample size times the number of variables, not a pairwise weight matrix.
+Older saved objects without this retained state still rely on their original
+data bindings; rebuild their bandwidth object from the intended data before
+changing those bindings. User-defined transformation and missing-value
+functions should not rely on subsequently modified closure state.
+
 
 The \code{scale.factor.*} controls are dimensionless search
 controls. The package converts scale factors to bandwidths using the
@@ -522,8 +646,15 @@ or standard-deviation factors.
   (1993) method maximizing the leave-one-out log likelihood function
   jointly with respect to the bandwidth and coefficient vector. Note
   that Klein and Spady's (1993) method is for \emph{binary outcomes
-    only}, while Ichimura's (1993) method can be applied for any outcome
-  data type (i.e., continuous or discrete).
+    only}, while Ichimura's (1993) method accepts numeric outcomes, whether
+  continuous or discrete-valued.
+
+  Invalid outer-search guidance uses the exact declared leave-one-out null:
+  the constant-model least-squares null for Ichimura and the clipped
+  Bernoulli likelihood null for Klein--Spady. Inner regression evaluation
+  remains raw; only terminal invalidity is mapped at the outer boundary.
+  The selected point is replayed once against the raw objective and is
+  rejected if it is not finite and valid.
 
   We impose the identification condition that the first element of the
   coefficient vector beta is equal to one, while identification also
@@ -545,6 +676,36 @@ or standard-deviation factors.
     the chosen first variable and its units; choose the first continuous
     regressor deliberately when interpretation is important.
   }
+
+  For fixed-bandwidth R \code{optim} searches, an automatic raw-invalid
+  starting bandwidth is doubled while keeping its starting coefficients and
+  degree fixed. This applies to all supported regression types, kernel orders
+  and support options, including generated starts in automatic degree-search
+  children. Each multistart uses its own coefficients' index scale.
+  Only the first scalar evaluation already
+  requested by \code{optim} is checked. A valid original start continues in
+  that same optimizer invocation without an additional objective evaluation.
+  A rejected start does not incur a numerical-gradient stencil.
+
+  Restoration permits at most eight doublings (nine starting scalar
+  evaluations) for each multistart or existing convergence-retry start and
+  respects the existing search bounds. Each rejected start adds one scalar
+  evaluation, which can be costly. The random-draw control
+  \code{scale.factor.init.upper} is not a search upper bound, so restoration
+  may exceed it. Explicit initial bandwidths and bandwidths held by
+  \code{only.optimize.beta=TRUE} are never expanded; a raw-invalid first
+  evaluation fails with the method, start/retry, attempted bandwidth range,
+  count and reason. Budget exhaustion also fails the complete call.
+
+  This rule does not change subsequent optimizer trials, finite differences,
+  penalties, convergence-retry controls or final exact-point certification.
+  A valid start does not guarantee convergence or a valid final point.
+  Increasing the bandwidth does not guarantee feasibility for higher-order
+  kernels or local-polynomial fits; every attempted start must pass the same
+  raw-objective check. Nearest-neighbour bandwidths and NOMAD's own direct
+  search retain their existing feasibility mechanisms. An explicit NOMAD
+  refinement start is checked but not expanded. No alternative solver or earlier multistart winner
+  is substituted when restoration fails.
 
   \subsection{Choosing \code{optim.method}}{
     The default \code{"Nelder-Mead"} search is often a good starting
@@ -651,6 +812,9 @@ or standard-deviation factors.
 }
 
 \section{Book And Method Pointers}{
+  Local-polynomial index search inherits the numerical-ridging policies
+  described in \code{\link{npreg}}; see Seifert and Gasser (2000) there.
+
   \code{npindexbw} selects the index direction, bandwidth, and when
   requested local-polynomial degree/search metadata for the single-index
   model. The continuous-outcome target is typically written

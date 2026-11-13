@@ -4,7 +4,13 @@ test_that("npqreg selected-CDF inversion honors iteration, midpoint, and clamp c
   quantile_clamp <- getFromNamespace(".npqreg_quantile_clamp", "npRmpi")
   mark_clamped_delta <- getFromNamespace(".npqreg_mark_clamped_delta", "npRmpi")
 
-  bws <- list(regtype.engine = "lc")
+  bws <- list(
+    regtype.engine = "lc",
+    basis.engine = "glp",
+    degree.engine = 0L,
+    bernstein.basis.engine = FALSE,
+    xncon = 1L
+  )
   xdat <- data.frame(x = 0)
   ydat <- data.frame(y = c(-1, 1))
   exdat <- data.frame(x = 0)
@@ -20,7 +26,7 @@ test_that("npqreg selected-CDF inversion honors iteration, midpoint, and clamp c
     "failed to converge"
   )
   expect_error(
-    inv(list(regtype.engine = "lc", cykerorder = 4L),
+    inv(c(bws, list(cykerorder = 4L)),
         xdat, ydat, exdat, tau = 0.6, tol = 0.5,
         small = .Machine$double.eps, itmax = 1500L,
         cdf.values = linear_cdf),
@@ -30,7 +36,8 @@ test_that("npqreg selected-CDF inversion honors iteration, midpoint, and clamp c
   out <- inv(bws, xdat, ydat, exdat, tau = 0.6, tol = 0.5,
              small = .Machine$double.eps, itmax = 1500L,
              cdf.values = linear_cdf)
-  expect_equal(as.numeric(out), 0.25, tolerance = 0)
+  # tol * initial span = 1: the first half-bracket already meets tolerance.
+  expect_equal(as.numeric(out), 0.5, tolerance = 0)
   expect_identical(quantile_clamp(out), "none")
 })
 
@@ -39,7 +46,13 @@ test_that("npqreg MPI internal local inversion carries clamp metadata", {
   quantile_clamp <- getFromNamespace(".npqreg_quantile_clamp", "npRmpi")
   mark_clamped_delta <- getFromNamespace(".npqreg_mark_clamped_delta", "npRmpi")
 
-  bws <- list(regtype.engine = "lc")
+  bws <- list(
+    regtype.engine = "lc",
+    basis.engine = "glp",
+    degree.engine = 0L,
+    bernstein.basis.engine = FALSE,
+    xncon = 1L
+  )
   xdat <- data.frame(x = 0)
   ydat <- data.frame(y = c(-1, 1))
   exdat3 <- data.frame(x = 1:3)
@@ -83,7 +96,8 @@ test_that("npRmpi npqreg direct evaluation preserves NA rows for vector tau grad
     tydat = ydat,
     exdat = exdat,
     tau = c(0.25, 0.5),
-    gradients = TRUE
+    gradients = TRUE,
+    se = TRUE
   )
 
   expect_equal(dim(fit$quantile), c(3L, 2L))

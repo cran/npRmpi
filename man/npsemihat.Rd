@@ -66,7 +66,10 @@ These arguments control operator output, derivative selection, finite-difference
   \item{s}{For \code{npindexhat}, \code{s=0} returns fit operator and \code{s=1} returns index-derivative operator.}
 
 
-  \item{y}{Optional response vector or matrix for apply mode. For \code{output = "constraint"}, \code{y} is required and must be a vector or one-column object.}
+  \item{y}{Optional response vector or matrix for apply mode. For \code{output = "constraint"}, \code{y} is required and must be a vector or one-column object.
+    When the fitted response is a factor, factor payloads use its retained
+    numerical level coding, including numeric level labels; payload levels are
+    aligned to the fitted levels. Numeric vectors and matrices are used as supplied.}
 
 
 \subsection{Partially Linear And Smooth-Coefficient Data}{
@@ -89,7 +92,7 @@ These arguments control smooth-coefficient iteration, leave-one-out behavior, an
   \item{leave.one.out}{Logical; leave-one-out kernel weights for \code{npscoefhat}. This currently requires evaluation \code{z} data to match training \code{z} data.}
 
 
-  \item{ridge}{Base ridge term for local linear solves in \code{npscoefhat}; must be a non-negative finite scalar. The ridge sequence starts at \code{0} (no regularization) and then increments by \code{1/n.train} as needed for stable solves.}
+  \item{ridge}{Base ridge term for local linear solves in \code{npscoefhat}; must be a non-negative finite scalar. The ridge sequence starts at the supplied base (zero by default) and then increments by \code{1/n.train} as needed for stable solves. The ridge is expressed in the normalized kernel-weight units of the matrix output; categorical profile application converts it to the equivalent profile-system scale.}
 
 
 \subsection{Additional Arguments}{
@@ -107,6 +110,15 @@ constraint design matrix \eqn{\operatorname{diag}(y)H'} as represented in R by
 \code{t(H) * y}.
 }
 \details{
+For local-constant and degree-zero local-polynomial \code{npindexhat} means,
+every finite nonzero kernel-weight sum is used without an epsilon floor.
+An explicitly supplied external evaluation row with all computed weights zero
+returns \code{NA} with a warning, preserving its position in matrix and applied
+outputs. This does not distinguish geometric absence from weights that have
+underflowed. Signed cancellation and nonfinite normalizing sums are errors.
+Required internal and bootstrap computations do not omit undefined rows or
+replications.
+
 These operators are intended for fixed-\eqn{X} workflows such as one-shot wild
 bootstrap calculations where many response draws are projected through the same
 operator. The implementation is intentionally conservative: class and scalar

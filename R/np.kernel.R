@@ -1,7 +1,9 @@
 npksum <-
   function(...){
     mc <- match.call(expand.dots = FALSE)
-    target <- .np_bw_dispatch_target(dots = mc$..., eval_env = parent.frame())
+    target <- .np_bw_dispatch_target(dots = mc$..., data_arg_names = "txdat",
+                                     eval_env = parent.frame(),
+                                     promise.frame = environment())
     UseMethod("npksum", target)
   }
 
@@ -20,30 +22,41 @@ npksum <-
 
 npksum.formula <-
   function(formula, data, newdata, subset, na.action, ...){
+    dots <- list(...)
     .npRmpi_require_active_slave_pool(where = "npksum()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_npksum_should_localize(NULL, list(...)) &&
         !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
       return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
-    if (.npRmpi_autodispatch_active())
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
-
     mf <- match.call(expand.dots = FALSE)
     m <- match(c("formula", "data", "subset", "na.action"),
                names(mf), nomatch = 0)
     mf <- mf[c(1,m)]
     mf[[1]] <- as.name("model.frame")
-    mf.args <- as.list(mf[-1L])
-    mf <- do.call(stats::model.frame, mf.args, envir = parent.frame())
+    mf.args <- .np_formula_frame_promises(as.list(mf[-1L]), environment())
+    mf.args$formula <- .np_formula_aligned_terms(
+      if (missing(data)) terms(formula) else terms(formula, data = data))
+    if (!missing(subset))
+      mf.args[c("data", "subset")] <- .np_formula_subset_inputs(
+        if (missing(data)) NULL else data, match.call()[["subset"]], parent.frame())
+    if (!is.null(dots$weights)) mf.args$.np.auxiliary <- list(weights = dots$weights)
+    mf <- do.call(.np_formula_model_frame, mf.args, envir = parent.frame())
+    if (!is.null(dots$weights)) dots$weights <- model.weights(mf)
     
     tydat <- model.response(mf)
-    txdat <- mf[, attr(attr(mf, "terms"),"term.labels"), drop = FALSE]
+    txdat <- mf[, .np_formula_term_names(attr(attr(mf, "terms"),"term.labels")), drop = FALSE]
 
     miss.new <- missing(newdata)
     if (!miss.new){
-      tt <- delete.response(attr(mf,"terms"))
+      tt <- .np_formula_aligned_terms(delete.response(attr(mf,"terms")))
+      npValidateNewdataFormula(newdata, tt, include.response = FALSE)
       umf.args <- list(formula = tt, data = newdata)
-      umf <- do.call(stats::model.frame, umf.args, envir = parent.frame())
-      exdat <- umf[, attr(attr(umf, "terms"),"term.labels"), drop = FALSE]
+      umf <- do.call(.np_formula_model_frame, umf.args, envir = parent.frame())
+      exdat <- umf[, .np_formula_term_names(attr(attr(umf, "terms"),"term.labels")), drop = FALSE]
     }
 
     call_args <- list(txdat = txdat)
@@ -52,7 +65,7 @@ npksum.formula <-
     if (!miss.new)
       call_args$exdat <- exdat
 
-    tobj <- do.call(npksum, c(call_args, list(...)))
+    tobj <- do.call(npksum, c(call_args, dots))
 
     tobj$formula <- formula
     tobj$na.action <- attr(mf, "na.action")
@@ -61,7 +74,21 @@ npksum.formula <-
   }
 
 npksum.integer <-
-  function(...) { npksum.numeric(...) }
+  function(...) {
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+ npksum.numeric(...) }
+
+# Transport already-owned dots instead of replaying expressions on workers.
+# This is local to npksum; shared dispatcher targets and protocol are unchanged.
+.npRmpi_npksum_owned_call <- function(mc, dots) {
+  if (length(dots)) {
+    mc[["..."]] <- as.pairlist(lapply(dots, function(value) {
+      if (is.language(value)) substitute(quote(VALUE), list(VALUE = value)) else value
+    }))
+  }
+  .npRmpi_autodispatch_expand_dots_call(mc)
+}
 
 npksum.numeric <-
   function(bws,
@@ -72,15 +99,36 @@ npksum.numeric <-
            bandwidth.divide, compute.ocg, compute.score, kernel.pow,
            leave.one.out, operator, permutation.operator, return.kernel.weights,
            ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     dots <- list(...)
     return.derivative.kernel.weights <- isTRUE(dots$return.derivative.kernel.weights)
     dots$return.derivative.kernel.weights <- NULL
+    # Computation controls must survive numeric-bandwidth redispatch, not be
+    # consumed as bandwidth-constructor options. Preserve their exact values.
+    power.args <- NULL
+    if (length(dots)) {
+      power.names <- names(dots) %in%
+        c(".np.internal.power12", ".np.internal.power12.weighted")
+      if (any(power.names)) {
+        power.args <- dots[power.names]
+        dots <- dots[!power.names]
+      }
+    }
     .npRmpi_require_active_slave_pool(where = "npksum()")
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
     if (.npRmpi_npksum_should_localize(bws, list(...)) &&
         !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
       return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
     if (.npRmpi_autodispatch_active())
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      return(.npRmpi_autodispatch_call(
+        .npRmpi_npksum_owned_call(match.call(expand.dots = FALSE), list(...)),
+        parent.frame(), owner.name = "npksum.numeric"))
 
     txdat <- toFrame(txdat)
     if (!missing(exdat)) {
@@ -130,6 +178,8 @@ npksum.numeric <-
       call_args$return.kernel.weights <- return.kernel.weights
     if (return.derivative.kernel.weights)
       call_args$return.derivative.kernel.weights <- return.derivative.kernel.weights
+    if (length(power.args))
+      call_args <- c(call_args, power.args)
 
     do.call(npksum.default, call_args)
   }
@@ -149,14 +199,80 @@ npksum.default <-
            permutation.operator = names(PERMUTATION_OPERATORS),
            return.kernel.weights = FALSE,
            ...){
+  .np_reject_native_data(substitute(list(...))[-1L])
+  .np_reject_native_frame_args(substitute(list(...))[-1L])
+
     dots <- list(...)
+    internal.power12 <- isTRUE(dots$.np.internal.power12)
+    dots$.np.internal.power12 <- NULL
+    internal.power12.weighted <-
+      isTRUE(dots$.np.internal.power12.weighted)
+    dots$.np.internal.power12.weighted <- NULL
+    internal.bandwidth.divide.weights <-
+      isTRUE(dots$.np.internal.bandwidth.divide.weights)
+    dots$.np.internal.bandwidth.divide.weights <- NULL
+    internal.eval.train.index <- dots$.np.internal.eval.train.index
+    dots$.np.internal.eval.train.index <- NULL
+    internal.fold.geometry <- isTRUE(dots$.np.internal.fold.geometry)
+    dots$.np.internal.fold.geometry <- NULL
+    internal.fold.train.index <- dots$.np.internal.fold.train.index
+    dots$.np.internal.fold.train.index <- NULL
+    internal.tree.outer.blas <- isTRUE(dots$.np.internal.tree.outer.blas)
+    dots$.np.internal.tree.outer.blas <- NULL
+    internal.entry.guard <- dots$.np.internal.entry.guard
+    dots$.np.internal.entry.guard <- NULL
     return.derivative.kernel.weights <- isTRUE(dots$return.derivative.kernel.weights)
+
+    bandwidth.divide <- npValidateScalarLogical(bandwidth.divide, "bandwidth.divide")
+    compute.ocg <- npValidateScalarLogical(compute.ocg, "compute.ocg")
+    compute.score <- npValidateScalarLogical(compute.score, "compute.score")
+    leave.one.out <- npValidateScalarLogical(leave.one.out, "leave.one.out")
+    return.kernel.weights <-
+      npValidateScalarLogical(return.kernel.weights, "return.kernel.weights")
+
+    if (!is.numeric(kernel.pow) || length(kernel.pow) != 1L ||
+        is.na(kernel.pow) || !is.finite(kernel.pow) ||
+        kernel.pow != floor(kernel.pow) ||
+        abs(kernel.pow) > .Machine$integer.max)
+      stop("'kernel.pow' must be one finite integer")
+    kernel.pow <- as.integer(kernel.pow)
+
     .npRmpi_require_active_slave_pool(where = "npksum()")
-    if (.npRmpi_npksum_should_localize(bws, list(...)) &&
-        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
-      return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+    if (.npRmpi_master_local_entry_needed()) {
+      .np.local.entry <- new.env(parent=emptyenv())
+      on.exit(.npRmpi_local_entry_end(.np.local.entry), add=TRUE)
+      .npRmpi_local_entry_begin(.np.local.entry)
+    }
+    if (.npRmpi_npksum_should_localize(bws, dots) &&
+        !isTRUE(getOption("npRmpi.local.regression.mode", FALSE))) {
+      if (is.null(internal.entry.guard))
+        return(.npRmpi_with_local_regression(.npRmpi_eval_without_dispatch(match.call(), parent.frame())))
+      reentry.call <- match.call()
+      reentry.env <- parent.frame()
+      return(.npRmpi_with_local_regression({
+        # Preserve the existing invocation and lookup precedence. The guard
+        # retains only an error escaping re-entry, before command evaluation
+        # can simplify an ordinary condition to its message.
+        if (is.symbol(reentry.call[[1L]])) {
+          name <- as.character(reentry.call[[1L]])
+          target <- get0(name, envir = reentry.env, mode = "function", inherits = TRUE)
+          if (is.null(target))
+            target <- get0(name, envir = asNamespace("npRmpi"),
+                           mode = "function", inherits = FALSE)
+          if (!is.null(target)) reentry.call[[1L]] <- target
+        }
+        retain <- function(expr) tryCatch(force(expr), error = function(e) {
+          if (is.null(internal.entry.guard$reentry.error))
+            internal.entry.guard$reentry.error <- e
+          stop(e)
+        })
+        .npRmpi_eval_without_dispatch(as.call(list(retain, reentry.call)), reentry.env)
+      }))
+    }
     if (.npRmpi_autodispatch_active())
-      return(.npRmpi_autodispatch_call(match.call(), parent.frame()))
+      return(.npRmpi_autodispatch_call(
+        .npRmpi_npksum_owned_call(match.call(expand.dots = FALSE), list(...)),
+        parent.frame(), owner.name = "npksum.default"))
 
     miss.ty <- missing(tydat)
     miss.ex <- missing(exdat)
@@ -170,6 +286,27 @@ npksum.default <-
       operator <- match.arg(operator, choices = names(ALL_OPERATORS), several.ok = TRUE)
 
     permutation.operator <- match.arg(permutation.operator, choices = names(PERMUTATION_OPERATORS) )
+
+    if (internal.power12.weighted && !internal.power12)
+      stop("invalid use of the internal weighted dual-power kernel-sum route")
+
+    if (internal.bandwidth.divide.weights &&
+        (!return.kernel.weights || !bandwidth.divide))
+      stop("invalid use of the internal divided kernel-weight route")
+
+    invalid.power12.response <- if (internal.power12.weighted) {
+      is.null(tydat) || !is.null(weights)
+    } else {
+      !is.null(tydat) || !is.null(weights)
+    }
+
+    if (internal.power12 &&
+        (invalid.power12.response ||
+         !identical(as.double(kernel.pow), 1.0) ||
+         compute.ocg || compute.score ||
+         permutation.operator != "none" || return.kernel.weights ||
+         return.derivative.kernel.weights || any(operator != "normal")))
+      stop("invalid use of the internal dual-power kernel-sum route")
     
     txdat = toFrame(txdat)
 
@@ -193,6 +330,14 @@ npksum.default <-
       }
     }
 
+    bws <- .np_ordered_bandwidth_contract(bws)
+
+    if (internal.power12.weighted &&
+        (!identical(bws[["type", exact = TRUE]], "fixed") ||
+         !is.matrix(tydat) || ncol(tydat) != 1L ||
+         !is.numeric(tydat)))
+      stop("invalid use of the internal weighted dual-power kernel-sum route")
+
     if (!miss.ex){
       exdat = toFrame(exdat)
 
@@ -211,12 +356,35 @@ npksum.default <-
 
     if(compute.score && compute.ocg)
       stop("compute.score and compute.ocg are mutually exclusive, and cannot be enabled simultaneously")
+    if(compute.score && permutation.operator != "none")
+      stop("compute.score cannot be combined with a permutation operator")
     if(!all(operator[bws$iuno | bws$iord] %in% uo.operators) && !compute.score)
       stop("unordered and ordered variables may only make use of 'normal', 'convolution' and 'integral' operator types")
     
     operator.num <- ALL_OPERATORS[operator]
     poperator.num <- PERMUTATION_OPERATORS[permutation.operator]
-    
+
+    beta.kernel <- identical(bws$ckertype, "beta")
+    if (beta.kernel) {
+      if (!(bws$type %in% c("fixed", "generalized_nn", "adaptive_nn")))
+        stop("beta kernel sums require a recognized bandwidth mode")
+      if (!(as.integer(bws$ckerorder) %in% c(2L, 4L, 6L, 8L)))
+        stop("beta kernel sums require order 2, 4, 6, or 8")
+      if (!(bws$ckerbound %in% c("fixed", "range")) ||
+          any(!is.finite(bws$ckerlb[bws$icon])) ||
+          any(!is.finite(bws$ckerub[bws$icon])))
+        stop("beta kernel sums require finite fixed or empirical-range bounds")
+      if (any(!operator %in% c("normal", "convolution", "derivative", "integral")))
+        stop("beta kernel sums support operator = \"normal\", \"convolution\", \"derivative\", or \"integral\"")
+      if (sum(operator == "derivative") > 1L)
+        stop("beta kernel sums support one direct derivative dimension at a time")
+      if (compute.score || compute.ocg ||
+          !permutation.operator %in% c("none", "derivative"))
+        stop("beta kernel sums support only derivative permutation operators")
+      if (any(operator == "derivative") && permutation.operator == "derivative")
+        stop("direct and permutation beta derivatives cannot be combined")
+    }
+
     if ((any(bws$icon) &&
          !all(vapply(txdat[, bws$icon, drop = FALSE], inherits, logical(1), c("integer", "numeric")))) ||
         (any(bws$iord) &&
@@ -228,11 +396,6 @@ npksum.default <-
     if (!miss.ty && (nrow(txdat) != nrow(tydat)))
       stop("number of explanatory data 'txdat' and dependent data 'tydat' do not match")
 
-    integer.pow = identical(as.double(as.integer(kernel.pow)),as.double(kernel.pow))
-    
-    if(!integer.pow)
-      stop("'kernel.pow' is not an integer")
-
     if (!miss.ex && leave.one.out)
       stop("you may not specify 'leave.one.out = TRUE' and provide evaluation data")
 
@@ -241,13 +404,13 @@ npksum.default <-
     ## catch and destroy NA's
 
     keep.rows <- rep_len(TRUE, nrow(txdat))
-    rows.omit <- attr(na.omit(txdat), "na.action")
+    rows.omit <- .np_current_rows_omit(txdat)
 
     if (!miss.ty)
-      rows.omit <- union(rows.omit, attr(na.omit(tydat), "na.action"))
+      rows.omit <- union(rows.omit, .np_current_rows_omit(tydat))
 
     if (!miss.weights)
-      rows.omit <- union(rows.omit, attr(na.omit(weights), "na.action"))
+      rows.omit <- union(rows.omit, .np_current_rows_omit(weights))
 
     
     if (length(rows.omit) > 0L)
@@ -275,17 +438,44 @@ npksum.default <-
 
     tnrow = nrow(txdat)
     enrow = (if (miss.ex) tnrow else nrow(exdat))
+    fold.geometry <- internal.fold.geometry &&
+      (leave.one.out || !is.null(internal.fold.train.index)) &&
+      bws$type %in% c("generalized_nn", "adaptive_nn") && bws$ncon > 0L
+    if (!is.null(internal.fold.train.index) &&
+        (!fold.geometry || miss.ex || leave.one.out ||
+         length(rows.omit) || length(attr(exdat, "na.action")) ||
+         !is.integer(internal.fold.train.index) ||
+         length(internal.fold.train.index) != enrow ||
+         anyNA(internal.fold.train.index) ||
+         any(internal.fold.train.index < 1L | internal.fold.train.index > tnrow)))
+      stop("invalid internal raw delete-one occurrence map")
+    if (fold.geometry && (internal.power12 || compute.ocg || compute.score ||
+                          permutation.operator != "none" ||
+                          any(operator != "normal") || !kernel.pow %in% c(1, 2)))
+      stop("invalid internal raw delete-one kernel-sum request")
+    if (!is.null(internal.eval.train.index)) {
+      if (miss.ex || leave.one.out || internal.power12 ||
+          bws$type != "generalized_nn" || bws$ncon < 1L ||
+          length(rows.omit) || length(attr(exdat, "na.action")) ||
+          !is.integer(internal.eval.train.index) ||
+          length(internal.eval.train.index) != enrow ||
+          anyNA(internal.eval.train.index) ||
+          any(internal.eval.train.index < 1L | internal.eval.train.index > tnrow))
+        stop("invalid use of the internal mapped NN kernel-sum route")
+    }
     twncol = (if (miss.weights) 0 else ncol(weights))
     tyncol = (if (miss.ty) 0 else ncol(tydat))
 
     dim.in = c(twncol, tyncol, enrow)
 
-    dim.out = c(twncol, tyncol, enrow)
+    ## Missing weight/response roles are multiplicative identities in the
+    ## output, although the native input counts above remain zero.
+    dim.out = c(max(1L, twncol), max(1L, tyncol), enrow)
     
     length.out = prod(dim.out[which(dim.out > 0)])
 
     has.permutation <- permutation.operator != "none"
-    has.pksum <- has.permutation || compute.ocg
+    has.pksum <- has.permutation || compute.score || compute.ocg
 
     if (has.pksum){
       npvar <- (if (has.permutation) bws$ncon else 0L) +
@@ -306,6 +496,43 @@ npksum.default <-
     
     if (!miss.ex)
       exdat <- adjustLevels(exdat, bws$xdati, allowNewCells = TRUE)
+
+    # A near-integer retained support must not silently change the raw LR
+    # integration measure. Check before native allocations/MPI collectives.
+    if (bws$okertype == "liracine") {
+      for (j in which(bws$iord & operator == "integral"))
+        .np_ordered_lr_cumulative_contract(bws$xdati$all.dlev[[j]])
+    }
+
+    # Reject singular new elementwise score endpoints before entering any MPI
+    # collective. Value operators still admit lambda=0; no bandwidth is moved.
+    if (compute.score && bws$okertype %in% c("liracine", "racineliyan")) {
+      for (j in which(bws$iord)) {
+        if (bws$bw[j] != 0) next
+        support <- sort(unique(c(bws$xdati$all.dlev[[j]], dlev(txdat[, j]),
+                                if (!miss.ex) dlev(exdat[, j]))))
+        gaps <- diff(support)
+        # A raw LR cumulative on incumbent lattice support integrates its
+        # unit interval, including gaps. New donors may be less than one unit
+        # from such an integration point even if retained levels are farther.
+        if (bws$okertype == "liracine" && operator[j] == "integral") {
+          retained <- bws$xdati$all.dlev[[j]]
+          offset <- retained-retained[1L]
+          lattice <- round(offset)
+          if (all(abs(offset-lattice) <=
+                  8*.Machine$double.eps*pmax(1,abs(offset))) &&
+              tail(lattice,1L) < .Machine$integer.max) {
+            donor <- dlev(txdat[,j])
+            nearest <- pmin(tail(retained,1L),pmax(retained[1L],
+              retained[1L]+round(donor-retained[1L])))
+            gaps <- c(gaps,abs(donor-nearest))
+          }
+        }
+        if (any(gaps > 0 & gaps < 1 - 8*.Machine$double.eps))
+          stop("ordered bandwidth score at lambda = 0 is not finite for distances below 1; use an interior bandwidth for scores",
+               call. = FALSE)
+      }
+    }
 
     if (!miss.ex)
       npKernelBoundsCheckEval(exdat, bws$icon, bws$ckerlb, bws$ckerub, argprefix = "cker")
@@ -345,9 +572,13 @@ npksum.default <-
       has.pksum &&
       (p.length.out > 0L)
 
-    return.names <- c("ksum", "kernel.weights", "p.ksum")
-    if (need.pkw)
-      return.names <- c(return.names, "p.kernel.weights")
+    if (internal.power12) {
+      return.names <- c("ksum", "ksum.power2")
+    } else {
+      return.names <- c("ksum", "kernel.weights", "p.ksum")
+      if (need.pkw)
+        return.names <- c(return.names, "p.kernel.weights")
+    }
       
 	    myopti = list(
       num_obs_train = tnrow,
@@ -365,7 +596,8 @@ npksum.default <-
         gaussian = CKER_GAUSS + bws$ckerorder/2 - 1,
         epanechnikov = CKER_EPAN + bws$ckerorder/2 - 1,
         uniform = CKER_UNI,
-        "truncated gaussian" = CKER_TGAUSS),
+        beta = CKER_COORDINATE
+),
       ukerneval = switch(bws$ukertype,
         aitchisonaitken = UKER_AIT,
         liracine = UKER_LR),
@@ -386,8 +618,30 @@ npksum.default <-
       compute.score = compute.score,
       compute.ocg = compute.ocg,
       suppress.parallel = isTRUE(getOption("npRmpi.local.regression.mode", FALSE)))
+      myopti <- c(myopti, npContinuousKernelDescriptorOptions(bws))
+      myopti <- c(myopti, list(
+        divide.returned.kernel.weights = internal.bandwidth.divide.weights
+      ))
+      myopti <- c(myopti, list(
+        categorical.compress =
+          beta.kernel &&
+          bws[["nuno", exact = TRUE]] + bws[["nord", exact = TRUE]] > 0L &&
+          npStrictLogicalOption("np.categorical.compress", TRUE),
+        tree.outer.blas = internal.tree.outer.blas
+      ))
 
-	    cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
+    cker.bounds.c <- npKernelBoundsMarshal(bws$ckerlb[bws$icon], bws$ckerub[bws$icon])
+    if (fold.geometry) myopti$leave.one.out <- FALSE
+    myopti <- as.integer(myopti)
+    if (fold.geometry) {
+      # Private estimator contract: delete the occurrence before constructing
+      # its NN geometry. Public leave.one.out keeps its zero-diagonal meaning.
+      attr(myopti, "np.fold.train.index") <-
+        (if (is.null(internal.fold.train.index)) seq_len(tnrow)
+         else internal.fold.train.index) - 1L
+    }
+    if (!is.null(internal.eval.train.index))
+      attr(myopti, "np.eval.train.index") <- internal.eval.train.index - 1L
     
    asDouble <- function(data){
 	   if (is.null(data)){
@@ -399,21 +653,61 @@ npksum.default <-
 	   return(result)
    }
 
-    myout <-
-      .Call("C_np_kernelsum",
-            asDouble(tuno), asDouble(tord), asDouble(tcon),
-            asDouble(tydat), asDouble(weights),
-            asDouble(euno), asDouble(eord), asDouble(econ),
-            as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
-            as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
-            as.integer(c(operator.num[bws$icon], operator.num[bws$iuno], operator.num[bws$iord])),
-            as.integer(myopti), as.double(kernel.pow),
-            as.integer(length.out),
-            as.integer(p.length.out),
-            as.integer(nkw),
-            as.double(cker.bounds.c$lb),
-            as.double(cker.bounds.c$ub),
-            PACKAGE="npRmpi")[return.names]
+    if (internal.power12) {
+      myout <-
+        .np_with_nn_radius_context(.Call("C_np_kernelsum_power12",
+              asDouble(tuno), asDouble(tord), asDouble(tcon),
+              asDouble(tydat), asDouble(weights),
+              asDouble(euno), asDouble(eord), asDouble(econ),
+              as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+              as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+              as.integer(c(operator.num[bws$icon], operator.num[bws$iuno], operator.num[bws$iord])),
+              myopti, as.double(kernel.pow),
+              as.integer(length.out),
+              as.integer(p.length.out),
+              as.integer(nkw),
+              as.double(cker.bounds.c$lb),
+              as.double(cker.bounds.c$ub),
+              PACKAGE="npRmpi"), continuous.names = bws[["xnames", exact = TRUE]][bws[["icon", exact = TRUE]]])[return.names]
+    } else {
+      eval.native <- if (is.null(internal.entry.guard)) .Call else function(...) {
+        # Force every existing R argument before collective readiness. The
+        # captured guard retains its original communicator through ANN locality.
+        args <- list(...)
+        if (!internal.entry.guard$enter(native = TRUE))
+          stop(internal.entry.guard$invalid)
+        value <- do.call(.Call, args)
+        internal.entry.guard$phase <- "returned"
+        value
+      }
+      myout <-
+        .np_with_nn_radius_context(eval.native("C_np_kernelsum",
+              asDouble(tuno), asDouble(tord), asDouble(tcon),
+              asDouble(tydat), asDouble(weights),
+              asDouble(euno), asDouble(eord), asDouble(econ),
+              as.double(c(bws$bw[bws$icon], bws$bw[bws$iuno], bws$bw[bws$iord])),
+              as.double(bws$xmcv), as.double(attr(bws$xmcv, "pad.num")),
+              as.integer(c(operator.num[bws$icon], operator.num[bws$iuno], operator.num[bws$iord])),
+              myopti, as.double(kernel.pow),
+              as.integer(length.out),
+              as.integer(p.length.out),
+              as.integer(nkw),
+              as.double(cker.bounds.c$lb),
+              as.double(cker.bounds.c$ub),
+              PACKAGE="npRmpi"), continuous.names = bws[["xnames", exact = TRUE]][bws[["icon", exact = TRUE]]])[return.names]
+    }
+
+    if (!beta.kernel && twncol > 1L && tyncol > 1L) {
+      # Ordinary native sums pack response before weight; the public W'Y
+      # contract (and the beta owner) packs weight before response.
+      decode.roles <- function(value, blocks = 1L) {
+        dim(value) <- c(tyncol, twncol, enrow, blocks)
+        as.vector(aperm(value, c(2L, 1L, 3L, 4L)))
+      }
+      myout[["ksum"]] <- decode.roles(myout[["ksum"]])
+      if (has.pksum && p.length.out > 0L)
+        myout[["p.ksum"]] <- decode.roles(myout[["p.ksum"]], npvar)
+    }
 
     if (dim.out[1] > 1){
       dim(myout[["ksum"]]) <- dim.out
@@ -423,6 +717,18 @@ npksum.default <-
       dim(myout[["ksum"]]) <- dim.out[dim.out > 1]
       if (miss.weights)
         myout[["ksum"]] <- aperm(myout[["ksum"]])
+    }
+
+    if (internal.power12) {
+      if (dim.out[1] > 1){
+        dim(myout[["ksum.power2"]]) <- dim.out
+        if (dim.out[2] < 2)
+          dim(myout[["ksum.power2"]]) <- dim(myout[["ksum.power2"]])[-2]
+      } else if (max(dim.out) > 1) {
+        dim(myout[["ksum.power2"]]) <- dim.out[dim.out > 1]
+        if (miss.weights)
+          myout[["ksum.power2"]] <- aperm(myout[["ksum.power2"]])
+      }
     }
 
     if(return.kernel.weights){
@@ -465,18 +771,80 @@ npksum.default <-
           ip <- c(ip,which(bws$iord))
       }
 
-      p.myout[,ip] <- p.myout
+      if(length(ip) != npvar)
+        stop("internal kernel-sum permutation dimension mismatch")
+
+      block.order <- order(ip)
+      p.myout <- p.myout[, block.order, drop = FALSE]
+      if(!is.null(p.kw) && npvar > 1L)
+        p.kw <- p.kw[, , block.order, drop = FALSE]
 
       p.myout <- array(data = as.vector(p.myout), dim = dim.p)
     } else {
       p.myout <- NULL
     }
-    return( npkernelsum(bws = bws,
-                        eval = teval,
-                        ksum = myout[["ksum"]],
-                        kw = kw,
-                        p.ksum = p.myout,
-                        p.kw = p.kw,
-                        ntrain = tnrow, trainiseval = miss.ex) )
+    result <- npkernelsum(bws = bws,
+                          eval = teval,
+                          ksum = myout[["ksum"]],
+                          kw = kw,
+                          p.ksum = p.myout,
+                          p.kw = p.kw,
+                          ntrain = tnrow, trainiseval = miss.ex)
+    if (internal.power12)
+      result$ksum.power2 <- myout[["ksum.power2"]]
+    result
 
   }
+
+.npksum_closed_values <- function(args) {
+  if (!is.list(args) || !length(args) || is.null(names(args)) ||
+      anyNA(names(args)) || any(!nzchar(names(args))) ||
+      anyDuplicated(names(args))) {
+    stop("internal closed npksum arguments must be a uniquely named list",
+         call. = FALSE)
+  }
+  for (i in seq_along(args)) {
+    if (is.language(args[[i]])) {
+      stop("internal closed npksum arguments must contain values, not language objects",
+           call. = FALSE)
+    }
+  }
+
+  # The explicit named call head and concrete argument values survive
+  # match.call() unchanged. No caller-local symbol can therefore cross an MPI
+  # autodispatch boundary.
+  eval(as.call(c(list(as.name("npksum.default")), args)),
+       envir = environment())
+}
+
+.npksum_power12 <- function(bws,
+                            txdat = stop("training data 'txdat' missing"),
+                            exdat,
+                            ...) {
+  call.args <- list(bws = bws, txdat = txdat)
+  if (!missing(exdat))
+    call.args$exdat <- exdat
+  do.call(npksum.default,
+          c(call.args, list(...), list(.np.internal.power12 = TRUE)))
+}
+
+.npksum_power12_weighted <- function(bws,
+                                     txdat = stop("training data 'txdat' missing"),
+                                     counts,
+                                     exdat,
+                                     ...) {
+  if (!is.numeric(counts) || length(counts) != NROW(txdat) ||
+      any(!is.finite(counts)) || any(counts <= 0))
+    stop("'counts' must be a positive finite numeric vector matching 'txdat'")
+
+  call.args <- list(bws = bws, txdat = txdat, tydat = as.numeric(counts))
+  if (!missing(exdat))
+    call.args$exdat <- exdat
+  do.call(
+    npksum.default,
+    c(call.args, list(...), list(
+      .np.internal.power12 = TRUE,
+      .np.internal.power12.weighted = TRUE
+    ))
+  )
+}
